@@ -1,0 +1,8 @@
+{
+  "observation_id": "obs-synthetic-001",
+  "kind": "focused_window",
+  "summary": "Synthetic focused window (fake)",
+  "source": "synthetic-fixture",
+  "data_class": "INTERNAL",
+  "evidence_strength": 0.5
+}

@@ -1,0 +1,65 @@
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets/
+
+# Model weights and downloads (manifests only in Git)
+models/*.gguf
+models/*.onnx
+models/*.bin
+models/*.pt
+models/*.safetensors
+*.gguf
+
+# Local databases and vaults
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+data/
+.undo_vault/
+rollback_vault/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.envrc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Node / Electron
+node_modules/
+apps/desktop/dist/
+apps/desktop/out/
+*.local
+
+# Logs and diagnostics
+logs/
+*.log
+diagnostics/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+.idea/
+
+# Generated
+schemas/generated/
+coverage/
+htmlcov/
+
+# Local export archives (do not commit)
+AETHER-OS-phase0.tar.gz
+*.tar.gz

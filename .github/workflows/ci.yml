@@ -1,0 +1,64 @@
+# AETHER OS — Phase 0 CI (Windows)
+# MANUAL-ONLY: do not enable automatic hosted execution until the user
+# explicitly authorises CI activation. This workflow is intentionally
+# triggered by workflow_dispatch only (no push/pull_request triggers).
+name: CI (Phase 0, manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (Windows, Python 3.12)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Pin Python 3.12 for this project
+        run: uv python pin 3.12
+
+      - name: Verify Python 3.12
+        run: |
+          uv run python --version
+          uv run python -c "import sys; assert sys.version_info[:2] == (3, 12), f'expected 3.12, got {sys.version}'; print('Python 3.12 verified')"
+
+      - name: Install dependencies (locked)
+        run: uv sync --all-extras --locked
+
+      - name: Lint (Ruff)
+        run: uv run ruff check .
+
+      - name: Typecheck (mypy)
+        run: uv run mypy
+
+      - name: Tests (pytest)
+        run: uv run pytest
+
+      - name: Whitespace check (git diff --check)
+        run: git diff --check
+
+      # NOTE: Automated secret scanning is PENDING. No scanner is
+      # configured in Phase 0. Reviewers must manually confirm that
+      # no .env, *.gguf, *.db, credentials, or personal data are
+      # staged (see .gitignore). An open-source scanner (e.g. gitleaks)
+      # will be added only with explicit user approval.
+      - name: Manual secret review (pending automated scan)
+        run: |
+          echo "MANUAL CHECK REQUIRED: confirm no secrets in git status"
+          git status --porcelain
+          echo "Automated secret scanning is pending (not implemented in Phase 0)."
