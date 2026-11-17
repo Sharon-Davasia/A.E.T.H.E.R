@@ -1,0 +1,214 @@
+{
+  "$defs": {
+    "ModelFile": {
+      "additionalProperties": false,
+      "properties": {
+        "filename": {
+          "maxLength": 255,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "title": "Filename",
+          "type": "string"
+        },
+        "role": {
+          "default": "weights",
+          "enum": [
+            "weights",
+            "projector"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "size_bytes": {
+          "exclusiveMinimum": 0,
+          "title": "Size Bytes",
+          "type": "integer"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "filename",
+        "size_bytes",
+        "sha256"
+      ],
+      "title": "ModelFile",
+      "type": "object"
+    },
+    "RuntimeCompatibility": {
+      "additionalProperties": false,
+      "properties": {
+        "project": {
+          "default": "llama.cpp",
+          "title": "Project",
+          "type": "string"
+        },
+        "version": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Version",
+          "type": "string"
+        },
+        "build_id": {
+          "maxLength": 256,
+          "minLength": 1,
+          "title": "Build Id",
+          "type": "string"
+        },
+        "executable_sha256": {
+          "pattern": "^[0-9a-fA-F]{64}$",
+          "title": "Executable Sha256",
+          "type": "string"
+        },
+        "cuda_required": {
+          "default": false,
+          "title": "Cuda Required",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "version",
+        "build_id",
+        "executable_sha256"
+      ],
+      "title": "RuntimeCompatibility",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Manifest for verified local assets; paths are relative to configured root.",
+  "properties": {
+    "schema_version": {
+      "default": "1.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "model_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Model Id",
+      "type": "string"
+    },
+    "publisher": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "Publisher",
+      "type": "string"
+    },
+    "source_repository": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Source Repository",
+      "type": "string"
+    },
+    "source_revision": {
+      "pattern": "^[0-9a-fA-F]{40}$",
+      "title": "Source Revision",
+      "type": "string"
+    },
+    "conversion_repository": {
+      "maxLength": 512,
+      "minLength": 1,
+      "title": "Conversion Repository",
+      "type": "string"
+    },
+    "conversion_revision": {
+      "pattern": "^[0-9a-fA-F]{40}$",
+      "title": "Conversion Revision",
+      "type": "string"
+    },
+    "architecture": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Architecture",
+      "type": "string"
+    },
+    "quantisation": {
+      "maxLength": 64,
+      "minLength": 1,
+      "title": "Quantisation",
+      "type": "string"
+    },
+    "files": {
+      "items": {
+        "$ref": "#/$defs/ModelFile"
+      },
+      "maxItems": 8,
+      "minItems": 1,
+      "title": "Files",
+      "type": "array"
+    },
+    "license": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "License",
+      "type": "string"
+    },
+    "local_install_path": {
+      "maxLength": 512,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-][A-Za-z0-9._-]*(/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$",
+      "title": "Local Install Path",
+      "type": "string"
+    },
+    "context_length": {
+      "maximum": 262144,
+      "minimum": 512,
+      "title": "Context Length",
+      "type": "integer"
+    },
+    "chat_template": {
+      "maxLength": 256,
+      "minLength": 1,
+      "title": "Chat Template",
+      "type": "string"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeCompatibility"
+    },
+    "text_generation": {
+      "title": "Text Generation",
+      "type": "boolean"
+    },
+    "multimodal": {
+      "default": false,
+      "title": "Multimodal",
+      "type": "boolean"
+    },
+    "projector_required": {
+      "default": false,
+      "title": "Projector Required",
+      "type": "boolean"
+    },
+    "unsupported_features": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 32,
+      "title": "Unsupported Features",
+      "type": "array"
+    }
+  },
+  "required": [
+    "model_id",
+    "publisher",
+    "source_repository",
+    "source_revision",
+    "conversion_repository",
+    "conversion_revision",
+    "architecture",
+    "quantisation",
+    "files",
+    "license",
+    "local_install_path",
+    "context_length",
+    "chat_template",
+    "runtime",
+    "text_generation"
+  ],
+  "title": "ModelManifest",
+  "type": "object"
+}

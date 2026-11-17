@@ -1,43 +1,37 @@
-# AETHER OS — Trust Boundaries (Phase 0)
+# AETHER OS — Trust Boundaries (Phase 1 foundation)
 
-**Status:** Accepted baseline (master spec v1.0)
+**Status:** Master-spec baseline with Phase 1 local-inference boundaries; no Phase 2 permissions/actions.
 
-## Process layout and trust
+## Phase 1 process and module layout
 
-| Process | Runs as / trust | Allowed responsibilities |
-|---|---|---|
-| Electron main + preload | Normal interactive user | Trusted windows, approval UI, restricted IPC bridge |
-| React renderer | Chromium sandbox, no Node | Presentation only; escaped strings |
-| FastAPI orchestrator | Normal user, loopback bound | Plans, policies, task state, model routing, memory |
-| llama.cpp server | Normal user, loopback only | Inference; **no independent OS permissions** |
-| Adapter workers | Separate processes where useful | Named commands under broker policy |
-| Restricted script worker | Low-privilege isolated identity | Only approved code, constrained resources |
-| Voice service | Normal user, mic-consent controlled | Wake, VAD, transcription, synthesis |
-| Updater/recovery helper | Separately approved privilege if needed | Verified packages, atomic activation, rollback |
+| Process/module | Trust and allowed responsibility |
+|---|---|
+| FastAPI backend | Normal user, developer launcher binds `127.0.0.1`; peer-loopback check, ephemeral bearer session, exact-origin allowlist; typed chat/status only |
+| `model_gateway` | Internal HTTP client constrained to numeric loopback, requires model-server key for inference/tokenization; no filesystem writers, shell, credentials or Windows automation imports |
+| llama.cpp server | Separate ordinary-user process, `127.0.0.1`, authenticated protected routes; no tools/agent/MCP; no independent OS-action privileges |
+| `model_runtime` supervisor | Verifies manifest and files, launches an exact configured executable with fixed arguments and `shell=False`, starts one server, no automatic restart; Windows Job Object containment is generated but needs target Windows validation |
+| Mock tool registry | In-memory deterministic synthetic handlers only; proposals are validated but never dispatched from chat |
+| `PolicyBroker` | Continues to deny every real OS action, independent of model output |
 
-Phase 0 implements only the FastAPI health endpoint. All other processes are deferred.
+The llama.cpp server exposes an upstream minimal `/health` endpoint without API-key authentication. It is loopback-only and contains no paths or secrets. Chat and tokenization routes require a random in-memory API key passed via child environment, never command-line arguments. Loopback is not treated as authentication: backend routes separately require a bearer token. The local API token is generated at developer-server startup and displayed once in the interactive terminal, not logged or stored in the repository.
 
-## Network policy
+## Trust hierarchy and untrusted content
 
-- Default local-only inference; model server binds loopback, not LAN.
-- `WEB_PUBLIC` (research/downloads), `RSI_REMOTE` (disabled by default), and `UPDATE_FETCH` are separate capabilities.
-- Reject arbitrary model-produced URLs for credential-bearing requests; enforce redirect chains, TLS, hostname allowlists, response size limits.
-- Enforceable Offline switch (not merely a prompt).
+- The user is the sole authorizing principal for future consequential actions; Phase 1 does not implement approvals or actions.
+- Trusted system guidance is assembled separately from user content. Only server-created user/assistant history is accepted. External evidence, if provided internally for tests, is explicitly labelled `UNTRUSTED_SOURCE`.
+- Labels, system prompts, constrained JSON and Pydantic validation are not security boundaries by themselves. Security derives from module separation, authenticated loopback transport, deterministic registry validation and the deny-all real-OS broker.
+- No real world-state, memory, browser, file or Windows context is available. The implementation says so rather than inventing observations.
+- A local logged-in user with Windows-level access can inspect or modify same-user processes/files; AETHER does not claim to defeat a compromised local account.
 
-## Module boundaries (enforced in Phase 0 tests)
+## Phase 1 network and process policy
 
-- `core/policy` cannot depend on model content.
-- `core/orchestration` calls `policy`, `world_state`, `adapters`, `memory` via interfaces (later phases).
-- Adapters cannot call other adapters' privileged methods directly.
-- `model_gateway` cannot import filesystem writers, shell runners, or credential stores (later phases; boundary test asserts no model/shell imports in policy/adapters).
-- `desktop` invokes a narrow backend API, receives events (not raw Python objects).
-- `voice` produces intent with transcription evidence; it cannot apply changes.
-- `provider_connectors` can only send broker-approved payload hashes.
+- The FastAPI developer launcher binds to `127.0.0.1`; middleware rejects non-loopback peers. Non-allowlisted `Origin` values are rejected as a request boundary. No CORS middleware or CORS response headers are present; browser-based cross-origin clients are not supported.
+- The gateway accepts only numeric loopback HTTP URLs and disables ambient proxy configuration. No cloud model/provider classes or fallback exist.
+- The model server binds only to `127.0.0.1` on a configurable port distinct from backend port 9931. Its protected routes use an ephemeral API key. The model server health route is public but minimal and loopback-restricted.
+- Supervisor passes no user/model-generated CLI flags, does not invoke a shell, removes inherited proxy/model-hub credentials and `LLAMA_ARG_*` overrides, and sets model-hub offline mode. Built-in tools, agent and MCP proxy options are explicitly disabled.
+- A model can suggest `request_tool` or `offer_rsi`; these are typed proposals only. Unknown tool IDs, invalid mock arguments and malformed structures are rejected. No output runs a command or changes policy.
+- The offline unit tests constrain code paths and mock transports; they do not prove Windows firewall-level egress policy.
 
-## Windows path and resource security
+## Existing broader-phase risks
 
-`SafePath` is useful but **not a sandbox**. It resolves aliases to canonical trusted resources, identifies volume/file identity, rejects reparse-point/junction escapes, and validates near execution time. Directory zones: Trusted workspace (write only under approved plan), Reference roots (read-only until granted), Protected OS/secret paths (excluded from model context), Removable/network volumes (by identity, unknown = read-only/no-execute).
-
-## Script execution
-
-Prefer typed commands (`run_tests`, `git_status`) over arbitrary shell. AST scan is inspection only; Job Objects are resource management, not isolation. Stronger isolation (restricted token, AppContainer, disposable environment) is required for untrusted code; if unavailable, the path stays disabled. Phase 0: no script execution at all.
+Filesystem path resolution, T0-T3 authorization, approval binding, adapters, Electron IPC, script-worker isolation, RSI disclosure, durable task storage and recovery remain later-phase designs. Phase 1 does not implement or claim them.

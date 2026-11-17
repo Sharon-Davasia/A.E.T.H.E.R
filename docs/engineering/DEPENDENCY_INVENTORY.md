@@ -1,56 +1,57 @@
-# Dependency and Licence Inventory (Phase 0)
+# Dependency and Licence Inventory (Phase 1)
 
-**Status:** Initial check; verify per exact released version before distribution.
-**Public-distribution licence:** **PENDING user decision** (no `LICENSE` file yet).
+**Status:** Development inventory; verify exact released versions and binaries before distribution.
+**Public-distribution project licence:** **PENDING user decision** (no `LICENSE` file).
 
-## Phase 0 runtime dependencies
-
-| Component | Role | Licence / attention |
-|---|---|---|
-| Python 3.12 (target) | Runtime | PSF; 3.11+ supported for dev |
-| FastAPI | Backend API | Open-source (MIT); verify version/lockfile |
-| Uvicorn | ASGI server | Open-source (BSD); localhost only |
-| Pydantic v2 | Typed contracts | Open-source (MIT) |
-| Structlog | Structured logging | Open-source (Apache-2.0) |
-
-## Phase 0 dev dependencies
+## Current Python runtime dependencies
 
 | Component | Role | Licence / attention |
 |---|---|---|
-| pytest | Testing | Open-source (MIT) |
-| httpx | TestClient transport | Open-source (BSD) |
-| Ruff | Lint/format | Open-source (MIT) |
-| mypy | Typecheck | Open-source (MIT) |
-| uv | Dependency manager | Open-source (Apache-2.0/MIT) |
+| Python 3.12 (target) | Runtime | PSF; supported-version policy `>=3.11` |
+| FastAPI | Authenticated local backend API | MIT; verify exact lockfile version |
+| Uvicorn | ASGI server | BSD; developer launcher binds 127.0.0.1 |
+| Pydantic v2 | Typed requests, decisions and manifest validation | MIT |
+| Structlog | Structured diagnostics | Apache-2.0; prompts/responses are not logged |
+| HTTPX | Async local llama.cpp transport | BSD; `trust_env=False`, numeric loopback-only URL |
 
-All Phase 0 dependencies are OSI-approved open-source. Exact versions are pinned in `backend/uv.lock`.
-
-## Later-phase components (not in Phase 0; licence review required)
+## Development and benchmark extras
 
 | Component | Role | Licence / attention |
 |---|---|---|
-| Electron | Desktop shell | MIT; security config + Chromium footprint |
-| React/Vite/TS/Tailwind | Frontend | Open-source; audit release notices |
-| llama.cpp | Local inference | MIT; check distributed builds |
-| Qwen3.5-4B upstream | Core model | Apache-2.0 per official repo; GGUF conversion separately verified; **candidate, pending V-01** |
-| Gemma 4 E4B | Alternative benchmark | Check exact checkpoint terms; **candidate** |
-| pywinauto / pywin32 | Windows controls | Audit packages + platform constraints |
-| Playwright | Browser adapter | Apache-2.0; browser binaries + profile handling |
-| pdfplumber | PDF parsing | MIT; no OCR/full editing |
-| PyMuPDF | Optional PDF engine | AGPLv3 or commercial — review before distribution |
-| openWakeWord | Wake word code | Apache-2.0 code; weights CC BY-NC-SA 4.0 |
-| whisper.cpp | Local STT | MIT; verify weights/usage |
-| Kokoro-82M | TTS candidate | Check model card + voice terms |
-| Piper/OHF fork | TTS alternative | GPL-3.0; audit voice packages |
-| SQLite/FTS5 | Storage | Public-domain SQLite; build-specific checks |
-| VS Code | Editor integration | Check Microsoft distribution vs Code-OSS |
-| Groq API | Optional RSI | Commercial hosted service; quotas/terms; **candidate, pending V-02** |
+| pytest | Unit and API tests | MIT |
+| pytest-asyncio | Deterministic async unit tests | Apache-2.0 |
+| Ruff | Lint/format | MIT |
+| mypy | Strict type checks | MIT |
+| psutil (benchmark extra) | Optional model-process RSS samples | BSD; not used to authorize actions |
+| uv | Dependency manager | Apache-2.0/MIT |
 
-Avoid silently mixing GPL/AGPL binaries or weights into incompatible redistribution. Legal/licensing review required before public distribution (V-06).
+Exact Python package versions are pinned in `backend/uv.lock`. CI remains manual-only.
 
-## Supply-chain controls (Phase 0)
+## Model/runtime candidates — not yet verified or installed
 
-- Pinned versions + `uv.lock`; no floating installs.
-- No model weights, API keys, or personal data in Git.
-- CI runs on `windows-latest` with locked deps; manual-only until authorised.
-- SBOM generation deferred to Phase 9 (release packaging).
+| Component | Role | Status / required evidence |
+|---|---|---|
+| `ggml-org/Qwen3.5-4B-GGUF`, `Qwen3.5-4B-Q4_K_M.gguf` | Preferred user-identified local text model candidate | **Pending independent verification:** immutable repo revision, exact artifact/hash/size, architecture/quantisation, chat template, text capability, projector requirements and exact licence. No download. |
+| llama.cpp Windows CUDA build | Local inference process | Upstream server protocol inspected; exact immutable release/build and CUDA compatibility with candidate GGUF **pending**. No binary downloaded. |
+| NVIDIA CUDA driver/runtime | Target GPU inference | Laptop version and compatibility unverified until Windows acceptance. |
+
+The master spec states the upstream Qwen checkpoint is Apache-2.0. That is not treated as verification of the specific candidate repository, conversion or redistribution rights. Do not distribute the GGUF until its exact license/terms are checked.
+
+## Later-phase components (not in Phase 1)
+
+| Component | Role | Licence / attention |
+|---|---|---|
+| Electron/React/Vite | Desktop UI | Deferred; audit release notices |
+| Gemma 4 E4B | Possible model challenger | Deferred; exact checkpoint terms and benchmark review |
+| pywinauto / pywin32 | Windows controls | Not present; real OS actions remain denied |
+| Playwright, Office/PDF tools | App integrations | Deferred |
+| SQLite/FTS5 persistent memory | Storage | Deferred |
+| Groq/RSI providers | Remote inference | Prohibited in Phase 1; no integration or fallback |
+
+## Supply-chain controls
+
+- Locked Python packages; no model/runtime auto-download code.
+- Model files are outside Git, declared in a manifest and checked by exact file inventory, size and streaming SHA-256 before process launch.
+- Runtime receives a generated API key through its child environment, not command-line arguments; no proxy or HF credentials are inherited.
+- No real model, CUDA binary, cloud provider SDK or personal data is included in the sandbox tests.
+- Automated secret scanner remains pending; manual review only.

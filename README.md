@@ -2,87 +2,81 @@
 
 **A dependable, private, context-aware personal computer operating assistant.**
 
-AETHER OS is a local-first, security-conscious, agentic desktop intelligence platform for Windows. It interprets natural language and voice, understands the current Windows workspace, uses local AI, manages authorised files and applications, performs structured coding and document workflows, remembers relevant facts with provenance, and explains what it is doing.
+AETHER OS is a local-first, security-conscious desktop intelligence platform for Windows. Its long-term specification describes broader capabilities; implemented status is recorded separately below.
 
-> **Current status: Phase 0 — Architecture repository, threat model and CI (foundation only).**
-> No inference, computer control, voice, memory engine, or remote services are implemented yet. All real OS actions are denied by default.
+> **Current status: Phase 1 foundation implemented in the current development branch; target acceptance is pending.** Authenticated text-chat scaffolding, local model interfaces, manifest integrity checks, process supervision, context/decision contracts, task tracking and mock tools are present and tested with fakes. The exact Qwen GGUF metadata and pinned CUDA runtime remain pending verification. No model is bundled or downloaded. **No real Windows actions, approvals, cloud inference, voice or persistent memory are implemented. Real OS actions remain denied by default.**
 
 ## Core principles
 
-1. The user understands and approves consequential changes **before** AETHER executes them.
+1. The user understands and approves consequential changes before execution (later-phase capability).
 2. The local AI never grants its own permissions or executes unrestricted arbitrary shell code.
-3. Private information stays local unless the user approves the exact outbound disclosure and destination.
-4. Tool responses, web pages, PDFs, repository files, skills, and remote answers are **data**, not instruction sources.
-5. AETHER reports verified outcomes and uncertainty truthfully; it stops rather than bluffs or exceeds scope.
+3. Private information stays local; Phase 1 has no hosted inference or cloud fallback.
+4. Tool responses, web pages, repository files and model outputs are data, not authority.
+5. AETHER reports verified outcomes and uncertainty truthfully; it stops rather than bluffing or exceeding scope.
 
 ## Target hardware
 
-Intel Core i7-14650HX · 16 GB RAM · RTX 4050 Laptop GPU (6 GB VRAM) · 450 GB–1 TB free SSD · Windows 11 first.
+Intel Core i7-14650HX · 16 GB RAM · RTX 4050 Laptop GPU (6 GB VRAM) · Windows 11 first. CUDA compatibility, GPU offload, VRAM and performance are **unverified until local Windows testing**.
 
 ## Quickstart (Windows)
 
 ```powershell
-# 1. Install uv (if not present) — https://docs.astral.sh/uv/getting-started/installation/
-irm https://astral.sh/uv/install.ps1 | iex
+# Install uv using the official instructions: https://docs.astral.sh/uv/getting-started/installation/
+# Python 3.12 is the project target.
 
-# 2. Clone and enter the backend
-git clone <repo-url> AETHER-OS
-cd AETHER-OS\backend
+# From the repository root, place uv cache/model storage on the clone's drive.
+. .\scripts\configure_dev_storage.ps1
 
-# 3. Sync dependencies (Python 3.12 target; 3.11+ supported for dev)
-uv sync --all-extras
-
-# 4. Run tests, lint, typecheck
-uv run pytest
-uv run ruff check .
-uv run mypy
-
-# 5. Run the Phase 0 health server (loopback via launch config)
-uv run uvicorn aether.api.app:app --host 127.0.0.1 --port 9931
-# Health: http://127.0.0.1:9931/v1/health
-# NOTE: Loopback binding is controlled by the launch command above,
-# not by the FastAPI application itself. Always launch with --host 127.0.0.1.
-```
-
-Or run the one-command verifier (from repo root):
-
-```powershell
+# Sync the locked environment and run verification.
+cd .\backend
+uv python install 3.12
+uv sync --all-extras --locked
+cd ..
 .\scripts\verify.ps1
 ```
+
+The verifier uses fake gateways and synthetic fixtures; it does not require model weights, CUDA or network inference. To start the authenticated API in loopback-only developer mode:
+
+```powershell
+.\scripts\run_backend.ps1
+```
+
+The launcher generates a temporary bearer token and displays it once in that terminal. Health and chat require the token, and the API rejects non-loopback peers. Without a verified model manifest/runtime, health reports `model_ready: false` and chat returns a typed unavailable error. See `docs/engineering/WINDOWS_PHASE1_VALIDATION.md` before any model installation; the candidate download remains pending separate approval.
 
 ## Documentation
 
 | Document | Purpose |
 |---|---|
-| `docs/architecture/MASTER_SPEC.md` | **What AETHER must eventually become** (authoritative v1.0 baseline) |
-| `docs/engineering/STATUS.md` | **What has actually been implemented and verified** |
-| `docs/architecture/adrs/` | **Why architectural decisions were made** |
-| `docs/security/THREAT_MODEL.md` | Trust hierarchy, adversaries, boundaries |
-| `docs/engineering/DEVELOPER_SETUP.md` | Full setup, testing, and verification guide |
-| `docs/engineering/DEPENDENCY_INVENTORY.md` | Dependency and licence register |
+| `docs/architecture/MASTER_SPEC.md` | What AETHER must eventually become (authoritative v1.0 baseline) |
+| `docs/engineering/STATUS.md` | What has actually been implemented and verified |
+| `docs/architecture/adrs/` | Why architectural decisions were made; candidate vs accepted status |
+| `docs/security/THREAT_MODEL.md` | Trust hierarchy, adversaries and boundaries |
+| `docs/engineering/DEVELOPER_SETUP.md` | Setup, testing and verification |
+| `docs/engineering/MODEL_INSTALLATION.md` | Pending model verification and later manual installation |
+| `docs/engineering/WINDOWS_PHASE1_VALIDATION.md` | Target-laptop acceptance procedure |
+| `docs/engineering/BENCHMARK_METHODOLOGY.md` | Synthetic V-01 benchmark methodology |
 
-The master specification does not change when a coding agent proposes a shortcut. Implementation changes are documented in `STATUS.md`; consequential architecture changes require an ADR and user review before the specification is amended.
+The master specification does not change to accommodate implementation shortcuts. Implementation changes are documented in `STATUS.md`; consequential architecture changes require an ADR and user review before the specification is amended.
 
 ## Repository layout
 
-```
+```text
 AETHER-OS/
-├── docs/          # architecture, ADRs, security, engineering
-├── apps/          # desktop, vscode-extension, browser-extension (later phases)
+├── docs/          # architecture, ADRs, security, engineering and validation
+├── apps/          # desktop and extensions (later phases)
 ├── backend/       # Python FastAPI backend (aether package)
-├── workers/       # restricted-executor, model-host (later phases)
-├── schemas/       # language-neutral JSON Schema (later)
-├── scripts/       # verify.ps1 and build/release helpers
-├── models/        # model manifests only, never weights in Git
-├── assets/        # icons, audio cues, licensed art
-├── tests/         # synthetic fixtures, e2e, benchmarks (later)
-└── .github/       # Windows CI workflow (manual-only until authorised)
+├── workers/       # future workers; model process supervised by backend
+├── schemas/       # language-neutral contracts
+├── scripts/       # verify.ps1 and run_backend.ps1
+├── models/        # manifests only; weights never in Git
+├── assets/        # licensed assets (later phases)
+└── tests/         # synthetic fixtures and benchmark procedures
 ```
 
 ## Licence
 
-**Pending user decision.** No public-distribution licence has been selected yet. See `docs/engineering/DEPENDENCY_INVENTORY.md`.
+Project public-distribution licence: **pending user decision**. The model/runtime licences are separate and must be verified before any asset download or redistribution.
 
 ## Security
 
-Phase 0 provides **foundational security contracts and a deny-by-default broker**: every real OS action is denied until permission and execution systems are implemented in later phases. This is not yet full runtime enforcement (no session auth, approval issuance, or resource resolution). See `docs/security/THREAT_MODEL.md`. Never commit secrets, model weights, local databases, or personal data.
+Phase 1 adds authenticated loopback API access and a supervised local-inference boundary. The model server receives no OS-action privileges; its inference/tokenization routes require a fresh API key held in process memory and supplied through its environment, not command-line arguments. The llama.cpp health endpoint is a minimal public liveness route, restricted by loopback binding. The FastAPI app also checks the connecting peer, requires a bearer session and rejects non-allowlisted `Origin` headers. This does not enable CORS; browser-based cross-origin clients are unsupported in Phase 1. The supervisor verifies a declared executable SHA-256 and authenticates model readiness. Built-in agent/tools/MCP options are disabled. None of this constitutes Phase 2 authorization or real OS-action enforcement; `PolicyBroker` continues to deny real actions. Never commit secrets, model weights, local databases, benchmark reports or personal data.

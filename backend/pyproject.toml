@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "aether-os"
-version = "0.0.1"
-description = "AETHER OS — local-first personal AI operating assistant (Phase 0 foundation)"
+version = "0.1.0"
+description = "AETHER OS — local-first personal AI operating assistant (Phase 1 foundation)"
 # Supported-version policy: 3.11+ for development; 3.12 is the pinned
 # development target (see backend/.python-version and CI).
 requires-python = ">=3.11"
@@ -15,15 +15,17 @@ dependencies = [
     "uvicorn[standard]>=0.30,<1.0",
     "pydantic>=2.7,<3.0",
     "structlog>=24.2,<26.0",
+    "httpx>=0.27,<1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0,<9.0",
-    "httpx>=0.27,<1.0",
+    "pytest-asyncio>=0.24,<2.0",
     "ruff>=0.6,<1.0",
     "mypy>=1.11,<2.0",
 ]
+benchmark = ["psutil>=6.0,<8.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["aether"]
@@ -43,8 +45,11 @@ known-first-party = ["aether"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
+asyncio_mode = "auto"
 markers = [
     "phase0: Phase 0 foundation tests",
+    "integration: optional tests requiring a local llama.cpp runtime",
+    "gpu: tests requiring CUDA and target hardware",
 ]
 
 [tool.mypy]

@@ -1,6 +1,6 @@
 # ADR-002: Qwen3.5-4B + llama.cpp initial local baseline
 
-**Status:** Candidate — pending benchmark validation (V-01)
+**Status:** Candidate — preferred conversion identified; artifact/runtime metadata and V-01 pending
 **Date:** 2026-11-14 (master spec v1.0)
 
 ## Context
@@ -16,6 +16,16 @@ llama.cpp CUDA, context 4,096 initially (trial 8,192), server bound to
 127.0.0.1, single active generation. Exact converter/runtime/vision
 support is a release test; the downloadable artifact must not be assumed
 authentic from its filename. Gemma 4 E4B is a challenger if it fits.
+
+## Candidate provenance update (Phase 1)
+
+The user identified `https://huggingface.co/ggml-org/Qwen3.5-4B-GGUF`, file
+`Qwen3.5-4B-Q4_K_M.gguf`, as the preferred candidate. This identity is
+user-provided and has **not** been independently verified from this
+restricted development environment. Immutable conversion/source revisions,
+full SHA-256, exact size, licence, GGUF metadata, template/projector needs,
+and the compatible pinned Windows CUDA build remain pending. No weights or
+runtime binaries were downloaded and no runnable manifest is present.
 
 ## Alternatives considered
 
