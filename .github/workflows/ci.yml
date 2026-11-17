@@ -1,8 +1,8 @@
-# AETHER OS — Phase 0 CI (Windows)
+# AETHER OS — Phase 1 CI (Windows)
 # MANUAL-ONLY: do not enable automatic hosted execution until the user
 # explicitly authorises CI activation. This workflow is intentionally
 # triggered by workflow_dispatch only (no push/pull_request triggers).
-name: CI (Phase 0, manual)
+name: CI (Phase 1, manual)
 
 on:
   workflow_dispatch:
@@ -43,6 +43,9 @@ jobs:
       - name: Lint (Ruff)
         run: uv run ruff check .
 
+      - name: Check formatting (Ruff)
+        run: uv run ruff format --check .
+
       - name: Typecheck (mypy)
         run: uv run mypy
 
@@ -53,7 +56,7 @@ jobs:
         run: git diff --check
 
       # NOTE: Automated secret scanning is PENDING. No scanner is
-      # configured in Phase 0. Reviewers must manually confirm that
+      # configured in Phase 1. Reviewers must manually confirm that
       # no .env, *.gguf, *.db, credentials, or personal data are
       # staged (see .gitignore). An open-source scanner (e.g. gitleaks)
       # will be added only with explicit user approval.
@@ -61,4 +64,4 @@ jobs:
         run: |
           echo "MANUAL CHECK REQUIRED: confirm no secrets in git status"
           git status --porcelain
-          echo "Automated secret scanning is pending (not implemented in Phase 0)."
+          echo "Automated secret scanning is pending (not implemented)."

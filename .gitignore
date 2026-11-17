@@ -24,7 +24,8 @@ data/
 .undo_vault/
 rollback_vault/
 
-# Python
+# Python and local development caches
+.cache/
 __pycache__/
 *.py[cod]
 *$py.class
@@ -55,8 +56,9 @@ Thumbs.db
 .vscode/settings.json
 .idea/
 
-# Generated
+# Generated and local benchmark reports
 schemas/generated/
+reports/benchmarks/
 coverage/
 htmlcov/
 

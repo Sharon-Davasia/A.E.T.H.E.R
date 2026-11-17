@@ -1,9 +1,8 @@
-"""AETHER OS backend package (Phase 0 foundation).
+"""AETHER OS backend package.
 
-Local-first personal AI operating assistant.
-Phase 0: contracts, deny-by-default policy, fake adapters, health endpoint.
-No real OS automation, inference, or remote services in this phase.
+Phase 1 provides local text-inference scaffolding and authenticated chat;
+real operating-system actions, cloud inference and persistent memory are absent.
 """
 
-__version__ = "0.0.1"
-__phase__ = "phase0"
+__version__ = "0.1.0"
+__phase__ = "phase1"

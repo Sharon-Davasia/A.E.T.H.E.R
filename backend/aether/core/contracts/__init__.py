@@ -1,12 +1,10 @@
-"""Typed contracts for AETHER cross-module boundaries (Phase 0).
-
-Each model carries ``schema_version`` for forward compatibility.
-These are foundational shapes only — no orchestration, approval UI,
-cloud gateway, or computer-control implementation in Phase 0.
-"""
+"""Typed contracts for AETHER cross-module boundaries (Phase 1 foundation)."""
 
 from aether.core.contracts.adapter import AdapterCapabilities
 from aether.core.contracts.approval import ApprovalGrant, ApprovalRequest
+from aether.core.contracts.chat import ChatTurnRequest, ChatTurnResponse
+from aether.core.contracts.decision import Decision, DecisionKind, ToolProposal
+from aether.core.contracts.model import ModelManifest, ModelReadiness
 from aether.core.contracts.policy import PolicyDecision, RiskTier
 from aether.core.contracts.receipt import ActionReceipt, RecoveryClass
 from aether.core.contracts.resource import DataClass, ResourceRef
@@ -21,7 +19,13 @@ __all__ = [
     "AdapterCapabilities",
     "ApprovalGrant",
     "ApprovalRequest",
+    "ChatTurnRequest",
+    "ChatTurnResponse",
     "DataClass",
+    "Decision",
+    "DecisionKind",
+    "ModelManifest",
+    "ModelReadiness",
     "PolicyDecision",
     "RSIDisclosureRequest",
     "RecoveryClass",
@@ -30,6 +34,7 @@ __all__ = [
     "SkillManifest",
     "TaskRecord",
     "TaskState",
+    "ToolProposal",
     "ToolRequest",
     "WorldStateObservation",
 ]
