@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import ipaddress
 import time
 from urllib.parse import urlsplit
@@ -16,6 +17,17 @@ from aether.model_gateway.base import (
     ModelTimeout,
     ModelUnavailable,
 )
+
+
+def _remove_max_length(value: object) -> None:
+    """Drop llama.cpp-incompatible length metadata from a copied JSON schema."""
+    if isinstance(value, dict):
+        value.pop("maxLength", None)
+        for nested in value.values():
+            _remove_max_length(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _remove_max_length(nested)
 
 
 class LlamaCppGateway:
@@ -101,7 +113,13 @@ class LlamaCppGateway:
     async def generate_text(self, messages: list[dict[str, str]], *, max_tokens: int) -> str:
         if not 1 <= max_tokens <= 512:
             raise ValueError("max_tokens must be between 1 and 512")
-        payload = {"model": self._model_id, "messages": messages, "max_tokens": max_tokens}
+        payload = {
+            "model": self._model_id,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
         return await self._complete(payload)
 
     async def generate_structured(
@@ -113,13 +131,17 @@ class LlamaCppGateway:
     ) -> str:
         if not 1 <= max_tokens <= 512:
             raise ValueError("max_tokens must be between 1 and 512")
+        runtime_schema = copy.deepcopy(schema)
+        _remove_max_length(runtime_schema)
         payload = {
             "model": self._model_id,
             "messages": messages,
             "max_tokens": max_tokens,
+            "reasoning_effort": "none",
+            "chat_template_kwargs": {"enable_thinking": False},
             "response_format": {
                 "type": "json_schema",
-                "json_schema": {"name": "aether_decision", "schema": schema},
+                "json_schema": {"name": "aether_decision", "schema": runtime_schema},
             },
         }
         return await self._complete(payload)
