@@ -70,14 +70,17 @@ class ContextAssembler:
             raise ValueError("message must not be blank")
         safe_history = [m for m in history if m.role in {"user", "assistant"}]
         safe_history = safe_history[-self.history_turn_limit * 2 :]
-        trusted = [
-            {"role": "system", "content": TRUSTED_SYSTEM_GUIDANCE},
-            {
-                "role": "system",
-                "content": "Context status: no verified world-state or personal memory is available.",
-            },
-            {"role": "system", "content": output_contract},
-        ]
+        trusted_system_content = "\n\n".join(
+            (
+                TRUSTED_SYSTEM_GUIDANCE.strip(),
+                "Context status: no verified world-state or personal memory is available.",
+                output_contract,
+            )
+        )
+        context_notice = (
+            "Context notice: older turns or untrusted evidence were omitted/truncated "
+            "to fit the token budget."
+        )
         current = {"role": "user", "content": user_text}
         evidence_messages: list[dict[str, str]] = []
         truncated = False
@@ -96,7 +99,19 @@ class ContextAssembler:
         history_messages = [
             {"role": message.role, "content": message.content} for message in safe_history
         ]
-        messages = [*trusted, *history_messages, current, *evidence_messages]
+
+        def build_messages() -> list[dict[str, str]]:
+            system_content = trusted_system_content
+            if truncated:
+                system_content = f"{system_content}\n\n{context_notice}"
+            return [
+                {"role": "system", "content": system_content},
+                *history_messages,
+                current,
+                *evidence_messages,
+            ]
+
+        messages = build_messages()
         count = await self._count(messages, token_counter)
         while count > self.input_token_budget and safe_history:
             safe_history = safe_history[2:]
@@ -104,23 +119,15 @@ class ContextAssembler:
                 {"role": message.role, "content": message.content} for message in safe_history
             ]
             truncated = True
-            messages = [*trusted, *history_messages, current, *evidence_messages]
+            messages = build_messages()
             count = await self._count(messages, token_counter)
         while count > self.input_token_budget and evidence_messages:
             evidence_messages.pop(0)
             truncated = True
-            messages = [*trusted, *history_messages, current, *evidence_messages]
+            messages = build_messages()
             count = await self._count(messages, token_counter)
         if count > self.input_token_budget:
             raise ContextOverflow("current request exceeds the safe context budget")
-        if truncated:
-            messages.insert(
-                len(trusted),
-                {
-                    "role": "system",
-                    "content": "Context notice: older turns or untrusted evidence were omitted/truncated to fit the token budget.",
-                },
-            )
         return AssembledContext(messages, truncated, count)
 
     async def _count(
