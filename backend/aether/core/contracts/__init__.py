@@ -1,7 +1,13 @@
 """Typed contracts for AETHER cross-module boundaries (Phase 1 foundation)."""
 
 from aether.core.contracts.adapter import AdapterCapabilities
-from aether.core.contracts.approval import ApprovalGrant, ApprovalRequest
+from aether.core.contracts.approval import (
+    ApprovalGrant,
+    ApprovalRequest,
+    ApprovedOperation,
+    ApprovedResourceVersion,
+    ExactApprovalGrant,
+)
 from aether.core.contracts.chat import ChatTurnRequest, ChatTurnResponse
 from aether.core.contracts.decision import Decision, DecisionKind, ToolProposal
 from aether.core.contracts.model import ModelManifest, ModelReadiness
@@ -19,11 +25,14 @@ __all__ = [
     "AdapterCapabilities",
     "ApprovalGrant",
     "ApprovalRequest",
+    "ApprovedOperation",
+    "ApprovedResourceVersion",
     "ChatTurnRequest",
     "ChatTurnResponse",
     "DataClass",
     "Decision",
     "DecisionKind",
+    "ExactApprovalGrant",
     "ModelManifest",
     "ModelReadiness",
     "PolicyDecision",

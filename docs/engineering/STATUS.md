@@ -4,14 +4,14 @@
 
 ## Current phase
 
-**Phase 1 — Local intelligence and task scaffolding (foundation implementation; model asset/build gate pending).**
+**Phase 2A — Resource and policy foundation (implementation in progress on the current feature branch; not reviewed/merged; filesystem execution and mutation remain disabled).** Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. The user has separately reported successful Phase 1 Windows acceptance; that is user-reported, not independently verified here.
 
 ## Phase 0 baseline
 
 - Phase 0 repository, contracts, deny-by-default policy, fakes, docs and manual-only Windows CI are merged in `main`.
 - The user reports target Windows acceptance: 43 tests passed and the backend health endpoint succeeded. This browser-based environment cannot independently inspect the target laptop. The original Phase 0 status recorded Python 3.12/PowerShell checks as pending before that user report.
 
-## Implemented in the current working branch (not pushed or PR'd)
+## Phase 1 implementation inventory (merged through PR #4)
 
 - `backend/aether/model_gateway/`: replaceable gateway protocol/errors, local llama.cpp HTTP transport, schema-constrained generation, tokenization, protected readiness check, one-generation semaphore, token/time metrics, model capability discovery. No remote gateway or image generation is exposed.
 - `backend/aether/model_runtime/`: manifest parsing, strict local path and file-inventory checks, streaming SHA-256/size validation for model assets and the configured llama-server executable, version/build gate, direct-child process supervisor with fixed arguments and manifest ID passed as `--alias`, loopback port preflight, authenticated tokenizer readiness using the fresh child API key, no proxy/HF token/`LLAMA_ARG_*` inheritance, offline hub mode, cancellation cleanup, no restart loop, shutdown and Windows Job Object source. Concrete runtime checksum/build values remain unverified and are not fabricated.
@@ -19,21 +19,33 @@
 - `backend/aether/api/`: authenticated `GET /v1/health`, typed `POST /v1/chat/turns`, per-start bearer session, numeric loopback peer check, reject-only exact loopback Origin policy, request bounds, sanitized errors/logs, and runtime-process-aware readiness. No CORS middleware/headers or browser-based cross-origin support are provided. Built-in docs/OpenAPI are disabled in this local development surface.
 - `backend/aether/context/`: fixed trusted guidance, bounded server-managed conversation context, token counter with conservative fallback, explicit truncation, no invented world state/memory, and untrusted evidence labels.
 - `backend/aether/core/chat_service.py`: typed decision parsing, exactly one bounded repair, registered mock schema validation, IDs, bounded in-memory task/conversation records, no model-triggered tool execution, no cloud fallback.
-- `backend/aether/core/tasks/` and `core/tools/`: deterministic Phase 1 state transitions (execution/verification states cannot be entered), synthetic mock registry, real `PolicyBroker` checked for tool proposals and remains deny-all. Stale `AWAITING_APPROVAL` mock proposals expire to `CANCELLED` after one hour and become reclaimable; capacity exhaustion is a typed 503. `propose_plan` and `offer_rsi` are completed discussion-only text turns, not approval flows.
+- `backend/aether/core/tasks/` and `core/tools/`: deterministic Phase 1 state transitions (execution/verification states cannot be entered), synthetic mock registry, no-argument `PolicyBroker` denies all real OS actions, and Phase 2A registered contracts also deny until an executor and trusted approval flow exist. Stale `AWAITING_APPROVAL` mock proposals expire to `CANCELLED` after one hour and become reclaimable; capacity exhaustion is a typed 503. `propose_plan` and `offer_rsi` are completed discussion-only text turns, not approval flows.
 - `backend/aether/benchmarks/`: synthetic benchmark runner and redacted JSON report; reports require a configured separate directory. It leaves unavailable metrics null and does not infer TTFT from full-response latency.
 - `scripts/configure_dev_storage.ps1`: derives uv cache (`.cache/uv`), uv's default project-local environment (`backend/.venv`) and model root (`models/`) from this clone, placing them on the clone’s drive. Cache/model variables are process-scoped; it does not set or persist `UV_PROJECT_ENVIRONMENT` at User scope, avoiding unrelated-project effects.
 - `scripts/run_backend.ps1`, expanded exit-checked `scripts/verify.ps1`, manual-only Windows CI, model manifest schema and Phase 1 setup/install/benchmark/Windows runbooks.
 - Removed the untracked synthetic `backend/manifest.json`; `models/manifests/` contains the generated schema only, with no selected production model/runtime manifest.
-- No model weights, llama.cpp executable, network inference, real OS action, Phase 2 feature or cloud provider was downloaded or introduced.
+- No model weights, llama.cpp executable, network inference, real OS action, Phase 2 executor or cloud provider was downloaded or introduced.
+
+## Phase 2A implementation on the current working branch (PR #5 open; requested corrections pending re-review)
+
+- Added explicit trusted-directory registration, Windows-aware relative path rejection, canonical broker-issued resource IDs, protected-path checks, reparse/symlink checks, fixed-volume/device identity enforcement and version-drift revalidation in `backend/aether/core/resources/`.
+- Added strict typed capability schemas, explicit T0–T3 metadata, unknown-operation denial and exact scoped resource checks. T3 always denies; all built-in filesystem capability contracts are non-executable; T2 mutation is denied pending a real trusted approval channel. The no-registry broker preserves Phase 0/1 deny-all behavior.
+- Added versioned exact task/plan/step/capability/arguments/effect/resource-version grant contracts with immutable tuple-based operation/resource collections and deterministic matching foundations. `ExactApprovalGrant` is the intended authoritative Phase 2B persistence contract; the legacy Phase 0 `ApprovalGrant` is not Phase 2 authorization. No trusted issuer, durable store, Electron IPC approval, bearer-token privilege, mutation endpoint or executor is implemented.
+- Windows reserved-name checks include superscript COM/LPT digits and `CONIN$`/`CONOUT$`. Case-folded resource-ID collisions between different physical entries at different canonical relative paths fail closed; atomic replacement at the same path refreshes the mapping/version and makes older references stale. `fs.inspect_file` means metadata-only (no file bytes), hence T0.
+- Added synthetic adversarial tests for lexical traversal/Windows device names, sibling-prefix escape, symlink escape, unknown roots/volumes, secret paths, stale/forged references, atomic `os.replace()` refresh/stale-ref denial, case-collision preservation, unknown capabilities, immutable approval operation/resource collections, exact approval drift, replay/expiry/revocation and T3/T2 deny.
+- `scripts/verify.ps1` runs pytest with `--basetemp` under ignored `<repo>/.cache/pytest-tmp` on the D: checkout, keeping synthetic `tmp_path` roots outside protected `%LOCALAPPDATA%` while leaving protected-path rules unchanged.
+- Security boundaries, limitations and exact Windows validation checklist are in `docs/engineering/PHASE2A_RESOURCE_POLICY.md` and `docs/security/TRUST_BOUNDARIES.md`. No new ADR was needed; existing deny-all architecture remains unchanged.
+- This is broker-side protection, not a sandbox; stat-derived version tokens do not eliminate TOCTOU. **No Windows 11 execution or acceptance is claimed.**
 
 ## Verified in this sandbox (Linux, Python 3.11 override)
 
-- `uv sync --python 3.11 --all-extras --locked` — passed; the lock resolves 38 packages.
-- `uv run --python 3.11 ruff check .` — passed.
-- `uv run --python 3.11 ruff format --check .` — passed.
-- `uv run --python 3.11 mypy` — passed, strict, 48 source files.
-- `uv run --python 3.11 pytest -q -rs` — **107 passed, 1 skipped, 108 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. Separately, the base-commit Phase 0 snapshot was run from an archive: **43 passed**. The existing 43 Phase 0 regression tests remain in the current suite.
-- Ruff lint and format checks passed; strict mypy passed for 48 source files.
+- `uv sync --directory backend --python 3.11 --all-extras --locked` — passed; lock dependencies unchanged.
+- `uv run --directory backend --python 3.11 ruff check .` and `ruff format --check .` — passed.
+- `uv run --directory backend --python 3.11 mypy` — passed, strict, 52 source files.
+- Targeted regressions (`tests/test_phase2_approval_binding.py`, `tests/test_resource_registry.py`, `tests/test_policy_deny.py`) — **49 passed**, including the no-argument deny-all broker invariant.
+- Full `uv run --directory backend --python 3.11 pytest -q -rs -o addopts=''` — **163 passed, 1 skipped, 164 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. Separately, the base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- Locked workflow import check and authenticated health `TestClient` check both passed (health returned HTTP 200).
+- A Starlette `TestClient`/HTTPX deprecation warning remains non-failing; no actual Windows or model compatibility is inferred from it.
 - Added exact checked-in JSON-schema drift enforcement; runtime executable checksum, startup cancellation/cleanup, port conflict, authenticated readiness, post-start process exit, task TTL/capacity and controlled API-health failure tests use synthetic bytes, fake processes, and `httpx.MockTransport`.
 - FastAPI tests cover authenticated health/chat with fake gateways, sanitized health timeout and dead-child status, typed errors, prompt/context limits, no auto tool execution, mock-only behavior, non-loopback/origin rejection (without CORS support), and unavailable model status.
 - No real external API, model, runtime executable or Windows process operation was contacted.
@@ -73,4 +85,4 @@ The official llama.cpp server README was inspected on GitHub for its HTTP API/au
 | Windows PowerShell / Python 3.12 | Pending user laptop execution |
 | V-01 RTX 4050 benchmark | Pending verified assets and target laptop |
 
-CI remains manual-only and no changes have been pushed or PR'd. Automated secret scanning remains pending.
+CI remains manual-only. Phase 2A is committed on `arena/8db78286-a-e-t-h-e-r` and proposed for review in PR #5; `main` was not modified. Automated secret scanning remains pending.

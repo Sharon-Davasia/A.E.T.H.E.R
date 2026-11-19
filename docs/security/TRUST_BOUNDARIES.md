@@ -1,6 +1,6 @@
 # AETHER OS — Trust Boundaries (Phase 1 foundation)
 
-**Status:** Master-spec baseline with Phase 1 local-inference boundaries; no Phase 2 permissions/actions.
+**Status:** Phase 1 boundaries plus the unmerged Phase 2A resource/policy contract foundation; no Phase 2 filesystem execution, trusted approvals or mutations.
 
 ## Phase 1 process and module layout
 
@@ -34,4 +34,8 @@ The llama.cpp server exposes an upstream minimal `/health` endpoint without API-
 
 ## Existing broader-phase risks
 
-Filesystem path resolution, T0-T3 authorization, approval binding, adapters, Electron IPC, script-worker isolation, RSI disclosure, durable task storage and recovery remain later-phase designs. Phase 1 does not implement or claim them.
+## Phase 2A security foundation (not executable)
+
+The current feature branch adds `ResourceRegistry`, typed capability contracts, a configured deterministic policy path and exact approval grant contracts; details, limitations and target-Windows validation guidance are in `docs/engineering/PHASE2A_RESOURCE_POLICY.md`. This code is not yet reviewed or merged. The no-argument broker still denies all, built-in filesystem capabilities have no executor, T2 is denied because no trusted approval issuer exists, and T3 is always denied. A client-supplied approval ID or the contract's `trusted-electron` label is never authorization. No filesystem API/action or mutation surface is exposed by Phase 2A.
+
+The resource resolver rejects unsupported path syntax (including Win32 reserved device names), registered-root escape, protected names, reparse points and volume/device identity changes. On Windows-semantics paths, a case-folded ID collision between distinct physical entries denies before replacing the existing registry mapping. Its stat-derived version token is only a freshness indicator, not a content hash or a protection against post-check races. Exact approval scope uses immutable tuple collections; `ExactApprovalGrant` is the intended authoritative Phase 2B persisted contract, while the legacy Phase 0 `ApprovalGrant` is not authorization. These broker-side checks are not an OS sandbox. No target Windows execution has been performed here, so Windows path/reparse/volume safety remains unverified. PR 2B must operationalize trusted persistent Electron approvals; PR 2C may add only verified read-only adapters; PR 2D may add only exact approved mutations and recovery after 2B/Windows security tests pass. RSI disclosure, script-worker isolation and unrelated higher-phase capabilities remain outside this milestone.
