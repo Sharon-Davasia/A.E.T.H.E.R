@@ -223,11 +223,14 @@ class ResourceRegistry:
             data_class=root.data_class,
         )
         existing_identity = self._resources.get(resource_id)
-        if existing_identity is not None and (
-            existing_identity.root_id != result.root_id
-            or existing_identity.volume_id != result.volume_id
-            or existing_identity.device_id != result.device_id
-            or existing_identity.file_id != result.file_id
+        if (
+            existing_identity is not None
+            and (
+                existing_identity.volume_id != result.volume_id
+                or existing_identity.device_id != result.device_id
+                or existing_identity.file_id != result.file_id
+            )
+            and existing_identity.relative_path != result.relative_path
         ):
             raise ResourceRegistryError("resource_identity_collision")
         self._resources[resource_id] = result

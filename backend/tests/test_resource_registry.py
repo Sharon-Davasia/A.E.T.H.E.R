@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from uuid import UUID
 
@@ -107,6 +108,31 @@ def test_resource_ids_are_registry_issued_and_version_drift_is_detected(tmp_path
             ),
             "fs.read_file",
         )
+
+
+def test_atomic_replacement_refreshes_path_and_stales_old_resource_ref(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "note.txt"
+    replacement = workspace / "replacement.tmp"
+    target.write_text("synthetic original", encoding="utf-8")
+    registry, root = _registry(workspace)
+    original = registry.resolve(root.root_id, "note.txt")
+
+    replacement.write_text("synthetic replacement", encoding="utf-8")
+    os.replace(replacement, target)
+    refreshed = registry.resolve(root.root_id, "note.txt")
+
+    assert refreshed.canonical_path == target.resolve()
+    assert refreshed.ref.resource_id == original.ref.resource_id
+    assert refreshed.version_token != original.version_token
+    with pytest.raises(ResourceRegistryError, match="resource_reference_version_mismatch"):
+        registry.authorize_ref(original.ref, "fs.read_file", expected_kind="file")
+    authorized = registry.authorize_ref(refreshed.ref, "fs.read_file", expected_kind="file")
+    assert authorized.canonical_path == target.resolve()
+    assert authorized.version_token == refreshed.version_token
 
 
 def test_windows_case_sensitive_distinct_files_never_share_resource_id(

@@ -34,7 +34,12 @@ Invoke-Checked "[4/7] Ruff formatting..." { uv run ruff format --check . }
 
 Invoke-Checked "[5/7] mypy typecheck..." { uv run mypy }
 
-Invoke-Checked "[6/7] pytest..." { uv run pytest }
+# Keep tmp_path fixtures on the D: checkout; registry roots under AppData are denied.
+$pytestBase = Join-Path $root ".cache\pytest-tmp"
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pytestBase) | Out-Null
+Invoke-Checked "[6/7] pytest (D: repository-local synthetic fixtures)..." {
+    uv run pytest --basetemp $pytestBase
+}
 
 Invoke-Checked "[7/7] Authenticated health endpoint (TestClient)..." {
     uv run python -c "from fastapi.testclient import TestClient; from aether.api.app import create_app; app=create_app(); c=TestClient(app, client=('127.0.0.1', 43000)); r=c.get('/v1/health', headers={'Authorization': 'Bearer ' + app.state.session_token}); print(r.status_code, r.json()); assert r.status_code==200"
