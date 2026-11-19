@@ -11,7 +11,7 @@
 - Phase 0 repository, contracts, deny-by-default policy, fakes, docs and manual-only Windows CI are merged in `main`.
 - The user reports target Windows acceptance: 43 tests passed and the backend health endpoint succeeded. This browser-based environment cannot independently inspect the target laptop. The original Phase 0 status recorded Python 3.12/PowerShell checks as pending before that user report.
 
-## Implemented in the current working branch (not pushed or PR'd)
+## Phase 1 implementation inventory (merged through PR #4)
 
 - `backend/aether/model_gateway/`: replaceable gateway protocol/errors, local llama.cpp HTTP transport, schema-constrained generation, tokenization, protected readiness check, one-generation semaphore, token/time metrics, model capability discovery. No remote gateway or image generation is exposed.
 - `backend/aether/model_runtime/`: manifest parsing, strict local path and file-inventory checks, streaming SHA-256/size validation for model assets and the configured llama-server executable, version/build gate, direct-child process supervisor with fixed arguments and manifest ID passed as `--alias`, loopback port preflight, authenticated tokenizer readiness using the fresh child API key, no proxy/HF token/`LLAMA_ARG_*` inheritance, offline hub mode, cancellation cleanup, no restart loop, shutdown and Windows Job Object source. Concrete runtime checksum/build values remain unverified and are not fabricated.
@@ -19,7 +19,7 @@
 - `backend/aether/api/`: authenticated `GET /v1/health`, typed `POST /v1/chat/turns`, per-start bearer session, numeric loopback peer check, reject-only exact loopback Origin policy, request bounds, sanitized errors/logs, and runtime-process-aware readiness. No CORS middleware/headers or browser-based cross-origin support are provided. Built-in docs/OpenAPI are disabled in this local development surface.
 - `backend/aether/context/`: fixed trusted guidance, bounded server-managed conversation context, token counter with conservative fallback, explicit truncation, no invented world state/memory, and untrusted evidence labels.
 - `backend/aether/core/chat_service.py`: typed decision parsing, exactly one bounded repair, registered mock schema validation, IDs, bounded in-memory task/conversation records, no model-triggered tool execution, no cloud fallback.
-- `backend/aether/core/tasks/` and `core/tools/`: deterministic Phase 1 state transitions (execution/verification states cannot be entered), synthetic mock registry, real `PolicyBroker` checked for tool proposals and remains deny-all. Stale `AWAITING_APPROVAL` mock proposals expire to `CANCELLED` after one hour and become reclaimable; capacity exhaustion is a typed 503. `propose_plan` and `offer_rsi` are completed discussion-only text turns, not approval flows.
+- `backend/aether/core/tasks/` and `core/tools/`: deterministic Phase 1 state transitions (execution/verification states cannot be entered), synthetic mock registry, no-argument `PolicyBroker` denies all real OS actions, and Phase 2A registered contracts also deny until an executor and trusted approval flow exist. Stale `AWAITING_APPROVAL` mock proposals expire to `CANCELLED` after one hour and become reclaimable; capacity exhaustion is a typed 503. `propose_plan` and `offer_rsi` are completed discussion-only text turns, not approval flows.
 - `backend/aether/benchmarks/`: synthetic benchmark runner and redacted JSON report; reports require a configured separate directory. It leaves unavailable metrics null and does not infer TTFT from full-response latency.
 - `scripts/configure_dev_storage.ps1`: derives uv cache (`.cache/uv`), uv's default project-local environment (`backend/.venv`) and model root (`models/`) from this clone, placing them on the clone’s drive. Cache/model variables are process-scoped; it does not set or persist `UV_PROJECT_ENVIRONMENT` at User scope, avoiding unrelated-project effects.
 - `scripts/run_backend.ps1`, expanded exit-checked `scripts/verify.ps1`, manual-only Windows CI, model manifest schema and Phase 1 setup/install/benchmark/Windows runbooks.
@@ -83,4 +83,4 @@ The official llama.cpp server README was inspected on GitHub for its HTTP API/au
 | Windows PowerShell / Python 3.12 | Pending user laptop execution |
 | V-01 RTX 4050 benchmark | Pending verified assets and target laptop |
 
-CI remains manual-only and no changes have been pushed or PR'd. Automated secret scanning remains pending.
+CI remains manual-only. Phase 2A is committed on `arena/8db78286-a-e-t-h-e-r` and proposed for review in PR #5; `main` was not modified. Automated secret scanning remains pending.
