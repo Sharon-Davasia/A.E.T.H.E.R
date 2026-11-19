@@ -76,7 +76,7 @@ def inspect_volume(path: Path) -> VolumeInfo:
 
 
 def _inspect_windows_volume(path: Path) -> VolumeInfo:
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32 = getattr(ctypes, "windll").kernel32  # noqa: B009
     volume_root = ctypes.create_unicode_buffer(32768)
     if not kernel32.GetVolumePathNameW(str(path), volume_root, len(volume_root)):
         return VolumeInfo("unknown", VolumeKind.UNKNOWN)
