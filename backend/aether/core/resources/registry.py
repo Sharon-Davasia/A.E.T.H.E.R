@@ -89,7 +89,7 @@ class ResourceRegistry:
     ) -> RegisteredRoot:
         """Register one explicit non-volume-root directory in trusted code."""
         normalized_alias = alias.strip().casefold()
-        if not alias or len(alias) > 64 or normalized_alias in self._aliases:
+        if not normalized_alias or len(alias) > 64 or normalized_alias in self._aliases:
             raise ResourceRegistryError("root_alias_invalid_or_duplicate")
         candidate = Path(path)
         if not candidate.is_absolute():
@@ -222,6 +222,14 @@ class ResourceRegistry:
             version_token=version,
             data_class=root.data_class,
         )
+        existing_identity = self._resources.get(resource_id)
+        if existing_identity is not None and (
+            existing_identity.root_id != result.root_id
+            or existing_identity.volume_id != result.volume_id
+            or existing_identity.device_id != result.device_id
+            or existing_identity.file_id != result.file_id
+        ):
+            raise ResourceRegistryError("resource_identity_collision")
         self._resources[resource_id] = result
         return result
 

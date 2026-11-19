@@ -49,6 +49,14 @@ def _registry(path: Path, *, capabilities: frozenset[str] = frozenset({"fs.read_
         "folder//file.txt",
         "folder:stream.txt",
         "CON.txt",
+        "COM¹.txt",
+        "folder/COM¹.txt",
+        "nested/LpT².LOG",
+        "Com³.backup.txt",
+        "CONIN$",
+        "cOnIn$.txt",
+        "folder/CONOUT$",
+        "nested/cOnOuT$.log",
         "trailing.",
         "/absolute/path.txt",
     ],
@@ -99,6 +107,40 @@ def test_resource_ids_are_registry_issued_and_version_drift_is_detected(tmp_path
             ),
             "fs.read_file",
         )
+
+
+def test_windows_case_sensitive_distinct_files_never_share_resource_id(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "case-sensitive-workspace"
+    workspace.mkdir()
+    uppercase = workspace / "A.txt"
+    lowercase = workspace / "a.txt"
+    uppercase.write_text("synthetic uppercase entry", encoding="utf-8")
+    lowercase.write_text("synthetic lowercase entry", encoding="utf-8")
+    if uppercase.stat().st_ino == lowercase.stat().st_ino:
+        pytest.skip("fixture volume does not support case-sensitive sibling files")
+
+    registry = ResourceRegistry(volume_inspector=FixedVolume(), windows_semantics=True)
+    root = registry.register_root(
+        "case-test", workspace, allowed_capabilities=frozenset({"fs.read_file"})
+    )
+    first = registry.resolve(root.root_id, "A.txt")
+    with pytest.raises(ResourceRegistryError, match="resource_identity_collision"):
+        registry.resolve(root.root_id, "a.txt")
+
+    # The rejected resolution must not overwrite the first resource's mapping.
+    still_first = registry.authorize_ref(first.ref, "fs.read_file", expected_kind="file")
+    assert still_first.canonical_path == uppercase.resolve()
+    assert still_first.file_id == uppercase.stat().st_ino
+
+
+def test_whitespace_only_root_alias_is_rejected(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    registry = ResourceRegistry(volume_inspector=FixedVolume())
+    with pytest.raises(ResourceRegistryError, match="root_alias_invalid_or_duplicate"):
+        registry.register_root(" \t ", workspace, allowed_capabilities=frozenset({"fs.read_file"}))
 
 
 def test_sibling_prefix_and_absolute_child_paths_never_match_root(tmp_path: Path) -> None:

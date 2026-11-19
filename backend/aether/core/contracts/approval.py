@@ -1,9 +1,10 @@
-"""Approval requests and scope (Phase 0 foundation).
+"""Approval request and exact-scope contracts.
 
-Spec refs: Approval-bound mutation protocol, Approval lifecycle.
-An approval binds an exact plan revision/hash + enumerated operations.
-Silence is never approval; any plan/resource change invalidates grants.
-Phase 0 defines shapes only — no approval UI or broker issuance.
+``ApprovalGrant`` is the legacy Phase 0 shape and is not Phase 2 authorization.
+``ExactApprovalGrant`` is the intended authoritative Phase 2B persisted contract:
+its immutable scope must be loaded from the trusted approval store and verified
+against its stored scope digest after authenticating trusted Electron-main input.
+Phase 2A defines these shapes only — it has no issuer, store or approval UI.
 """
 
 from __future__ import annotations
@@ -72,7 +73,7 @@ class ApprovedOperation(BaseModel):
     risk_tier: RiskTier
     arguments_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
     expected_effect_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
-    resources: list[ApprovedResourceVersion] = Field(min_length=1, max_length=16)
+    resources: tuple[ApprovedResourceVersion, ...] = Field(min_length=1, max_length=16)
 
     @model_validator(mode="after")
     def unique_resource_ids(self) -> ApprovedOperation:
@@ -97,7 +98,7 @@ class ExactApprovalGrant(BaseModel):
     task_id: UUID
     plan_revision: int = Field(ge=0)
     plan_hash: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
-    operations: list[ApprovedOperation] = Field(min_length=1, max_length=32)
+    operations: tuple[ApprovedOperation, ...] = Field(min_length=1, max_length=32)
     max_tier: RiskTier = RiskTier.NAVIGATE
     issued_at: datetime
     expires_at: datetime

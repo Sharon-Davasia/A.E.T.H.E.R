@@ -89,6 +89,9 @@ class CapabilityRegistry:
     def phase2_filesystem(cls) -> CapabilityRegistry:
         """Return Phase 2 contracts; actual adapters remain disabled in 2A."""
         registry = cls()
+        # fs.inspect_file is metadata-only (type, size and modified time); it must
+        # never read file bytes. Its future adapter needs separate T1 classification
+        # if its effect expands beyond metadata. Phase 2A has no adapter at all.
         for definition in (
             CapabilityDefinition("fs.inspect_file", RiskTier.OBSERVE, ResourceArguments, "file"),
             CapabilityDefinition(

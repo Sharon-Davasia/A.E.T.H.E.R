@@ -132,6 +132,22 @@ def test_grant_rejects_invalid_hash_duplicate_steps_t3_and_naive_timestamps() ->
         )
 
 
+def test_scope_collections_are_structurally_immutable_after_grant_construction() -> None:
+    grant = _grant()
+    with pytest.raises(AttributeError):
+        grant.operations.append(grant.operations[0])  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        grant.operations[0].resources[0] = ApprovedResourceVersion(
+            resource_id="file:00000000-0000-0000-0000-000000000004",
+            expected_version="replacement",
+        )  # type: ignore[index]
+
+    round_tripped = ExactApprovalGrant.model_validate_json(grant.model_dump_json())
+    assert isinstance(round_tripped.operations, tuple)
+    assert isinstance(round_tripped.operations[0].resources, tuple)
+    assert _matches(round_tripped) is True
+
+
 def test_scope_digest_changes_when_bound_resource_version_changes() -> None:
     assert exact_approval_scope_digest(_grant()) != exact_approval_scope_digest(
         _grant(resource_version="version-2")

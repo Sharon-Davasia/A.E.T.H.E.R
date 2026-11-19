@@ -52,9 +52,16 @@ def relative_parts(value: str) -> tuple[str, ...]:
         if any(char in part for char in '<>"|?*'):
             raise PathSafetyError("invalid_windows_path_component")
         stem = part.split(".", 1)[0].casefold()
-        if stem in {"con", "prn", "aux", "nul"} or re.fullmatch(r"(?:com|lpt)[1-9]", stem):
+        if _is_reserved_device_name(stem):
             raise PathSafetyError("reserved_windows_path_component")
     return tuple(raw_parts)
+
+
+def _is_reserved_device_name(stem: str) -> bool:
+    """Match Win32 reserved device basenames, including superscript COM/LPT digits."""
+    if stem in {"con", "prn", "aux", "nul", "conin$", "conout$"}:
+        return True
+    return re.fullmatch(r"(?:com|lpt)(?:[1-9]|[¹²³])", stem) is not None
 
 
 def inspect_volume(path: Path) -> VolumeInfo:

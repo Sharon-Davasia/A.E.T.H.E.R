@@ -26,23 +26,25 @@
 - Removed the untracked synthetic `backend/manifest.json`; `models/manifests/` contains the generated schema only, with no selected production model/runtime manifest.
 - No model weights, llama.cpp executable, network inference, real OS action, Phase 2 executor or cloud provider was downloaded or introduced.
 
-## Phase 2A implementation in the current working branch (not pushed or PR'd)
+## Phase 2A implementation on the current working branch (PR #5 open; requested corrections pending re-review)
 
 - Added explicit trusted-directory registration, Windows-aware relative path rejection, canonical broker-issued resource IDs, protected-path checks, reparse/symlink checks, fixed-volume/device identity enforcement and version-drift revalidation in `backend/aether/core/resources/`.
 - Added strict typed capability schemas, explicit T0–T3 metadata, unknown-operation denial and exact scoped resource checks. T3 always denies; all built-in filesystem capability contracts are non-executable; T2 mutation is denied pending a real trusted approval channel. The no-registry broker preserves Phase 0/1 deny-all behavior.
-- Added versioned exact task/plan/step/capability/arguments/effect/resource-version grant contracts and deterministic matching foundations. No trusted issuer, durable store, Electron IPC approval, bearer-token privilege, mutation endpoint or executor is implemented.
-- Added synthetic adversarial tests for lexical traversal/Windows path forms, sibling-prefix escape, symlink escape, unknown roots/volumes, secret paths, stale/forged resource references, unknown capability, exact approval drift, replay/expiry/revocation and T3/T2 deny.
+- Added versioned exact task/plan/step/capability/arguments/effect/resource-version grant contracts with immutable tuple-based operation/resource collections and deterministic matching foundations. `ExactApprovalGrant` is the intended authoritative Phase 2B persistence contract; the legacy Phase 0 `ApprovalGrant` is not Phase 2 authorization. No trusted issuer, durable store, Electron IPC approval, bearer-token privilege, mutation endpoint or executor is implemented.
+- Windows reserved-name checks include superscript COM/LPT digits and `CONIN$`/`CONOUT$`. Case-folded resource-ID collisions between distinct physical identities fail closed before the existing mapping can be overwritten. `fs.inspect_file` means metadata-only (no file bytes), hence T0.
+- Added synthetic adversarial tests for lexical traversal/Windows device names, sibling-prefix escape, symlink escape, unknown roots/volumes, secret paths, stale/forged references, case-collision preservation, unknown capabilities, immutable approval operation/resource collections, exact approval drift, replay/expiry/revocation and T3/T2 deny.
 - Security boundaries, limitations and exact Windows validation checklist are in `docs/engineering/PHASE2A_RESOURCE_POLICY.md` and `docs/security/TRUST_BOUNDARIES.md`. No new ADR was needed; existing deny-all architecture remains unchanged.
 - This is broker-side protection, not a sandbox; stat-derived version tokens do not eliminate TOCTOU. **No Windows 11 execution or acceptance is claimed.**
 
 ## Verified in this sandbox (Linux, Python 3.11 override)
 
 - For this Phase 2A change, `uv sync --python 3.11 --all-extras --locked` — passed; the lock resolves 38 packages.
-- `uv run --python 3.11 ruff check .` — passed.
-- `uv run --python 3.11 ruff format --check .` — passed.
-- `uv run --python 3.11 ruff check .` and `ruff format --check .` — passed.
-- `uv run --python 3.11 mypy aether` — passed, strict, 52 source files.
-- `uv run --python 3.11 pytest -q -rs -o addopts=''` — **151 passed, 1 skipped, 152 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. Separately, the base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- `uv sync --directory backend --python 3.11 --all-extras --locked` — passed; lock dependencies unchanged.
+- `uv run --directory backend --python 3.11 ruff check .` and `ruff format --check .` — passed.
+- `uv run --directory backend --python 3.11 mypy` — passed, strict, 52 source files.
+- Targeted review regressions (`tests/test_phase2_approval_binding.py` and `tests/test_resource_registry.py`) — **44 passed**.
+- Full `uv run --directory backend --python 3.11 pytest -q -rs -o addopts=''` — **162 passed, 1 skipped, 163 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. Separately, the base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- Locked workflow import check and authenticated health `TestClient` check both passed (health returned HTTP 200).
 - A Starlette `TestClient`/HTTPX deprecation warning remains non-failing; no actual Windows or model compatibility is inferred from it.
 - Added exact checked-in JSON-schema drift enforcement; runtime executable checksum, startup cancellation/cleanup, port conflict, authenticated readiness, post-start process exit, task TTL/capacity and controlled API-health failure tests use synthetic bytes, fake processes, and `httpx.MockTransport`.
 - FastAPI tests cover authenticated health/chat with fake gateways, sanitized health timeout and dead-child status, typed errors, prompt/context limits, no auto tool execution, mock-only behavior, non-loopback/origin rejection (without CORS support), and unavailable model status.
