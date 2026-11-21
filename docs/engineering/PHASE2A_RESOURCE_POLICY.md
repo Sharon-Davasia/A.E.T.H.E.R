@@ -33,7 +33,7 @@ Parent-path substitution evidence must distinguish the always-run deterministic 
 
 ## Follow-on sequence and mandatory checkpoint
 
-- **PR 2B-1 (PR #7 merged; Windows hotfix PR #8 open for independent re-review):** SQLite persistence, versioned migrations, typed immutable plan revisions, append-only redacted audit, integrity checks, and fail-closed restart recovery. Approval decisions remain non-authorizing audit records only; there is no grant issuer, loader, or executor.
+- **PR 2B-1 (PR #7 and #8 merged; test-only Windows stat-result hotfix PR #9 open for independent review):** SQLite persistence, versioned migrations, typed immutable plan revisions, append-only redacted audit, integrity checks, and fail-closed restart recovery. Approval decisions remain non-authorizing audit records only; there is no grant issuer, loader, or executor.
 - **PR 2B-2 (dependent; not started):** trusted Electron-main approval UI, process bootstrap, authenticated backend channel, exact-preview binding, revalidation, revocation and replay prevention. It must depend on the reviewed 2B-1 persistence contracts and still keep all filesystem capabilities non-executable.
 - **Mandatory checkpoint:** after 2B-1/2B-2 review and the user's Windows 11 verification, review and close the outstanding Phase 2A Windows-security validation register before requesting authorization for Phase 2C. Failed or unsupported checks remain explicit fail-closed restrictions, not safety claims.
 - **PR 2C (not authorized):** read-only filesystem listing/open/search through verified handles, bounded outputs, secret redaction/denial and trusted-root UX; keep all writes unavailable.
