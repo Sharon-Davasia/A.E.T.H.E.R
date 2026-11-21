@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**Phase 2B-1 — durable persistence (implementation submitted in PR #7 for independent review).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
+**Phase 2B-1 — durable persistence (PR #7 review corrections implemented and submitted for independent re-review).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
 
 ## Phase 0 baseline
 
@@ -37,12 +37,14 @@
 - Security boundaries, limitations and exact Windows validation checklist are in `docs/engineering/PHASE2A_RESOURCE_POLICY.md` and `docs/security/TRUST_BOUNDARIES.md`. No new ADR was needed; existing deny-all architecture remains unchanged.
 - This is broker-side protection, not a sandbox; stat-derived version tokens do not eliminate TOCTOU. The user reports Windows 11 validation after PR #6, but the NTFS case-sensitive fixture and symlink test were skipped/blocked and junction/reparse, volume-boundary, and root-replacement validation remain pending. Arena has not independently verified Windows security acceptance.
 
-## Phase 2B-1 implementation in this working tree (not yet reviewed)
+## Phase 2B-1 implementation in PR #7 (review corrections submitted; Windows validation pending)
 
 - Added versioned SQLite migration and `SQLiteTaskStore` for persistent task state, immutable canonical plan revisions and normalized steps, append-only audit events, and immutable approval-decision audit records.
 - Task/plan/step schemas use the Master Specification state vocabulary and typed dependency DAG, resource versions, expected state/effect, risk, retry/idempotency, postcondition, and recovery metadata. Explicit state adapters preserve the Phase 1 `TaskState` contract and reject states that cannot be mapped.
-- Startup verifies SQLite/foreign-key integrity, applies only known forward migrations, rejects future schema versions, and pauses in-flight work so fresh planning/consent is required. Phase 2B-1 provides no trusted-root rehydration, grant loader/issuer, action consumption, executor, or filesystem mutation route. Approval decisions are fixed as non-authorizing audit-only records.
-- Audit metadata blocks sensitive field names and the SQL event/plan/step/approval tables are append-only. POSIX database directory/file permissions are owner-only; Windows ACL behavior remains a laptop verification requirement.
+- Startup verifies exact packaged migration-byte checksums and a code-pinned schema fingerprint, checks SQLite/foreign-key integrity, rejects missing/changed/future schema state, and pauses in-flight work only after acquiring the single-owner lock. A second live store fails closed; OS lock release permits crash recovery. Fresh planning/consent is required after restart.
+- Database paths are absolute, component-checked for symlink/junction/reparse, hardlink, unsafe Windows names, fixed-volume changes, and parent identity substitutions. The intended LocalAppData-shaped location is not blocked by Phase 2A protected-user-file policy.
+- Audit metadata is allow-listed and plan/user-goal redaction is conservative. SQL plan/step/event/approval-audit records are immutable/append-only. Approval decisions are non-authorizing; no trusted-root rehydration, grant loader/issuer, action consumption, executor, or filesystem mutation route exists.
+- POSIX database and lock-file permissions are owner-only. Windows ACL, junction/reparse, and actual `msvcrt` lock behavior remain target-laptop verification requirements.
 - Target Windows checklist remains open in `docs/engineering/PHASE2A_RESOURCE_POLICY.md`; no Windows security or desktop acceptance is inferred from Linux tests.
 
 ## Verified in this sandbox (Linux, Python 3.11 override)
@@ -50,8 +52,8 @@
 - `uv sync --directory backend --python 3.11 --all-extras --locked` — passed; lock dependencies unchanged.
 - `uv run --directory backend --python 3.11 ruff check .` and `ruff format --check .` — passed.
 - `uv run --directory backend --python 3.11 mypy` — passed, strict, 56 source files.
-- New persistence adversarial tests (`tests/test_phase2b_persistence.py`) — **17 passed**.
-- Full `uv run --directory backend --python 3.11 pytest -q -rs -o addopts=''` — **180 passed, 1 skipped, 181 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. The earlier base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- New persistence adversarial tests (`tests/test_phase2b_persistence.py`) — **36 passed**.
+- Full `uv run --directory backend --python 3.11 pytest -q -rs -o addopts=''` — **199 passed, 1 skipped, 200 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. The earlier base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
 - Locked workflow import check and authenticated health `TestClient` check both passed (health returned HTTP 200).
 - A Starlette `TestClient`/HTTPX deprecation warning remains non-failing; no actual Windows or model compatibility is inferred from it.
 - Added exact checked-in JSON-schema drift enforcement; runtime executable checksum, startup cancellation/cleanup, port conflict, authenticated readiness, post-start process exit, task TTL/capacity and controlled API-health failure tests use synthetic bytes, fake processes, and `httpx.MockTransport`.
@@ -93,4 +95,4 @@ The official llama.cpp server README was inspected on GitHub for its HTTP API/au
 | Windows PowerShell / Python 3.12 | Pending user laptop execution |
 | V-01 RTX 4050 benchmark | Pending verified assets and target laptop |
 
-CI remains manual-only. Phase 2A is in the baseline after PR #5 and hotfix PR #6 were merged. Phase 2B-1 is submitted for independent review in PR #7 from `arena/6a6f42f3-a-e-t-h-e-r`; `main` has not been modified. Automated secret scanning remains pending.
+CI remains manual-only. Phase 2A is in the baseline after PR #5 and hotfix PR #6 were merged. PR #7 remains open with the requested persistence corrections submitted from `arena/6a6f42f3-a-e-t-h-e-r`; `main` has not been modified. Automated secret scanning remains pending.

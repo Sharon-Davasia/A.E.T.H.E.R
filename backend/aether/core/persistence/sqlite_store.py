@@ -7,6 +7,7 @@ API. Approval decisions written here are immutable audit records only.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -17,7 +18,9 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.resources import files
+from importlib.resources.abc import Traversable
 from pathlib import Path
+from typing import BinaryIO
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -31,6 +34,13 @@ from aether.core.persistence.models import (
     PersistentTaskState,
     TaskPlan,
 )
+from aether.core.resources.path_safety import (
+    PathSafetyError,
+    VolumeKind,
+    inspect_volume,
+    reject_reparse_components,
+    relative_parts,
+)
 from aether.core.security.redaction import redact_text
 
 
@@ -40,6 +50,10 @@ class PersistenceError(RuntimeError):
 
 class PersistenceIntegrityError(PersistenceError):
     """The database failed integrity, schema, or canonical-record validation."""
+
+
+class PersistenceBusyError(PersistenceError):
+    """Another process already owns this database for the application's lifetime."""
 
 
 class IllegalPersistentTransition(PersistenceError):
@@ -187,6 +201,27 @@ _ACTIVE_RESTART_STATES = frozenset(
 )
 _EVENT_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+_EXPECTED_MIGRATIONS: dict[int, tuple[str, str]] = {
+    1: (
+        "0001_phase2b_core.sql",
+        "709077298230c7065c6778b3149f93b679b6e678220e2d1a34d3540a348d741e",
+    )
+}
+_EXPECTED_SCHEMA_SHA256: dict[int, str] = {
+    1: "02f3cac7e905dfb4d1f161621c789bd5c437530002dec36202e9b2dfaa5d2e30"
+}
+_CRITICAL_TRIGGER_NAMES = frozenset(
+    {
+        "task_plans_no_update",
+        "task_plans_no_delete",
+        "task_steps_no_update",
+        "task_steps_no_delete",
+        "task_events_no_update",
+        "task_events_no_delete",
+        "approval_records_no_update",
+        "approval_records_no_delete",
+    }
+)
 
 
 def persistent_state_from_phase1(state: TaskState) -> PersistentTaskState:
@@ -208,11 +243,27 @@ def phase1_state_from_persistent(state: PersistentTaskState) -> TaskState:
 class SQLiteTaskStore:
     """Versioned SQLite task/plan/audit store with fail-closed startup recovery."""
 
-    def __init__(self, database_path: Path | str) -> None:
+    def __init__(
+        self,
+        database_path: Path | str,
+        *,
+        migrations_dir: Path | Traversable | None = None,
+    ) -> None:
         self.database_path = Path(database_path).expanduser()
         self._lock = threading.RLock()
-        self._prepare_private_path()
+        self._owner_lock_file: BinaryIO | None = None
+        self._closed = False
+        self._storage_volume_id = ""
+        self._parent_identity: tuple[int, int] | None = None
+        self._database_identity: tuple[int, int] | None = None
+        self._migrations_dir = migrations_dir or files("aether.core.persistence").joinpath(
+            "migrations"
+        )
         try:
+            self._verified_migrations = self._load_verified_migrations()
+            self._prepare_private_path()
+            self._acquire_owner_lock()
+            self._secure_database_permissions()
             self._connection = sqlite3.connect(
                 self.database_path,
                 timeout=5.0,
@@ -224,6 +275,8 @@ class SQLiteTaskStore:
             self._connection.execute("PRAGMA busy_timeout = 5000")
             self._connection.execute("PRAGMA synchronous = FULL")
             self._connection.execute("PRAGMA secure_delete = ON")
+            self._verify_database_location()
+            self._secure_database_permissions()
             self._check_integrity()
             self._apply_migrations()
             self._verify_schema()
@@ -231,17 +284,25 @@ class SQLiteTaskStore:
             journal_mode = self._connection.execute("PRAGMA journal_mode = WAL").fetchone()[0]
             if journal_mode.casefold() != "wal":
                 raise PersistenceError("SQLite WAL mode is unavailable")
+            self._verify_database_location()
             self.recover_on_startup()
-        except (sqlite3.Error, OSError, PersistenceError) as exc:
+        except (sqlite3.Error, OSError, PersistenceError, PathSafetyError) as exc:
             if hasattr(self, "_connection"):
                 self._connection.close()
+            self._release_owner_lock()
             if isinstance(exc, PersistenceError):
                 raise
             raise PersistenceError("database initialization failed closed") from exc
 
     def close(self) -> None:
         with self._lock:
-            self._connection.close()
+            if self._closed:
+                return
+            try:
+                self._connection.close()
+            finally:
+                self._release_owner_lock()
+                self._closed = True
 
     def __enter__(self) -> SQLiteTaskStore:
         return self
@@ -288,6 +349,7 @@ class SQLiteTaskStore:
 
     def get_task(self, task_id: UUID) -> StoredTask:
         with self._lock:
+            self._verify_database_location()
             row = self._connection.execute(
                 "SELECT * FROM tasks WHERE id = ?", (str(task_id),)
             ).fetchone()
@@ -420,6 +482,7 @@ class SQLiteTaskStore:
         current_hash: str | None = None
         current_revision: int | None = None
         with self._lock:
+            self._verify_database_location()
             task = self._connection.execute(
                 "SELECT plan_revision, plan_hash FROM tasks WHERE id = ?", (str(task_id),)
             ).fetchone()
@@ -507,6 +570,7 @@ class SQLiteTaskStore:
 
     def get_approval_record(self, approval_id: UUID) -> ApprovalDecisionRecord:
         with self._lock:
+            self._verify_database_location()
             row = self._connection.execute(
                 "SELECT * FROM approval_records WHERE id = ?", (str(approval_id),)
             ).fetchone()
@@ -530,6 +594,7 @@ class SQLiteTaskStore:
 
     def list_events(self, task_id: UUID, *, after_sequence: int = 0) -> tuple[StoredTaskEvent, ...]:
         with self._lock:
+            self._verify_database_location()
             rows = self._connection.execute(
                 "SELECT * FROM task_events WHERE task_id = ? AND seq > ? ORDER BY seq",
                 (str(task_id), after_sequence),
@@ -587,63 +652,207 @@ class SQLiteTaskStore:
 
     def check_integrity(self) -> None:
         with self._lock:
+            self._verify_database_location()
             self._check_integrity()
 
     def _prepare_private_path(self) -> None:
-        if self.database_path.is_symlink():
-            raise PersistenceError("database symlinks are not accepted")
-        parent = self.database_path.parent
-        was_present = parent.exists()
+        path = self.database_path
+        if not path.is_absolute() or ".." in path.parts:
+            raise PersistenceError("database path must be absolute and traversal-free")
+        path = Path(os.path.abspath(path))
+        _check_safe_storage_path(path)
+        initial_volume = _inspect_storage_volume(path)
+        parent = path.parent
+        parent_was_present = parent.exists()
         parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not parent.is_dir():
             raise PersistenceError("database parent is not a directory")
+        _check_safe_storage_path(path)
+        volume_id = _inspect_storage_volume(path)
+        if volume_id != initial_volume:
+            raise PersistenceError("database storage volume changed during path preparation")
         if os.name != "nt":
-            if not was_present:
+            if not parent_was_present:
                 parent.chmod(0o700)
             elif stat.S_IMODE(parent.stat().st_mode) & 0o077:
                 raise PersistenceError("database directory permissions must be owner-only")
+        resolved_parent = parent.resolve(strict=True)
+        if not _same_path(resolved_parent, parent):
+            raise PersistenceError("database parent was redirected during preparation")
+        self.database_path = resolved_parent / path.name
         if self.database_path.exists():
-            metadata = self.database_path.stat()
-            if not stat.S_ISREG(metadata.st_mode):
-                raise PersistenceError("database path must be a regular file")
+            metadata = self.database_path.lstat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink > 1:
+                raise PersistenceError("database path must be a non-hardlinked regular file")
+            if not _same_path(self.database_path.resolve(strict=True), self.database_path):
+                raise PersistenceError("database file was redirected during preparation")
+            self._database_identity = (metadata.st_dev, metadata.st_ino)
+        self._storage_volume_id = volume_id
+        parent_stat = self.database_path.parent.stat()
+        self._parent_identity = (parent_stat.st_dev, parent_stat.st_ino)
+        _check_safe_storage_path(self.database_path)
+
+    def _secure_database_permissions(self) -> None:
+        if os.name != "nt" and self.database_path.exists():
+            self.database_path.chmod(0o600)
+
+    def _verify_database_location(self) -> None:
+        _check_safe_storage_path(self.database_path)
+        parent_stat = self.database_path.parent.stat()
+        if self._parent_identity != (parent_stat.st_dev, parent_stat.st_ino):
+            raise PersistenceError("database parent identity changed")
+        if _inspect_storage_volume(self.database_path) != self._storage_volume_id:
+            raise PersistenceError("database storage volume changed")
+        metadata = self.database_path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink > 1:
+            raise PersistenceError("database target is not a non-hardlinked regular file")
+        if not _same_path(self.database_path.resolve(strict=True), self.database_path):
+            raise PersistenceError("database target was redirected")
+        identity = (metadata.st_dev, metadata.st_ino)
+        if self._database_identity is not None and identity != self._database_identity:
+            raise PersistenceError("database file identity changed")
+        self._database_identity = identity
+
+    def _acquire_owner_lock(self) -> None:
+        lock_path = self.database_path.with_name(self.database_path.name + ".owner.lock")
+        _check_safe_storage_path(lock_path)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise PersistenceError("database owner lock could not be opened safely") from exc
+        try:
+            _check_safe_storage_path(lock_path)
+            metadata = os.fstat(descriptor)
+            parent_stat = lock_path.parent.stat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink > 1
+                or metadata.st_dev != parent_stat.st_dev
+                or _inspect_storage_volume(lock_path) != self._storage_volume_id
+            ):
+                raise PersistenceError("database owner lock is redirected or not a regular file")
             if os.name != "nt":
-                self.database_path.chmod(0o600)
+                os.fchmod(descriptor, 0o600)
+            if metadata.st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.name == "nt":
+                windows_locking = importlib.import_module("msvcrt")
+                windows_locking.locking(descriptor, windows_locking.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._owner_lock_file = os.fdopen(descriptor, "r+b", buffering=0)
+        except OSError as exc:
+            os.close(descriptor)
+            raise PersistenceBusyError("another process owns this database") from exc
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _release_owner_lock(self) -> None:
+        lock_file = self._owner_lock_file
+        if lock_file is None:
+            return
+        self._owner_lock_file = None
+        try:
+            if os.name == "nt":
+                windows_locking = importlib.import_module("msvcrt")
+                lock_file.seek(0)
+                windows_locking.locking(lock_file.fileno(), windows_locking.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            lock_file.close()
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
+            self._verify_database_location()
             try:
                 self._connection.execute("BEGIN IMMEDIATE")
                 yield self._connection
                 self._connection.execute("COMMIT")
+                self._verify_database_location()
             except Exception:
                 if self._connection.in_transaction:
                     self._connection.execute("ROLLBACK")
                 raise
-            finally:
-                if os.name != "nt" and self.database_path.exists():
-                    self.database_path.chmod(0o600)
+
+    def _load_verified_migrations(self) -> dict[int, tuple[str, str, str]]:
+        expected_names = {filename for filename, _ in _EXPECTED_MIGRATIONS.values()}
+        try:
+            files_by_name = {
+                item.name: item
+                for item in self._migrations_dir.iterdir()
+                if item.name.endswith(".sql") and item.is_file()
+            }
+        except (OSError, FileNotFoundError) as exc:
+            raise PersistenceIntegrityError("packaged migrations are unavailable") from exc
+        if set(files_by_name) != expected_names:
+            raise PersistenceIntegrityError("packaged migration set is missing or unexpected")
+        verified: dict[int, tuple[str, str, str]] = {}
+        for version, (filename, expected_sha256) in _EXPECTED_MIGRATIONS.items():
+            try:
+                migration_bytes = files_by_name[filename].read_bytes()
+                migration_sql = migration_bytes.decode("utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                raise PersistenceIntegrityError("packaged migration cannot be read") from exc
+            actual_sha256 = hashlib.sha256(migration_bytes).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise PersistenceIntegrityError("packaged migration checksum mismatch")
+            if re.search(r"(?i)\b(?:INSERT|REPLACE)\s+INTO\s+schema_migrations\b", migration_sql):
+                raise PersistenceIntegrityError("migration ledger writes must be external to SQL")
+            verified[version] = (filename, actual_sha256, migration_sql)
+        return verified
 
     def _apply_migrations(self) -> None:
         current = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        migration_dir = files("aether.core.persistence").joinpath("migrations")
-        migration_paths = sorted(migration_dir.iterdir(), key=lambda item: item.name)
-        available: dict[int, tuple[str, str]] = {}
-        for migration in migration_paths:
-            match = re.fullmatch(r"(\d{4})_[a-z0-9_]+\.sql", migration.name)
-            if match is None:
-                continue
-            version = int(match.group(1))
-            available[version] = (migration.name, migration.read_text(encoding="utf-8"))
-        if current > max(available, default=0):
+        latest_version = max(_EXPECTED_MIGRATIONS, default=0)
+        if current > latest_version:
             raise PersistenceIntegrityError("database schema is newer than this application")
-        for version in range(current + 1, max(available, default=0) + 1):
-            migration_entry = available.get(version)
-            if migration_entry is None:
-                raise PersistenceIntegrityError("database migration sequence has a gap")
-            migration_name, script = migration_entry
+        if current > 0:
             try:
-                self._connection.executescript(f"BEGIN IMMEDIATE;\n{script}\nCOMMIT;")
+                ledger = self._connection.execute(
+                    "SELECT version, name, sha256 FROM schema_migrations ORDER BY version"
+                ).fetchall()
+            except sqlite3.Error as exc:
+                raise PersistenceIntegrityError(
+                    "applied migration checksums are unavailable"
+                ) from exc
+            if len(ledger) != current:
+                raise PersistenceIntegrityError("applied migration ledger is incomplete")
+            for expected_version, row in enumerate(ledger, start=1):
+                expected_name, expected_sha256 = _EXPECTED_MIGRATIONS[expected_version]
+                if (
+                    row["version"] != expected_version
+                    or row["name"] != expected_name.removesuffix(".sql")
+                    or row["sha256"] != expected_sha256
+                ):
+                    raise PersistenceIntegrityError("applied migration checksum mismatch")
+        for version in range(current + 1, latest_version + 1):
+            migration_name, checksum, script = self._verified_migrations[version]
+            try:
+                self._connection.executescript(f"BEGIN IMMEDIATE;\n{script}")
+                self._connection.execute(
+                    "INSERT INTO schema_migrations(version, name, sha256, applied_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (
+                        version,
+                        migration_name.removesuffix(".sql"),
+                        checksum,
+                        _timestamp(None),
+                    ),
+                )
+                self._connection.execute("COMMIT")
             except sqlite3.Error as exc:
                 if self._connection.in_transaction:
                     self._connection.execute("ROLLBACK")
@@ -661,28 +870,34 @@ class SQLiteTaskStore:
             "task_events",
             "approval_records",
         }
-        required_triggers = {
-            "task_plans_no_update",
-            "task_plans_no_delete",
-            "task_steps_no_update",
-            "task_steps_no_delete",
-            "task_events_no_update",
-            "task_events_no_delete",
-            "approval_records_no_update",
-            "approval_records_no_delete",
-        }
         rows = self._connection.execute(
-            "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'trigger')"
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE type IN ('table', 'index', 'trigger') "
+            "AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' "
+            "ORDER BY type, name"
         ).fetchall()
-        present = {row["name"] for row in rows}
-        missing = (required_tables | required_triggers) - present
-        if missing:
+        present_tables = {row["name"] for row in rows if row["type"] == "table"}
+        present_triggers = {row["name"] for row in rows if row["type"] == "trigger"}
+        if not required_tables.issubset(present_tables) or not _CRITICAL_TRIGGER_NAMES.issubset(
+            present_triggers
+        ):
             raise PersistenceIntegrityError("database schema objects are missing")
-        migration = self._connection.execute(
-            "SELECT name FROM schema_migrations WHERE version = 1"
-        ).fetchone()
+        schema_descriptor = [
+            (row["type"], row["name"], _normalize_schema_sql(row["sql"])) for row in rows
+        ]
+        schema_hash = hashlib.sha256(_canonical_json(schema_descriptor).encode("utf-8")).hexdigest()
         user_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        if migration is None or migration["name"] != "0001_phase2b_core" or user_version != 1:
+        if schema_hash != _EXPECTED_SCHEMA_SHA256.get(user_version):
+            raise PersistenceIntegrityError("database schema integrity fingerprint mismatch")
+        expected_name, expected_sha256 = _EXPECTED_MIGRATIONS[user_version]
+        migration = self._connection.execute(
+            "SELECT name, sha256 FROM schema_migrations WHERE version = ?", (user_version,)
+        ).fetchone()
+        if (
+            migration is None
+            or migration["name"] != expected_name.removesuffix(".sql")
+            or migration["sha256"] != expected_sha256
+        ):
             raise PersistenceIntegrityError("database migration ledger is inconsistent")
 
     def _check_integrity(self) -> None:
@@ -828,3 +1043,49 @@ def _parse_timestamp(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise PersistenceIntegrityError("stored timestamp lacks timezone")
     return parsed.astimezone(UTC)
+
+
+def _check_safe_storage_path(path: Path) -> None:
+    """Reject redirection and unsafe Windows components without user-file policy."""
+    try:
+        reject_reparse_components(path)
+        for component in path.parts:
+            if component != path.anchor:
+                relative_parts(component)
+    except PathSafetyError as exc:
+        raise PersistenceError(
+            "database path contains a symlink or reparse point or unsafe component"
+        ) from exc
+
+
+def _inspect_storage_volume(path: Path) -> str:
+    """Require every existing component to stay on one supported fixed volume."""
+    components = list(reversed(path.parents))
+    if path.exists() or path.is_symlink():
+        components.append(path)
+    volume_id: str | None = None
+    for component in components:
+        if not component.exists() and not component.is_symlink():
+            continue
+        try:
+            metadata = component.lstat()
+            inspected_path = component if stat.S_ISDIR(metadata.st_mode) else component.parent
+            info = inspect_volume(inspected_path)
+        except (OSError, PathSafetyError) as exc:
+            raise PersistenceError("database path volume identity is unavailable") from exc
+        if info.kind != VolumeKind.FIXED or not info.volume_id or info.volume_id == "unknown":
+            raise PersistenceError("database requires a known fixed storage volume")
+        if volume_id is not None and info.volume_id != volume_id:
+            raise PersistenceError("database path crosses a storage-volume boundary")
+        volume_id = info.volume_id
+    if volume_id is None:
+        raise PersistenceError("database path has no verifiable existing ancestor")
+    return volume_id
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def _normalize_schema_sql(sql: str) -> str:
+    return re.sub(r"\s+", " ", sql.strip())

@@ -3,6 +3,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
     applied_at TEXT NOT NULL
 );
 
@@ -112,6 +113,4 @@ BEGIN SELECT RAISE(ABORT, 'approval audit records are immutable'); END;
 CREATE TRIGGER approval_records_no_delete BEFORE DELETE ON approval_records
 BEGIN SELECT RAISE(ABORT, 'approval audit records are immutable'); END;
 
-INSERT INTO schema_migrations(version, name, applied_at)
-VALUES (1, '0001_phase2b_core', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
 PRAGMA user_version = 1;

@@ -12,6 +12,7 @@ from aether.core.persistence.models import (
 )
 from aether.core.persistence.sqlite_store import (
     IllegalPersistentTransition,
+    PersistenceBusyError,
     PersistenceError,
     PersistenceIntegrityError,
     SQLiteTaskStore,
@@ -26,6 +27,7 @@ __all__ = [
     "ApprovalDecisionValue",
     "EventMetadata",
     "IllegalPersistentTransition",
+    "PersistenceBusyError",
     "PersistenceError",
     "PersistenceIntegrityError",
     "PersistentTaskState",
