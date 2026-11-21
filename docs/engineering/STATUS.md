@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**Phase 2A — Resource and policy foundation (implementation in progress on the current feature branch; not reviewed/merged; filesystem execution and mutation remain disabled).** Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. The user has separately reported successful Phase 1 Windows acceptance; that is user-reported, not independently verified here.
+**Phase 2B-1 — durable persistence (PR #7 review corrections implemented and submitted for independent re-review).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
 
 ## Phase 0 baseline
 
@@ -26,7 +26,7 @@
 - Removed the untracked synthetic `backend/manifest.json`; `models/manifests/` contains the generated schema only, with no selected production model/runtime manifest.
 - No model weights, llama.cpp executable, network inference, real OS action, Phase 2 executor or cloud provider was downloaded or introduced.
 
-## Phase 2A implementation on the current working branch (PR #5 open; requested corrections pending re-review)
+## Phase 2A implementation in the baseline (PR #5 and hotfix PR #6 merged)
 
 - Added explicit trusted-directory registration, Windows-aware relative path rejection, canonical broker-issued resource IDs, protected-path checks, reparse/symlink checks, fixed-volume/device identity enforcement and version-drift revalidation in `backend/aether/core/resources/`.
 - Added strict typed capability schemas, explicit T0–T3 metadata, unknown-operation denial and exact scoped resource checks. T3 always denies; all built-in filesystem capability contracts are non-executable; T2 mutation is denied pending a real trusted approval channel. The no-registry broker preserves Phase 0/1 deny-all behavior.
@@ -35,15 +35,26 @@
 - Added synthetic adversarial tests for lexical traversal/Windows device names, sibling-prefix escape, symlink escape, unknown roots/volumes, secret paths, stale/forged references, atomic `os.replace()` refresh/stale-ref denial, case-collision preservation, unknown capabilities, immutable approval operation/resource collections, exact approval drift, replay/expiry/revocation and T3/T2 deny.
 - `scripts/verify.ps1` runs pytest with `--basetemp` under ignored `<repo>/.cache/pytest-tmp` on the D: checkout, keeping synthetic `tmp_path` roots outside protected `%LOCALAPPDATA%` while leaving protected-path rules unchanged.
 - Security boundaries, limitations and exact Windows validation checklist are in `docs/engineering/PHASE2A_RESOURCE_POLICY.md` and `docs/security/TRUST_BOUNDARIES.md`. No new ADR was needed; existing deny-all architecture remains unchanged.
-- This is broker-side protection, not a sandbox; stat-derived version tokens do not eliminate TOCTOU. **No Windows 11 execution or acceptance is claimed.**
+- This is broker-side protection, not a sandbox; stat-derived version tokens do not eliminate TOCTOU. The user reports Windows 11 validation after PR #6, but the NTFS case-sensitive fixture and symlink test were skipped/blocked and junction/reparse, volume-boundary, and root-replacement validation remain pending. Arena has not independently verified Windows security acceptance.
+
+## Phase 2B-1 implementation in PR #7 (review corrections submitted; Windows validation pending)
+
+- Added versioned SQLite migration and `SQLiteTaskStore` for persistent task state, immutable canonical plan revisions and normalized steps, append-only audit events, and immutable approval-decision audit records.
+- Task/plan/step schemas use the Master Specification state vocabulary and typed dependency DAG, resource versions, expected state/effect, risk, retry/idempotency, postcondition, and recovery metadata. Explicit state adapters preserve the Phase 1 `TaskState` contract and reject states that cannot be mapped.
+- Startup verifies exact packaged migration-byte checksums and a code-pinned schema fingerprint, checks SQLite/foreign-key integrity, rejects missing/changed/future schema state, and pauses in-flight work only after acquiring the single-owner lock. POSIX locks the database inode directly, so replacing the historical `.owner.lock` pathname cannot give a second process authority; Windows retains the one-byte `msvcrt.locking` sidecar and its pathname-replacement/open-file semantics still require target-machine verification. A second live store fails closed; OS lock release permits crash recovery. Fresh planning/consent is required after restart.
+- Database paths are absolute, component-checked for symlink/junction/reparse, hardlink, unsafe Windows names, fixed-volume changes, and parent identity substitutions. The intended LocalAppData-shaped location is not blocked by Phase 2A protected-user-file policy.
+- Audit metadata is allow-listed and plan/user-goal redaction is conservative. SQL plan/step/event/approval-audit records are immutable/append-only. Approval decisions are non-authorizing; no trusted-root rehydration, grant loader/issuer, action consumption, executor, or filesystem mutation route exists.
+- POSIX database permissions are owner-only; the POSIX lock is the database inode. Windows ACL, junction/reparse, actual `msvcrt` contention, and `.owner.lock` pathname replacement behavior remain target-laptop verification requirements.
+- Target Windows checklist remains open in `docs/engineering/PHASE2A_RESOURCE_POLICY.md`; no Windows security or desktop acceptance is inferred from Linux tests.
 
 ## Verified in this sandbox (Linux, Python 3.11 override)
 
 - `uv sync --directory backend --python 3.11 --all-extras --locked` — passed; lock dependencies unchanged.
-- `uv run --directory backend --python 3.11 ruff check .` and `ruff format --check .` — passed.
-- `uv run --directory backend --python 3.11 mypy` — passed, strict, 52 source files.
-- Targeted regressions (`tests/test_phase2_approval_binding.py`, `tests/test_resource_registry.py`, `tests/test_policy_deny.py`) — **49 passed**, including the no-argument deny-all broker invariant.
-- Full `uv run --directory backend --python 3.11 pytest -q -rs -o addopts=''` — **163 passed, 1 skipped, 164 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. Separately, the base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- Latest B4 verification: Ruff lint and format checks passed; strict mypy passed for 55 source files.
+- Persistence adversarial tests (`tests/test_phase2b_persistence.py`) — **37 passed**.
+- Full pytest — **200 passed, 1 skipped**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. The earlier base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- The POSIX `flock` pathname replacement primitive was directly reproduced: after unlink/recreate of the locked sidecar pathname, a second `flock` succeeded on the new inode. With the B4 implementation, the store locks the database inode and the regression confirms a second process fails before restart recovery; normal recovery succeeds after owner release.
+- Built the backend wheel and confirmed its packaged migration bytes match pinned SHA-256 `709077298230c7065c6778b3149f93b679b6e678220e2d1a34d3540a348d741e`.
 - Locked workflow import check and authenticated health `TestClient` check both passed (health returned HTTP 200).
 - A Starlette `TestClient`/HTTPX deprecation warning remains non-failing; no actual Windows or model compatibility is inferred from it.
 - Added exact checked-in JSON-schema drift enforcement; runtime executable checksum, startup cancellation/cleanup, port conflict, authenticated readiness, post-start process exit, task TTL/capacity and controlled API-health failure tests use synthetic bytes, fake processes, and `httpx.MockTransport`.
@@ -85,4 +96,4 @@ The official llama.cpp server README was inspected on GitHub for its HTTP API/au
 | Windows PowerShell / Python 3.12 | Pending user laptop execution |
 | V-01 RTX 4050 benchmark | Pending verified assets and target laptop |
 
-CI remains manual-only. Phase 2A is committed on `arena/8db78286-a-e-t-h-e-r` and proposed for review in PR #5; `main` was not modified. Automated secret scanning remains pending.
+CI remains manual-only. Phase 2A is in the baseline after PR #5 and hotfix PR #6 were merged. PR #7 remains open with the requested persistence corrections submitted from `arena/6a6f42f3-a-e-t-h-e-r`; `main` has not been modified. Automated secret scanning remains pending.
