@@ -713,7 +713,7 @@ def test_parent_identity_drift_is_rejected_before_reads(tmp_path, monkeypatch) -
 
     def drifted_parent_stat(path, *args, **kwargs):
         result = original_stat(path, *args, **kwargs)
-        if path == parent:
+        if path == parent and kwargs.get("follow_symlinks", True):
             values = list(result)
             values[1] = int(values[1]) + 1
             return os.stat_result(values)
