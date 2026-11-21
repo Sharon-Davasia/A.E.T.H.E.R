@@ -714,7 +714,16 @@ class SQLiteTaskStore:
         self._database_identity = identity
 
     def _acquire_owner_lock(self) -> None:
-        lock_path = self.database_path.with_name(self.database_path.name + ".owner.lock")
+        # On POSIX, lock the database inode itself. A sidecar pathname can be
+        # unlinked while flock remains attached to its old inode, allowing a
+        # second process to lock a newly-created sidecar inode. Windows keeps
+        # the dedicated sidecar because its CRT locking/sharing semantics need
+        # target-platform validation before changing that mechanism.
+        lock_path = (
+            self.database_path
+            if os.name != "nt"
+            else self.database_path.with_name(self.database_path.name + ".owner.lock")
+        )
         _check_safe_storage_path(lock_path)
         flags = os.O_RDWR | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
@@ -726,17 +735,23 @@ class SQLiteTaskStore:
         try:
             _check_safe_storage_path(lock_path)
             metadata = os.fstat(descriptor)
+            path_metadata = lock_path.lstat() if os.name != "nt" else metadata
             parent_stat = lock_path.parent.stat()
             if (
                 not stat.S_ISREG(metadata.st_mode)
                 or metadata.st_nlink > 1
+                or (
+                    os.name != "nt"
+                    and (metadata.st_dev, metadata.st_ino)
+                    != (path_metadata.st_dev, path_metadata.st_ino)
+                )
                 or metadata.st_dev != parent_stat.st_dev
                 or _inspect_storage_volume(lock_path) != self._storage_volume_id
             ):
                 raise PersistenceError("database owner lock is redirected or not a regular file")
             if os.name != "nt":
                 os.fchmod(descriptor, 0o600)
-            if metadata.st_size == 0:
+            if os.name == "nt" and metadata.st_size == 0:
                 os.write(descriptor, b"\0")
             os.lseek(descriptor, 0, os.SEEK_SET)
             if os.name == "nt":
@@ -746,6 +761,16 @@ class SQLiteTaskStore:
                 import fcntl
 
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if os.name != "nt":
+                # Recheck after acquiring flock to close the open/stat race:
+                # the pathname must still identify the locked inode.
+                locked_metadata = os.fstat(descriptor)
+                current_path_metadata = lock_path.lstat()
+                if (locked_metadata.st_dev, locked_metadata.st_ino) != (
+                    current_path_metadata.st_dev,
+                    current_path_metadata.st_ino,
+                ):
+                    raise PersistenceError("database owner lock path changed during acquisition")
             self._owner_lock_file = os.fdopen(descriptor, "r+b", buffering=0)
         except OSError as exc:
             os.close(descriptor)

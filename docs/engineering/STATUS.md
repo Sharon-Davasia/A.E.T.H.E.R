@@ -41,19 +41,20 @@
 
 - Added versioned SQLite migration and `SQLiteTaskStore` for persistent task state, immutable canonical plan revisions and normalized steps, append-only audit events, and immutable approval-decision audit records.
 - Task/plan/step schemas use the Master Specification state vocabulary and typed dependency DAG, resource versions, expected state/effect, risk, retry/idempotency, postcondition, and recovery metadata. Explicit state adapters preserve the Phase 1 `TaskState` contract and reject states that cannot be mapped.
-- Startup verifies exact packaged migration-byte checksums and a code-pinned schema fingerprint, checks SQLite/foreign-key integrity, rejects missing/changed/future schema state, and pauses in-flight work only after acquiring the single-owner lock. A second live store fails closed; OS lock release permits crash recovery. Fresh planning/consent is required after restart.
+- Startup verifies exact packaged migration-byte checksums and a code-pinned schema fingerprint, checks SQLite/foreign-key integrity, rejects missing/changed/future schema state, and pauses in-flight work only after acquiring the single-owner lock. POSIX locks the database inode directly, so replacing the historical `.owner.lock` pathname cannot give a second process authority; Windows retains the one-byte `msvcrt.locking` sidecar and its pathname-replacement/open-file semantics still require target-machine verification. A second live store fails closed; OS lock release permits crash recovery. Fresh planning/consent is required after restart.
 - Database paths are absolute, component-checked for symlink/junction/reparse, hardlink, unsafe Windows names, fixed-volume changes, and parent identity substitutions. The intended LocalAppData-shaped location is not blocked by Phase 2A protected-user-file policy.
 - Audit metadata is allow-listed and plan/user-goal redaction is conservative. SQL plan/step/event/approval-audit records are immutable/append-only. Approval decisions are non-authorizing; no trusted-root rehydration, grant loader/issuer, action consumption, executor, or filesystem mutation route exists.
-- POSIX database and lock-file permissions are owner-only. Windows ACL, junction/reparse, and actual `msvcrt` lock behavior remain target-laptop verification requirements.
+- POSIX database permissions are owner-only; the POSIX lock is the database inode. Windows ACL, junction/reparse, actual `msvcrt` contention, and `.owner.lock` pathname replacement behavior remain target-laptop verification requirements.
 - Target Windows checklist remains open in `docs/engineering/PHASE2A_RESOURCE_POLICY.md`; no Windows security or desktop acceptance is inferred from Linux tests.
 
 ## Verified in this sandbox (Linux, Python 3.11 override)
 
 - `uv sync --directory backend --python 3.11 --all-extras --locked` — passed; lock dependencies unchanged.
-- `uv run --directory backend --python 3.11 ruff check .` and `ruff format --check .` — passed.
-- `uv run --directory backend --python 3.11 mypy` — passed, strict, 56 source files.
-- New persistence adversarial tests (`tests/test_phase2b_persistence.py`) — **36 passed**.
-- Full `uv run --directory backend --python 3.11 pytest -q -rs -o addopts=''` — **199 passed, 1 skipped, 200 collected**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. The earlier base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- Latest B4 verification: Ruff lint and format checks passed; strict mypy passed for 55 source files.
+- Persistence adversarial tests (`tests/test_phase2b_persistence.py`) — **37 passed**.
+- Full pytest — **200 passed, 1 skipped**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. The earlier base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
+- The POSIX `flock` pathname replacement primitive was directly reproduced: after unlink/recreate of the locked sidecar pathname, a second `flock` succeeded on the new inode. With the B4 implementation, the store locks the database inode and the regression confirms a second process fails before restart recovery; normal recovery succeeds after owner release.
+- Built the backend wheel and confirmed its packaged migration bytes match pinned SHA-256 `709077298230c7065c6778b3149f93b679b6e678220e2d1a34d3540a348d741e`.
 - Locked workflow import check and authenticated health `TestClient` check both passed (health returned HTTP 200).
 - A Starlette `TestClient`/HTTPX deprecation warning remains non-failing; no actual Windows or model compatibility is inferred from it.
 - Added exact checked-in JSON-schema drift enforcement; runtime executable checksum, startup cancellation/cleanup, port conflict, authenticated readiness, post-start process exit, task TTL/capacity and controlled API-health failure tests use synthetic bytes, fake processes, and `httpx.MockTransport`.

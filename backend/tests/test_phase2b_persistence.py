@@ -406,6 +406,48 @@ def test_database_owner_lock_is_enforced_across_processes(tmp_path) -> None:
     first.close()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock pathname-replacement regression")
+def test_replacing_owner_lock_path_cannot_grant_a_second_store_authority(tmp_path) -> None:
+    database = tmp_path / "store.sqlite3"
+    first = SQLiteTaskStore(database)
+    task = first.create_task("Synthetic goal", now=_NOW)
+    first.transition_task(task.task_id, PersistentTaskState.PLANNING, now=_NOW)
+
+    # Replace the historical sidecar pathname while Store A still owns the
+    # database. Ownership now attaches to the SQLite database inode, not this
+    # replaceable name, so Store B must fail before startup recovery can pause A.
+    sidecar = database.with_name(database.name + ".owner.lock")
+    sidecar.write_bytes(b"old lock pathname")
+    replacement = sidecar.with_suffix(sidecar.suffix + ".replacement")
+    replacement.write_bytes(b"replacement lock inode")
+    replacement.replace(sidecar)
+
+    code = (
+        "from aether.core.persistence.sqlite_store import SQLiteTaskStore, PersistenceBusyError; "
+        "import sys; "
+        "\ntry: SQLiteTaskStore(sys.argv[1])"
+        "\nexcept PersistenceBusyError: print('BUSY')"
+        "\nelse: raise SystemExit(4)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(database)],
+        cwd=Path(__file__).parents[1],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "BUSY"
+    assert first.get_task(task.task_id).state == PersistentTaskState.PLANNING
+    first.close()
+
+    # Once A releases ownership, normal restart recovery remains allowed.
+    reopened = SQLiteTaskStore(database)
+    assert reopened.get_task(task.task_id).state == PersistentTaskState.PAUSED
+    reopened.close()
+
+
 def test_abnormal_process_exit_releases_owner_and_triggers_restart_recovery(tmp_path) -> None:
     database = tmp_path / "store.sqlite3"
     code = (

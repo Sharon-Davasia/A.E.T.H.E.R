@@ -15,18 +15,25 @@ It enables foreign keys, WAL, `synchronous=FULL`, and `secure_delete`, checks
 SQLite and foreign-key integrity before and after migration, and rejects missing,
 changed, or newer migration/schema state.
 
-A nonblocking OS-level lock file grants one active process ownership of each
-database. It is held for the store lifetime; POSIX uses `flock`, Windows uses a
-one-byte `msvcrt.locking` lock. The OS releases it on process termination. A
-second live owner fails before opening the database or running restart recovery.
-Startup pauses active tasks only after acquiring ownership; a paused task must
-be replanned and receive fresh consent.
+A nonblocking OS-level lock grants one active process ownership of each
+database. On POSIX, `flock` is held on the database file descriptor itself for
+the store lifetime, so unlinking/replacing a historical `.owner.lock` sidecar
+cannot create a second lockable inode. On Windows, the existing one-byte
+`msvcrt.locking` lock remains on the `.owner.lock` sidecar. The implementation
+seeks to offset zero and requests `LK_NBLCK` for one byte; open-file
+rename/unlink and replacement-lock behavior has not been established here and
+requires target-machine verification. The OS releases the held lock on process termination. A second
+live owner fails before startup recovery; active tasks are paused only after
+ownership is acquired and must be replanned with fresh consent. This does not
+claim protection from a malicious same-OS-user actor able to replace database
+paths or otherwise tamper with the private storage directory.
 
 The selected absolute database path is checked component-by-component for
-symlinks, junctions/reparse points, hard-linked database/lock files, and fixed
-volume identity before/after directory creation and database open, and again
-before reads and transactions. No Phase 2A protected-user-file path policy is
-applied to the intended private `%LOCALAPPDATA%\AetherOS\data` location.
+symlinks, junctions/reparse points, hard-linked database files (and the
+Windows lock sidecar), and fixed volume identity before/after directory
+creation and database open, and again before reads and transactions. No Phase
+2A protected-user-file path policy is applied to the intended private
+`%LOCALAPPDATA%\AetherOS\data` location.
 Windows ACL enforcement and actual junction/reparse/file-lock behavior remain
 target-machine verification gates.
 
