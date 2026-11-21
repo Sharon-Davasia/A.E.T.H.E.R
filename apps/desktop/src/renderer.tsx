@@ -41,7 +41,7 @@ function App(): React.JSX.Element {
     <h1>Local control channel</h1>
     <p className="lede">Stage 1 demonstrates an isolated desktop shell and an authenticated synthetic backend message.</p>
     <section className="status" aria-live="polite">
-      <span className={`dot ${status.startsWith('ready') ? 'online' : ''}`} />
+      <span className={`dot ${status.startsWith('ready') ? 'online' : ''}`} aria-hidden="true" />
       <div><div className="label">BACKEND STATUS</div><div>{status}</div></div>
     </section>
     <button type="button" onClick={() => void ping()} disabled={busy || !status.startsWith('ready')}>

@@ -12,6 +12,25 @@ Node/npm are pinned by `.nvmrc`, `packageManager`, strict `engines`, and `.npmrc
 
 Install npm dependencies with `npm ci`. Electron 44's package lazily downloads its platform binary the first time its launcher is invoked; a successful `npm ci` alone does not establish that Electron can run. Invoke the Electron launcher or `npx install-electron` only where the verified Electron distribution endpoint is reachable. This sandbox installed the locked npm tree, but its Electron binary fetch failed, so no Electron runtime was launched here.
 
+## Visual system baseline
+
+The default desktop appearance is the Master Spec's light baseline; no dark-mode switch or dashboard is included in this Stage 1 shell. `src/style.css` defines these exact tokens:
+
+| Token | Value |
+|:--|:--|
+| Background | `#F8FAFC` |
+| Surface | `#FFFFFF` |
+| Border | `#E2E8F0` |
+| Primary accent | `#2563EB` |
+| Secondary accent | `#6366F1` |
+| Primary text | `#0F172A` |
+| Secondary text | `#64748B` |
+| Success | `#059669` |
+| Warning | `#D97706` |
+| Danger | `#DC2626` |
+
+Status/result wording stays textual; color is only supplemental. The theme regression verifies the emitted production CSS retains every token, tests WCAG AA normal-text contrast for primary/secondary text and the primary button label, checks at least 3:1 contrast for semantic status markers, and verifies visible keyboard focus, a narrow-screen layout, and accessible status announcements.
+
 ## Commands
 
 From this directory:
@@ -26,7 +45,7 @@ npm run build
 npm run check
 ```
 
-`npm run check` runs ESLint, TypeScript checks, Python child unit tests, `npm test` (which first builds the actual Vite renderer and then runs Node unit, Node/Python pipe-integration, generated-asset and lifecycle-race tests), and Electron main/preload compilation. The lifecycle regressions cover stop during handshake, failed startup, stale child events, repeated shutdown, request rejection, fresh-session sequence reset, and waiting for graceful/forced child exit. Python tests exercise the actual child script with real stdin/stdout/stderr pipes. Existing FastAPI bearer-token, Origin and loopback protections are unchanged; Stage 1 adds no HTTP endpoint. These Linux checks do **not** establish Windows acceptance. `npm start` builds and starts Electron. For a development run, set `AETHER_DEV_PYTHON` to an absolute Python executable path before `npm start`, for example a local Python 3.12 venv's executable; the value selects the parent-side executable and is not forwarded to the child environment. Production expects the bundled runtime at `resources/backend/python[.exe]`.
+`npm run check` runs ESLint, TypeScript checks, Python child unit tests, `npm test` (which first builds the actual Vite renderer and then runs Node unit, Node/Python pipe-integration, generated-asset, light-theme and lifecycle-race tests), and Electron main/preload compilation. The lifecycle regressions cover stop during handshake, failed startup, stale child events, repeated shutdown, request rejection, fresh-session sequence reset, and waiting for graceful/forced child exit. Python tests exercise the actual child script with real stdin/stdout/stderr pipes. Existing FastAPI bearer-token, Origin and loopback protections are unchanged; Stage 1 adds no HTTP endpoint. These Linux checks do **not** establish Windows acceptance. `npm start` builds and starts Electron. For a development run, set `AETHER_DEV_PYTHON` to an absolute Python executable path before `npm start`, for example a local Python 3.12 venv's executable; the value selects the parent-side executable and is not forwarded to the child environment. Production expects the bundled runtime at `resources/backend/python[.exe]`.
 
 `npm run dev` starts only the unprivileged Vite renderer development server on loopback; it does not create an Electron window or expose a backend channel.
 
@@ -40,9 +59,25 @@ npm run check
 - Each child has an isolated session object containing its handshake, decoder, request map, send chain, sequence, key and exit completion. Every stdout/stderr/exit/error/close callback captures that child/session and checks it is still the active generation before changing client state. A stale event can only settle its own retired-process completion. `stop()` rejects a pending handshake and all requests, clears secrets/timers, closes stdin, waits 1.5 seconds, then kills and waits for the actual process exit. Concurrent stops share one promise; failed children are tracked until exit; a fresh start waits for prior retirements and creates a new key/session and fresh sequence/send chain. No automatic restart is attempted. If Electron itself is terminated abruptly, Windows handle closure/child EOF is expected to stop the child; verify this on the target Windows build.
 - HMAC is message integrity/authentication, not a boundary against a compromised parent/child or a hostile process with same-user process-memory/handle access. The pipe's local handle inheritance and launch relationship are part of the trust assumptions.
 
-## Linux evidence vs target-Windows gate
+## Stage 1 closeout evidence ledger
 
-The generated-renderer regression checks `dist/index.html` and verifies that its script/CSS references are relative, exist under `dist`, and retain CSP. Linux static/unit/build tests exercise the protocol, IPC guard and file-asset layout but cannot prove actual Electron `loadFile()` rendering on Windows, `CreatePipe`/inheritable-handle behavior, Electron's exact Node runtime behavior, ACLs, or process cleanup. Electron's platform binary download was not available in the implementation sandbox due certificate verification failure; source compilation is not Electron runtime startup evidence. The following exact procedure is required on a clean Windows 11 x64 machine before Stage 1 can be called Windows-verified or any later trusted approval/grant/filesystem stage is enabled.
+### Completed in this Linux workspace
+
+- `npm ci` completed from the committed lockfile; `npm audit` reports zero vulnerabilities and `npm ls --all` reports no dependency problems.
+- `npm run check` passes lint, renderer/Electron typechecks and compilation, production renderer asset regression, light-theme regression, **14/14 Node tests**, and **6/6 Python child tests** (no skips). Node coverage includes authenticated Node–Python ping/cleanup and IPC trust positive/negative cases.
+- The light-theme test checks all specified tokens in production CSS, text/button contrast thresholds, responsive styling, keyboard focus, and accessible textual status.
+
+### Windows results reported by the user (not independently reproduced here)
+
+For the pre-light-theme PR state, the user reports Windows 11 results of 13/13 Node tests, 6/6 Python tests, zero npm audit findings, successful real Electron GUI launch and authenticated synthetic ping, and one normal plus one controlled forced termination with no AETHER Python children remaining. These are useful reported results, not an independent Windows run by this workspace; they do not cover the new light-theme regression.
+
+### Still unverified / future phase gates
+
+- Secret non-disclosure across actual Windows process command lines, child environment, logs, and renderer-visible state has not been fully verified. Repeatable abnormal-termination cleanup across multiple fault points/runs also remains outstanding; one controlled forced-termination pass is not a repeatability gate.
+- The latest light theme, its generated CSS, and the new theme regression have only been checked on Linux. Re-run the complete `npm ci` / `npm run check` sequence on Windows and launch the actual Electron 44.11.5 app before treating the visual correction as Windows-verified.
+- Preserve these Windows filesystem gaps for their applicable future file/approval phase gates: verify production data-directory ACLs at creation; symlink tests were blocked by WinError 1314; NTFS case-sensitive sibling identity and native cross-volume traversal are unverified; native open-database parent replacement was denied by Windows; sidecar rename denial applies only to the tested handle configuration. No filesystem capability is authorized by this Stage 1 work.
+
+Electron's platform binary fetch failed in this Linux sandbox, so its GUI was not launched here. Source compilation does not establish Electron runtime startup or Windows acceptance. The following procedure supplements the user's reported Windows checks; record only pass/fail counts and never actual session-secret values.
 
 ### Exact Windows 11 verification procedure (Python 3.12.10)
 
@@ -61,10 +96,14 @@ npm run check
 npm start
 ```
 
-Record OS build, architecture, Node/Electron/Python versions, command output and process IDs. Confirm `npm test`'s generated-file regression passes, then launch the actual Electron app: confirm `BrowserWindow.loadFile()` renders the built UI with no missing `file://` JS/CSS assets or CSP/navigation errors in the renderer console. In the UI confirm `ready: Authenticated synthetic channel ready`; click **Send synthetic ping** and confirm the synthetic-only result. Use Process Explorer or an equivalent signed local inspection tool to verify the child command line contains only the fixed Python flags and script path, has the explicit desktop backend working directory, has only stdin/stdout/stderr redirected as intended, and that the key/session/challenge are absent from argv and environment. Confirm stdout carries only protocol frames and stderr remains separate.
+Use a disposable Windows account and non-sensitive test profile. Record OS build, architecture, external Node/npm/Python versions, and Electron's `process.versions.node` separately; capture only test outcomes and non-secret runtime versions. Confirm `npm test`'s generated-file regression passes, then launch Electron and confirm `BrowserWindow.loadFile()` renders the built UI without missing `file://` assets or CSP/navigation errors. Verify the UI reports `ready: Authenticated synthetic channel ready`, send **Send synthetic ping**, and confirm the synthetic-only result.
+
+Use Process Explorer (or an equivalent signed local inspection tool) to inspect the AETHER parent/child tree. In memory, verify the child's executable, fixed `-I -S -B -u` arguments, backend script, working directory, and stdin/stdout/stderr pipe handles against the launch policy. Inspect the child Environment tab against the explicit environment allowlist. Do not export environment blocks, copy raw command lines into logs, or capture screenshots of those panes. Do not record pipe contents; stdout carries protocol data and must remain private to the process channel.
+
+For exact-value non-disclosure checks, use only a disposable, untracked test harness that observes generated key/session/challenge values in volatile memory at creation. Have it compare those values (and their defined encodings) against in-memory copies of the child's command line/environment, captured application logs, and renderer-visible DOM/window/storage state. Obtain renderer state through a test-only in-process inspection call; do not add a production IPC method or expose values through DevTools. The observer must report only surface names, match counts, and pass/fail; it must never print, serialize, hash, screenshot, or persist secret values or raw scanned surfaces. Zero its buffers in a `finally` block and terminate the harness after each run. Keep the observer out of the shipped build. Confirm the renderer exposes only the intended status/ping text and no unexpected global, storage, or diagnostic entries.
 
 Run the Windows child transport/security tests above: require the test suite to pass authenticated handshake and synthetic ping; reject malformed and oversized frames, bad MAC, wrong direction, stale session, stale timestamp, replayed sequence/nonce and duplicate request ID; close stdin and prove graceful child exit. For additional runtime-failure checks, use a test-only harness outside the shipped renderer to terminate the child unexpectedly, close stdout, send a truncated frame, and send an invalid-MAC frame. Confirm main changes to `offline`, pending ping rejects, no synthetic success is displayed, child is terminated/reaped, and restarting the desktop makes a fresh authenticated session rather than accepting old frames.
 
-Finally, close the desktop normally and verify the backend exits within the bounded shutdown interval; force-terminate the Electron main process in Task Manager/Process Explorer and verify inherited pipe closure causes the Python child to exit, with no orphan remaining after 5 seconds. Capture process listings before and after. Search the child command line, environment, Electron/child logs, renderer devtools state, and application output for the generated key/session/challenge (they must not appear). Repeat with an incorrect bootstrap, bad HMAC, replay, child crash and parent termination at least three times each. A failed assertion blocks acceptance and requires a reviewed transport/lifecycle correction; do not substitute environment variables, command-line secrets or an unauthenticated localhost service.
+For cleanup repeatability, run at least 10 fresh trials per condition in the disposable profile: normal desktop close, child crash/pipe closure, and forced Electron-main termination from a separate controller. Include malformed/truncated-frame and bad-MAC failure tests. After each trial, poll for up to 5 seconds for Python processes matching both the isolated runtime executable and the exact AETHER child script; require zero matches before proceeding. The controller may retain PIDs and pass/fail counts, but must not print or persist raw environment, logs, pipe data, or session-secret values. Report only aggregate runs/passes/failures and any remaining matching-child count. A failure blocks acceptance and requires a reviewed transport/lifecycle correction; do not substitute environment variables, command-line secrets, or an unauthenticated localhost service.
 
-**Until this evidence is recorded and independently reviewed, Windows inherited-pipe feasibility and cleanup remain unverified.** Do not claim Windows acceptance from the Linux results; do not enable approval authority, grant issuance, filesystem execution, Phase 2C, or Phase 2D based on this Stage 1 scaffold.
+**Windows results currently reported by the user cover one normal and one controlled forced-termination trial only.** The repeated fault matrix and secret-hygiene procedure above remain to be completed and independently reviewed. Do not claim complete Windows security acceptance or enable approval authority, grant issuance, filesystem execution, Phase 2C, or Phase 2D based on the current Stage 1 scaffold.
