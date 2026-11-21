@@ -93,4 +93,4 @@ The official llama.cpp server README was inspected on GitHub for its HTTP API/au
 | Windows PowerShell / Python 3.12 | Pending user laptop execution |
 | V-01 RTX 4050 benchmark | Pending verified assets and target laptop |
 
-CI remains manual-only. Phase 2A is in the baseline after PR #5 and hotfix PR #6 were merged. Phase 2B-1 changes are on `arena/6a6f42f3-a-e-t-h-e-r`; no commit or PR has been created yet, and `main` has not been modified. Automated secret scanning remains pending.
+CI remains manual-only. Phase 2A is in the baseline after PR #5 and hotfix PR #6 were merged. Phase 2B-1 commit `e08cda0` is on `arena/6a6f42f3-a-e-t-h-e-r` and is being prepared for independent PR review; `main` has not been modified. Automated secret scanning remains pending.
