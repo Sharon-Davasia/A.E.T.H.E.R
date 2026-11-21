@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #e5edf7; background: #08111f; font-synthesis: none; }
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 720px; min-height: 100vh; background: radial-gradient(ellipse at 78% 10%, #153252 0, transparent 40%), #08111f; }
+.shell { width: min(680px, calc(100% - 64px)); margin: 0 auto; padding: 96px 0; }
+.eyebrow, .label { color: #67d7c4; font-size: 11px; font-weight: 700; letter-spacing: .16em; }
+h1 { margin: 22px 0 12px; font-size: 42px; letter-spacing: -.04em; }
+.lede { max-width: 560px; color: #9bacc2; line-height: 1.65; }
+.status { display: flex; align-items: center; gap: 16px; margin: 40px 0 24px; padding: 20px; border: 1px solid #263b54; border-radius: 12px; background: #0d1a2a; color: #c7d4e4; }
+.label { margin-bottom: 8px; color: #7f91a8; font-size: 10px; }
+.dot { width: 10px; height: 10px; flex: 0 0 10px; border-radius: 50%; background: #ef9c68; box-shadow: 0 0 12px #ef9c6855; }
+.dot.online { background: #52dbba; box-shadow: 0 0 12px #52dbba88; }
+button { padding: 12px 18px; border: 0; border-radius: 8px; background: #48d2b5; color: #07151b; font: inherit; font-weight: 700; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .45; }
+.result { margin-top: 18px; color: #a4e7d8; }
+.notice { margin-top: 64px; padding-top: 18px; border-top: 1px solid #1e3045; color: #8292a8; font-size: 13px; }
