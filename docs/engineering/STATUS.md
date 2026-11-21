@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**Phase 2B-1 — durable persistence (PR #7 review corrections implemented and submitted for independent re-review).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
+**Phase 2B-1 — durable persistence (PR #7 merged; approved Windows hotfix PR #8 open for independent review).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
 
 ## Phase 0 baseline
 
@@ -37,7 +37,7 @@
 - Security boundaries, limitations and exact Windows validation checklist are in `docs/engineering/PHASE2A_RESOURCE_POLICY.md` and `docs/security/TRUST_BOUNDARIES.md`. No new ADR was needed; existing deny-all architecture remains unchanged.
 - This is broker-side protection, not a sandbox; stat-derived version tokens do not eliminate TOCTOU. The user reports Windows 11 validation after PR #6, but the NTFS case-sensitive fixture and symlink test were skipped/blocked and junction/reparse, volume-boundary, and root-replacement validation remain pending. Arena has not independently verified Windows security acceptance.
 
-## Phase 2B-1 implementation in PR #7 (review corrections submitted; Windows validation pending)
+## Phase 2B-1 implementation (PR #7 merged; hotfix PR #8 open, Windows validation pending)
 
 - Added versioned SQLite migration and `SQLiteTaskStore` for persistent task state, immutable canonical plan revisions and normalized steps, append-only audit events, and immutable approval-decision audit records.
 - Task/plan/step schemas use the Master Specification state vocabulary and typed dependency DAG, resource versions, expected state/effect, risk, retry/idempotency, postcondition, and recovery metadata. Explicit state adapters preserve the Phase 1 `TaskState` contract and reject states that cannot be mapped.
@@ -45,16 +45,17 @@
 - Database paths are absolute, component-checked for symlink/junction/reparse, hardlink, unsafe Windows names, fixed-volume changes, and parent identity substitutions. The intended LocalAppData-shaped location is not blocked by Phase 2A protected-user-file policy.
 - Audit metadata is allow-listed and plan/user-goal redaction is conservative. SQL plan/step/event/approval-audit records are immutable/append-only. Approval decisions are non-authorizing; no trusted-root rehydration, grant loader/issuer, action consumption, executor, or filesystem mutation route exists.
 - POSIX database permissions are owner-only; the POSIX lock is the database inode. Windows ACL, junction/reparse, actual `msvcrt` contention, and `.owner.lock` pathname replacement behavior remain target-laptop verification requirements.
+- Hotfix findings: Windows strict-mypy portability is covered with POSIX-only APIs dynamically resolved; database input spelling is rejected before `pathlib` normalization; deterministic parent-identity drift is tested on every host. Native rename of an open SQLite parent returned WinError 5 on the reported Windows target, so the native substitution remains explicitly unverified if that test is skipped. Keep the two Windows-skipped symlink cases and their exact skip reasons in the validation register.
 - Target Windows checklist remains open in `docs/engineering/PHASE2A_RESOURCE_POLICY.md`; no Windows security or desktop acceptance is inferred from Linux tests.
 
 ## Verified in this sandbox (Linux, Python 3.11 override)
 
-- `uv sync --directory backend --python 3.11 --all-extras --locked` — passed; lock dependencies unchanged.
-- Latest B4 verification: Ruff lint and format checks passed; strict mypy passed for 55 source files.
-- Persistence adversarial tests (`tests/test_phase2b_persistence.py`) — **37 passed**.
-- Full pytest — **200 passed, 1 skipped**. The skip is `tests/test_model_integration.py`: actual runtime integration requires `AETHER_RUN_MODEL_INTEGRATION=1`; no verified manifest, binary or weights are configured. The earlier base-commit Phase 0 snapshot was run from an archive: **43 passed**. Existing Phase 0/1 regressions remain in the current suite.
-- The POSIX `flock` pathname replacement primitive was directly reproduced: after unlink/recreate of the locked sidecar pathname, a second `flock` succeeded on the new inode. With the B4 implementation, the store locks the database inode and the regression confirms a second process fails before restart recovery; normal recovery succeeds after owner release.
-- Built the backend wheel and confirmed its packaged migration bytes match pinned SHA-256 `709077298230c7065c6778b3149f93b679b6e678220e2d1a34d3540a348d741e`.
+- `uv sync --directory backend --python /usr/bin/python3.11 --all-extras --locked` — passed; dependencies remained locked.
+- Hotfix Ruff lint and format checks passed; strict mypy passed for 56 source files on Linux and with `--platform win32` (type-target simulation only, not Windows execution).
+- Persistence adversarial tests (`tests/test_phase2b_persistence.py`) — **53 passed**.
+- Full pytest — **216 passed, 1 skipped**. The skip is optional model integration (`AETHER_RUN_MODEL_INTEGRATION=1` is not configured); the non-failing warning is Starlette/HTTPX deprecation. Existing Phase 0/1 regressions remain in the current suite.
+- Linux parent-path tests passed: native substitution and deterministic identity drift. No Windows native parent-replacement behavior is inferred; WinError 5 and symlink skips remain in the target validation register.
+- Built the backend wheel and confirmed its packaged migration bytes match pinned SHA-256 `709077298230c7065c6778b3149f93b679b6e678220e2d1a34d3540a348d741e`; migration SQL and schema pins were unchanged.
 - Locked workflow import check and authenticated health `TestClient` check both passed (health returned HTTP 200).
 - A Starlette `TestClient`/HTTPX deprecation warning remains non-failing; no actual Windows or model compatibility is inferred from it.
 - Added exact checked-in JSON-schema drift enforcement; runtime executable checksum, startup cancellation/cleanup, port conflict, authenticated readiness, post-start process exit, task TTL/capacity and controlled API-health failure tests use synthetic bytes, fake processes, and `httpx.MockTransport`.

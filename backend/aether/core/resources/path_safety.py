@@ -51,7 +51,9 @@ def relative_parts(value: str) -> tuple[str, ...]:
             raise PathSafetyError("invalid_windows_path_component")
         if any(char in part for char in '<>"|?*'):
             raise PathSafetyError("invalid_windows_path_component")
-        stem = part.split(".", 1)[0].casefold()
+        # Win32 trims trailing dots/spaces from names; apply the reserved-device
+        # check after the same conservative normalization to reject aliases.
+        stem = part.split(".", 1)[0].rstrip(" .").casefold()
         if _is_reserved_device_name(stem):
             raise PathSafetyError("reserved_windows_path_component")
     return tuple(raw_parts)

@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib.resources import files
 from importlib.resources.abc import Traversable
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import BinaryIO
 from uuid import UUID, uuid4
 
@@ -249,7 +249,16 @@ class SQLiteTaskStore:
         *,
         migrations_dir: Path | Traversable | None = None,
     ) -> None:
-        self.database_path = Path(database_path).expanduser()
+        try:
+            raw_database_path = os.fspath(database_path)
+        except TypeError as exc:
+            raise PersistenceError("database path must be text or a path-like object") from exc
+        if not isinstance(raw_database_path, str):
+            raise PersistenceError("database path must be text or a path-like object")
+        _validate_raw_database_path(raw_database_path)
+        expanded_database_path = Path(raw_database_path).expanduser()
+        _validate_raw_database_path(os.fspath(expanded_database_path))
+        self.database_path = expanded_database_path
         self._lock = threading.RLock()
         self._owner_lock_file: BinaryIO | None = None
         self._closed = False
@@ -750,7 +759,10 @@ class SQLiteTaskStore:
             ):
                 raise PersistenceError("database owner lock is redirected or not a regular file")
             if os.name != "nt":
-                os.fchmod(descriptor, 0o600)
+                posix_fchmod = getattr(os, "fchmod", None)
+                if posix_fchmod is None:
+                    raise PersistenceError("owner-only database lock permissions are unavailable")
+                posix_fchmod(descriptor, 0o600)
             if os.name == "nt" and metadata.st_size == 0:
                 os.write(descriptor, b"\0")
             os.lseek(descriptor, 0, os.SEEK_SET)
@@ -758,9 +770,8 @@ class SQLiteTaskStore:
                 windows_locking = importlib.import_module("msvcrt")
                 windows_locking.locking(descriptor, windows_locking.LK_NBLCK, 1)
             else:
-                import fcntl
-
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                posix_locking = importlib.import_module("fcntl")
+                posix_locking.flock(descriptor, posix_locking.LOCK_EX | posix_locking.LOCK_NB)
             if os.name != "nt":
                 # Recheck after acquiring flock to close the open/stat race:
                 # the pathname must still identify the locked inode.
@@ -790,9 +801,8 @@ class SQLiteTaskStore:
                 lock_file.seek(0)
                 windows_locking.locking(lock_file.fileno(), windows_locking.LK_UNLCK, 1)
             else:
-                import fcntl
-
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                posix_locking = importlib.import_module("fcntl")
+                posix_locking.flock(lock_file.fileno(), posix_locking.LOCK_UN)
         except OSError:
             pass
         finally:
@@ -1068,6 +1078,28 @@ def _parse_timestamp(value: str) -> datetime:
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise PersistenceIntegrityError("stored timestamp lacks timezone")
     return parsed.astimezone(UTC)
+
+
+def _validate_raw_database_path(raw_path: str) -> None:
+    """Validate original path components before pathlib/Win32 can normalize them."""
+    if not raw_path or "\x00" in raw_path:
+        raise PersistenceError("database path is empty or contains a NUL character")
+    windows_drive = PureWindowsPath(raw_path).drive
+    components = re.split(r"[\\/]", raw_path)
+    first_component = True
+    for component in components:
+        if not component or component == ".":
+            continue
+        if component == "..":
+            raise PersistenceError("database path contains an unsafe component")
+        if first_component and windows_drive and component.casefold() == windows_drive.casefold():
+            first_component = False
+            continue
+        first_component = False
+        try:
+            relative_parts(component)
+        except PathSafetyError as exc:
+            raise PersistenceError("database path contains an unsafe component") from exc
 
 
 def _check_safe_storage_path(path: Path) -> None:

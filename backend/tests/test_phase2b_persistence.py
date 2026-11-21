@@ -40,6 +40,15 @@ from aether.core.resources.path_safety import PathSafetyError, VolumeInfo, Volum
 _NOW = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
 
 
+def _skip_if_symlink_unavailable(exc: OSError | NotImplementedError) -> None:
+    """Skip only when the host explicitly cannot create the test symlink."""
+    if isinstance(exc, NotImplementedError) or os.name != "nt":
+        pytest.skip("symlink creation is unavailable on this host")
+    if getattr(exc, "winerror", None) in {5, 1314}:
+        pytest.skip(f"Windows denied symlink creation (WinError {exc.winerror})")
+    raise exc
+
+
 def _plan(task_id: UUID, *, revision: int = 1) -> TaskPlan:
     first = uuid4()
     second = uuid4()
@@ -638,8 +647,8 @@ def test_database_symlink_is_rejected(tmp_path) -> None:
     link = tmp_path / "link.sqlite3"
     try:
         link.symlink_to(target)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlink creation is unavailable on this host")
+    except (OSError, NotImplementedError) as exc:
+        _skip_if_symlink_unavailable(exc)
     with pytest.raises(PersistenceError, match="symlink or reparse"):
         SQLiteTaskStore(link)
 
@@ -662,8 +671,8 @@ def test_symlinked_database_parent_is_rejected(tmp_path) -> None:
     redirected_parent = tmp_path / "redirected"
     try:
         redirected_parent.symlink_to(actual_parent, target_is_directory=True)
-    except (OSError, NotImplementedError):
-        pytest.skip("symlink creation is unavailable on this host")
+    except (OSError, NotImplementedError) as exc:
+        _skip_if_symlink_unavailable(exc)
     with pytest.raises(PersistenceError, match="symlink or reparse"):
         SQLiteTaskStore(redirected_parent / "aether.sqlite3")
     assert not (actual_parent / "aether.sqlite3").exists()
@@ -675,15 +684,47 @@ def test_parent_substitution_after_open_is_detected_before_reads(tmp_path) -> No
     store = SQLiteTaskStore(database)
     task = store.create_task("Synthetic goal", now=_NOW)
     moved = tmp_path / "moved-private"
-    parent.rename(moved)
     try:
-        parent.symlink_to(moved, target_is_directory=True)
-    except (OSError, NotImplementedError):
+        try:
+            parent.rename(moved)
+        except PermissionError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 5:
+                pytest.skip(
+                    "Windows denied renaming a directory containing the open SQLite database "
+                    "(WinError 5); synthetic identity-drift coverage runs separately"
+                )
+            raise
+        try:
+            parent.symlink_to(moved, target_is_directory=True)
+        except (OSError, NotImplementedError) as exc:
+            _skip_if_symlink_unavailable(exc)
+        with pytest.raises(PersistenceError, match="symlink or reparse"):
+            store.get_task(task.task_id)
+    finally:
         store.close()
-        pytest.skip("symlink creation is unavailable on this host")
-    with pytest.raises(PersistenceError, match="symlink or reparse"):
-        store.get_task(task.task_id)
-    store.close()
+
+
+def test_parent_identity_drift_is_rejected_before_reads(tmp_path, monkeypatch) -> None:
+    parent = tmp_path / "private"
+    database = parent / "state.sqlite3"
+    store = SQLiteTaskStore(database)
+    task = store.create_task("Synthetic goal", now=_NOW)
+    original_stat = Path.stat
+
+    def drifted_parent_stat(path, *args, **kwargs):
+        result = original_stat(path, *args, **kwargs)
+        if path == parent:
+            values = list(result)
+            values[1] = int(values[1]) + 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(Path, "stat", drifted_parent_stat)
+    try:
+        with pytest.raises(PersistenceError, match="database parent identity changed"):
+            store.get_task(task.task_id)
+    finally:
+        store.close()
 
 
 def test_windows_junction_or_reparse_component_fails_closed_synthetically(
@@ -720,10 +761,46 @@ def test_database_path_volume_substitution_is_rejected(tmp_path, monkeypatch) ->
         SQLiteTaskStore(mounted / "data" / "aether.sqlite3")
 
 
-@pytest.mark.parametrize("name", ["state:alternate.sqlite3", "CON.sqlite3", "trailingdot."])
-def test_windows_unsafe_database_components_are_rejected(tmp_path, name: str) -> None:
+@pytest.mark.parametrize(
+    "name",
+    [
+        "state:alternate.sqlite3",
+        "CON.sqlite3",
+        "CON .sqlite3",
+        "CONIN$",
+        "LPT¹.txt",
+        "trailingdot.",
+        "trailingspace ",
+        "bad?.sqlite3",
+    ],
+)
+@pytest.mark.parametrize("input_kind", ["str", "path"])
+def test_windows_unsafe_database_components_are_rejected(
+    tmp_path, name: str, input_kind: str
+) -> None:
+    guarded_parent = tmp_path / "must-not-be-created"
+    database = guarded_parent / name
+    database_input = os.fspath(database) if input_kind == "str" else database
     with pytest.raises(PersistenceError, match="unsafe component"):
-        SQLiteTaskStore(tmp_path / name)
+        SQLiteTaskStore(database_input)
+    assert not guarded_parent.exists()
+
+
+def test_raw_windows_database_path_validation_precedes_normalization() -> None:
+    persistence_store._validate_raw_database_path(r"C:\Aether\data\state.sqlite3")
+    with pytest.raises(PersistenceError, match="unsafe component"):
+        persistence_store._validate_raw_database_path(r"C:\Aether\data\trailingdot.")
+    with pytest.raises(PersistenceError, match="unsafe component"):
+        persistence_store._validate_raw_database_path(r"C:\Aether\data\state.sqlite3:stream")
+
+
+def test_normalized_safe_database_basename_remains_usable(tmp_path) -> None:
+    database = tmp_path / "trailingdot"
+    store = SQLiteTaskStore(database)
+    try:
+        assert store.database_path == database
+    finally:
+        store.close()
 
 
 def test_legitimate_local_appdata_shaped_directory_is_not_blocked_by_path_policy(tmp_path) -> None:

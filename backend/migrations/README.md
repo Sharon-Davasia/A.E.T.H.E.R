@@ -28,14 +28,22 @@ ownership is acquired and must be replanned with fresh consent. This does not
 claim protection from a malicious same-OS-user actor able to replace database
 paths or otherwise tamper with the private storage directory.
 
-The selected absolute database path is checked component-by-component for
-symlinks, junctions/reparse points, hard-linked database files (and the
-Windows lock sidecar), and fixed volume identity before/after directory
-creation and database open, and again before reads and transactions. No Phase
-2A protected-user-file path policy is applied to the intended private
-`%LOCALAPPDATA%\AetherOS\data` location.
+The original caller-provided database-path spelling is checked before
+`pathlib` normalization or filesystem access, then checked again component by
+component for symlinks, junctions/reparse points, hard-linked database files
+(and the Windows lock sidecar), and fixed volume identity before/after directory
+creation and database open, and again before reads and transactions. Raw
+trailing dots/spaces, reserved device names, alternate data streams and invalid
+Windows components are rejected. No Phase 2A protected-user-file path policy is
+applied to the intended private `%LOCALAPPDATA%\AetherOS\data` location.
 Windows ACL enforcement and actual junction/reparse/file-lock behavior remain
 target-machine verification gates.
+
+Parent-identity drift is checked independently of native directory replacement.
+The deterministic drift regression runs on every OS. Renaming a parent that
+contains an open SQLite database may be denied by Windows sharing rules
+(WinError 5); that native substitution remains unverified if blocked, and the
+test records the block as a skip rather than counting it as acceptance.
 
 The 2B-1 schema stores task state, canonical immutable plan revisions,
 normalized immutable step rows, append-only allow-listed audit metadata, and
