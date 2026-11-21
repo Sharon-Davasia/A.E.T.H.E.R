@@ -1,6 +1,6 @@
 # Phase 2A — Resource and policy foundation
 
-**Status:** Broker-side foundation on the current feature branch; PR #5 has been reviewed and the requested corrections are implemented pending re-review. It is not merged. Phase 2A does not expose filesystem execution or mutation and is not Phase 2 acceptance.
+**Status:** Phase 2A broker-side foundation is present in the baseline after PR #5 and hotfix PR #6 were merged. Phase 2A does not expose filesystem execution or mutation and is not Phase 2 acceptance. Linux evidence and the user-reported Windows run do not close the target Windows security checkpoint below.
 
 ## What this milestone adds
 
@@ -16,7 +16,7 @@ This is broker-side validation, not a filesystem sandbox. It does not prevent a 
 
 Protected-name matching is conservative but cannot infer that every arbitrary user file contains a secret. Future UX and data-classification rules must preserve deny-by-default access for secret locations/content. Unknown Windows volume/reparse behavior must remain a denial. No content is logged by these helpers.
 
-No target Windows execution has been performed in this environment; Linux tests with synthetic directories/fixed volume inspectors are not evidence of Windows 11 safety. Test guidance for the eventual Windows run:
+Arena has not independently run Windows tests. The user reports that after PR #6, Windows 11 validation passed locked dependency sync, imports, Ruff lint/format, strict mypy (52 files), pytest (161 passed, 3 skipped), and authenticated FastAPI health (HTTP 200). These are user-reported results, not independently observed here, and do not establish Windows resource-security acceptance. The skipped optional model integration is not a pass; the case-sensitive NTFS sibling-file check was unsupported by its fixture directory; the symlink escape test was blocked by WinError 1314. Real junction/reparse and volume-boundary checks remain outstanding. Linux tests with synthetic directories/fixed volume inspectors are not evidence of Windows 11 safety. Test guidance for the target Windows run:
 
 1. Use Python 3.12.10, PowerShell, uv, and a disposable `D:\A.E.T.H.E.R` checkout; do not place fixtures in personal project folders.
 2. From the D: checkout root, run `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify.ps1`. Its pytest step runs `uv run pytest --basetemp $pytestBase`, where `$pytestBase` is `<repository>\.cache\pytest-tmp` on D:. Thus the `tmp_path` synthetic registry fixtures avoid `%LOCALAPPDATA%\Temp`; do not weaken protected-path rules to accommodate pytest defaults.
@@ -24,11 +24,14 @@ No target Windows execution has been performed in this environment; Linux tests 
 4. Verify that a removable/network/unknown volume, protected/secret path, stale reference, forged reference, unknown capability, unsupported operation and every T3 operation yields deny with no access and no file changes.
 5. Confirm no mutation route or executor is reachable in 2A, and that changing a syntactically supplied client `approval_id` never changes policy outcome.
 6. Record exact Windows OS/Python/PowerShell/uv versions and command outputs. Do not mark Windows safety accepted without successful execution and review of the actual Windows results.
+7. For Phase 2B-1 on the target Windows 11/Python 3.12.10 laptop, run the locked full verification and persistence suite from a disposable D: checkout. Exercise migration creation/reopen, interrupted-task restart pausing, future/corrupt-schema denial, immutable plan/event/approval records, and check the actual ACLs on the database directory plus SQLite database/WAL/SHM files. This store does not set Windows ACLs itself; if inherited ACLs are not appropriately private, keep persistence disabled until the desktop chooses a protected per-user data location and an ACL implementation is reviewed. Record failures/skips explicitly; do not interpret Python chmod bits as Windows ACL evidence.
 
-## Follow-on sequence
+## Follow-on sequence and mandatory checkpoint
 
-- **PR 2B:** durable task/plan/approval storage, one-use/revocable/expiring grant lifecycle, and authenticated trusted Electron-main approval channel; tests for spoofed IPC, forged/stale/replayed grants, restart semantics and atomic consumption. Still no mutation unless trust validation is operational.
-- **PR 2C:** read-only filesystem listing/open/search through verified handles, bounded outputs, secret redaction/denial and trusted-root UX; keep all writes unavailable.
-- **PR 2D:** exact approved edit preview/apply, independent content/version checks, receipts/snapshots, safe recovery/Undo and verified end-to-end Windows demo. Gate every mutation on trusted 2B authorization and platform-specific handle checks.
+- **PR 2B-1 (in progress):** SQLite persistence, versioned migrations, typed immutable plan revisions, append-only redacted audit, integrity checks, and fail-closed restart recovery. Approval decisions in this PR are non-authorizing audit records only; there is no grant issuer, loader, or executor.
+- **PR 2B-2 (dependent; not started):** trusted Electron-main approval UI, process bootstrap, authenticated backend channel, exact-preview binding, revalidation, revocation and replay prevention. It must depend on the reviewed 2B-1 persistence contracts and still keep all filesystem capabilities non-executable.
+- **Mandatory checkpoint:** after 2B-1/2B-2 review and the user's Windows 11 verification, review and close the outstanding Phase 2A Windows-security validation register before requesting authorization for Phase 2C. Failed or unsupported checks remain explicit fail-closed restrictions, not safety claims.
+- **PR 2C (not authorized):** read-only filesystem listing/open/search through verified handles, bounded outputs, secret redaction/denial and trusted-root UX; keep all writes unavailable.
+- **PR 2D (not authorized):** exact approved edit preview/apply, independent content/version checks, receipts/snapshots, safe recovery/Undo and verified end-to-end Windows demo. Gate every mutation on trusted 2B authorization and platform-specific handle checks.
 
 The response-quality regression suite and examples are a separate workstream; they must not expand scope or delay these security PRs. The longer-term Phase 2 acceptance in `docs/architecture/MASTER_SPEC.md` remains authoritative; this milestone satisfies none of its end-to-end mutation/Undo gates by itself.
