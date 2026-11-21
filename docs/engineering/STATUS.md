@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**Phase 2B-1 — durable persistence (implementation in progress on the current Arena branch; PR not yet opened).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
+**Phase 2B-1 — durable persistence (implementation submitted in PR #7 for independent review).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
 
 ## Phase 0 baseline
 
@@ -93,4 +93,4 @@ The official llama.cpp server README was inspected on GitHub for its HTTP API/au
 | Windows PowerShell / Python 3.12 | Pending user laptop execution |
 | V-01 RTX 4050 benchmark | Pending verified assets and target laptop |
 
-CI remains manual-only. Phase 2A is in the baseline after PR #5 and hotfix PR #6 were merged. Phase 2B-1 commit `e08cda0` is on `arena/6a6f42f3-a-e-t-h-e-r` and is being prepared for independent PR review; `main` has not been modified. Automated secret scanning remains pending.
+CI remains manual-only. Phase 2A is in the baseline after PR #5 and hotfix PR #6 were merged. Phase 2B-1 is submitted for independent review in PR #7 from `arena/6a6f42f3-a-e-t-h-e-r`; `main` has not been modified. Automated secret scanning remains pending.
