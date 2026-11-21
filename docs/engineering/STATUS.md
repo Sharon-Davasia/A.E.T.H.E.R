@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**Phase 2B-1 — durable persistence (PR #7 merged; approved Windows hotfix in progress on the current review branch).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
+**Phase 2B-1 — durable persistence (PR #7 merged; approved Windows hotfix PR #8 open for independent review).** Phase 2B-2 trusted Electron integration is not started. All Phase 2A filesystem capabilities remain non-executable; no T2 grant issuer, executor, Phase 2C/2D work, or response-quality work is included. Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox. User-reported Windows checks are recorded separately and are not independently verified here.
 
 ## Phase 0 baseline
 
@@ -37,7 +37,7 @@
 - Security boundaries, limitations and exact Windows validation checklist are in `docs/engineering/PHASE2A_RESOURCE_POLICY.md` and `docs/security/TRUST_BOUNDARIES.md`. No new ADR was needed; existing deny-all architecture remains unchanged.
 - This is broker-side protection, not a sandbox; stat-derived version tokens do not eliminate TOCTOU. The user reports Windows 11 validation after PR #6, but the NTFS case-sensitive fixture and symlink test were skipped/blocked and junction/reparse, volume-boundary, and root-replacement validation remain pending. Arena has not independently verified Windows security acceptance.
 
-## Phase 2B-1 implementation (PR #7 merged; Windows hotfix review pending)
+## Phase 2B-1 implementation (PR #7 merged; hotfix PR #8 open, Windows validation pending)
 
 - Added versioned SQLite migration and `SQLiteTaskStore` for persistent task state, immutable canonical plan revisions and normalized steps, append-only audit events, and immutable approval-decision audit records.
 - Task/plan/step schemas use the Master Specification state vocabulary and typed dependency DAG, resource versions, expected state/effect, risk, retry/idempotency, postcondition, and recovery metadata. Explicit state adapters preserve the Phase 1 `TaskState` contract and reject states that cannot be mapped.
