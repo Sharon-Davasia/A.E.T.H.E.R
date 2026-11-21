@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomUUID } from 'node:crypto';
+import path from 'node:path';
 import test from 'node:test';
+import { tmpdir } from 'node:os';
+import { pathToFileURL } from 'node:url';
 import {
   encodeFrame, FrameDecoder, parseEnvelope, PROTOCOL_VERSION, SessionGuard, signEnvelope,
 } from '../shared/channel';
@@ -62,13 +65,20 @@ test('rejects replayed nonce even at a later sequence', () => {
   assert.throws(() => guard.accept(second), /nonce/);
 });
 
-test('IPC sender trust requires focused exact window, main frame and exact file URL', () => {
-  const expected = '/opt/aether/index.html';
-  const frame = { url: 'file:///opt/aether/index.html' };
+test('IPC sender trust requires focused exact window, live sender, main frame and exact file URL', () => {
+  const expected = path.resolve(tmpdir(), 'aether-ipc-test', 'index.html');
+  const frame = { url: pathToFileURL(expected).href };
   const sender = { mainFrame: frame, isDestroyed: () => false };
   const window = { webContents: sender, isDestroyed: () => false, isFocused: () => true };
+
   assert.equal(isTrustedSender(window as never, sender as never, frame as never, expected), true);
-  assert.equal(isTrustedSender(window as never, sender as never, { url: 'https://evil.test' } as never, expected), false);
+  assert.equal(isTrustedSender(undefined, sender as never, frame as never, expected), false);
+  assert.equal(isTrustedSender({ ...window, isDestroyed: () => true } as never, sender as never, frame as never, expected), false);
   assert.equal(isTrustedSender({ ...window, isFocused: () => false } as never, sender as never, frame as never, expected), false);
+  assert.equal(isTrustedSender(window as never, { ...sender, isDestroyed: () => true } as never, frame as never, expected), false);
   assert.equal(isTrustedSender(window as never, { ...sender } as never, frame as never, expected), false);
+  assert.equal(isTrustedSender(window as never, sender as never, undefined, expected), false);
+  assert.equal(isTrustedSender(window as never, sender as never, { url: frame.url } as never, expected), false);
+  assert.equal(isTrustedSender(window as never, sender as never, { url: 'https://evil.test' } as never, expected), false);
+  assert.equal(isTrustedSender(window as never, sender as never, { url: pathToFileURL(`${expected}.other`).href } as never, expected), false);
 });
