@@ -283,6 +283,8 @@ class EventMetadata(BaseModel):
             "decision",
             "authority",
             "requires_fresh_plan_and_consent",
+            "preview_digest",
+            "preview_id",
             "error_code",
         }
         if any(key not in allowed for key in value):
@@ -315,6 +317,19 @@ class EventMetadata(BaseModel):
                 raise ValueError("event authority metadata is invalid")
             if key == "requires_fresh_plan_and_consent" and not isinstance(item, bool):
                 raise ValueError("fresh-consent metadata must be boolean")
+            if key == "preview_digest" and (
+                not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
+            ):
+                raise ValueError("event preview digest must be a lowercase SHA-256 digest")
+            if key == "preview_id" and (
+                not isinstance(item, str)
+                or not re.fullmatch(
+                    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                    item,
+                    re.I,
+                )
+            ):
+                raise ValueError("event preview ID must be a UUID")
             if key == "error_code" and (
                 not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_.-]{0,127}", item)
             ):
