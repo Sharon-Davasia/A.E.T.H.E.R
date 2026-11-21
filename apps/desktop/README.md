@@ -6,11 +6,11 @@ This is a deliberately minimal Electron + React + TypeScript + Vite + Tailwind f
 
 Node/npm are pinned by `.nvmrc`, `packageManager`, strict `engines`, and `.npmrc`; direct dependencies are exact in `package.json` and transitive npm dependencies are captured in `package-lock.json` (lockfile v3):
 
-- Electron 39.2.3; Node.js 22.22.3 is the pinned development CLI. Electron uses its bundled Node runtime; record its actual version during the Windows gate.
-- React / React DOM 19.2.0, TypeScript 5.9.3, Vite 7.2.2, Tailwind CSS 3.4.18.
+- Electron **44.11.5** is the pinned runtime. Electron's bundled Node.js is **v24.22.3** ([Electron 44.11.5 `DEPS`](https://github.com/electron/electron/blob/v44.11.5/DEPS), `node_version`); this is distinct from the pinned external development CLI, Node.js **22.22.3** with npm **10.9.8**. Electron's [official support policy](https://github.com/electron/electron/blob/main/docs/tutorial/electron-timelines.md#version-support-policy) covers the latest three stable major versions; Electron 44 is within the supported release window as of the target review date. Recheck the Electron release schedule before each release.
+- React / React DOM 19.2.0, TypeScript 5.9.3, PostCSS **8.5.33**, Vite **7.3.8**, Tailwind CSS 3.4.18.
 - Linux parent/child protocol tests ran with Python 3.11.2. The app handshake intentionally accepts only the target runtime, Python **3.12.10**, which must be verified on Windows.
 
-Install with `npm ci`. Electron's postinstall downloads its platform binary; use the normal verified Electron distribution setup in environments where that download is available. `npm install --ignore-scripts` is only useful for static checking and does not install a runnable Electron binary.
+Install npm dependencies with `npm ci`. Electron 44's package lazily downloads its platform binary the first time its launcher is invoked; a successful `npm ci` alone does not establish that Electron can run. Invoke the Electron launcher or `npx install-electron` only where the verified Electron distribution endpoint is reachable. This sandbox installed the locked npm tree, but its Electron binary fetch failed, so no Electron runtime was launched here.
 
 ## Commands
 

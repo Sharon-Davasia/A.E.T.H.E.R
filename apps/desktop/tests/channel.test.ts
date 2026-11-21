@@ -65,13 +65,16 @@ test('rejects replayed nonce even at a later sequence', () => {
   assert.throws(() => guard.accept(second), /nonce/);
 });
 
-test('IPC sender trust requires focused exact window, live sender, main frame and exact file URL', () => {
+test('IPC sender trust rejects URL mutation on the same main frame and all untrusted senders', () => {
   const expected = path.resolve(tmpdir(), 'aether-ipc-test', 'index.html');
   const frame = { url: pathToFileURL(expected).href };
   const sender = { mainFrame: frame, isDestroyed: () => false };
   const window = { webContents: sender, isDestroyed: () => false, isFocused: () => true };
 
   assert.equal(isTrustedSender(window as never, sender as never, frame as never, expected), true);
+  frame.url = pathToFileURL(`${expected}.changed`).href;
+  assert.equal(isTrustedSender(window as never, sender as never, frame as never, expected), false);
+  frame.url = pathToFileURL(expected).href;
   assert.equal(isTrustedSender(undefined, sender as never, frame as never, expected), false);
   assert.equal(isTrustedSender({ ...window, isDestroyed: () => true } as never, sender as never, frame as never, expected), false);
   assert.equal(isTrustedSender({ ...window, isFocused: () => false } as never, sender as never, frame as never, expected), false);
