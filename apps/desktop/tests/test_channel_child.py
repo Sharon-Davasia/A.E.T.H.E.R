@@ -18,7 +18,9 @@ MAGIC = b"AETHR1\x00\x01"
 
 
 def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
 
 
 def sign(value: dict[str, object], key: bytes) -> dict[str, object]:
@@ -78,9 +80,14 @@ class ChannelChildTests(unittest.TestCase):
 
     def envelope(self, active_session: str, **overrides: object) -> dict[str, object]:
         base: dict[str, object] = {
-            "v": 1, "session": active_session, "direction": "parent-to-child", "seq": 1,
-            "nonce": secrets.token_hex(16), "timestamp": int(time.time() * 1000),
-            "requestId": "123e4567-e89b-42d3-a456-426614174000", "kind": "demo.ping",
+            "v": 1,
+            "session": active_session,
+            "direction": "parent-to-child",
+            "seq": 1,
+            "nonce": secrets.token_hex(16),
+            "timestamp": int(time.time() * 1000),
+            "requestId": "123e4567-e89b-42d3-a456-426614174000",
+            "kind": "demo.ping",
             "payload": {"text": "synthetic-only"},
         }
         base.update(overrides)
@@ -138,7 +145,9 @@ class ChannelChildTests(unittest.TestCase):
         process.stdin.write(encode(first))
         process.stdin.flush()
         read_frame(process.stdout)
-        duplicate_nonce = self.envelope(session, seq=2, nonce=first["nonce"], requestId="123e4567-e89b-42d3-a456-426614174001")
+        duplicate_nonce = self.envelope(
+            session, seq=2, nonce=first["nonce"], requestId="123e4567-e89b-42d3-a456-426614174001"
+        )
         process.stdin.write(encode(duplicate_nonce))
         process.stdin.close()
         self.assertNotEqual(wait_and_close(process), 0)
@@ -175,8 +184,12 @@ class ChannelChildTests(unittest.TestCase):
 
     def test_invalid_bootstrap_exits_without_protocol_output(self) -> None:
         process = subprocess.Popen(
-            [sys.executable, "-I", "-S", "-B", "-u", str(SCRIPT)], cwd=SCRIPT.parent,
-            env={"PATH": os.defpath}, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            [sys.executable, "-I", "-S", "-B", "-u", str(SCRIPT)],
+            cwd=SCRIPT.parent,
+            env={"PATH": os.defpath},
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
         assert process.stdin is not None and process.stdout is not None
         process.stdin.write(b"x" * (len(MAGIC) + 16 + 32 + 32))
