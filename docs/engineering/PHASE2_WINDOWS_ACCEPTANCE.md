@@ -72,7 +72,10 @@ Useful switches:
 5. **Native Windows behaviour** — behaviours that *cannot* be inferred from the
    Linux test run:
    - a directory junction is refused by the reparse-point check;
-   - the Undo Vault key file is created and its ACL is owner-only;
+   - the Undo Vault key file is created **outside** the vault directory and an
+     owner-only, non-inherited DACL is read back from the OS for both the key and
+     the vault directories (S14-5; the verifier fails the gate if the key sits
+     inside the vault or the DACL is not protected);
    - a second store instance cannot open the same database (owner lock);
    - the volume identity prefix is the Windows form.
 6. **Evidence** — writes sanitized JSON and Markdown under the evidence root and

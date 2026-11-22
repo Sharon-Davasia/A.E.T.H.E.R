@@ -274,20 +274,36 @@ def owner_lock():
         first.close()
 
 def acl_owner_only():
+    # S14-5: the key must live OUTSIDE the vault directory, and its protection
+    # must be read back from the OS rather than assumed. Both are asserted here
+    # because both were previously wrong.
+    from aether.core.security.file_permissions import verify_owner_only
     from aether.core.vault.undo_vault import UndoVault
     vault = UndoVault(fixture / "vault").open()
     try:
-        key = Path(fixture) / "vault" / "vault.key"
+        key = vault.key_path
         if not key.exists():
             raise AssertionError("vault key was not created")
-        return "vault created; ACL checked separately"
+        inside = key.resolve().is_relative_to((fixture / "vault").resolve())
+        if inside:
+            raise AssertionError("vault key is stored inside the vault directory")
+        key_report = verify_owner_only(key, directory=False)
+        if not key_report.enforced:
+            raise AssertionError("vault key ACL is not owner-only: " + key_report.detail)
+        if key_report.platform != "windows":
+            raise AssertionError("expected the native Windows DACL mechanism")
+        for directory in (fixture / "vault", fixture / "vault" / "objects"):
+            report = verify_owner_only(directory, directory=True)
+            if not report.enforced:
+                raise AssertionError("vault directory ACL is not owner-only: " + report.detail)
+        return "key outside vault; owner-only DACL verified for key and vault directories"
     finally:
         vault.close()
 
 check("junction escape refused", junction_refused)
 check("volume identity", volume_identity)
 check("database owner lock", owner_lock)
-check("vault creation", acl_owner_only)
+check("vault key location and ACL", acl_owner_only)
 print(json.dumps(report))
 '@
     Set-Content -Path $probePath -Value $probe -Encoding utf8
