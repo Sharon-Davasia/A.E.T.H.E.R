@@ -196,7 +196,7 @@ Environment: `/tmp/aether-stage4-venv` (Python 3.11), editable backend install.
 
 | Check | Result |
 |---|---|
-| `pytest tests` | **398 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 112 (111 in `test_phase2b_stage4_grants.py` + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
+| `pytest tests` | **401 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 115 (114 in `test_phase2b_stage4_grants.py` + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
 | `ruff check .` | passed |
 | `ruff format --check` (Stage 4 files) | passed |
 | `mypy` (strict) | passed, 73 source files |
@@ -291,17 +291,18 @@ Consequences:
   calls the gate, and persists. There is no second copy of the checks to drift and no
   caller-supplied path around it. Operation/plan binding moved to the same module
   (`check_operation_binding`) so the trust-relevant checks live together.
-- **Production storage fails closed on provenance.** `GrantLedger.open(store)` (the default,
-  production-configured entry point) sets `_trust_source_policy = "production"` and
-  `_check_permit_trust` rejects every permit that is not a `trusted_verifier` decision bound
-  to this exact task, plan revision/hash and issuance identity — denied with
-  `AUTHORIZATION_EVIDENCE_REQUIRED` / `ISSUANCE_PERMIT_MISMATCH` before any write. Grant
-  rows, state rows, events and consumptions all stay at zero on the denied path (asserted).
+- **Production storage fails closed.** `GrantLedger.open(store)` (the default,
+  production-configured entry point) sets `_trust_source_policy = "production"`. As shipped in
+  `8570bc1` this rejected permits whose *fields* did not match; re-review correctly showed that
+  field validation cannot establish provenance, so §6e replaces it with a configuration-level
+  denial of all new issuance (`GRANT_ISSUANCE_DISABLED`) evaluated before the permit is read.
+  Grant rows, state rows, events and consumptions all stay at zero on the denied path.
 - **Default-deny preserved.** Production still ships `NullAttestationVerifier` +
   `NullPreviewAuthority`, so `authorize_issuance` always raises
-  (`AUTHORIZATION_SOURCE_NOT_TRUSTED` / `PREVIEW_SOURCE_UNAVAILABLE`). No production
-  verifier and no production preview source exist; the authenticated Electron main → backend
-  interaction remains unimplemented and no authorizing IPC was added.
+  (`AUTHORIZATION_SOURCE_NOT_TRUSTED` / `PREVIEW_SOURCE_UNAVAILABLE`), *and* (§6e) the
+  production-configured ledger refuses all new issuance regardless of the permit. No
+  production verifier and no production preview source exist; the authenticated Electron
+  main → backend interaction remains unimplemented and no authorizing IPC was added.
 - **Test simulation isolated.** Low-level ledger semantics (replay, rollback, immutability)
   still use real persistence, via `authorize_test_persistence` + `open_tests_scoped`. Three
   independent conditions are required (test-scoped ledger instance, allow-listed requesting
@@ -328,6 +329,54 @@ Consequences:
 | Test-only mechanisms are isolated from production-capable configurations | `test_test_only_configuration_is_isolated_from_the_shipped_package`, `test_production_package_exports_no_test_only_authorization_surface`, `test_no_production_module_issues_grants_or_exposes_ipc` |
 | `open()` integrity/schema reads run under the store lock | `test_open_runs_initial_integrity_reads_under_the_store_lock`, `test_open_serializes_with_a_concurrent_store_transaction` |
 | Positive synthetic issuance and exact idempotent replay still work | `test_verified_preview_identity_is_required_for_successful_issuance`, `test_issued_grant_is_denied_after_the_plan_advances` (fresh-revision issuance), `test_replay_with_changed_authorization_terms_is_a_conflict`, `test_replay_with_changed_issuer_identity_is_a_conflict`, `test_issuance_permit_is_single_use_and_bound_to_its_scope` |
+
+## 6e. Final boundary closure — production issuance is configurationally denied
+
+Re-review at `8570bc1` accepted the central decision, the test-only separation, the
+transactional consent checks and the SQLite synchronization, and found one remaining gap:
+`_check_permit_trust` validated a permit's *fields*, but a permit is an ordinary Python
+object, so a hand-built permit carrying `trust_source="trusted_verifier"` plus a complete
+matching binding was indistinguishable from the real thing. Field validation therefore never
+established the claimed provenance.
+
+The boundary is now closed by **configuration, not by credential**:
+
+- `GrantLedger.open(store)` — the default, production-configured entry point — refuses **all
+  new grant issuance** with `GRANT_ISSUANCE_DISABLED`. The check runs *before* the permit is
+  inspected or spent, so no caller-supplied object (exact-type, correctly labelled, correctly
+  bound, or obtained from `authorize_issuance` itself) can enable production issuance.
+- Reads, status, revocation and **consumption** of grants that already exist are unaffected:
+  the denial is confined to issuance, so the configuration is not a blanket outage.
+- The attestation contract, the authoritative-preview contract and the single central
+  decision (`authorize_issuance`) are preserved untouched for future integration. They are
+  retained and exercised on the test-scoped path; they are not a production capability today.
+- `activate` is deliberately not a runtime flag, constructor argument, environment variable
+  or permit kind. Enabling production issuance requires the separately reviewed authenticated
+  authorizing boundary to be implemented and this gate to be changed in code.
+- Test-scoped configuration (`GrantLedger.open_tests_scoped`, allow-listed modules only)
+  accepts the central decision's permit as well as the isolated `test_simulation` permit, so
+  the real issuance path keeps end-to-end positive coverage plus exact idempotent replay.
+
+No further permit hierarchy, security framework or refactor was introduced. The full denial
+surface is a single `if` on the ledger's own configuration.
+
+| Requirement | Tests |
+|---|---|
+| Production-configured ledger refuses an exact-type permit with `trust_source="trusted_verifier"`, correct task, plan, scope digest, issuer and issuance key — zero grant/state/event/consumption rows | `test_default_production_ledger_refuses_a_perfectly_forged_permit` |
+| Even a permit minted by `authorize_issuance()` cannot enable production issuance | `test_default_production_ledger_refuses_the_central_decision_too` |
+| The production issuer path denies closed with the same code before storage | `test_production_issuance_fails_closed_without_any_permit` |
+| Default-deny is confined to issuance; existing grants still read and consume | `test_production_configuration_can_still_read_and_consume_existing_grants` |
+| Positive synthetic issuance, exact replay and ledger semantics still covered | `test_verified_preview_identity_is_required_for_successful_issuance`, `test_issuance_permit_is_single_use_and_bound_to_its_scope`, `test_trusted_decision_permit_is_bound_to_the_exact_authorization`, `test_replay_with_changed_authorization_terms_is_a_conflict`, `test_replay_with_changed_issuer_identity_is_a_conflict`, `test_exact_consumption_replay_is_idempotent` |
+| No production module gains an issuance path | `test_no_production_module_issues_grants_or_exposes_ipc`, `test_production_package_exports_no_test_only_authorization_surface`, `test_test_only_configuration_is_isolated_from_the_shipped_package` |
+
+### Remaining limitation (explicit)
+
+Production issuance is **off**, and it is off because the authenticated authorizing boundary
+does not exist — not because a Python object is unforgeable. Any code able to run inside the
+backend process can reach internals; what it cannot do is make the production-configured
+ledger accept a new grant, because that ledger denies issuance by configuration. Turning it on
+is future, separately reviewed work that must supply a real attestation verifier and a real
+authoritative preview source and change this gate.
 
 ### Migration-control outcome (third round)
 

@@ -134,6 +134,9 @@ CONSUMED_BY_CODES = frozenset({"policy_check", "execution_adapter", "test_simula
 _ISSUER_CODE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 
 # S4-9: trust sources a permit may record (see aether.core.grants.authorization).
+# ``trusted_verifier`` records the central decision's outcome for future
+# integration; it is *not* accepted by the production-configured ledger, which
+# denies all new issuance (see ``_check_permit_trust``).
 _TRUSTED_TRUST_SOURCE = "trusted_verifier"
 _TEST_TRUST_SOURCE = "test_simulation"
 
@@ -292,12 +295,16 @@ class IssuancePermit:
     * ``trust_source="trusted_verifier"`` — minted by
       :func:`aether.core.grants.authorization.authorize_issuance` after the
       injected attestation verifier and the authoritative preview source both
-      accepted this exact grant. Accepted by any ledger.
+      accepted this exact grant. Reserved for the future authenticated
+      authorizing boundary; it is accepted only by a test-scoped ledger today.
     * ``trust_source="test_simulation"`` — minted by
       :func:`aether.core.grants.authorization.authorize_test_persistence` for
-      low-level persistence tests. Accepted **only** by a ledger opened with
-      :meth:`GrantLedger.open_tests_scoped`, which the default production
-      configuration never uses.
+      low-level persistence tests.
+
+    The default, production-configured :meth:`GrantLedger.open` accepts
+    **neither**: it refuses all new grant issuance until the authenticated
+    authorizing boundary exists (see ``_check_permit_trust``). The trust source
+    is a record of which decision ran, not a credential.
 
     Permits are single-use, bound to one scope digest plus issuer identity, and
     never persisted.
@@ -732,8 +739,10 @@ class GrantLedger:
                 "grant storage requires a permit from the trusted authorization decision; "
                 "direct issuance is not an authorization path",
             )
-        IssuancePermit._claim(permit, scope_digest=scope_digest, issued_by=issued_by)
+        # Configuration policy first: the production ledger denies every grant
+        # before the permit is even inspected or spent (S4-9).
         self._check_permit_trust(permit, grant=grant, issuance_key=issuance_key)
+        IssuancePermit._claim(permit, scope_digest=scope_digest, issued_by=issued_by)
         # S4-2: the supplied digest is verified independently, never trusted.
         actual_digest = exact_approval_scope_digest(grant)
         if not isinstance(scope_digest, str) or scope_digest != actual_digest:
@@ -1150,17 +1159,37 @@ class GrantLedger:
         grant: ExactApprovalGrant,
         issuance_key: UUID,
     ) -> None:
-        """S4-9: only the central decision may authorize a write on this ledger.
+        """S4-9: default-deny. New grant issuance is disabled by configuration.
 
-        The default (production-configured) ledger accepts nothing but a
-        ``trusted_verifier`` permit, which only
-        :func:`aether.core.grants.authorization.authorize_issuance` mints after
-        the verifier and authoritative preview source both succeeded. A
-        ``test_simulation`` permit needs an explicitly test-scoped ledger *and*
-        an allow-listed requesting module, so test-only persistence cannot be
-        reached by the production configuration.
+        The production-configured ledger — ``GrantLedger.open(store)`` — refuses
+        **every** new grant, whatever permit the caller supplies. A permit is an
+        ordinary Python object, so its fields cannot prove that a trusted
+        verifier or an authoritative preview source ever ran; checking more
+        fields would only make forgery slightly longer to type.
+
+        Production issuance therefore stays switched off until the separately
+        reviewed authenticated authorizing boundary exists (see
+        :mod:`aether.core.grants.authorization`). Enabling it is a deliberate
+        code change to this gate, not something a caller can supply at runtime.
+
+        :meth:`open_tests_scoped` — reachable solely from allow-listed test
+        modules — accepts the central decision's ``trusted_verifier`` permit and
+        the isolated ``test_simulation`` permit, so the real issuance path and
+        synthetic ledger semantics stay testable without weakening the
+        production configuration.
         """
 
+        # 1. Default-deny, decided by configuration and checked before the
+        #    permit is inspected at all: no caller-supplied object changes this.
+        if self._trust_source_policy != "test_scoped":
+            raise GrantIssuanceDenied(
+                "GRANT_ISSUANCE_DISABLED",
+                "production grant issuance is disabled: the authenticated authorizing "
+                "boundary does not exist yet, and no caller-supplied permit can enable it",
+            )
+        # 2. Test-scoped configuration (reachable only from allow-listed test
+        #    modules): accept the central decision's permit so the real issuance
+        #    path stays exercised end-to-end, or the isolated test seam.
         source = permit.trust_source
         if source == _TRUSTED_TRUST_SOURCE:
             binding = permit.binding
@@ -1179,13 +1208,6 @@ class GrantLedger:
             raise GrantIssuanceDenied(
                 "AUTHORIZATION_EVIDENCE_REQUIRED",
                 "grant storage requires a permit from a recognized authorization decision",
-            )
-        # Test-only path.
-        if self._trust_source_policy != "test_scoped":
-            raise GrantIssuanceDenied(
-                "AUTHORIZATION_EVIDENCE_REQUIRED",
-                "the default grant-ledger configuration accepts only permits from the trusted "
-                "authorization decision; test-only persistence requires a test-scoped ledger",
             )
         requester = permit.test_requester
         if not isinstance(requester, str) or not _is_permitted_test_authorizer(requester):

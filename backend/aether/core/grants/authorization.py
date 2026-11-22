@@ -14,7 +14,9 @@ This module is that single place. It has two — and only two — factories for
   user was shown. Only then does it mint a ``trusted_verifier`` permit.
   :class:`~aether.core.grants.issuance.GrantIssuer` applies no trust checks of
   its own; it builds the grant (from persisted state), calls this function, and
-  persists the result. One decision, one place.
+  persists the result. One decision, one place. The decision is retained and
+  exercised for future integration, while production storage refuses every new
+  grant until the authorizing boundary is activated.
 * :func:`authorize_test_persistence` — the test-only seam, for low-level ledger
   semantics (replay, rollback, immutability) that must not fabricate an
   attestation. It mints a ``test_simulation`` permit, which the ledger accepts
@@ -28,18 +30,20 @@ Trusted-code assumptions (stated explicitly, because this is an in-process
 Python boundary and not an OS security capability):
 
 1. A caller able to run arbitrary Python *inside the backend process* can reach
-   module internals. No Python object, name-mangling scheme, subclass check or
-   module-private constant is treated as an unforgeable capability, and this
-   module does not claim otherwise.
-2. What *is* guaranteed is structural: the production-configured entry point
-   into storage accepts a permit only from :func:`authorize_issuance`, and that
-   function's only success path is "verifier accepted + authoritative preview
-   matched". The production configuration is ``NullAttestationVerifier`` plus
-   ``NullPreviewAuthority``, so it always raises: issuance is disabled by
-   construction rather than by a label check.
-3. Test-only persistence needs three independent conditions (test-scoped ledger,
-   allow-listed requester, ``test_simulation`` permit). None of them exists in a
-   production configuration.
+   module internals, including ``IssuancePermit._mint``. No Python object,
+   name-mangling scheme, subclass check, field check or module-private constant
+   is treated as an unforgeable capability, and this module does not claim
+   otherwise.
+2. What *is* guaranteed is a configuration rule, not a credential: the
+   production-configured storage boundary (:meth:`GrantLedger.open`) refuses
+   **all** new grant issuance, whatever permit it is handed. That decision is
+   made from the ledger's own configuration before the permit is inspected, so
+   no caller-supplied object can change it. Turning production issuance on
+   requires activating the separately reviewed authenticated authorizing
+   boundary as an explicit code change — not a runtime value.
+3. Test-only persistence and the positive issuance path run on a test-scoped
+   ledger, reachable only from allow-listed test modules. That configuration
+   does not exist in production.
 4. The authenticated authorizing interaction (Electron main → backend) still
    does not exist. When it does, it supplies a verifier and a preview authority
    backed by that channel; this module needs no change, because it already

@@ -94,13 +94,20 @@ merged; Stage 4 is a new branch from merged `main`.
   explicit user gesture authenticated at the Electron-main/backend boundary, plus a production
   planner/narrative source — is future work. Until it exists, issuance stays disabled and the
   Stage 3 approve button is untouched (not upgraded into a second, ambiguous approval).
-- **Trust provenance, not permit objects (S4-9).** `IssuancePermit` is *not* authentication.
-  The single decision procedure lives in `aether.core.grants.authorization`: only
-  `authorize_issuance()` mints a `trusted_verifier` permit, and only after the attested field
-  replay, the injected `AttestationVerifier` and the authoritative `PreviewAuthority` all
-  succeed. `GrantLedger.open(store)` — the production configuration — accepts **only** that
-  permit, bound to the exact task, plan revision/hash and issuance identity; anything else is
-  `AUTHORIZATION_EVIDENCE_REQUIRED` with zero grant/state/event/consumption rows written.
+- **Production issuance is denied by configuration, not by credential (S4-9).**
+  `IssuancePermit` is *not* authentication: it is an ordinary Python object, and no field
+  check on it can establish that a verifier or preview source ever ran.
+  `GrantLedger.open(store)` — the production configuration — therefore refuses **all** new
+  grant issuance with `GRANT_ISSUANCE_DISABLED`, decided from the ledger's own configuration
+  *before* any permit is inspected or spent. No caller-supplied permit changes this, including
+  a correctly labelled, correctly bound one or one minted by `authorize_issuance()` itself;
+  zero grant/state/event/consumption rows are written. Reads, status, revocation and
+  consumption of existing grants are unaffected. The single central decision
+  (`aether.core.grants.authorization.authorize_issuance`) plus the attestation and
+  authoritative-preview contracts are preserved for future integration and exercised on the
+  test-scoped path. Enabling production issuance requires implementing and separately
+  reviewing the authenticated authorizing boundary and changing this gate in code — it is not
+  a runtime flag, constructor argument, environment variable or permit kind.
   Test-only persistence requires three independent conditions (test-scoped ledger instance,
   allow-listed requesting module, `test_simulation` permit), none reachable from a production
   configuration, and neither the factory nor `open_tests_scoped` is exported from
@@ -186,7 +193,7 @@ merged; Stage 4 is a new branch from merged `main`.
   detected and fails closed. Expiry comparisons trust the caller-supplied clock; there is no
   attested time source. Consumption is not yet bound to a real action, so "one use = one action"
   is proven transactionally, not end-to-end.
-- Stage 4 is Linux-verified only (398 passed / 1 skipped backend, desktop `npm run check`,
+- Stage 4 is Linux-verified only (401 passed / 1 skipped backend, desktop `npm run check`,
   golden fixture check). No Windows filesystem, ACL, reparse, process or resource-security
   behavior is inferred from those results; the Windows acceptance items remain open. T3 remains
   unavailable until a dedicated authorization design and its prerequisites are separately approved.

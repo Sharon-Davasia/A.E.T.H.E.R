@@ -251,7 +251,7 @@ def _tool_request(world: SyntheticT2Plan, ref, **overrides) -> ToolRequest:  # t
 def test_grant_binds_exact_scope_and_digest_is_stable(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         outcome = _issue(store, ledger, world, uses=2)
         grant = ledger.load(world.approval_id)
         assert outcome.approval_id == world.approval_id
@@ -339,7 +339,7 @@ def test_production_verifier_denies_all_issuance(tmp_path, monkeypatch) -> None:
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         previews = _previews(world)
         issuer = GrantIssuer(
             store=store,
@@ -359,7 +359,7 @@ def test_production_verifier_denies_all_issuance(tmp_path, monkeypatch) -> None:
 def test_issuance_requires_attestation_never_review_evidence(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         store.record_approval_decision(world.decision(value="APPROVE"))
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(store, ledger, world, attestation=None)
@@ -380,7 +380,7 @@ def test_attestation_is_validated_data_not_a_duck_typed_object(tmp_path, monkeyp
         authority_id = "test.attestation"
 
     with (
-        GrantLedger.open(store) as ledger,
+        GrantLedger.open_tests_scoped(store) as ledger,
         pytest.raises((GrantIssuanceDenied, AttributeError, TypeError)),
     ):
         _issue(store, ledger, world, attestation=ForgedClaim())
@@ -405,7 +405,7 @@ def test_attestation_must_bind_this_exact_authorization(
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     previews = _previews(world)
     claim = _attestation(world, previews=previews, **overrides)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(store, ledger, world, attestation=claim)
         assert denied.value.reason_code == reason
@@ -451,7 +451,7 @@ def test_attestation_from_another_task_cannot_authorize(tmp_path, monkeypatch) -
         plan_revision=other.revision,
         plan_hash=other.plan_hash,
     )
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(store, ledger, world, attestation=foreign)
         assert denied.value.reason_code == "ATTESTATION_TASK_MISMATCH"
@@ -462,7 +462,7 @@ def test_attestation_expiry_must_cover_the_grant(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     short = _attestation(world, expires_at=NOW + timedelta(minutes=2))
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(store, ledger, world, attestation=short, lifetime=timedelta(minutes=30))
         assert denied.value.reason_code == "ATTESTATION_EXPIRY_EXCEEDED"
@@ -472,7 +472,7 @@ def test_attestation_expiry_must_cover_the_grant(tmp_path, monkeypatch) -> None:
 def test_issuance_requires_current_persisted_plan(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as stale:
             _issue(store, ledger, world, plan_hash="b" * 64)
         assert stale.value.reason_code == "PLAN_HASH_MISMATCH"
@@ -500,7 +500,7 @@ def test_issuance_rejects_any_operation_wider_or_different_than_the_plan(
 ) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(store, ledger, world, operations=(world.operation_with(**overrides),))
         assert denied.value.reason_code == reason
@@ -517,7 +517,7 @@ def test_issuance_rejects_substituted_resources(tmp_path, monkeypatch) -> None:
             ApprovedResourceVersion(resource_id=f"file:{uuid4()}", expected_version="v1:9999"),
         )
     )
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(store, ledger, world, operations=(substituted,))
         assert denied.value.reason_code == "RESOURCE_MISMATCH"
@@ -527,7 +527,7 @@ def test_issuance_rejects_substituted_resources(tmp_path, monkeypatch) -> None:
 def test_issuance_bounds_lifetime_uses_and_tier(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as too_long:
             _issue(store, ledger, world, lifetime=timedelta(minutes=61))
         assert too_long.value.reason_code == "GRANT_LIFETIME_TOO_LONG"
@@ -553,7 +553,7 @@ def test_duplicate_issuance_is_idempotent_only_for_identical_terms(tmp_path, mon
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     claim = _attestation(world)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         first = _issue(store, ledger, world, attestation=claim)
         second = _issue(store, ledger, world, attestation=claim)
         assert first.replayed is False
@@ -582,7 +582,7 @@ def test_supplied_scope_digest_is_verified_independently(tmp_path, monkeypatch) 
         expires_at=LATER,
         approval_origin="trusted-electron",
     )
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         # S4-6: the ledger's storage primitive refuses anything but a permit from
         # the trusted authorization decision, so it cannot be reached directly.
         with pytest.raises(GrantIssuanceDenied) as direct:
@@ -726,7 +726,7 @@ def test_issuance_intent_digest_covers_every_immutable_term() -> None:
 def test_exact_consumption_replay_is_idempotent(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
         first = _consume_kwargs(world)
         consumed = ledger.consume(**first)
@@ -758,7 +758,7 @@ def test_consumption_replay_with_changed_action_terms_fails_closed(
     del reason
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=3)
         first = _consume_kwargs(world)
         ledger.consume(**first)
@@ -774,7 +774,7 @@ def test_consumption_replay_binding_survives_reopen(tmp_path, monkeypatch) -> No
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     database = tmp_path / "store.sqlite3"
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
         first = _consume_kwargs(world)
         ledger.consume(**first)
@@ -825,7 +825,7 @@ def test_consumption_action_digest_covers_every_action_field() -> None:
 def test_exhaustion_and_duplicate_consumption(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
         ledger.consume(**_consume_kwargs(world))
         ledger.consume(**_consume_kwargs(world))
@@ -864,7 +864,7 @@ def test_issued_grant_is_denied_after_the_plan_advances(tmp_path, monkeypatch) -
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=3)
         new_hash = _advance_plan(store, world)
         assert new_hash != world.plan_hash
@@ -918,7 +918,7 @@ def test_issued_grant_is_denied_after_the_plan_advances(tmp_path, monkeypatch) -
 def test_use_is_denied_once_the_task_leaves_consent_states(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
         store.transition_task(world.task_id, PersistentTaskState.CANCELLED, now=NOW)
         with pytest.raises(GrantDeniedError) as denied:
@@ -933,7 +933,7 @@ def test_issuance_refuses_tasks_outside_consent_states_and_invalidated_consent(
 ) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         store.record_preview_revocation(
             world.task_id,
             plan_revision=world.revision,
@@ -961,7 +961,7 @@ def test_current_plan_check_and_decrement_are_atomic_under_concurrency(
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=4)
         _advance_plan(store, world)
 
@@ -987,7 +987,7 @@ def test_issuance_rechecks_the_plan_inside_its_transaction(tmp_path, monkeypatch
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         original_get_plan = store.get_plan
         advanced = {"done": False}
 
@@ -1024,7 +1024,7 @@ def test_recovery_class_comes_from_the_trusted_plan_step(tmp_path, monkeypatch) 
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         # The plan step is SNAPSHOT_RESTORABLE; claiming REVERSIBLE is refused
         # even though REVERSIBLE looks "stronger".
         with pytest.raises(GrantIssuanceDenied) as denied:
@@ -1049,7 +1049,7 @@ def test_ledger_refuses_v1_database_without_the_approved_migration(tmp_path) -> 
     store.create_task("synthetic", task_id=uuid4(), now=NOW)
     try:
         with pytest.raises(GrantUnavailableError):
-            GrantLedger.open(store)
+            GrantLedger.open_tests_scoped(store)
     finally:
         store.close()
 
@@ -1085,7 +1085,7 @@ def test_raw_applied_migration_without_ledger_row_is_untrusted(tmp_path) -> None
 def test_scope_rows_and_ledgers_are_immutable(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         ledger.consume(**_consume_kwargs(world))
         ledger.revoke(world.approval_id, reason_code="SUPERSEDED_BY_PLAN", now=NOW)
@@ -1122,7 +1122,7 @@ def test_scope_rows_and_ledgers_are_immutable(tmp_path, monkeypatch) -> None:
 def test_revocation_is_bounded_code_and_idempotent(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
         status = ledger.revoke(world.approval_id, reason_code="CONSENT_REVOKED", now=NOW)
         assert status.state == "REVOKED"
@@ -1145,7 +1145,7 @@ def test_free_text_audit_metadata_is_refused(tmp_path, monkeypatch) -> None:
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
         for bad in (
             "token=sk-abcdefghijklmnop",
@@ -1165,7 +1165,7 @@ def test_free_text_audit_metadata_is_refused(tmp_path, monkeypatch) -> None:
 def test_consumption_consumer_code_is_bounded(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         with pytest.raises(GrantDeniedError):
             ledger.consume(**_consume_kwargs(world, consumed_by="Bearer abc123"))
@@ -1177,7 +1177,7 @@ def test_crash_restart_preserves_committed_state(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     database = tmp_path / "store.sqlite3"
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=3)
         ledger.consume(**_consume_kwargs(world))
     store.close()  # simulated abrupt end of the process
@@ -1198,7 +1198,7 @@ def test_crash_restart_preserves_committed_state(tmp_path, monkeypatch) -> None:
 def test_transactional_failure_leaves_no_partial_consumption(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
 
         def fail_after_decrement(connection, approval_id, event, *, reason_code, detail):
@@ -1223,7 +1223,7 @@ def test_transactional_failure_leaves_no_partial_consumption(tmp_path, monkeypat
 def test_concurrent_consumption_never_overspends(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
 
         def attempt(_: int) -> str:
@@ -1251,7 +1251,7 @@ def test_concurrent_consumption_never_overspends(tmp_path, monkeypatch) -> None:
 def test_expiry_denies_consume_and_reports_state(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         assert ledger.status(world.approval_id, now=NOW).state == "ACTIVE"
         expired_at = LATER + timedelta(seconds=1)
@@ -1275,13 +1275,13 @@ def test_ledger_shares_the_store_connection_and_lock(tmp_path, monkeypatch) -> N
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         assert ledger._connection is store._connection
         assert ledger._owns_connection is False
         assert ledger._owns_lock is False
         assert store._stage4_grant_ledger is ledger
         with pytest.raises(GrantUnavailableError):
-            GrantLedger.open(store)  # only one ledger per store
+            GrantLedger.open_tests_scoped(store)  # only one ledger per store
         _issue(store, ledger, world)
         ledger.consume(**_consume_kwargs(world))
         # The store keeps working and still owns the database.
@@ -1296,7 +1296,7 @@ def test_ledger_write_is_rolled_back_with_the_task_transaction(tmp_path, monkeyp
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
 
         def fail_after_decrement(connection, approval_id, event, *, reason_code, detail):
@@ -1315,7 +1315,7 @@ def test_ledger_write_is_rolled_back_with_the_task_transaction(tmp_path, monkeyp
 def test_store_still_enforces_single_owner_while_ledger_is_open(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         from aether.core.persistence.sqlite_store import PersistenceBusyError
 
@@ -1333,7 +1333,7 @@ def test_standalone_ledger_cannot_take_ownership_from_a_store(tmp_path, monkeypa
         with pytest.raises(GrantUnavailableError):
             GrantLedger(tmp_path / "store.sqlite3")
         # The store's own ledger still works afterwards.
-        with GrantLedger.open(store) as ledger:
+        with GrantLedger.open_tests_scoped(store) as ledger:
             _issue(store, ledger, world)
     finally:
         store.close()
@@ -1357,7 +1357,7 @@ def test_standalone_ledgers_are_mutually_exclusive(tmp_path, monkeypatch) -> Non
 def test_read_only_handle_verifies_and_cannot_write(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
     store.close()
     with GrantLedger.read_only(tmp_path / "store.sqlite3") as handle:
@@ -1371,7 +1371,7 @@ def test_read_only_handle_verifies_and_cannot_write(tmp_path, monkeypatch) -> No
 def test_grant_file_permissions_are_private(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         if os.name != "nt":
             mode = (tmp_path / "store.sqlite3").stat().st_mode & 0o777
@@ -1452,7 +1452,7 @@ def test_validated_exact_grant_verifies_scope_but_enables_no_executor(
         resource_id=resolved.resource_id,
         resource_version=resolved.observed_version,
     )
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         broker = PolicyBroker(
             capabilities=CapabilityRegistry.phase2_filesystem(),
@@ -1482,7 +1482,7 @@ def test_validated_exact_grant_verifies_scope_but_enables_no_executor(
 def test_expired_revoked_exhausted_or_absent_grants_deny(tmp_path, monkeypatch, reason) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    ledger = GrantLedger.open(store)
+    ledger = GrantLedger.open_tests_scoped(store)
     _issue(store, ledger, world)
     request = _tool_request(world, _dummy_ref(world))
     now = NOW
@@ -1519,7 +1519,7 @@ def test_expired_revoked_exhausted_or_absent_grants_deny(tmp_path, monkeypatch, 
 def test_grant_authority_rejects_unknown_and_forged_grant_ids(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         check = GrantAuthority(ledger, store=store).check_action(
             _tool_request(world, _dummy_ref(world)),
             _grant_request(world, approval_id=uuid4()),
@@ -1545,7 +1545,7 @@ def test_substitution_of_task_plan_step_or_effect_denies(
 ) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         authority = GrantAuthority(ledger, store=store)
         overrides: dict[str, object] = {}
@@ -1571,7 +1571,7 @@ def test_resource_substitution_scope_widening_and_stale_versions_deny(
 ) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         authority = GrantAuthority(ledger, store=store)
         ref = _dummy_ref(world)
@@ -1617,7 +1617,7 @@ def test_resource_substitution_scope_widening_and_stale_versions_deny(
 def test_arguments_substitution_denies(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         widened = {**world.arguments, "expected_sha256": "b" * 64}
         check = GrantAuthority(ledger, store=store).check_action(
@@ -1633,7 +1633,7 @@ def test_arguments_substitution_denies(tmp_path, monkeypatch) -> None:
 def test_t3_requests_remain_denied_even_with_a_maximum_grant(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, max_tier=RiskTier.MODIFY)
         broker = _broker(tmp_path)
         critical_broker = PolicyBroker(
@@ -1682,7 +1682,7 @@ def test_synthetic_preview_review_cannot_produce_a_grant(tmp_path, monkeypatch) 
     monkeypatch.setenv("AETHER_REVIEW_TASK_ID", str(uuid4()))
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         store.record_approval_decision(world.decision(value="APPROVE"))
         with pytest.raises(GrantIssuanceDenied):
             _issue(store, ledger, world, attestation=None)
@@ -1758,7 +1758,7 @@ def test_no_ledger_entry_point_can_persist_a_grant_without_authorization(
         approval_origin="trusted-electron",
     )
     digest = exact_approval_scope_digest(grant)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         # The old public write entry point is gone entirely.
         assert not hasattr(ledger, "issue")
 
@@ -1932,7 +1932,7 @@ def test_production_default_has_no_preview_source_and_stays_disabled(tmp_path, m
             task_id=world.task_id, plan_revision=world.revision, plan_hash=world.plan_hash
         )
     assert unavailable.value.reason_code == "PREVIEW_SOURCE_UNAVAILABLE"
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         # Preview-verified attestation is not available in production, because
         # a claim carried in the attestation object is never evidence.
         issuer = GrantIssuer(
@@ -1962,7 +1962,7 @@ def test_forged_preview_identity_is_rejected_against_authoritative_evidence(
         ({"preview_digest": "b" * 64}, "PREVIEW_IDENTITY_MISMATCH"),
         ({"preview_id": uuid4()}, "PREVIEW_IDENTITY_MISMATCH"),
     ]:
-        with GrantLedger.open(store) as ledger:
+        with GrantLedger.open_tests_scoped(store) as ledger:
             with pytest.raises(GrantIssuanceDenied) as denied:
                 _issue(
                     store,
@@ -1984,7 +1984,7 @@ def test_forged_preview_identity_is_rejected_against_authoritative_evidence(
             del kwargs
             return authoritative.model_copy(update={"task_id": uuid4()})
 
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(
                 store,
@@ -2007,7 +2007,7 @@ def test_verified_preview_identity_is_required_for_successful_issuance(
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     previews = _previews(world)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         outcome = _issue(store, ledger, world, previews=previews)
         assert outcome.replayed is False
         stored = ledger.load(world.approval_id)
@@ -2030,7 +2030,7 @@ def test_preview_source_failures_fail_closed(tmp_path, monkeypatch) -> None:
             raise RuntimeError("preview backend unreachable")
 
     previews = _previews(world)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(
                 store,
@@ -2076,7 +2076,7 @@ def test_revocation_between_issuance_precheck_and_transaction_denies(tmp_path, m
     previews = _previews(world)
     transaction_checks: list[str] = []
     connection_in_transaction: list[object] = [None]
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         original_consent_check = GrantLedger._check_fresh_consent
 
         def recording_consent_check(self, connection, task_id):  # type: ignore[no-untyped-def]
@@ -2130,7 +2130,7 @@ def test_revocation_after_issuance_denies_consumption_without_decrement(
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=3)
         before = ledger.status(world.approval_id, now=NOW)
         assert before.uses_remaining == 3
@@ -2170,7 +2170,7 @@ def test_consent_check_is_shared_with_the_store_not_reimplemented(tmp_path, monk
         return original(task_id)
 
     monkeypatch.setattr(store, "is_stage2_preview_blocked", spy)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         after_issuance = len(calls)
         # Pre-check plus the in-transaction recheck inside the grant write.
@@ -2186,7 +2186,7 @@ def test_standalone_ledger_cannot_verify_consent_and_fails_closed(tmp_path, monk
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     database = tmp_path / "store.sqlite3"
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
     store.close()
 
@@ -2211,7 +2211,7 @@ def test_grant_authority_without_store_fails_closed(tmp_path, monkeypatch) -> No
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world)
         check = GrantAuthority(ledger).check_action(
             _tool_request(world, _dummy_ref(world)),
@@ -2240,7 +2240,7 @@ def test_historical_grant_denies_after_supersession_without_store(tmp_path, monk
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         _issue(store, ledger, world, uses=2)
         _advance_plan(store, world)
         check = GrantAuthority(ledger).check_action(
@@ -2259,7 +2259,7 @@ def test_shared_connection_reads_take_the_store_lock(tmp_path, monkeypatch) -> N
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         assert ledger._lock is store._lock, "shared mode must use the store's mechanism"
         _issue(store, ledger, world)
 
@@ -2304,7 +2304,7 @@ def test_reader_cannot_observe_an_uncommitted_grant_write(tmp_path, monkeypatch)
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    ledger = GrantLedger.open(store)
+    ledger = GrantLedger.open_tests_scoped(store)
     previews = _previews(world)
 
     observed: dict[str, object] = {}
@@ -2374,10 +2374,14 @@ def _row_counts(database: Path) -> tuple[int, int, int]:
         )
 
 
-def test_direct_permit_construction_cannot_write_through_the_default_ledger(
-    tmp_path, monkeypatch
-) -> None:
-    """S4-9: the production-configured ledger writes nothing for a test permit."""
+def test_default_production_ledger_refuses_a_perfectly_forged_permit(tmp_path, monkeypatch) -> None:
+    """S4-9: the production-configured ledger denies all issuance, permit or not.
+
+    The permit here is *exact-type* with every field an attacker could want:
+    ``trust_source="trusted_verifier"``, the correct task, plan revision/hash,
+    scope digest, issuer identity and issuance key. Persistence still must be
+    refused with zero grant, state, event and consumption rows written.
+    """
 
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
@@ -2394,34 +2398,107 @@ def test_direct_permit_construction_cannot_write_through_the_default_ledger(
         approval_origin="trusted-electron",
     )
     digest = exact_approval_scope_digest(grant)
+    key = uuid4()
+
+    forged = IssuancePermit._mint(  # type: ignore[attr-defined]
+        scope_digest=digest,
+        issued_by="test.attestation",
+        trust_source="trusted_verifier",
+        test_requester=None,
+        binding={
+            "task_id": str(world.task_id),
+            "plan_revision": world.revision,
+            "plan_hash": world.plan_hash,
+            "issuance_key": str(key),
+        },
+    )
+    assert type(forged) is IssuancePermit
+    assert forged.trust_source == "trusted_verifier"
+    assert forged.binding["issuance_key"] == str(key)
+
     before = _row_counts(database)
     with GrantLedger.open(store) as ledger:  # default, production-configured
         assert ledger._trust_source_policy == "production"
-        permit = authorize_test_persistence(
-            scope_digest=digest,
-            issued_by="test.attestation",
-            task_id=world.task_id,
-            plan_revision=world.revision,
-            plan_hash=world.plan_hash,
-        )
         with pytest.raises(GrantIssuanceDenied) as denied:
             ledger._persist_verified_grant(  # type: ignore[attr-defined]
                 grant,
-                permit=permit,
+                permit=forged,
                 scope_digest=digest,
-                issuance_key=uuid4(),
+                issuance_key=key,
                 issued_by="test.attestation",
             )
-        assert denied.value.reason_code == "AUTHORIZATION_EVIDENCE_REQUIRED"
+        assert denied.value.reason_code == "GRANT_ISSUANCE_DISABLED"
         with pytest.raises(GrantNotFoundError):
             ledger.load(world.approval_id)
-    # Zero grant rows, zero grant events, zero consumptions: nothing was written.
+    # Zero grant rows, state rows, events and consumptions: nothing was written.
     assert _row_counts(database) == before == (0, 0, 0)
     with sqlite3.connect(database) as connection:
         state_rows = connection.execute(
             "SELECT COUNT(*) FROM exact_approval_grant_state"
         ).fetchone()[0]
     assert state_rows == 0, "a denied path wrote grant state"
+    store.close()
+
+
+def test_default_production_ledger_refuses_the_central_decision_too(tmp_path, monkeypatch) -> None:
+    """S4-9: even a permit from ``authorize_issuance`` cannot enable production."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    database = tmp_path / "store.sqlite3"
+    previews = _previews(world)
+    grant = ExactApprovalGrant(
+        approval_id=world.approval_id,
+        task_id=world.task_id,
+        plan_revision=world.revision,
+        plan_hash=world.plan_hash,
+        operations=(world.operation,),
+        max_tier=RiskTier.MODIFY,
+        issued_at=NOW,
+        expires_at=LATER,
+        approval_origin="trusted-electron",
+    )
+    digest = exact_approval_scope_digest(grant)
+    key = uuid4()
+    permit = authorize_issuance(
+        _attestation(world, previews=previews, authorization_id=key, scope_digest=digest),
+        grant=grant,
+        scope_digest=digest,
+        attestations=SimulatedAttestationVerifier(),
+        previews=previews,
+    )
+    assert permit.trust_source == "trusted_verifier"
+    with (
+        pytest.raises(GrantIssuanceDenied) as denied,
+        GrantLedger.open(store) as ledger,  # production configuration
+    ):
+        ledger._persist_verified_grant(  # type: ignore[attr-defined]
+            grant,
+            permit=permit,
+            scope_digest=digest,
+            issuance_key=key,
+            issued_by="test.attestation",
+        )
+    assert denied.value.reason_code == "GRANT_ISSUANCE_DISABLED"
+    assert _row_counts(database) == (0, 0, 0)
+    store.close()
+
+
+def test_production_issuance_fails_closed_without_any_permit(tmp_path, monkeypatch) -> None:
+    """S4-9: the production issuer denies before storage regardless of the permit."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    database = tmp_path / "store.sqlite3"
+    previews = _previews(world)
+    with GrantLedger.open(store) as ledger:
+        issuer = _issuer(store, ledger, previews=previews)
+        with pytest.raises(GrantIssuanceDenied) as denied:
+            issuer.issue(attestation=_attestation(world, previews=previews), **world.issue_kwargs())
+        assert denied.value.reason_code == "GRANT_ISSUANCE_DISABLED"
+        with pytest.raises(GrantNotFoundError):
+            ledger.load(world.approval_id)
+    assert _row_counts(database) == (0, 0, 0)
     store.close()
 
 
@@ -2433,7 +2510,7 @@ def test_permit_minting_is_not_authorization(tmp_path, monkeypatch) -> None:
     # The public constructor cannot produce a permit at all.
     with pytest.raises(TypeError):
         IssuancePermit(scope_digest="a" * 64, issued_by="test.attestation")
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         # A permit whose recorded trust source is not a recognized decision is
         # refused even if it names the trusted source — a label is not a decision.
         labelled = object.__new__(IssuancePermit)
@@ -2502,7 +2579,7 @@ def test_trusted_decision_permit_is_bound_to_the_exact_authorization(tmp_path, m
     )
     assert permit.trust_source == "trusted_verifier"
     assert permit.test_requester is None
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         # Re-pointing a genuine permit at a different issuance identity fails.
         with pytest.raises(GrantIssuanceDenied) as denied:
             ledger._persist_verified_grant(  # type: ignore[attr-defined]
@@ -2515,8 +2592,16 @@ def test_trusted_decision_permit_is_bound_to_the_exact_authorization(tmp_path, m
         assert denied.value.reason_code == "ISSUANCE_PERMIT_MISMATCH"
         with pytest.raises(GrantNotFoundError):
             ledger.load(world.approval_id)
-        # And the permit is consumed, so it cannot be retried either.
-        with pytest.raises(GrantIssuanceDenied):
+        # A refused permit is not spent, so the correct binding still works —
+        # and then the permit really is consumed.
+        ledger._persist_verified_grant(  # type: ignore[attr-defined]
+            grant,
+            permit=permit,
+            scope_digest=digest,
+            issuance_key=key,
+            issued_by="test.attestation",
+        )
+        with pytest.raises(GrantIssuanceDenied) as replayed:
             ledger._persist_verified_grant(  # type: ignore[attr-defined]
                 grant,
                 permit=permit,
@@ -2524,6 +2609,7 @@ def test_trusted_decision_permit_is_bound_to_the_exact_authorization(tmp_path, m
                 issuance_key=key,
                 issued_by="test.attestation",
             )
+        assert replayed.value.reason_code == "ISSUANCE_PERMIT_ALREADY_USED"
     store.close()
 
 
@@ -2549,7 +2635,7 @@ def test_open_runs_initial_integrity_reads_under_the_store_lock(tmp_path, monkey
     store = stage4_store(tmp_path, monkeypatch)
     SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     observed = _capturing_store_lock(monkeypatch, store)
-    with GrantLedger.open(store) as ledger:
+    with GrantLedger.open_tests_scoped(store) as ledger:
         assert ledger._lock is store._lock
     assert observed, "the ledger never ran its integrity reads"
     assert all(observed), "initial integrity reads ran without the store lock"
@@ -2574,7 +2660,7 @@ def test_open_serializes_with_a_concurrent_store_transaction(tmp_path, monkeypat
     holder.start()
     try:
         assert holding.wait(timeout=10)
-        opener = threading.Thread(target=lambda: GrantLedger.open(store).close())
+        opener = threading.Thread(target=lambda: GrantLedger.open_tests_scoped(store).close())
         opener.start()
         opener.join(timeout=0.5)
         assert opener.is_alive(), "ledger construction did not wait for the store lock"
@@ -2689,3 +2775,43 @@ def test_production_package_exports_no_test_only_authorization_surface() -> None
         if name.lower() in {"authorize_test_persistence", "open_tests_scoped"}
     }
     assert test_only == set(), test_only
+
+
+def test_production_configuration_can_still_read_and_consume_existing_grants(
+    tmp_path, monkeypatch
+) -> None:
+    """S4-9: default-deny is confined to *issuance*; reads and use still work.
+
+    A grant persisted under a test-scoped ledger (standing in for one written
+    before the boundary closed) is readable and consumable through the default
+    production-configured ledger, so the denial is not a blanket outage.
+    """
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    with GrantLedger.open_tests_scoped(store) as ledger:
+        _issue(store, ledger, world, uses=2)
+    with GrantLedger.open(store) as ledger:  # production configuration
+        assert ledger.load(world.approval_id).approval_id == world.approval_id
+        consumption = ledger.consume(**_consume_kwargs(world))
+        assert consumption.approval_id == world.approval_id
+        assert ledger.status(world.approval_id, now=NOW).uses_remaining == 1
+        assert len(ledger.list_consumptions(world.approval_id)) == 1
+        # ... and issuance stays refused even though reads/writes of grant *use*
+        # are permitted.
+        with pytest.raises(GrantIssuanceDenied) as denied:
+            ledger._persist_verified_grant(  # type: ignore[attr-defined]
+                ledger.load(world.approval_id),
+                permit=authorize_test_persistence(
+                    scope_digest=exact_approval_scope_digest(ledger.load(world.approval_id)),
+                    issued_by="test.attestation",
+                    task_id=world.task_id,
+                    plan_revision=world.revision,
+                    plan_hash=world.plan_hash,
+                ),
+                scope_digest=exact_approval_scope_digest(ledger.load(world.approval_id)),
+                issuance_key=uuid4(),
+                issued_by="test.attestation",
+            )
+        assert denied.value.reason_code == "GRANT_ISSUANCE_DISABLED"
+    store.close()
