@@ -46,7 +46,7 @@ Ordered. Each row is one PR. "Depends on" must merge first.
 | O | **S14-13 — replay preserves terminal state** | `3149b6c` | `grants/consumption.py`, `test_phase2_consumption_recovery.py` | N |
 | P | **Vault index race (found during S14-12)** | `9194036` | `vault/undo_vault.py`, `test_phase2_vault_key_protection.py` | L (independent of M–O) |
 | Q | **S14-14 — complete the vault concurrency invariant** | `eb7e07e` | `vault/undo_vault.py`, `test_phase2_vault_key_protection.py` | P |
-| R | **Documentation set** | `1038b1d`, `9a1334f`, `03e11e8`, `ec9452b`, `190ddb6` | `PR14_SPLITTING_PLAN.md`, `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | Q |
+| R | **Documentation set** | `1038b1d`, `9a1334f`, `03e11e8`, `ec9452b`, *and the branch HEAD at split time* | `PR14_SPLITTING_PLAN.md`, `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | Q |
 
 ---
 
@@ -323,9 +323,25 @@ git cherry-pick -x 1038b1d   # CREATES PR14_SPLITTING_PLAN.md
 git cherry-pick -x 9a1334f   # CREATES the acceptance report, .gitignore
 git cherry-pick -x 03e11e8   # modifies both
 git cherry-pick -x ec9452b   # modifies both
-git cherry-pick -x 190ddb6   # final docs: split preflight + S14-14 note
+git cherry-pick -x "$DOCS_TIP"   # final docs commit(s); see the note below
 git push -u origin split/pr14-docs
 ```
+
+#### Why the final docs commit is referenced as a variable
+
+A document cannot contain the hash of the commit that contains it: writing the
+hash changes the content, which changes the hash. Making it literal creates an
+infinite regress, and any fixed value goes stale the moment the plan is edited
+again. So the final documentation commit is resolved at split time:
+
+```bash
+SOURCE_HEAD=$(git -C /home/user/A.E.T.H.E.R rev-parse arena/9ff5f05b-a-e-t-h-e-r)
+DOCS_TIP=$SOURCE_HEAD     # the last commit that is documentation-only
+echo "splitting from $SOURCE_HEAD"
+```
+
+Every other hash in this plan is a fixed, already-pushed commit and is quoted
+literally, because those are stable. Only the tip moves.
 
 #### Preflight: verify content, not ancestry
 
@@ -373,7 +389,7 @@ HEAD, no change was lost, dropped or silently altered in the split.
 
 ```bash
 # Run this on the Q tip. Empty output means the split reproduces source exactly.
-git diff --name-status HEAD 190ddb6
+git diff --name-status HEAD "$SOURCE_HEAD"
 ```
 
 Before opening **Q**, confirm the documentation set is complete rather than partial:
