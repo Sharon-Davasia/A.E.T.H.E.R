@@ -171,13 +171,11 @@ class CapabilitySession:
             expected_effect="read-only observation",
         )
         decision = self._broker.evaluate(request, now=self._clock())
-        # T0/T1 capabilities are allowed by the configured broker; anything it
-        # denies is denied here too. In particular a broker that has no
-        # executor configured returns a not-available code, so the session
-        # treats "denied + executor unavailable" as permission to proceed only
-        # when the tier is observation/navigation and the resource re-verifies.
+        # Only an explicit broker allow reaches the executor. A broker with no
+        # adapter configured, an out-of-scope resource or a stale version all
+        # return a denial, and a denial is honoured verbatim.
         if not self._capability_permitted(decision, capability):
-            self._record(
+            recorded = self._record(
                 task_id,
                 "CAPABILITY_DENIED",
                 {
@@ -193,12 +191,12 @@ class CapabilitySession:
                 reason_code=decision.reason_code,
                 policy=decision,
                 result=None,
-                event_recorded=True,
+                event_recorded=recorded,
             )
         try:
             result, audit = action()
         except FsCapabilityDenied as denied:
-            self._record(
+            recorded = self._record(
                 task_id,
                 "CAPABILITY_DENIED",
                 {"capability": capability.value, "reason_code": denied.reason_code},
@@ -211,7 +209,7 @@ class CapabilitySession:
                 reason_code=denied.reason_code,
                 policy=decision,
                 result=None,
-                event_recorded=True,
+                event_recorded=recorded,
             )
         recorded = self._record(
             task_id,

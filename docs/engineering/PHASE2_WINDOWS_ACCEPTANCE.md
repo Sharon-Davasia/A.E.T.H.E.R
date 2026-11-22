@@ -4,6 +4,13 @@
 **Status authority:** this document defines *how* Phase 2 is accepted. It does not
 assert that it has been. Results are recorded in `PHASE2_ACCEPTANCE_REPORT.md`.
 
+> **⚠️ The verifier has not been independently reviewed and must not be run on a
+> machine holding real data until it is.** `scripts/verify_phase2.ps1` deletes
+> nothing itself — every fixture operation is delegated to
+> `aether.core.acceptance.fixture_safety`, which has negative tests proving that
+> sibling prefixes, unmarked directories, junctions and arbitrary paths are
+> refused. Review those tests first; that is the safety argument.
+
 A Phase 2 claim is only valid when every **mandatory** item below is `PASS`.
 `NOT VERIFIED` is not a soft pass: while any mandatory item is `NOT VERIFIED`,
 Phase 2 is **incomplete** and must not be announced as complete.
@@ -16,13 +23,15 @@ Phase 2 is **incomplete** and must not be announced as complete.
 |---|---|
 | Operating system | Windows 11, fully patched, NTFS system volume |
 | Account | **Normal user.** No elevation. The verifier refuses to run elevated. |
-| Fixture location | `D:\Projects\AETHER-Phase2-Fixture` — disposable, created and destroyed by the verifier |
+| Fixture location | A uniquely named `AETHER-Phase2-Fixture-<token>` directory created under an explicit base (default `D:\Projects`). Created and removed only by the reviewed fixture module, and removed only after its ownership marker proves the harness created it. |
 | Forbidden locations | Real documents, Desktop, Downloads, OneDrive, any source repository, any network or removable share |
 | Toolchain | `python`, `node`, `npm`, `uv`, `git` on `PATH` |
 | Repository | Clean working tree at a known commit (the verifier records the SHA and flags a dirty tree) |
 
-**Never run acceptance against real user data.** The verifier hard-fails unless
-the fixture root is under `D:\Projects\AETHER-Phase2-Fixture`.
+**Never run acceptance against real user data.** Containment is enforced by the
+fixture module, not by string comparison: a sibling such as
+`D:\Projects\AETHER-Phase2-Fixture-Other` is *outside* the base and is refused.
+A pre-existing directory is never adopted, reused or deleted.
 
 ## 2. Running it
 
@@ -38,6 +47,7 @@ Useful switches:
 | `-FixtureRoot <path>` | Override the fixture root (must remain under `D:\Projects\AETHER-Phase2-Fixture`) |
 | `-EvidenceRoot <path>` | Where sanitized evidence is written (default `.cache\phase2-evidence`) |
 | `-SkipDesktop` | Skip desktop gates — records them as `NOT VERIFIED`, never as `PASS` |
+| `-SkipBackend` | Skip backend gates — likewise `NOT VERIFIED` |
 
 ### Exit codes
 
@@ -51,8 +61,9 @@ Useful switches:
 
 1. **Environment** — asserts Windows 11, non-elevated account, records git SHA,
    Python, Node and `uv` versions, and flags a dirty working tree.
-2. **Fixture containment** — refuses to run outside the disposable fixture root,
-   then builds a synthetic project (`README.md`, `src\module.py`).
+2. **Fixture containment** — first exercises a *negative control* proving the
+   containment rule refuses a sibling prefix path, then creates a fresh uniquely
+   named fixture and writes a synthetic project (`README.md`, `src\module.py`).
 3. **Backend gates** — `uv sync --locked`, `ruff check`, `ruff format --check`,
    strict `mypy`, the full `pytest` suite, and the Phase 2B/2C/2D/persistence
    suites individually.
@@ -69,17 +80,26 @@ Useful switches:
 
 ## 4. What the verifier cannot do
 
-These must be performed and evidenced by a human, and remain `NOT VERIFIED`
-until then:
+The script itself records these as `NOT VERIFIED` on every run, so its own
+output can never be mistaken for acceptance. They require a human demonstration:
 
-- a **real** approval gesture in the running Electron UI (the verifier exercises
-  the chain programmatically, not through a human clicking);
-- an **actual interruption** (power loss, process kill, forced unmount) during a
-  write — the automated test simulates the crash in-process;
-- a real `D:\Projects` demo performed on your own checkout with your own eyes on
-  the preview;
-- confirming that no cloud traffic occurred, by observing the machine rather
-  than by asserting it in a test.
+- a **real** approval gesture in the running Electron UI (the automated tests
+  exercise the chain programmatically, not through a human clicking);
+- that approving patch **A** cannot cause patch **B** to be applied;
+- refusal before approval and application only after approval, live;
+- grant denial for forged, expired, revoked, exhausted and replayed grants
+  against the real ledger;
+- receipts surviving a real application restart;
+- undo restoring the exact original and refusing to overwrite a newer edit;
+- an **actual interruption** (power loss, process kill, forced unmount) between
+  replacement and receipt — the automated test simulates the crash in-process;
+- zero unauthorized mutation and zero unauthorized disclosure across the run;
+- no cloud traffic, by observing the machine rather than asserting it in a test;
+- the Undo Vault key ACL reviewed on NTFS.
+
+Because these are always present, a fully successful automated run still exits
+**2**, never `0`. There is no configuration in which this script prints PASS for
+Phase 2 as a whole.
 
 ## 5. Sanitization rules
 
@@ -122,8 +142,10 @@ pre-fill results.
 ## 7. Recording the result
 
 Copy `phase2-windows-<stamp>.md` into the acceptance report with the matrix
-above filled in. Any `FAIL` blocks the phase. Any `NOT VERIFIED` blocks the
-phase. There is no "mostly passed".
+above filled in, and record each human-required demonstration alongside it with
+what was actually observed. Any `FAIL` blocks the phase. Any `NOT VERIFIED`
+blocks the phase. There is no "mostly passed", and a green script is not a
+substitute for the human evidence.
 
 The person performing acceptance signs the result with: date, machine identity,
 git SHA, and their own statement of what they observed with their own eyes

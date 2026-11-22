@@ -223,6 +223,53 @@ def test_an_unrecordable_action_is_reported_not_hidden(world, monkeypatch) -> No
     assert outcome.event_recorded is False
 
 
+def test_a_failed_audit_after_a_denial_is_not_reported_as_recorded(world, monkeypatch) -> None:
+    """A denial whose audit event cannot be written must not claim it was."""
+
+    session, registry, task_id = world["session"], world["registry"], world["task_id"]
+
+    def broken_record(*args, **kwargs):
+        raise RuntimeError("audit store unavailable")
+
+    monkeypatch.setattr(world["store"], "record_observation_event", broken_record)
+    # A directory cannot be read as a file, so this is denied by the executor.
+    outcome = session.read(task_id=task_id, resource_id=resolve(registry, "src"))
+    assert outcome.succeeded is False
+    assert outcome.event_recorded is False
+
+
+def test_a_failed_audit_after_a_broker_denial_is_not_reported_as_recorded(world) -> None:
+    """A broker denial whose audit event fails must report the audit failure."""
+
+    from aether.core.fs.session import CapabilitySession
+    from aether.core.policy.broker import PolicyBroker
+
+    registry = world["registry"]
+    store = world["store"]
+    task_id = world["task_id"]
+    # An unconfigured broker denies everything, so the read never executes.
+    denying = CapabilitySession(
+        store=store,
+        broker=PolicyBroker(),
+        executor=world["executor"],
+        clock=lambda: NOW,
+    )
+    original = store.record_observation_event
+
+    def broken_record(*args, **kwargs):
+        raise RuntimeError("audit store unavailable")
+
+    store.record_observation_event = broken_record  # type: ignore[method-assign]
+    try:
+        outcome = denying.read(task_id=task_id, resource_id=resolve(registry, "README.md"))
+    finally:
+        store.record_observation_event = original  # type: ignore[method-assign]
+
+    assert outcome.allowed is False
+    assert outcome.reason_code == "PHASE0_DENY_ALL_OS_ACTIONS"
+    assert outcome.event_recorded is False
+
+
 def test_session_has_no_write_surface() -> None:
     """The T0/T1 session cannot mutate: mutation has its own gated path."""
 
