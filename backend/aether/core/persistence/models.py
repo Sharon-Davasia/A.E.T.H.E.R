@@ -285,6 +285,7 @@ class EventMetadata(BaseModel):
             "requires_fresh_plan_and_consent",
             "preview_digest",
             "preview_id",
+            "requested_outcome",
             "error_code",
         }
         if any(key not in allowed for key in value):
@@ -311,6 +312,8 @@ class EventMetadata(BaseModel):
                 )
             ):
                 raise ValueError("event approval ID must be a UUID")
+            if key == "requested_outcome" and item not in {"APPROVE", "REVISE", "REJECT", "CANCELLED"}:
+                raise ValueError("event requested outcome is invalid")
             if key == "decision" and item not in {"APPROVE", "REJECT"}:
                 raise ValueError("event decision is invalid")
             if key == "authority" and item != "NON_AUTHORIZING_AUDIT_RECORD":

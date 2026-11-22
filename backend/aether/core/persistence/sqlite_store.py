@@ -605,6 +605,7 @@ class SQLiteTaskStore:
                     "plan_hash": record.plan_hash,
                     "preview_digest": record.preview_digest,
                     "preview_id": str(record.preview_id),
+                    "requested_outcome": record.decision.value,
                 }
             ),
             now=now,
@@ -685,6 +686,7 @@ class SQLiteTaskStore:
                     preview_id=preview_id,
                     preview_digest=preview_digest,
                     now=timestamp,
+                    requested_outcome=requested_outcome,
                     error_code="preview_stale",
                 )
                 return Stage2ReviewWrite(
@@ -718,6 +720,7 @@ class SQLiteTaskStore:
                     preview_id=preview_id,
                     preview_digest=preview_digest,
                     now=timestamp,
+                    requested_outcome=requested_outcome,
                     error_code="review_unavailable",
                 )
                 return Stage2ReviewWrite(
@@ -782,6 +785,7 @@ class SQLiteTaskStore:
                     preview_id=preview_id,
                     preview_digest=preview_digest,
                     now=timestamp,
+                    requested_outcome=requested_outcome,
                     requires_fresh_plan_and_consent=True,
                 )
                 decision_id = None
@@ -806,6 +810,7 @@ class SQLiteTaskStore:
                     preview_id=preview_id,
                     preview_digest=preview_digest,
                     now=timestamp,
+                    requested_outcome=requested_outcome,
                 )
                 decision_id = None
                 resolution = "CANCELLED"
@@ -1010,7 +1015,10 @@ class SQLiteTaskStore:
                 or metadata.get("preview_digest") != preview_digest
             ):
                 raise ReviewConflictError("review request identity was replayed with different data")
-            if resolution in {"REVISE", "CANCELLED"} and requested_outcome != resolution:
+            stored_outcome = metadata.get("requested_outcome")
+            if stored_outcome is None:
+                raise PersistenceIntegrityError("stored Stage 2 audit event is missing its requested outcome")
+            if stored_outcome != requested_outcome:
                 raise ReviewConflictError("review request identity was replayed with a different outcome")
             return Stage2ReviewWrite(
                 resolution=resolution,
@@ -1097,6 +1105,7 @@ class SQLiteTaskStore:
         preview_id: UUID,
         preview_digest: str,
         now: str,
+        requested_outcome: str | None = None,
         error_code: str | None = None,
         requires_fresh_plan_and_consent: bool = False,
     ) -> UUID:
@@ -1108,6 +1117,10 @@ class SQLiteTaskStore:
             "preview_digest": preview_digest,
             "preview_id": str(preview_id),
         }
+        if requested_outcome is not None:
+            if requested_outcome not in {"APPROVE", "REVISE", "REJECT", "CANCELLED"}:
+                raise ValueError("Stage 2 requested outcome is invalid")
+            values["requested_outcome"] = requested_outcome
         if requires_fresh_plan_and_consent:
             values["requires_fresh_plan_and_consent"] = True
         if error_code is not None:

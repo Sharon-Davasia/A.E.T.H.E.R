@@ -88,6 +88,60 @@ def _narrative(*, action: str = "Preview one synthetic code edit") -> PreviewNar
     )
 
 
+def _two_step_conflicting_plan(task_id, *, display_name_change: bool = False) -> TaskPlan:
+    first = uuid4()
+    second = uuid4()
+    shared = "file:synthetic-shared"
+    return TaskPlan(
+        task_id=task_id,
+        revision=1,
+        summary="Prepare a synthetic two-step edit for exact human review.",
+        steps=(
+            PlanStep(
+                step_id=first,
+                capability_id="fs.preview_edit",
+                arguments={"resource_id": shared, "operation": "replace-line"},
+                resources=(
+                    TaskPlanResource(
+                        resource_id=shared,
+                        expected_version="synthetic-version-1",
+                        display_name="example.py",
+                    ),
+                ),
+                resource_locks=(shared,),
+                expected_state={"resource": "unchanged"},
+                expected_effect={"effect": "synthetic-edit-1"},
+                risk_tier=RiskTier.MODIFY,
+                approval_status="REQUIRED",
+                idempotency_key=uuid4(),
+                postconditions=({"condition": "synthetic content hash matches expected value"},),
+                recovery_class="REVERSIBLE",
+            ),
+            PlanStep(
+                step_id=second,
+                capability_id="fs.verify_synthetic",
+                arguments={"resource_id": shared, "operation": "verify"},
+                resources=(
+                    TaskPlanResource(
+                        resource_id=shared,
+                        expected_version="synthetic-version-2",
+                        display_name="example-renamed.py" if display_name_change else "example.py",
+                    ),
+                ),
+                resource_locks=(shared,),
+                expected_state={"resource": "changed"},
+                expected_effect={"effect": "synthetic-verify"},
+                risk_tier=RiskTier.NAVIGATE,
+                approval_status="REQUIRED",
+                idempotency_key=uuid4(),
+                postconditions=({"condition": "synthetic content hash confirmed"},),
+                recovery_class="REVERSIBLE",
+            ),
+        ),
+        created_at=_NOW + timedelta(seconds=1),
+    )
+
+
 def _store_with_plan(tmp_path, *, revision: int = 1):
     store = SQLiteTaskStore(tmp_path / "stage2.sqlite3")
     task = store.create_task("Review a synthetic edit", now=_NOW)
@@ -181,6 +235,43 @@ def test_exact_preview_rejects_cross_resource_diff_reference(tmp_path) -> None:
     store.close()
 
 
+def test_conflicting_expected_versions_for_same_resource_are_rejected(tmp_path) -> None:
+    store, task_id = _ready_store(tmp_path)
+    conflicting = _two_step_conflicting_plan(task_id)
+    with pytest.raises(ValueError, match="conflicting display name or expected version"):
+        build_preview(conflicting, _narrative())
+    store.close()
+
+
+def test_conflicting_display_names_for_same_resource_are_rejected(tmp_path) -> None:
+    store, task_id = _ready_store(tmp_path)
+    conflicting = _two_step_conflicting_plan(task_id, display_name_change=True)
+    with pytest.raises(ValueError, match="conflicting display name or expected version"):
+        build_preview(conflicting, _narrative())
+    store.close()
+
+
+def test_consistent_shared_resource_metadata_merges_operations(tmp_path) -> None:
+    store, task_id = _ready_store(tmp_path)
+    plan = _two_step_conflicting_plan(task_id)
+    shared_metadata = TaskPlanResource(
+        resource_id="file:synthetic-shared",
+        expected_version="synthetic-version-1",
+        display_name="example.py",
+    )
+    steps = tuple(
+        step.model_copy(update={"resources": (shared_metadata,)}) if index else step
+        for index, step in enumerate(plan.steps)
+    )
+    consistent = plan.model_copy(update={"steps": steps})
+    narrative = PreviewNarrative(**{**_narrative().model_dump(), "full_diff": ()})
+    preview = build_preview(consistent, narrative)
+    assert len(preview.resources) == 1
+    assert preview.resources[0].expected_version == "synthetic-version-1"
+    assert preview.resources[0].operations == ("fs.preview_edit", "fs.verify_synthetic")
+    store.close()
+
+
 def test_full_diff_acknowledgement_is_required_before_recording(tmp_path) -> None:
     store, task_id = _ready_store(tmp_path)
     service = PreviewReviewService(store)
@@ -193,6 +284,38 @@ def test_full_diff_acknowledgement_is_required_before_recording(tmp_path) -> Non
     assert result.resolution is ReviewResolution.APPROVE
     assert result.granted is False
     assert result.execution_available is False
+    store.close()
+
+
+def test_revise_reject_and_cancel_do_not_require_full_diff_acknowledgement(tmp_path) -> None:
+    for outcome in (ReviewOutcome.REVISE, ReviewOutcome.REJECT, ReviewOutcome.CANCELLED):
+        scoped = tmp_path / outcome.value
+        scoped.mkdir(mode=0o700)
+        store, task_id = _ready_store(scoped)
+        service = PreviewReviewService(store)
+        preview = service.present(task_id, _narrative())
+        request = _request(preview, outcome, acknowledged=False)
+        result = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=20))
+        assert result.resolution is ReviewResolution(outcome.value)
+        assert result.granted is False
+        assert result.execution_available is False
+        assert result.idempotent_replay is False
+        store.close()
+
+
+def test_approve_without_any_diff_does_not_require_acknowledgement(tmp_path) -> None:
+    store, task_id = _ready_store(tmp_path)
+    service = PreviewReviewService(store)
+    narrative = PreviewNarrative(
+        **{**_narrative().model_dump(), "full_diff": ()},
+    )
+    preview = service.present(task_id, narrative)
+    assert preview.full_diff_available is False
+    result = service.record_outcome(
+        task_id, narrative, _request(preview, ReviewOutcome.APPROVE, acknowledged=False)
+    )
+    assert result.resolution is ReviewResolution.APPROVE
+    assert result.granted is False
     store.close()
 
 
@@ -485,6 +608,97 @@ def test_tampered_approve_record_fails_closed_on_replay(tmp_path) -> None:
     with pytest.raises(PersistenceIntegrityError, match="stored approval audit record is invalid"):
         service.record_outcome(task_id, _narrative(), request)
     store.close()
+
+
+def test_stale_replay_with_changed_outcome_or_preview_fails_closed(tmp_path) -> None:
+    store, task_id = _ready_store(tmp_path)
+    service = PreviewReviewService(store)
+    original = service.present(task_id, _narrative())
+    original_request = _request(original, ReviewOutcome.APPROVE)
+    store.transition_task(task_id, PersistentTaskState.PLANNING, now=_NOW + timedelta(seconds=20))
+    store.save_plan(_plan(task_id, revision=2))
+    stale = service.record_outcome(task_id, _narrative(), original_request, now=_NOW + timedelta(seconds=30))
+    assert stale.resolution is ReviewResolution.STALE
+    database_path = tmp_path / "stage2.sqlite3"
+    store.close()
+
+    reopened = SQLiteTaskStore(database_path)
+    reopened_service = PreviewReviewService(reopened)
+    replayed = reopened_service.record_outcome(
+        task_id, _narrative(), original_request, now=_NOW + timedelta(seconds=40)
+    )
+    assert replayed.resolution is ReviewResolution.STALE
+    assert replayed.idempotent_replay is True
+
+    conflicting_outcome = ReviewOutcomeRequest(
+        **{**original_request.model_dump(), "outcome": ReviewOutcome.REJECT}
+    )
+    with pytest.raises(ReviewConflictError, match="different outcome"):
+        reopened_service.record_outcome(
+            task_id, _narrative(), conflicting_outcome, now=_NOW + timedelta(seconds=41)
+        )
+
+    drifted_data = ReviewOutcomeRequest(
+        **{**original_request.model_dump(), "preview_digest": "f" * 64}
+    )
+    with pytest.raises(ReviewConflictError, match="different data"):
+        reopened_service.record_outcome(
+            task_id, _narrative(), drifted_data, now=_NOW + timedelta(seconds=42)
+        )
+    reopened.close()
+
+
+def test_unavailable_replay_with_changed_outcome_fails_closed_after_reopen(tmp_path) -> None:
+    store, task_id = _ready_store(tmp_path)
+    service = PreviewReviewService(store)
+    preview = service.present(task_id, _narrative())
+    request = _request(preview, ReviewOutcome.APPROVE)
+    store.transition_task(task_id, PersistentTaskState.PAUSED, now=_NOW + timedelta(seconds=20))
+    unavailable = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=21)
+    )
+    assert unavailable.resolution is ReviewResolution.UNAVAILABLE
+    database_path = tmp_path / "stage2.sqlite3"
+    store.close()
+
+    reopened = SQLiteTaskStore(database_path)
+    reopened_service = PreviewReviewService(reopened)
+    replayed = reopened_service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=30)
+    )
+    assert replayed.resolution is ReviewResolution.UNAVAILABLE
+    assert replayed.idempotent_replay is True
+
+    conflicting_outcome = ReviewOutcomeRequest(
+        **{**request.model_dump(), "outcome": ReviewOutcome.REVISE}
+    )
+    with pytest.raises(ReviewConflictError, match="different outcome"):
+        reopened_service.record_outcome(
+            task_id, _narrative(), conflicting_outcome, now=_NOW + timedelta(seconds=31)
+        )
+    reopened.close()
+
+
+def test_decision_event_replay_rejects_outcome_tampering_after_reopen(tmp_path) -> None:
+    store, task_id = _ready_store(tmp_path)
+    service = PreviewReviewService(store)
+    preview = service.present(task_id, _narrative())
+    request = _request(preview, ReviewOutcome.REVISE)
+    service.record_outcome(task_id, _narrative(), request)
+    database_path = tmp_path / "stage2.sqlite3"
+    store.close()
+
+    reopened = SQLiteTaskStore(database_path)
+    reopened_service = PreviewReviewService(reopened)
+    replayed = reopened_service.record_outcome(task_id, _narrative(), request)
+    assert replayed.resolution is ReviewResolution.REVISE
+    assert replayed.idempotent_replay is True
+    conflicting = ReviewOutcomeRequest(
+        **{**request.model_dump(), "outcome": ReviewOutcome.APPROVE}
+    )
+    with pytest.raises(ReviewConflictError, match="different outcome"):
+        reopened_service.record_outcome(task_id, _narrative(), conflicting)
+    reopened.close()
 
 
 def test_tampered_event_only_outcome_fails_closed_on_replay(tmp_path) -> None:

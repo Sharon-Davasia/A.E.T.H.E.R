@@ -1,9 +1,10 @@
 import React from 'react';
-import type {
-  ExactPreview,
-  ReviewAcknowledgement,
-  ReviewOutcome,
-  ReviewPreviewState,
+import {
+  canRecordOutcome,
+  type ExactPreview,
+  type ReviewAcknowledgement,
+  type ReviewOutcome,
+  type ReviewPreviewState,
 } from '../shared/review';
 
 interface ApprovalReviewSurfaceProps {
@@ -71,7 +72,8 @@ export function ApprovalReviewSurface({
   }
 
   const diffRequired = preview.fullDiffAvailable;
-  const outcomeDisabled = pending || (diffRequired && !diffAcknowledged);
+  const outcomeAvailable = (outcome: ReviewOutcome): boolean =>
+    canRecordOutcome(outcome, { pending, diffRequired, diffAcknowledged });
 
   return <section className="review-panel" aria-labelledby="review-preview-title">
     <p className="eyebrow">STAGE 2 · REVIEW EVIDENCE ONLY</p>
@@ -149,18 +151,18 @@ export function ApprovalReviewSurface({
       </button>
       {diffExpanded && <pre id="full-diff-panel" tabIndex={0} aria-label="Full proposed diff">{preview.fullDiff.map((diff) => `${diff.resourceId}\n${diff.unifiedDiff}`).join('\n\n')}</pre>}
       <label className="diff-acknowledgement">
-        <input type="checkbox" checked={diffAcknowledged} onChange={(event) => setDiffAcknowledged(event.target.checked)} />
-        <span>I inspected this exact full diff.</span>
+        <input type="checkbox" checked={diffAcknowledged} onChange={(event) => setDiffAcknowledged(event.target.checked)} aria-describedby="diff-acknowledgement-help" />
+        <span>I inspected this exact full diff.<span id="diff-acknowledgement-help" className="diff-acknowledgement-help"> Required only to approve; revising, rejecting, or cancelling does not require it.</span></span>
       </label>
     </div>}
 
     {error && <p className="review-error" role="alert">{error}</p>}
 
     <div className="review-actions" aria-label="Preview review outcomes">
-      <button type="button" onClick={() => onOutcome('APPROVE', diffAcknowledged)} disabled={outcomeDisabled}>Approve preview</button>
-      <button type="button" className="secondary" onClick={() => onOutcome('REVISE', diffAcknowledged)} disabled={outcomeDisabled}>Revise preview</button>
-      <button type="button" className="danger" onClick={() => onOutcome('REJECT', diffAcknowledged)} disabled={outcomeDisabled}>Reject preview</button>
-      <button type="button" className="secondary" onClick={() => onOutcome('CANCELLED', diffAcknowledged)} disabled={pending}>Cancel review</button>
+      <button type="button" onClick={() => onOutcome('APPROVE', diffAcknowledged)} disabled={!outcomeAvailable('APPROVE')}>Approve preview</button>
+      <button type="button" className="secondary" onClick={() => onOutcome('REVISE', diffAcknowledged)} disabled={!outcomeAvailable('REVISE')}>Revise preview</button>
+      <button type="button" className="danger" onClick={() => onOutcome('REJECT', diffAcknowledged)} disabled={!outcomeAvailable('REJECT')}>Reject preview</button>
+      <button type="button" className="secondary" onClick={() => onOutcome('CANCELLED', diffAcknowledged)} disabled={!outcomeAvailable('CANCELLED')}>Cancel review</button>
     </div>
     <p className="notice">Silence is never approval. Audit records and this screen cannot grant permission, unlock a filesystem capability, issue an ExactApprovalGrant, or run an action.</p>
   </section>;

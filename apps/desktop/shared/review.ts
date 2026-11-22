@@ -2,6 +2,21 @@ export const REVIEW_EVIDENCE_ONLY = 'REVIEW_EVIDENCE_ONLY' as const;
 export const NON_AUTHORIZING_AUDIT_RECORD = 'NON_AUTHORIZING_AUDIT_RECORD' as const;
 
 export type ReviewOutcome = 'APPROVE' | 'REVISE' | 'REJECT' | 'CANCELLED';
+
+/**
+ * Shared UI/backend policy for which outcomes require inspecting the exact
+ * full diff. Only APPROVE requires the acknowledgement; REJECT, REVISE and
+ * CANCELLED must remain possible without accepting or inspecting a proposal.
+ * The backend is the source of truth; this mirrors it for button state.
+ */
+export function canRecordOutcome(
+  outcome: ReviewOutcome,
+  flags: { pending: boolean; diffRequired: boolean; diffAcknowledged: boolean },
+): boolean {
+  if (flags.pending) return false;
+  if (outcome === 'APPROVE' && flags.diffRequired && !flags.diffAcknowledged) return false;
+  return true;
+}
 export type RiskClassification =
   | 'T0_OBSERVE'
   | 'T1_NAVIGATE_READ'

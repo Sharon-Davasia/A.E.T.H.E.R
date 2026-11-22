@@ -431,8 +431,17 @@ def _preview_resources(plan: TaskPlan) -> tuple[PreviewResource, ...]:
     resource_details: dict[str, TaskPlanResource] = {}
     for step in plan.steps:
         for resource in step.resources:
-            resource_details[resource.resource_id] = resource
-            operations_by_resource.setdefault(resource.resource_id, []).append(step.capability_id)
+            key = resource.resource_id
+            existing = resource_details.get(key)
+            if existing is not None and (
+                existing.display_name != resource.display_name
+                or existing.expected_version != resource.expected_version
+            ):
+                raise ValueError(
+                    f"resource {key} is referenced with conflicting display name or expected version"
+                )
+            resource_details[key] = resource
+            operations_by_resource.setdefault(key, []).append(step.capability_id)
     return tuple(
         PreviewResource(
             resource_id=resource_id,
@@ -599,8 +608,12 @@ class PreviewReviewService:
             and request.preview_digest == preview.preview_digest
         )
         if preview_matches_current:
-            if preview.full_diff and not request.full_diff_acknowledged:
-                raise ValueError("full diff must be inspected before recording an outcome")
+            if (
+                preview.full_diff
+                and request.outcome == ReviewOutcome.APPROVE
+                and not request.full_diff_acknowledged
+            ):
+                raise ValueError("full diff must be inspected before approving this exact preview")
             if request.review_request_id != preview.review_request_id:
                 raise ValueError("review request identity does not match this exact preview")
         write = self._store.record_stage2_review_outcome(

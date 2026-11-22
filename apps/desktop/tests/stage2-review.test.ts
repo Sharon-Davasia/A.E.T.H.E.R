@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  canRecordOutcome,
   parseExactPreview,
   parseReviewAcknowledgement,
   parseReviewOutcomeRequest,
@@ -169,6 +170,35 @@ test('renderer-facing state and acknowledgement parsers reject forged payloads',
   ]) {
     assert.throws(() => parseReviewAcknowledgement(forged));
   }
+});
+
+test('only APPROVE requires full-diff acknowledgement (S2-1 policy parity)', () => {
+  const diffRequired = { pending: false, diffRequired: true, diffAcknowledged: false };
+  assert.equal(canRecordOutcome('APPROVE', diffRequired), false);
+  assert.equal(canRecordOutcome('REVISE', diffRequired), true);
+  assert.equal(canRecordOutcome('REJECT', diffRequired), true);
+  assert.equal(canRecordOutcome('CANCELLED', diffRequired), true);
+
+  const acknowledged = { ...diffRequired, diffAcknowledged: true };
+  assert.equal(canRecordOutcome('APPROVE', acknowledged), true);
+
+  const noDiff = { pending: false, diffRequired: false, diffAcknowledged: false };
+  assert.equal(canRecordOutcome('APPROVE', noDiff), true);
+
+  const pending = { pending: true, diffRequired: false, diffAcknowledged: true };
+  for (const outcome of ['APPROVE', 'REVISE', 'REJECT', 'CANCELLED'] as const) {
+    assert.equal(canRecordOutcome(outcome, pending), false);
+  }
+});
+
+test('UI source disables only the approve control on missing acknowledgement', () => {
+  const renderer = readFileSync(path.join(root, 'src', 'ApprovalReviewSurface.tsx'), 'utf8');
+  assert.match(renderer, /outcomeAvailable\('APPROVE'\)/);
+  assert.match(renderer, /outcomeAvailable\('REVISE'\)/);
+  assert.match(renderer, /outcomeAvailable\('REJECT'\)/);
+  assert.match(renderer, /outcomeAvailable\('CANCELLED'\)/);
+  assert.match(renderer, /canRecordOutcome\(outcome,/);
+  assert.match(renderer, /Required only to approve/);
 });
 
 test('default trusted provider is fail-closed and cannot record or grant anything', async () => {
