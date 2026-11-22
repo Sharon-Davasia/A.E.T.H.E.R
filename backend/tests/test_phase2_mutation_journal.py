@@ -571,8 +571,13 @@ def test_an_unknown_intent_id_is_an_explicit_error(world) -> None:
     assert refused.value.reason_code == "journal_intent_missing"
 
 
-def test_the_executor_needs_no_journal_to_refuse_nothing(world) -> None:
-    """A journal-less executor still verifies; the journal is evidence, not authority."""
+def test_a_journal_less_executor_cannot_mutate_at_all(world) -> None:
+    """S14-9 inverted this test: the journal is mandatory, not optional.
+
+    S14-4 originally treated the journal as evidence produced alongside a
+    mutation. That allowed a mutation-capable executor with no journal, whose
+    writes would be invisible after a crash. It is now a precondition.
+    """
 
     executor = EditExecutor(
         world["registry"],
@@ -583,9 +588,13 @@ def test_the_executor_needs_no_journal_to_refuse_nothing(world) -> None:
         grants=world["grants"].ledger,
         clock=lambda: NOW,
     )
-    outcome = executor.apply(_plan(world))
-    assert outcome.status == "SUCCEEDED"
-    assert world["journal"].open_intents() == ()
+    before = world["tree"].readme.read_bytes()
+    with pytest.raises(EditDenied) as refused:
+        executor.apply(_plan(world))
+    assert refused.value.reason_code == "journal_unavailable"
+    # Nothing was written, and no use was spent: the refusal precedes all state.
+    assert world["tree"].readme.read_bytes() == before
+    assert world["grants"].ledger.pending() == ()
 
 
 def test_the_reconciliation_report_lists_every_open_intent(world) -> None:
