@@ -39,7 +39,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from aether.core.contracts.policy import RiskTier
@@ -52,6 +52,7 @@ from aether.core.edits.receipts import (
 )
 from aether.core.fs import errors as fs_errors
 from aether.core.grants.authority import GrantAuthority, GrantRequest
+from aether.core.planning.edit_binding import ApprovedEdit, EditBindingError
 from aether.core.resources.path_safety import (
     PathSafetyError,
     is_protected_path,
@@ -62,7 +63,15 @@ from aether.core.vault.undo_vault import UndoVault, VaultError
 
 EditStatus = Literal["SUCCEEDED", "FAILED", "UNVERIFIED", "PARTIAL"]
 
+
+class TaskPlanSource(Protocol):
+    """The narrow read surface this executor needs from plan persistence."""
+
+    def get_plan(self, task_id: UUID, revision: int | None = None) -> Any: ...
+
+
 _MAX_EDIT_BYTES = 4 * 1024 * 1024
+_FORWARD_EDIT_CAPABILITY = "fs.apply_approved_edit"
 
 
 class EditDenied(Exception):
@@ -111,9 +120,14 @@ class EditExecutor:
         vault: UndoVault,
         receipts: ReceiptStore,
         *,
+        plans: TaskPlanSource | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._registry = registry
+        # S14-1: the approved post-image is read from the persisted plan, never
+        # from the request. A caller-supplied digest would let a caller approve
+        # itself, which is precisely the substitution this closes.
+        self._plans = plans
         self._authority = authority
         self._vault = vault
         self._receipts = receipts
@@ -131,7 +145,7 @@ class EditExecutor:
             target=target,
             content=request.proposed_content,
             request=request,
-            capability_id="fs.apply_approved_edit",
+            capability_id=_FORWARD_EDIT_CAPABILITY,
             recovery_class="SNAPSHOT_RESTORABLE",
         )
 
@@ -271,6 +285,23 @@ class EditExecutor:
                 "edit_no_change", "the proposed content is identical to the current content"
             )
 
+        # S14-1: the bytes about to be written must be the bytes the persisted
+        # plan bound and the user approved. Checked here, immediately before any
+        # mutation, so a caller cannot pair the approved pre-image with a
+        # different post-image.
+        if capability_id == _FORWARD_EDIT_CAPABILITY:
+            self._verify_approved_result(request, intended_sha256, pre_image)
+        else:
+            # Undo is a distinct action with its own authorization requirement.
+            # Until S14-3 gives it a registered fs.undo_edit capability with its
+            # own plan-bound preview, it must NOT be able to reach the mutation
+            # path at all -- refusing is safer than reusing the edit binding.
+            raise EditDenied(
+                "undo_authorization_not_implemented",
+                "undo requires its own registered capability and exact approval; "
+                "it is not authorized through the edit path",
+            )
+
         # Snapshot first, and verify the snapshot before touching the original.
         try:
             snapshot = self._vault.put(
@@ -369,6 +400,65 @@ class EditExecutor:
             snapshot_id=str(snapshot.snapshot_id),
             detail="bytes were re-read from disk and match the approved content exactly",
         )
+
+    def _verify_approved_result(
+        self, request: EditRequest, intended_sha256: str, pre_image: bytes
+    ) -> None:
+        """Refuse unless the content matches the binding in the persisted plan.
+
+        The digest is *not* taken from the request. Reading it from the immutable
+        persisted plan means the only way to change which bytes are authorized is
+        to produce a new plan revision with a new hash — which invalidates the
+        existing approval instead of silently reusing it.
+        """
+
+        if self._plans is None:
+            raise EditDenied(
+                "approved_result_binding_unavailable",
+                "no persisted plan source is configured, so approval cannot be "
+                "bound to the bytes about to be written",
+            )
+        try:
+            plan = self._plans.get_plan(request.task_id, request.plan_revision)
+        except Exception as exc:
+            raise EditDenied(
+                "approved_plan_unavailable",
+                "the approved plan revision could not be read",
+            ) from exc
+        step = next((item for item in plan.steps if item.step_id == request.step_id), None)
+        if step is None:
+            raise EditDenied(
+                "approved_step_missing",
+                "the persisted plan has no such step, so nothing was approved here",
+            )
+        try:
+            binding = ApprovedEdit.from_step_arguments(
+                resource_id=request.resource_id, values=dict(step.expected_effect)
+            )
+        except EditBindingError as exc:
+            raise EditDenied(
+                "approved_binding_malformed",
+                "the persisted plan does not carry a usable approval binding",
+            ) from exc
+        try:
+            binding.verify_proposed(
+                proposed_content=request.proposed_content, current_pre_image=pre_image
+            )
+        except EditBindingError as exc:
+            raise EditDenied(exc.reason_code, str(exc)) from exc
+        if intended_sha256 != binding.post_sha256:
+            raise EditDenied(
+                "approved_post_image_mismatch",
+                "the content to be written is not the content that was approved",
+            )
+        # The grant's effect digest must be the one the plan bound, otherwise the
+        # grant covers a different change than the one being applied.
+        bound_effect = str(step.expected_effect.get("approved_effect_digest", ""))
+        if not bound_effect or request.expected_effect_sha256 != bound_effect:
+            raise EditDenied(
+                "approved_effect_digest_mismatch",
+                "the grant does not cover the effect the approved plan records",
+            )
 
     def _atomic_replace(self, target: Path, content: bytes, pre_image: bytes) -> None:
         """Same-volume atomic replacement, preserving the original file mode."""

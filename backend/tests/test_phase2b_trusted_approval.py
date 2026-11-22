@@ -210,6 +210,8 @@ def test_planner_never_adds_writes_after_approval(world) -> None:
             "expected_sha256": "a" * 64,
         },
         summary="edit",
+        # S14-1: an edit plan must carry the exact approved bytes.
+        proposed_content=b"# changed\n",
     )
     revised = planner.revision_for_change(
         existing=base.plan, intent=edit_intent, approved_steps=approved
@@ -329,6 +331,7 @@ def test_stale_resource_versions_are_detectable(world) -> None:
                 "expected_sha256": hashlib.sha256(tree.readme.read_bytes()).hexdigest(),
             },
             summary="edit",
+            proposed_content=b"# changed by the assistant\n",
         ),
     )
     before = world["previews"].live_resource_versions(
