@@ -41,7 +41,12 @@ Ordered. Each row is one PR. "Depends on" must merge first.
 | J | **S14-8 — orphan consumption** | `e399099` | `edits/journal.py`, `edits/reconcile.py`, `test_phase2_orphan_consumption.py` | I |
 | K | **S14-9 — operation state + mandatory journal** | `f5ab233` | `edits/executor.py`, `edits/journal.py`, `test_phase2_execution_context.py`, 6 adapted suites | J |
 | L | **S14-10 — exact Windows ACL** | `a65460c` | `core/security/file_permissions.py`, `test_phase2_windows_acl.py`, `verify_phase2.ps1` | K **and** D — `file_permissions.py` is *created by D*, so L cannot apply to `main` alone |
-| M | **Acceptance report** | `9a1334f`, *pending* | `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | L |
+| M | **S14-11 — one authoritative spend** | `d1bdd2c` | `grants/consumption.py`, `test_phase2_authoritative_consumption.py`, `test_phase2_grant_authority.py` | L |
+| N | **S14-12 — unprojected spend discoverable** | `3d1ade5` | `grants/consumption.py`, `edits/reconcile.py`, `test_phase2_consumption_recovery.py` | M |
+| O | **S14-13 — replay preserves terminal state** | `3149b6c` | `grants/consumption.py`, `test_phase2_consumption_recovery.py` | N |
+| P | **Vault index race (found during S14-12)** | `9194036` | `vault/undo_vault.py`, `test_phase2_vault_key_protection.py` | L (independent of M–O) |
+| Q | **S14-14 — complete the vault concurrency invariant** | `eb7e07e` | `vault/undo_vault.py`, `test_phase2_vault_key_protection.py` | P |
+| R | **Documentation set** | `1038b1d`, `9a1334f`, `03e11e8`, `ec9452b`, *and the branch HEAD at split time* | `PR14_SPLITTING_PLAN.md`, `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | Q |
 
 ---
 
@@ -130,34 +135,54 @@ interpreter**: a new `python3.11 -m venv` with the project installed editable *f
 that checkout*, so `aether` resolves to the code under test rather than to the
 sandbox's main checkout.
 
-| PR tip | Result |
-|---|---|
-| C (`1b2f9c8`) alone | 609 passed, 1 skipped |
-| D (C + S14-5) | 627 passed, 3 skipped |
-| E (C + S14-1) | 635 passed, 1 skipped |
-| F (E + S14-2) | 654 passed, 1 skipped |
-| G (F + S14-3) | 670 passed, 1 skipped |
-| H (G + S14-4) | 693 passed, 1 skipped |
-| I (H + S14-7) | **729 passed, 3 skipped, 0 failed** |
-| J (I + S14-8) | **740 passed, 3 skipped, 0 failed** |
-| K (J + S14-9) | **750 passed, 3 skipped, 0 failed** |
-| L (K + S14-10) | **775 passed, 3 skipped, 0 failed** |
-| M (L + S14-11) | **794 passed, 3 skipped, 0 failed** |
+**Every one of the 17 tips was rebuilt and re-tested** after the D→L and
+documentation-chain corrections, as one linear A→Q sequence from a clean `02dff4b`
+base. All 20 cherry-picks applied clean, and the A–Q tip is byte-identical to the
+branch HEAD, so the split preserves every file exactly.
 
-**Dependency-correct chain, re-verified (S14-11).** The individual tips above were
-measured before the D→L defect was found, and D was measured as a side branch off
-C. Rebuilt as one linear sequence carrying D inline, each pick clean:
+| PR | Contains | Result (isolated venv) |
+|---|---|---|
+| A | `2b60708` schema v2 prepared, inert | 429 passed, 1 skipped |
+| B | `470fea9` workstreams B–E | 589 passed, 1 skipped |
+| C | `1b2f9c8` S14-6 verifier | 612 passed, 1 skipped |
+| D | `fef5592` S14-5 vault key | 628 passed, 3 skipped |
+| E | `36a4063` S14-1 approved bytes | 652 passed, 3 skipped |
+| F | `fb58b49` S14-2 grant consumption | 671 passed, 3 skipped |
+| G | `ac0f39c` S14-3 undo authorization | 687 passed, 3 skipped |
+| H | `e75264b` S14-4 mutation journal | 709 passed, 3 skipped |
+| I | `58e271a` S14-7 grant authority | 729 passed, 3 skipped |
+| J | `e399099` S14-8 orphan consumption | 740 passed, 3 skipped |
+| K | `f5ab233` S14-9 operation state | 750 passed, 3 skipped |
+| L | `a65460c` S14-10 Windows ACL | 775 passed, 3 skipped |
+| M | `d1bdd2c` S14-11 authoritative spend | 794 passed, 3 skipped |
+| N | `3d1ade5` S14-12 unprojected spend | 802 passed, 3 skipped |
+| O | `3149b6c` S14-13 replay terminal state | 809 passed, 3 skipped |
+| P | `9194036` vault index race | 810 passed, 3 skipped |
+| Q | `eb7e07e` S14-14 vault concurrency | 819 passed, 3 skipped |
+| R | `1038b1d` `9a1334f` `03e11e8` `ec9452b` + docs tip | 819 passed, 3 skipped |
 
-```
-1b2f9c8 -> fef5592 -> 36a4063 -> fb58b49 -> ac0f39c -> e75264b
-        -> 58e271a -> e399099 -> f5ab233 -> a65460c -> d1bdd2c
-```
+**0 failures at every tip.**
 
-Tip of that chain, in a fresh `python3.11 -m venv` installed editable from the
-worktree: **794 passed, 3 skipped, 0 failed**, ruff `All checks passed!`,
-`ruff format --check` 144 files, `mypy aether` 95 files clean. This is the number
-that matters for the split: it proves the linear dependency applies, not just that
-each commit is individually plausible.
+One observation worth recording rather than hiding. Tip **N** (`3d1ade5`) failed
+`test_two_interleaved_operations_each_resolve_their_own_consumption` in **2 of 6**
+full-suite runs. That is expected and is not a split defect: N predates both vault
+fixes, so it still carries the pre-existing index race, exactly as the source
+branch did at the equivalent commit. Tip **P** (`9194036`, the first vault lock)
+showed **2 of 8** failures in one session; 24 subsequent full runs of that tip did
+not reproduce it, and I could not capture the error text, so I am not claiming P is
+clean -- only that the failure was not reproducible on demand. Tips **Q** and **R**
+were **18 of 18** and **10 of 10** clean respectively. The residual at P is
+consistent with the incomplete invariant that S14-14 exists to finish (maintenance
+paths still unlocked), but without the trace that is an inference, not a
+measurement. The count rises monotonically as tests are added, and
+never falls, which is the signature of a split that preserves coverage rather than
+one that quietly drops it. The earlier per-tip table this replaces was measured
+with D as a side branch off C, which is the arrangement the D→L correction exists
+to remove; those numbers are superseded, not silently reused.
+
+The 3 skips throughout are the two native-Windows ACL tests and the
+environment-gated model-integration test. A, B and C show 1 skip because the
+Windows-only tests are added by D.
 
 **No exclusions.** An earlier revision of this plan deselected
 `test_hardened_launch_import_origin_comes_from_selected_interpreter` because it
@@ -289,19 +314,152 @@ git cherry-pick -x a65460c && git push -u origin split/pr14-s14-10-windows-acl
 git switch -c split/pr14-s14-11-authoritative-consumption split/pr14-s14-10-windows-acl
 git cherry-pick -x d1bdd2c && git push -u origin split/pr14-s14-11-authoritative-consumption
 
-# N -- acceptance report
-git switch -c split/pr14-acceptance-report split/pr14-s14-11-authoritative-consumption
-git cherry-pick -x 03e11e8 && git push -u origin split/pr14-acceptance-report
+# N -- S14-12
+git switch -c split/pr14-s14-12-unprojected-spend split/pr14-s14-11-authoritative-consumption
+git cherry-pick -x 3d1ade5 && git push -u origin split/pr14-s14-12-unprojected-spend
+
+# O -- S14-13
+git switch -c split/pr14-s14-13-replay-terminal-state split/pr14-s14-12-unprojected-spend
+git cherry-pick -x 3149b6c && git push -u origin split/pr14-s14-13-replay-terminal-state
+
+# P -- the vault index race, independent of M-O but stacked on L so the chain stays linear
+git switch -c split/pr14-vault-index-race split/pr14-s14-13-replay-terminal-state
+git cherry-pick -x 9194036 && git push -u origin split/pr14-vault-index-race
+
+# Q -- S14-14, the vault concurrency invariant
+git switch -c split/pr14-s14-14-vault-concurrency split/pr14-vault-index-race
+git cherry-pick -x eb7e07e && git push -u origin split/pr14-s14-14-vault-concurrency
+
+# R -- the documentation set, in creation order (see below)
+git switch -c split/pr14-docs split/pr14-s14-14-vault-concurrency
+git cherry-pick -x 1038b1d   # CREATES PR14_SPLITTING_PLAN.md
+git cherry-pick -x 9a1334f   # CREATES the acceptance report, .gitignore
+git cherry-pick -x 03e11e8   # modifies both
+git cherry-pick -x ec9452b   # modifies both
+git cherry-pick -x "$DOCS_TIP"   # final docs commit(s); see the note below
+git push -u origin split/pr14-docs
 ```
 
-Before opening **L**, confirm its base really carries D:
+#### Why the final docs commit is referenced as a variable
+
+A document cannot contain the hash of the commit that contains it: writing the
+hash changes the content, which changes the hash. Making it literal creates an
+infinite regress, and any fixed value goes stale the moment the plan is edited
+again. So the final documentation commit is resolved at split time:
 
 ```bash
-git merge-base --is-ancestor fef5592 split/pr14-s14-10-windows-acl && echo "D present"
-test -f backend/aether/core/security/file_permissions.py && echo "file present"
+SOURCE_HEAD=$(git -C /home/user/A.E.T.H.E.R rev-parse arena/9ff5f05b-a-e-t-h-e-r)
+DOCS_TIP=$SOURCE_HEAD     # the last commit that is documentation-only
+echo "splitting from $SOURCE_HEAD"
+```
+
+Every other hash in this plan is a fixed, already-pushed commit and is quoted
+literally, because those are stable. Only the tip moves.
+
+#### Preflight: verify content, not ancestry
+
+**Do not use `git merge-base --is-ancestor` on these branches.** Cherry-picking
+rewrites commit ids, so the original SHA is never an ancestor of a split branch
+even when the change it carries is present. A check like
+
+```bash
+git merge-base --is-ancestor fef5592 split/pr14-s14-10-windows-acl   # WRONG
+```
+
+fails on a correct branch and tells you nothing about whether the change landed.
+The question is not "is this commit an ancestor" but "does this branch contain the
+resulting files and patches, and do they work". So verify content and behaviour:
+
+```bash
+# 1. The file D creates must exist on L's base, and must be the version L expects.
+git switch split/pr14-s14-10-windows-acl
+test -s backend/aether/core/security/file_permissions.py || { echo "MISSING file_permissions.py (D not applied)"; exit 1; }
+test -f scripts/verify_phase2.ps1 || { echo "MISSING verify_phase2.ps1"; exit 1; }
+
+# 2. L's own change must be present in that file, not just the file.
+grep -q "def parse_sddl_dacl" backend/aether/core/security/file_permissions.py || { echo "S14-10 parser absent"; exit 1; }
+grep -q "def evaluate_windows_dacl" backend/aether/core/security/file_permissions.py || { echo "S14-10 evaluator absent"; exit 1; }
+
+# 3. D's contribution must also still be present.
+grep -q "restrict_to_owner" backend/aether/core/security/file_permissions.py || { echo "S14-5 absent"; exit 1; }
+
+# 4. Behaviour is the only real proof: the tests that cover both must pass.
+cd backend && python -m pytest tests/test_phase2_vault_key_protection.py \
+                        tests/test_phase2_windows_acl.py -q
+```
+
+The same content-and-behaviour rule replaces the ancestry idea everywhere:
+
+| Question | Wrong check | Correct check |
+|---|---|---|
+| Does L's base carry D? | `--is-ancestor fef5592` | `test -s .../file_permissions.py` **and** `pytest test_phase2_vault_key_protection.py` |
+| Does Q carry both docs? | `--is-ancestor 1038b1d` | both files non-empty **and** `git log --oneline origin/main..HEAD -- <path>` non-empty for each |
+| Is the split identical to source? | compare commit ids | `git diff --name-status <split-tip> <source-HEAD>` is **empty** |
+
+That last row is the strongest check available, and it is the one to run before
+opening any PR: if the reconstructed tree is byte-identical to the reviewed source
+HEAD, no change was lost, dropped or silently altered in the split.
+
+```bash
+# Run this on the Q tip. Empty output means the split reproduces source exactly.
+git diff --name-status HEAD "$SOURCE_HEAD"
+```
+
+Before opening **Q**, confirm the documentation set is complete rather than partial:
+
+```bash
+for f in docs/engineering/PR14_SPLITTING_PLAN.md docs/engineering/PHASE2_ACCEPTANCE_REPORT.md; do
+  test -s "$f" || { echo "MISSING $f"; exit 1; }
+  echo "$f: $(git log --oneline origin/main..HEAD -- "$f" | wc -l) commits"
+done
+```
+
+Before opening **L**:
+
+```bash
+test -s backend/aether/core/security/file_permissions.py || { echo "D missing"; exit 1; }
+grep -q "def parse_sddl_dacl" backend/aether/core/security/file_permissions.py || exit 1
+cd backend && python -m pytest tests/test_phase2_windows_acl.py -q
 ```
 
 Open each with `gh pr create --fill` and a base of the previous PR's branch.
+
+#### The documentation commits are a chain too (corrected)
+
+An earlier revision of this plan put a single documentation PR at the end that
+cherry-picked `03e11e8` alone. That cannot work either, and for the same reason
+the D→L defect could not: a commit that *modifies* a file needs the commit that
+*created* it.
+
+```
+1038b1d  CREATES docs/engineering/PR14_SPLITTING_PLAN.md
+9a1334f  CREATES docs/engineering/PHASE2_ACCEPTANCE_REPORT.md, .gitignore
+03e11e8  modifies both
+ec9452b  modifies both
+```
+
+Cherry-picking `03e11e8` onto a tree with neither file fails outright; onto a tree
+with only one of them it half-applies. So the documentation PR carries all four in
+creation order, plus the final docs commit. This is why "PR N: acceptance report"
+in the previous revision was wrong: it named one commit for a four-commit set.
+
+**Why one PR and not four.** These are review *aids*, not security boundaries.
+The security boundary is the code, and the code is already split. Four separate
+documentation PRs would add review overhead for edits to prose that is being
+corrected as the code under it lands. If a reviewer prefers them separate, the
+sequence above is already ordered so each can be its own branch; say so and it
+can be split without touching a line of code.
+
+Verify the documentation set as a set, not commit by commit:
+
+```bash
+# On the tip of split/pr14-docs:
+git log --oneline origin/main..HEAD -- docs/engineering/PR14_SPLITTING_PLAN.md
+git log --oneline origin/main..HEAD -- docs/engineering/PHASE2_ACCEPTANCE_REPORT.md
+# Both must show every documentation commit, and both files must exist.
+test -s docs/engineering/PR14_SPLITTING_PLAN.md
+test -s docs/engineering/PHASE2_ACCEPTANCE_REPORT.md
+```
 
 ### 5.8 Verify before each push
 
