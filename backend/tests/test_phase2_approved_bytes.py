@@ -18,6 +18,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from aether.core.edits.executor import EditDenied, EditExecutor, EditRequest
+from aether.core.edits.journal import MutationJournal
 from aether.core.edits.receipts import ReceiptStore
 from aether.core.persistence.sqlite_store import PersistentTaskState, SQLiteTaskStore
 from aether.core.planning.edit_binding import ApprovedEdit, EditBindingError
@@ -56,6 +57,8 @@ def world(tmp_path: Path):
     store = SQLiteTaskStore(tmp_path / "store.sqlite3")
     # S14-2: real accounting. Eight uses so the substitution tests can each try.
     grants = ConsumptionHarness(tmp_path, clock=lambda: NOW, uses=8)
+    # S14-9: the journal is mandatory for any mutation-capable executor.
+    journal = MutationJournal(tmp_path / "journal.sqlite3", clock=lambda: NOW)
     executor = EditExecutor(
         registry,
         _Accepting(),
@@ -63,6 +66,7 @@ def world(tmp_path: Path):
         receipts,
         plans=store,
         grants=grants.ledger,
+        journal=journal,
         clock=lambda: NOW,
     )
     planner = Planner(
@@ -81,8 +85,10 @@ def world(tmp_path: Path):
         "planner": planner,
         "store": store,
         "grants": grants,
+        "journal": journal,
         "tmp": tmp_path,
     }
+    journal.close()
     grants.close()
     receipts.close()
     vault.close()
@@ -256,11 +262,14 @@ def test_an_executor_without_plan_authority_refuses_everything(world) -> None:
 
     planned = _plan(world, PATCH_A)
     before = world["tree"].readme.read_bytes()
+    # Everything else is present, so the *only* missing authority is the plan.
     blind = EditExecutor(
         world["registry"],
         _Accepting(),
         world["vault"],
         world["receipts"],
+        grants=world["grants"].ledger,
+        journal=world["journal"],
         clock=lambda: NOW,
     )
     with pytest.raises(EditDenied) as refused:

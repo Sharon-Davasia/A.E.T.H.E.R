@@ -30,6 +30,7 @@ import pytest
 
 from aether.core.contracts.policy import RiskTier
 from aether.core.edits.executor import EditDenied, EditExecutor, EditRequest
+from aether.core.edits.journal import MutationJournal
 from aether.core.edits.receipts import ReceiptStore
 from aether.core.persistence.sqlite_store import PersistentTaskState, SQLiteTaskStore
 from aether.core.planning.planner import PlanGoal, PlanIntent, Planner, PlannerError
@@ -70,6 +71,7 @@ def world(tmp_path: Path):
     vault = UndoVault(tmp_path / "vault").open()
     receipts = ReceiptStore(tmp_path / "receipts.sqlite3")
     authority = _Accepting()
+    journal = MutationJournal(tmp_path / "journal.sqlite3", clock=lambda: NOW)
     executor = EditExecutor(
         registry,
         authority,
@@ -77,6 +79,7 @@ def world(tmp_path: Path):
         receipts,
         plans=store,
         grants=grants.ledger,
+        journal=journal,
         clock=lambda: NOW,
     )
     planner = Planner(
@@ -328,6 +331,7 @@ def test_a_root_without_undo_scope_refuses_undo(world, tmp_path: Path) -> None:
     grants = ConsumptionHarness(grants_dir, clock=lambda: NOW, uses=4)
     vault = UndoVault(tmp_path / "narrow-vault").open()
     receipts = ReceiptStore(tmp_path / "narrow-receipts.sqlite3")
+    narrow_journal = MutationJournal(tmp_path / "narrow-journal.sqlite3", clock=lambda: NOW)
     executor = EditExecutor(
         registry,
         _Accepting(),
@@ -335,6 +339,7 @@ def test_a_root_without_undo_scope_refuses_undo(world, tmp_path: Path) -> None:
         receipts,
         plans=store,
         grants=grants.ledger,
+        journal=narrow_journal,
         clock=lambda: NOW,
     )
     try:
@@ -363,6 +368,7 @@ def test_a_root_without_undo_scope_refuses_undo(world, tmp_path: Path) -> None:
         # And the file is untouched by the attempt.
         assert narrow_world["tree"].readme.read_bytes() == EDIT
     finally:
+        narrow_journal.close()
         grants.close()
         receipts.close()
         vault.close()

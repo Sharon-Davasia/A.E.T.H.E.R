@@ -106,6 +106,22 @@ _FORWARD_EDIT_CAPABILITY = "fs.apply_approved_edit"
 _UNDO_CAPABILITY = "fs.undo_edit"
 
 
+@dataclass(frozen=True, slots=True)
+class _OperationContext:
+    """State belonging to exactly one attempt, never shared between attempts.
+
+    S14-9: ``_consumption_id`` used to be mutable executor state. Two overlapping
+    operations therefore shared it, and the second could resolve the first's
+    consumption (or the first could resolve the second's). Everything a single
+    attempt needs to identify itself is created per attempt and passed down
+    explicitly, so no operation can touch another's accounting.
+    """
+
+    consumption_id: UUID | None = None
+    journal_id: UUID | None = None
+    capability_id: str = _FORWARD_EDIT_CAPABILITY
+
+
 class EditDenied(Exception):
     """The edit was refused before any mutation; ``reason_code`` is authoritative."""
 
@@ -170,7 +186,6 @@ class EditExecutor:
         # S14-4: the durable pre-mutation intent, so a crash between replace and
         # receipt is never invisible.
         self._journal = journal
-        self._consumption_id: UUID | None = None
         self._authority = authority
         self._vault = vault
         self._receipts = receipts
@@ -411,7 +426,7 @@ class EditExecutor:
         binding: ApprovedEdit,
         *,
         capability_id: str = _FORWARD_EDIT_CAPABILITY,
-    ) -> None:
+    ) -> UUID:
         """Spend exactly one grant use against this exact action (S14-2).
 
         Ordering matters and is deliberate:
@@ -456,7 +471,7 @@ class EditExecutor:
                 "this grant use has already been spent on the same action",
             )
         del binding
-        self._consumption_id = consumption_id
+        return consumption_id
 
     def _mutate(
         self,
@@ -470,14 +485,24 @@ class EditExecutor:
         undo_of: str | None = None,
     ) -> EditOutcome:
         intended_sha256 = hashlib.sha256(content).hexdigest()
+        # S14-9: mutation requires a durable journal. Without one there is no
+        # record that the write was attempted, so a crash would be invisible and
+        # the operation is refused before any state changes.
+        if self._journal is None:
+            raise EditDenied(
+                "journal_unavailable",
+                "a durable mutation journal is mandatory for every mutation-capable "
+                "executor; refusing to mutate without one",
+            )
         # S14-2: spend the use before touching the file at all, so a crash leaves
         # a PENDING consumption (findable) rather than an unaccounted side effect.
-        self._consume_grant(
+        consumption_id = self._consume_grant(
             request,
             self._plan_step(request, capability_id=capability_id),
             self._plan_binding(request, capability_id=capability_id),
             capability_id=capability_id,
         )
+        context = _OperationContext(consumption_id=consumption_id, capability_id=capability_id)
         try:
             pre_image = target.read_bytes()
         except OSError as exc:
@@ -526,6 +551,7 @@ class EditExecutor:
         # crash can never leave a changed file with no record of why). If the
         # intent cannot be written, nothing is mutated.
         journal_id = self._begin_journal(
+            context,
             request,
             capability_id=capability_id,
             resource_id=request.resource_id,
@@ -533,7 +559,12 @@ class EditExecutor:
             pre_sha256=pre_sha256,
             intended_sha256=intended_sha256,
             snapshot_id=snapshot.snapshot_id,
-            consumption_id=self._consumption_id,
+        )
+
+        context = _OperationContext(
+            consumption_id=context.consumption_id,
+            journal_id=journal_id,
+            capability_id=capability_id,
         )
 
         warnings: list[str] = list(extra_warnings)
@@ -550,7 +581,11 @@ class EditExecutor:
                 denied.reason_code,
                 extra=undo_of,
             )
-            self._resolve_journal(journal_id, "FAILED", denied.reason_code)
+            # The replacement definitively did not happen, so the spent use is
+            # resolved FAILED. Leaving it PENDING would report a refused
+            # mutation to reconciliation as an unexplained one (S14-8).
+            self._resolve_consumption(context.consumption_id, "FAILED", denied.reason_code)
+            self._resolve_journal(context.journal_id, "FAILED", denied.reason_code)
             return EditOutcome(
                 status="FAILED",
                 reason_code=denied.reason_code,
@@ -581,7 +616,7 @@ class EditExecutor:
                 "readback_failed",
                 warnings,
                 undo_of,
-                journal_id,
+                context,
             )
         if post_sha256 != intended_sha256 or observed != content:
             return self._unverified(
@@ -594,7 +629,7 @@ class EditExecutor:
                 "verification_mismatch",
                 warnings,
                 undo_of,
-                journal_id,
+                context,
             )
 
         # The verified effect happened, so the receipt is recorded *now*. A
@@ -613,8 +648,8 @@ class EditExecutor:
             undo_of,
             verified_at=self._clock(),
         )
-        self._resolve_consumption("SUCCEEDED", "verified effect")
-        self._resolve_journal(journal_id, "VERIFIED", "verified effect")
+        self._resolve_consumption(context.consumption_id, "SUCCEEDED", "verified effect")
+        self._resolve_journal(context.journal_id, "VERIFIED", "verified effect")
         return EditOutcome(
             status="SUCCEEDED",
             reason_code="edit_verified",
@@ -627,6 +662,7 @@ class EditExecutor:
 
     def _begin_journal(
         self,
+        context: _OperationContext,
         request: EditRequest,
         *,
         capability_id: str,
@@ -635,16 +671,21 @@ class EditExecutor:
         pre_sha256: str,
         intended_sha256: str,
         snapshot_id: UUID,
-        consumption_id: UUID | None,
-    ) -> UUID | None:
+    ) -> UUID:
         """Write the durable intent, or refuse the mutation.
 
         A journal that cannot record the intent must not let the write proceed:
-        an unrecorded mutation is the failure mode this closes.
+        an unrecorded mutation is the failure mode this closes. The journal is
+        mandatory (S14-9), so this method is only reached with one configured,
+        and the check is repeated here so the guarantee does not depend on the
+        caller having remembered it.
         """
 
         if self._journal is None:
-            return None
+            raise EditDenied(
+                "journal_unavailable",
+                "a durable mutation journal is mandatory before mutation",
+            )
         try:
             intent = self._journal.begin(
                 task_id=request.task_id,
@@ -658,7 +699,7 @@ class EditExecutor:
                 intended_post_sha256=intended_sha256,
                 expected_effect_sha256=request.expected_effect_sha256,
                 snapshot_id=snapshot_id,
-                consumption_id=consumption_id,
+                consumption_id=context.consumption_id,
             )
         except JournalError as exc:
             raise EditDenied(
@@ -688,15 +729,16 @@ class EditExecutor:
             # An unresolved intent is the reconciliation work list; never mask it.
             return
 
-    def _resolve_consumption(self, state: str, detail: str) -> None:
+    def _resolve_consumption(self, consumption_id: UUID | None, state: str, detail: str) -> None:
         """Record what actually happened to the spent use.
 
         A failure here leaves the consumption PENDING, which is exactly what
         reconciliation looks for. A spent use is never recorded as successful
-        merely because the process reached this call.
+        merely because the process reached this call. The identity is passed in
+        rather than read from instance state, so one attempt can only ever resolve
+        its own consumption (S14-9).
         """
 
-        consumption_id = self._consumption_id
         if consumption_id is None:
             return
         resolver = getattr(self._grants, "resolve", None)
@@ -816,13 +858,13 @@ class EditExecutor:
         reason: str,
         warnings: list[str],
         undo_of: str | None,
-        journal_id: UUID | None = None,
+        context: _OperationContext,
     ) -> EditOutcome:
         """Record an edit we cannot prove; never claim success."""
 
         warnings = [*warnings, reason]
-        self._resolve_consumption("UNVERIFIED", reason)
-        self._resolve_journal(journal_id, "REPLACED_UNVERIFIED", reason)
+        self._resolve_consumption(context.consumption_id, "UNVERIFIED", reason)
+        self._resolve_journal(context.journal_id, "REPLACED_UNVERIFIED", reason)
         receipt = self._record(
             request,
             capability_id,

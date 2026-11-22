@@ -38,6 +38,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from aether.core.edits.executor import EditDenied, EditExecutor, EditRequest
+from aether.core.edits.journal import MutationJournal
 from aether.core.edits.receipts import ReceiptStore
 from aether.core.fs.executor import FilesystemExecutor, FsCapabilityDenied
 from aether.core.fs.session import CapabilitySession
@@ -134,6 +135,8 @@ def app(tmp_path: Path):
     receipts = ReceiptStore(tmp_path / "receipts.sqlite3")
     # S14-2: real accounting behind the mutation path.
     grants = ConsumptionHarness(tmp_path, clock=lambda: NOW, uses=32)
+    # S14-9: the journal is mandatory for any mutation-capable executor.
+    journal = MutationJournal(tmp_path / "journal.sqlite3", clock=lambda: NOW)
     edits = EditExecutor(
         registry,
         authority,
@@ -141,6 +144,7 @@ def app(tmp_path: Path):
         receipts,
         plans=store,
         grants=grants.ledger,
+        journal=journal,
         clock=lambda: NOW,
     )
     task_id = uuid4()
