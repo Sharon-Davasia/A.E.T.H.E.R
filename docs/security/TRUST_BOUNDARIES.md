@@ -1,6 +1,6 @@
 # AETHER OS — Trust Boundaries (Phase 1 foundation)
 
-**Status:** Phase 1 boundaries plus the merged Phase 2A resource/policy contract foundation, merged Phase 2B-1 persistence, and Stages 2–3 non-authorizing review-evidence presentation and transport; still no filesystem execution, trusted approval grants or mutations.
+**Status:** Phase 1 boundaries plus the merged Phase 2A resource/policy contract foundation, merged Phase 2B-1 persistence, merged Phase 2B-2 Stages 2–3 non-authorizing review-evidence presentation and transport, and the Stage 4 exact-approval-grant *foundation* (capability contracts, fail-closed validation and a schema-version-2 ledger that is proposed, not applied). Still no filesystem execution, no production grant issuance and no mutations.
 
 ## Phase 1 process and module layout
 
@@ -68,3 +68,58 @@ Stage 3 transports the Stage 2 review evidence over the Stage 1 authenticated ch
 - Stage 3 is Linux-verified only; no Windows execution or security acceptance is claimed. Requirements-to-test mapping lives in the Stage 3 desktop README section and the PR description.
 - **Digest verification ownership:** the renderer is never the verification or approval authority. The trusted main-process provider on the authenticated channel (future milestone) must recompute and verify the canonical digest, preview ID and review request ID against backend-supplied values before returning a preview to the renderer and before recording any outcome. Node-side verification helpers (`shared/review-integrity.ts`) are pinned to the backend by a generated golden fixture and are never imported by renderer code. Until a trusted provider exists, the default provider is fail-closed and no preview can be shown or recorded.
 - Stage 2 outcomes distinguish review evidence from authorization: the full-diff acknowledgement is required for APPROVE only; REJECT/REVISE/CANCELLED never imply inspection or acceptance. Audit events persist the requested outcome (`requested_outcome`) so replay with a changed outcome or changed preview data fails closed, including across store close/reopen.
+
+## Phase 2B Stage 4 — exact approval-grant foundation (authorizes nothing)
+
+Stage 4 implements the durable machinery an exact grant will need and keeps authorization
+unavailable. Merge state: Phase 2B-1 (PR #7–#10), Stage 2 (PR #11) and Stage 3 (PR #12) are
+merged; Stage 4 is a new branch from merged `main`.
+
+- **Authorization ceiling.** The strongest T2 outcome the broker can now produce is
+  `allowed=False, reason_code="GRANT_VALIDATED_EXECUTOR_NOT_ENABLED"`, meaning the persisted
+  grant matched the proposed action exactly and nothing was authorized, consumed or executed.
+  There is no execution adapter, no mutation, no shell and no renderer IPC route in this stage.
+- **Production issuance is disabled.** `AuthorizingProof` is an opaque capability that refuses
+  direct construction and ships **no production subclass**; only `TestOnlyAuthorizingProof`
+  exists, for tests. A renderer `APPROVE`, a client claim of `trusted-electron`, a persisted
+  `NON_AUTHORIZING_AUDIT_RECORD`, a model proposal, a synthetic dev preview and any
+  `AETHER_REVIEW_*` development seam can never produce a grant. A source-scan test asserts no
+  module outside `aether/core/grants` constructs a proof or an issuer.
+- **The trusted authorizing interaction does not exist yet.** The Master-required path —
+  explicit user gesture authenticated at the Electron-main/backend boundary, plus a production
+  planner/narrative source — is future work. Until it exists, issuance stays disabled and the
+  Stage 3 approve button is untouched (not upgraded into a second, ambiguous approval).
+- **Issuance prerequisites (all enforced).** A proof; the *current persisted* plan loaded
+  through the store's integrity-verifying path (never a caller-supplied plan); exact
+  step/capability/tier/argument-hash/effect-hash/resource-version/recovery-class binding;
+  lifetime ≤ 60 minutes; 1–8 uses; no T3; and an idempotent issuance identity whose replay
+  with a different scope is a conflict rather than a second grant.
+- **Scope is immutable; state is separate.** Approved scope (digest, JSON, plan revision/hash,
+  tier ceiling, approval origin, issuance identity, issued/expiry times) lives in
+  `exact_approval_grants`, protected by a no-update trigger. Uses and revocation live in
+  `exact_approval_grant_state`, whose guarded-update trigger permits only −1 use/+1 consumption
+  or a one-way revocation. Spending a use can never rewrite the hashed scope. Lifecycle events
+  and consumption rows are append-only.
+- **Verification, not assumption.** `GrantLedger` refuses to open unless `user_version = 2`,
+  the exact 30-object schema fingerprint matches the pinned value, the version-2 migration-ledger
+  row matches the proposed file's SHA-256, and `quick_check`/`foreign_key_check` pass. Persisted
+  scope JSON is re-validated through Pydantic, its digest recomputed, and use accounting must
+  agree across the state row, the consumption table and `CONSUMED` events. The ledger never
+  applies or registers a migration; version-1 databases fail closed with
+  `GrantUnavailableError`.
+- **Proposed migration requires separate approval.**
+  `backend/aether/core/persistence/proposed_migrations/0002_phase2b_stage4_grants.sql`
+  (SHA-256 `a91b431c…`) is inert. Applying it also requires updating the store's
+  `_EXPECTED_MIGRATIONS`, `_EXPECTED_SCHEMA_SHA256` and `_CRITICAL_TRIGGER_NAMES` plus tests,
+  as one separately approved change. Until then `SQLiteTaskStore` stays pinned to version 1 and
+  rejects version-2 databases.
+- **Trust limitations.** SQLite is not a hardware root of trust: a same-user attacker with write
+  access to the file can tamper with it, though schema/digest/accounting/migration tampering is
+  detected and fails closed. Expiry comparisons trust the caller-supplied clock; there is no
+  attested time source. Consumption is not yet bound to a real action, so "one use = one action"
+  is proven transactionally, not end-to-end.
+- Stage 4 is Linux-verified only (333 passed / 1 skipped backend, desktop `npm run check`,
+  golden fixture check). No Windows filesystem, ACL, reparse, process or resource-security
+  behavior is inferred from those results; the Windows acceptance items remain open. T3 remains
+  unavailable until a dedicated authorization design and its prerequisites are separately approved.
+  Details and the requirements→code→test matrix: `docs/engineering/PHASE2B_STAGE4_GRANTS.md`.

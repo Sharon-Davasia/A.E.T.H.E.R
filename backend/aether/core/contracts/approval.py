@@ -18,6 +18,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from aether.core.contracts.policy import RiskTier
+from aether.core.contracts.receipt import RecoveryClass
 
 
 class ApprovalRequest(BaseModel):
@@ -64,7 +65,13 @@ class ApprovedResourceVersion(BaseModel):
 
 
 class ApprovedOperation(BaseModel):
-    """Immutable binding for one named step, capability, args and resource set."""
+    """Immutable binding for one named step, capability, args and resource set.
+
+    ``recovery_class`` binds the recovery expectation for this operation. It
+    defaults to ``IRREVERSIBLE`` (the most conservative claim) so an operation
+    constructed without an explicit recovery classification never asserts a
+    stronger recoverability than was approved.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -74,6 +81,7 @@ class ApprovedOperation(BaseModel):
     arguments_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
     expected_effect_sha256: str = Field(pattern=r"^[0-9a-fA-F]{64}$")
     resources: tuple[ApprovedResourceVersion, ...] = Field(min_length=1, max_length=16)
+    recovery_class: RecoveryClass = RecoveryClass.IRREVERSIBLE
 
     @model_validator(mode="after")
     def unique_resource_ids(self) -> ApprovedOperation:
@@ -141,6 +149,7 @@ def exact_approval_scope_digest(grant: ExactApprovalGrant) -> str:
                 "risk_tier": int(operation.risk_tier),
                 "arguments_sha256": operation.arguments_sha256.casefold(),
                 "expected_effect_sha256": operation.expected_effect_sha256.casefold(),
+                "recovery_class": operation.recovery_class.value,
                 "resources": sorted(
                     [
                         {
@@ -172,8 +181,19 @@ def exact_operation_matches(
     arguments_sha256: str,
     expected_effect_sha256: str,
     resource_versions: dict[str, str],
+    recovery_class: RecoveryClass | None = None,
 ) -> bool:
-    """Return whether a persisted, already-authenticated grant covers exactly one action."""
+    """Return whether a persisted, already-authenticated grant covers exactly one action.
+
+    ``recovery_class`` is part of the hashed approved scope (Phase 2B Stage 4).
+    When the caller supplies the recovery class it must match the grant's
+    approved operation; a mismatched recovery expectation is a scope change
+    and denies. Omitting it keeps the Phase 2A call shape for callers that
+    only re-verify identity fields.
+
+    This helper is advisory validation only. The authoritative, fail-closed
+    path with reason codes is :func:`aether.core.grants.validation.check_grant_scope`.
+    """
     if now.tzinfo is None or now.utcoffset() is None:
         return False
     if (
@@ -192,6 +212,8 @@ def exact_operation_matches(
         return False
     operation = matching[0]
     expected_versions = {item.resource_id: item.expected_version for item in operation.resources}
+    if recovery_class is not None and operation.recovery_class != recovery_class:
+        return False
     return (
         operation.capability_id == capability_id
         and operation.risk_tier == risk_tier

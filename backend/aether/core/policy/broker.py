@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from aether.core.contracts.policy import PolicyDecision, RiskTier
 from aether.core.contracts.tool import ToolRequest
+from aether.core.grants.authority import GrantAuthority, GrantRequest
 from aether.core.policy.capabilities import CapabilityRegistry, CapabilityRegistryError
 from aether.core.resources.registry import ResourceRegistry, ResourceRegistryError
 
@@ -19,7 +22,10 @@ class PolicyBroker:
     The no-argument configuration preserves Phase 0/1 deny-all behavior. A
     configured Phase 2 broker can assess T0/T1 policy, but Phase 2A registers
     filesystem contracts as non-executable. T2 remains denied until a trusted
-    approval issuer exists; T3 is never enabled by this broker.
+    approval issuer and execution adapter exist; T3 is never enabled by this
+    broker. A valid Stage 4 exact grant is *scope-verified* by the optional
+    ``grant_authority`` — it is never execution authorization, and grant
+    consumption happens only at execution time (which does not exist yet).
     """
 
     def __init__(
@@ -27,11 +33,19 @@ class PolicyBroker:
         *,
         capabilities: CapabilityRegistry | None = None,
         resources: ResourceRegistry | None = None,
+        grant_authority: GrantAuthority | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._resources = resources
+        self._grant_authority = grant_authority
 
-    def evaluate(self, request: ToolRequest) -> PolicyDecision:
+    def evaluate(
+        self,
+        request: ToolRequest,
+        *,
+        grant: GrantRequest | None = None,
+        now: datetime | None = None,
+    ) -> PolicyDecision:
         """Return deterministic authorization status, without running a capability."""
         if self._capabilities is None and self._resources is None:
             return self._deny(RiskTier.CRITICAL, PHASE0_REASON_CODE, PHASE0_REASON, True)
@@ -100,11 +114,40 @@ class PolicyBroker:
                 True,
             )
         if definition.risk_tier == RiskTier.MODIFY:
-            return self._deny(
-                RiskTier.MODIFY,
-                "TRUSTED_APPROVAL_NOT_AVAILABLE",
-                "T2 mutation remains disabled until the trusted approval channel is implemented.",
-                True,
+            if grant is None or self._grant_authority is None:
+                return self._deny(
+                    RiskTier.MODIFY,
+                    "TRUSTED_APPROVAL_NOT_AVAILABLE",
+                    "T2 mutation remains disabled until the trusted approval channel is implemented.",
+                    True,
+                )
+            check = self._grant_authority.check_action(
+                request,
+                grant,
+                risk_tier=definition.risk_tier,
+                now=now or datetime.now(UTC),
+            )
+            if not check.ok:
+                return self._deny(
+                    RiskTier.MODIFY,
+                    check.reason_code,
+                    "T2 mutation remains denied: the exact grant failed closed validation.",
+                    True,
+                )
+            # Exact scope verified, but no execution adapter exists in this
+            # phase. This is not authorization to run anything, and it never
+            # becomes one without a separately approved Phase 2C executor.
+            return PolicyDecision(
+                allowed=False,
+                risk_tier=RiskTier.MODIFY,
+                reason_code="GRANT_VALIDATED_EXECUTOR_NOT_ENABLED",
+                reason=(
+                    "The exact grant scope was verified against the persisted ledger, "
+                    "but no execution adapter is enabled in this phase; no action was "
+                    "authorized or performed."
+                ),
+                requires_approval=False,
+                approval_id=str(grant.approval_id),
             )
         return self._deny(
             definition.risk_tier,
