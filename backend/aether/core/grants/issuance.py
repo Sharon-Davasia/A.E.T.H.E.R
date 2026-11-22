@@ -1,29 +1,41 @@
-"""Grant issuance prerequisites and the test-only issuance simulation.
+"""Grant issuance prerequisites (Phase 2B Stage 4).
 
 A Stage 3 ``NON_AUTHORIZING_AUDIT_RECORD`` is review evidence only. It is
 never proof of execution authorization, and nothing in the Stage 3 channel,
-UI, renderer or model path can produce one. Grant issuance therefore
-requires an :class:`AuthorizingProof` — an opaque artifact of an *explicit,
-authenticated trusted user action at the Electron-main/backend boundary*.
+UI, renderer or model path can issue a grant.
 
-No production code path in this phase constructs an ``AuthorizingProof``.
-The trusted authorizing interaction (authenticated user gesture -> Electron
-main -> backend attestation) does not exist yet; until it does, production
-issuance is disabled and a synthetic development preview being reviewed is
-never sufficient.
+Issuance therefore requires a verified :class:`AuthorizationAttestation`
+(see :mod:`aether.core.grants.attestation`) whose exact binding covers the
+task, plan revision/hash, preview identity, approved-scope digest, issuer
+identity and freshness window. Trust is decided by an **injected verifier**,
+never by Python class identity or inheritance.
 
-The only shipped implementation is :class:`TestOnlyAuthorizingProof`, used
-by tests to simulate that future interaction. Issuing from it is a test
-simulation — it is **not** real user authorization and grants created under
-it must never be presented as authorized actions.
+Fail-closed prerequisites enforced here, in order:
+
+1. an attestation exists and its verifier is configured (production ships a
+   rejecting verifier, so production issuance is disabled);
+2. the task exists, is in a consent-bearing state, is not blocked by fresh
+   consent/revocation, and its *current* persisted plan revision/hash match
+   the request;
+3. every requested operation binds exactly to a step of that current plan —
+   capability, risk tier, argument hash, effect hash, canonical resource
+   versions and the plan step's own trusted recovery requirement;
+4. the attestation covers this task/plan/preview/scope and was authorized no
+   later than the grant's issued time and no earlier than the grant's expiry;
+5. lifetime <= 60 minutes, 1..8 uses, tier ceiling <= MODIFY (T3 refused);
+6. replay: an issuance identity already bound to different authorization
+   terms is a conflict, never a second grant.
+
+Nothing here executes, mutates user files or exposes IPC/HTTP.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from aether.core.contracts.approval import (
     ApprovedOperation,
@@ -31,52 +43,30 @@ from aether.core.contracts.approval import (
     exact_approval_scope_digest,
 )
 from aether.core.contracts.policy import RiskTier
+from aether.core.grants.attestation import (
+    AttestationRejected,
+    AttestationVerifier,
+    AuthorizationAttestation,
+    IssuanceBinding,
+)
 from aether.core.grants.errors import GrantIssuanceDenied
 from aether.core.grants.ledger import GrantLedger
 from aether.core.grants.models import GrantIssuanceOutcome
-from aether.core.persistence.models import PlanStep, _thaw_json
+from aether.core.persistence import PersistentTaskState
+from aether.core.persistence.models import PlanStep, TaskPlan, _thaw_json
 from aether.core.persistence.sqlite_store import SQLiteTaskStore
 
 _MAX_LIFETIME = timedelta(minutes=60)
 
+# Task states in which an authorizing interaction may legitimately exist: the
+# user has been shown an exact preview of the current plan and may approve it.
+# Anything later (PRECHECK/EXECUTING/terminal) or earlier (planning) is
+# refused, so a stale or already-consumed consent cannot be re-issued.
+_ISSUABLE_TASK_STATES = frozenset(
+    {PersistentTaskState.PREVIEW_READY, PersistentTaskState.AWAITING_APPROVAL}
+)
 
-class AuthorizingProof:
-    """Opaque artifact of an authenticated trusted authorizing interaction.
-
-    Subclassing is intentionally narrow: production ships no subclass, so no
-    production code can hold one. The artifact is a *capability* — possessing
-    it means an explicit user action occurred at the trusted boundary. It is
-    never derived from a renderer message, a review audit record, preview
-    evidence, a model proposal or any synthetic development source.
-    """
-
-    __slots__ = ("authorizing_action_id", "issued_by")
-
-    def __init__(self, *, authorizing_action_id: UUID, issued_by: str) -> None:
-        if type(self) is AuthorizingProof:
-            raise TypeError(
-                "AuthorizingProof cannot be constructed directly; production ships no "
-                "authorizing interaction yet"
-            )
-        if not isinstance(authorizing_action_id, UUID):
-            raise TypeError("authorizing_action_id must be a UUID")
-        if not isinstance(issued_by, str) or not issued_by or len(issued_by) > 128:
-            raise ValueError("issued_by must be a non-empty label of at most 128 characters")
-        self.authorizing_action_id = authorizing_action_id
-        self.issued_by = issued_by
-
-
-class TestOnlyAuthorizingProof(AuthorizingProof):
-    """Test simulation of the future trusted authorizing interaction.
-
-    Grant issuance under this proof is a test simulation of a user approving
-    an exact plan. It is not real user authorization, it is not an Electron
-    attestation, and grants issued under it are never evidence that a user
-    authorized anything. It exists so the grant foundation (persistence,
-    consumption, revocation, policy validation) can be exercised now.
-    """
-
-    __slots__ = ()
+_AUTHORITY_ID = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 
 
 def _canonical_json(value: object) -> str:
@@ -100,30 +90,23 @@ def _step_operation_hashes(step: PlanStep) -> tuple[str, str]:
 
 
 class GrantIssuer:
-    """Issues exact grants against the *current persisted* plan only.
+    """Issues exact grants against the *current persisted* plan only."""
 
-    Fail-closed prerequisites (all mandatory):
-
-    1. an :class:`AuthorizingProof` (production-disabled today);
-    2. the current persisted plan for the task, loaded through the store's
-       integrity-verifying path (never a caller-supplied plan object);
-    3. exact per-operation binding to that plan: existing step, identical
-       capability, identical risk tier, identical argument and effect hashes,
-       identical resource id/version set, identical recovery class;
-    4. bounded lifetime (at most 60 minutes) and 1..8 uses;
-    5. an idempotent issuance identity (the authorizing action id) so replay
-       cannot mint a second grant, and a replayed identity with different
-       scope is a conflict, not a grant.
-    """
-
-    def __init__(self, *, store: SQLiteTaskStore, ledger: GrantLedger) -> None:
+    def __init__(
+        self,
+        *,
+        store: SQLiteTaskStore,
+        ledger: GrantLedger,
+        attestations: AttestationVerifier,
+    ) -> None:
         self._store = store
         self._ledger = ledger
+        self._attestations = attestations
 
     def issue(
         self,
         *,
-        proof: AuthorizingProof | None,
+        attestation: AuthorizationAttestation | None,
         task_id: UUID,
         plan_revision: int,
         plan_hash: str,
@@ -134,13 +117,6 @@ class GrantIssuer:
         uses_remaining: int,
         approval_id: UUID | None = None,
     ) -> GrantIssuanceOutcome:
-        if proof is None or not isinstance(proof, AuthorizingProof):
-            raise GrantIssuanceDenied(
-                "AUTHORIZATION_EVIDENCE_REQUIRED",
-                "grant issuance requires an authenticated authorizing interaction; "
-                "review evidence, renderer input, model proposals and synthetic previews "
-                "are never sufficient",
-            )
         for value in (issued_at, expires_at):
             if value.tzinfo is None or value.utcoffset() is None:
                 raise GrantIssuanceDenied(
@@ -155,21 +131,21 @@ class GrantIssuer:
             raise GrantIssuanceDenied(
                 "GRANT_LIFETIME_TOO_LONG", "grant lifetime exceeds the 60-minute bound"
             )
-        if not isinstance(uses_remaining, int) or uses_remaining < 1 or uses_remaining > 8:
+        if not isinstance(uses_remaining, int) or not 1 <= uses_remaining <= 8:
             raise GrantIssuanceDenied("GRANT_USE_BOUND_INVALID", "uses must be between 1 and 8")
         if max_tier > RiskTier.MODIFY:
             raise GrantIssuanceDenied("TIER3_DISABLED", "T3 grants are never issued")
         if not operations:
             raise GrantIssuanceDenied("GRANT_SCOPE_EMPTY", "at least one operation is required")
-
-        # The grant must bind the CURRENT persisted plan; issuance against a
-        # stale revision is refused.
-        try:
-            current = self._store.get_plan(task_id)
-        except KeyError as exc:
+        if attestation is None:
             raise GrantIssuanceDenied(
-                "PLAN_NOT_FOUND", "no persisted plan exists for the task"
-            ) from exc
+                "AUTHORIZATION_EVIDENCE_REQUIRED",
+                "grant issuance requires an authenticated authorizing interaction; review "
+                "evidence, renderer input, model proposals and synthetic previews are never "
+                "sufficient",
+            )
+
+        current_state, current = self._load_current_plan(task_id)
         if current.revision != plan_revision:
             raise GrantIssuanceDenied(
                 "PLAN_REVISION_MISMATCH", "requested revision is not the current persisted plan"
@@ -179,56 +155,14 @@ class GrantIssuer:
                 "PLAN_HASH_MISMATCH",
                 "requested plan hash does not match the current persisted plan",
             )
+        del current_state
 
         steps_by_id = {step.step_id: step for step in current.steps}
         for operation in operations:
-            step = steps_by_id.get(operation.step_id)
-            if step is None:
-                raise GrantIssuanceDenied(
-                    "STEP_NOT_IN_PLAN",
-                    "grant operation references a step outside the persisted plan",
-                )
-            if operation.capability_id != step.capability_id:
-                raise GrantIssuanceDenied(
-                    "OPERATION_MISMATCH", "grant capability does not match the persisted plan step"
-                )
-            if operation.risk_tier != step.risk_tier:
-                raise GrantIssuanceDenied(
-                    "OPERATION_MISMATCH", "grant risk tier does not match the persisted plan step"
-                )
-            if operation.risk_tier > max_tier:
-                raise GrantIssuanceDenied(
-                    "TIER_CEILING_EXCEEDED", "operation exceeds the grant's maximum risk tier"
-                )
-            arguments_sha256, effect_sha256 = _step_operation_hashes(step)
-            if operation.arguments_sha256.casefold() != arguments_sha256:
-                raise GrantIssuanceDenied(
-                    "OPERATION_MISMATCH", "grant arguments do not match the persisted plan step"
-                )
-            if operation.expected_effect_sha256.casefold() != effect_sha256:
-                raise GrantIssuanceDenied(
-                    "OPERATION_MISMATCH", "grant effect does not match the persisted plan step"
-                )
-            plan_resources = sorted(
-                (resource.resource_id, resource.expected_version) for resource in step.resources
-            )
-            grant_resources = sorted(
-                (resource.resource_id, resource.expected_version)
-                for resource in operation.resources
-            )
-            if plan_resources != grant_resources:
-                raise GrantIssuanceDenied(
-                    "RESOURCE_MISMATCH",
-                    "grant resources do not exactly match the persisted plan step",
-                )
-            if operation.recovery_class.value != step.recovery_class:
-                raise GrantIssuanceDenied(
-                    "RECOVERY_CLASS_MISMATCH",
-                    "grant recovery class does not match the persisted plan step",
-                )
+            self._check_operation_binding(operation, steps_by_id, max_tier=max_tier)
 
         grant = ExactApprovalGrant(
-            approval_id=approval_id or _new_approval_id(),
+            approval_id=approval_id or uuid4(),
             task_id=task_id,
             plan_revision=plan_revision,
             plan_hash=plan_hash.casefold(),
@@ -240,23 +174,184 @@ class GrantIssuer:
             revoked_at=None,
             approval_origin="trusted-electron",
         )
-        outcome = self._ledger.issue(
-            grant,
-            scope_digest=exact_approval_scope_digest(grant),
-            issuance_key=proof.authorizing_action_id,
-            issued_by=proof.issued_by,
+        scope_digest = exact_approval_scope_digest(grant)
+        self._check_attestation(
+            attestation,
+            grant=grant,
+            scope_digest=scope_digest,
+            issued_at=grant.issued_at,
+            expires_at=grant.expires_at,
         )
-        return outcome
+        return self._ledger.issue(
+            grant,
+            scope_digest=scope_digest,
+            issuance_key=attestation.authorization_id,
+            issued_by=attestation.authority_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal checks
+    # ------------------------------------------------------------------
+
+    def _load_current_plan(self, task_id: UUID) -> tuple[PersistentTaskState, TaskPlan]:
+        """Load the current task state and plan, refusing unusable tasks."""
+
+        try:
+            task = self._store.get_task(task_id)
+        except KeyError as exc:
+            raise GrantIssuanceDenied(
+                "TASK_NOT_AVAILABLE", "no persisted task exists for this authorization"
+            ) from exc
+        state = PersistentTaskState(task.state)
+        if state not in _ISSUABLE_TASK_STATES:
+            raise GrantIssuanceDenied(
+                "TASK_STATE_NOT_AUTHORIZABLE",
+                f"task state {state.value} does not carry a live authorizing interaction",
+            )
+        # Fresh plan/consent blocker: a REVISE or a revoked preview after the
+        # latest saved plan invalidates any earlier review or consent.
+        if self._store.is_stage2_preview_blocked(task_id):
+            raise GrantIssuanceDenied(
+                "CONSENT_INVALIDATED",
+                "fresh plan and consent are required before issuance for this task",
+            )
+        try:
+            plan = self._store.get_plan(task_id)
+        except KeyError as exc:
+            raise GrantIssuanceDenied(
+                "PLAN_NOT_FOUND", "no persisted plan exists for the task"
+            ) from exc
+        return state, plan
+
+    def _check_operation_binding(
+        self,
+        operation: ApprovedOperation,
+        steps_by_id: dict[UUID, PlanStep],
+        *,
+        max_tier: RiskTier,
+    ) -> None:
+        step = steps_by_id.get(operation.step_id)
+        if step is None:
+            raise GrantIssuanceDenied(
+                "STEP_NOT_IN_PLAN", "grant operation references a step outside the persisted plan"
+            )
+        if operation.capability_id != step.capability_id:
+            raise GrantIssuanceDenied(
+                "OPERATION_MISMATCH", "grant capability does not match the persisted plan step"
+            )
+        if operation.risk_tier != step.risk_tier:
+            raise GrantIssuanceDenied(
+                "OPERATION_MISMATCH", "grant risk tier does not match the persisted plan step"
+            )
+        if operation.risk_tier > max_tier:
+            raise GrantIssuanceDenied(
+                "TIER_CEILING_EXCEEDED", "operation exceeds the grant's maximum risk tier"
+            )
+        arguments_sha256, effect_sha256 = _step_operation_hashes(step)
+        if operation.arguments_sha256.casefold() != arguments_sha256:
+            raise GrantIssuanceDenied(
+                "OPERATION_MISMATCH", "grant arguments do not match the persisted plan step"
+            )
+        if operation.expected_effect_sha256.casefold() != effect_sha256:
+            raise GrantIssuanceDenied(
+                "OPERATION_MISMATCH", "grant effect does not match the persisted plan step"
+            )
+        plan_resources = sorted(
+            (resource.resource_id, resource.expected_version) for resource in step.resources
+        )
+        grant_resources = sorted(
+            (resource.resource_id, resource.expected_version) for resource in operation.resources
+        )
+        if plan_resources != grant_resources:
+            raise GrantIssuanceDenied(
+                "RESOURCE_MISMATCH", "grant resources do not exactly match the persisted plan step"
+            )
+        # S4-4: recovery class is compared against the trusted plan step, never
+        # against the caller's own claim about the plan.
+        if operation.recovery_class.value != step.recovery_class:
+            raise GrantIssuanceDenied(
+                "RECOVERY_CLASS_MISMATCH",
+                "grant recovery class does not match the persisted plan step",
+            )
+
+    def _check_attestation(
+        self,
+        attestation: AuthorizationAttestation,
+        *,
+        grant: ExactApprovalGrant,
+        scope_digest: str,
+        issued_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        if not _AUTHORITY_ID.fullmatch(attestation.authority_id):
+            raise GrantIssuanceDenied(
+                "AUTHORIZATION_SOURCE_NOT_TRUSTED", "attestation authority identity is invalid"
+            )
+        # The verifier is the only trust decision. A claim whose label does not
+        # match the configured verifier is refused before verification so a
+        # forged label cannot reach a permissive implementation.
+        verifier_authority = self._attestations.authority_id
+        if attestation.authority_id != verifier_authority:
+            raise GrantIssuanceDenied(
+                "AUTHORIZATION_SOURCE_NOT_TRUSTED",
+                "attestation authority does not match the configured trusted source",
+            )
+        if attestation.approval_origin != grant.approval_origin:
+            raise GrantIssuanceDenied(
+                "AUTHORIZATION_SOURCE_NOT_TRUSTED", "attestation origin is not the trusted origin"
+            )
+        # Binding: the attested interaction must cover exactly this issuance.
+        if attestation.task_id != grant.task_id:
+            raise GrantIssuanceDenied(
+                "ATTESTATION_TASK_MISMATCH",
+                "attestation authorizes a different task than this grant",
+            )
+        if attestation.plan_revision != grant.plan_revision:
+            raise GrantIssuanceDenied(
+                "ATTESTATION_PLAN_MISMATCH",
+                "attestation authorizes a different plan revision",
+            )
+        if attestation.plan_hash.casefold() != grant.plan_hash.casefold():
+            raise GrantIssuanceDenied(
+                "ATTESTATION_PLAN_MISMATCH",
+                "attestation authorizes a different plan hash",
+            )
+        if attestation.scope_digest != scope_digest:
+            raise GrantIssuanceDenied(
+                "ATTESTATION_SCOPE_MISMATCH",
+                "attestation does not cover the exact approved operation scope",
+            )
+        # Freshness: the authorizing action must predate issuance and must not
+        # have expired before the grant does.
+        if issued_at < attestation.authorized_at:
+            raise GrantIssuanceDenied(
+                "ATTESTATION_NOT_YET_VALID",
+                "grant issuance precedes the authorizing interaction",
+            )
+        if issued_at >= attestation.expires_at:
+            raise GrantIssuanceDenied(
+                "ATTESTATION_EXPIRED", "the authorizing interaction has expired"
+            )
+        if expires_at > attestation.expires_at:
+            raise GrantIssuanceDenied(
+                "ATTESTATION_EXPIRY_EXCEEDED",
+                "grant expiry exceeds the authorizing interaction's validity",
+            )
+        binding = IssuanceBinding(
+            task_id=grant.task_id,
+            plan_revision=grant.plan_revision,
+            plan_hash=grant.plan_hash,
+            scope_digest=scope_digest,
+            approval_origin=grant.approval_origin,
+            issued_at=issued_at,
+            expires_at=expires_at,
+            uses_remaining=grant.uses_remaining,
+            max_tier=int(grant.max_tier),
+        )
+        try:
+            self._attestations.verify(attestation, binding=binding)
+        except AttestationRejected as exc:
+            raise GrantIssuanceDenied(exc.reason_code, str(exc)) from exc
 
 
-def _new_approval_id() -> UUID:
-    from uuid import uuid4
-
-    return uuid4()
-
-
-__all__ = [
-    "AuthorizingProof",
-    "GrantIssuer",
-    "TestOnlyAuthorizingProof",
-]
+__all__ = ["GrantIssuer"]

@@ -46,7 +46,7 @@ MIGRATION_NAME_V2 = "0002_phase2b_stage4_grants"
 # Fingerprint of the full version-2 schema (all 27 tables/indexes/triggers),
 # computed exactly like ``SQLiteTaskStore._verify_schema`` does. Pinned in the
 # grant ledger as ``_EXPECTED_SCHEMA_SHA256_V2``.
-V2_SCHEMA_SHA256 = "f68447f63fe0c61313a8df30d09b572f74352f6860bcaf1678f06bf6565283f2"
+V2_SCHEMA_SHA256 = "dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788"
 
 T2_CAPABILITY = "fs.apply_approved_edit"
 
@@ -135,11 +135,12 @@ class SyntheticT2Plan:
             ),
             created_at=NOW,
         )
+        self.store = store
         store.create_task("synthetic grant foundation task", task_id=self.task_id, now=NOW)
         store.transition_task(self.task_id, PersistentTaskState.PLANNING, now=NOW)
         self.plan_hash = store.save_plan(self.plan)
         # Preview-ready + awaiting approval is the only state in which a review
-        # audit record may legally be written.
+        # audit record may legally be written and in which issuance is legal.
         store.transition_task(self.task_id, PersistentTaskState.PREVIEW_READY, now=NOW)
         store.transition_task(self.task_id, PersistentTaskState.AWAITING_APPROVAL, now=NOW)
 
@@ -192,6 +193,66 @@ class SyntheticT2Plan:
             "uses_remaining": 1,
             "approval_id": self.approval_id,
         }
+
+
+class SimulatedAttestationVerifier:
+    """Test-only verifier standing in for the future trusted interaction.
+
+    It proves the *contract* (binding + freshness are checked and replayed),
+    not real trust: no production code path can construct it, and it lives in
+    the test suite rather than the shipped package.
+    """
+
+    authority_id = "test.attestation"
+
+    def __init__(self) -> None:
+        self.seen: list[tuple[object, object]] = []
+
+    def verify(self, attestation, *, binding) -> None:  # type: ignore[no-untyped-def]
+        from aether.core.grants.attestation import AttestationRejected
+
+        self.seen.append((attestation, binding))
+        if attestation.authority_id != self.authority_id:
+            raise AttestationRejected("AUTHORIZATION_SOURCE_NOT_TRUSTED", "unknown authority")
+        if binding.task_id != attestation.task_id:
+            raise AttestationRejected("ATTESTATION_TASK_MISMATCH", "binding task mismatch")
+        if binding.scope_digest != attestation.scope_digest:
+            raise AttestationRejected("ATTESTATION_SCOPE_MISMATCH", "binding scope mismatch")
+        if binding.issued_at < attestation.authorized_at:
+            raise AttestationRejected("ATTESTATION_NOT_YET_VALID", "issued before authorization")
+
+
+def make_attestation(
+    *,
+    task_id,
+    plan_revision,
+    plan_hash,
+    scope_digest,
+    authorization_id=None,
+    authority_id="test.attestation",
+    preview_id=None,
+    preview_digest="a" * 64,
+    authorized_at=NOW,
+    expires_at=LATER,
+    **overrides,
+):  # type: ignore[no-untyped-def]
+    from aether.core.grants.attestation import AuthorizationAttestation
+
+    fields = {
+        "authorization_id": authorization_id or uuid4(),
+        "authority_id": authority_id,
+        "approval_origin": "trusted-electron",
+        "task_id": task_id,
+        "plan_revision": plan_revision,
+        "plan_hash": plan_hash,
+        "preview_id": preview_id or uuid4(),
+        "preview_digest": preview_digest,
+        "scope_digest": scope_digest,
+        "authorized_at": authorized_at,
+        "expires_at": expires_at,
+    }
+    fields.update(overrides)
+    return AuthorizationAttestation(**fields)
 
 
 def apply_proposed_migration_raw(database: Path) -> None:

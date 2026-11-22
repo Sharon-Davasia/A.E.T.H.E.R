@@ -2,11 +2,24 @@
 
 Internal contracts, a transactional schema-v2 ledger and fail-closed policy
 validation. Production issuance is disabled: no production code path can
-construct an :class:`AuthorizingProof`, no HTTP/IPC surface issues grants and
-the Stage 4 schema migration is proposed but not applied. Nothing in this
+obtain a trusted authorization attestation, no HTTP/IPC surface issues grants
+and the Stage 4 schema migration is proposed but not applied. Nothing in this
 package executes anything.
+
+Deliberately *not* exported: anything test-only. Test simulations live in the
+test suite, and authorization trust is decided by an injected
+:class:`~aether.core.grants.attestation.AttestationVerifier` — never by Python
+class identity or inheritance.
 """
 
+from aether.core.grants.attestation import (
+    PRODUCTION_ATTESTATION_VERIFIER,
+    AttestationRejected,
+    AttestationVerifier,
+    AuthorizationAttestation,
+    IssuanceBinding,
+    NullAttestationVerifier,
+)
 from aether.core.grants.authority import GrantAuthority, GrantRequest, canonical_arguments_sha256
 from aether.core.grants.errors import (
     GrantConflictError,
@@ -17,13 +30,24 @@ from aether.core.grants.errors import (
     GrantNotFoundError,
     GrantUnavailableError,
 )
-from aether.core.grants.issuance import AuthorizingProof, GrantIssuer, TestOnlyAuthorizingProof
-from aether.core.grants.ledger import GrantLedger
+from aether.core.grants.issuance import GrantIssuer
+from aether.core.grants.ledger import (
+    CONSUMED_BY_CODES,
+    REVOCATION_CODES,
+    GrantLedger,
+    consumption_action_digest,
+    issuance_intent_digest,
+)
 from aether.core.grants.models import GrantConsumption, GrantIssuanceOutcome, GrantStatus
 from aether.core.grants.validation import GrantCheck, check_grant_scope
 
 __all__ = [
-    "AuthorizingProof",
+    "CONSUMED_BY_CODES",
+    "PRODUCTION_ATTESTATION_VERIFIER",
+    "REVOCATION_CODES",
+    "AttestationRejected",
+    "AttestationVerifier",
+    "AuthorizationAttestation",
     "GrantAuthority",
     "GrantCheck",
     "GrantConflictError",
@@ -39,7 +63,10 @@ __all__ = [
     "GrantRequest",
     "GrantStatus",
     "GrantUnavailableError",
-    "TestOnlyAuthorizingProof",
+    "IssuanceBinding",
+    "NullAttestationVerifier",
     "canonical_arguments_sha256",
     "check_grant_scope",
+    "consumption_action_digest",
+    "issuance_intent_digest",
 ]

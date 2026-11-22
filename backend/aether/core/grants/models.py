@@ -23,6 +23,12 @@ class GrantConsumption(BaseModel):
     plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     step_id: UUID
     capability_id: str = Field(pattern=r"^[A-Za-z0-9._-]{1,128}$")
+    # Complete action binding: a replay must match every field below.
+    risk_tier: RiskTier
+    arguments_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_effect_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    # Bounded machine-readable consumer code; never free text.
+    consumed_by: str = Field(pattern=r"^[a-z][a-z0-9_.:-]{0,63}$")
     consumed_at: datetime
     uses_remaining_after: int = Field(ge=0)
     # Response metadata only; not persisted. True when the caller retried an
@@ -47,7 +53,8 @@ class GrantStatus(BaseModel):
     uses_remaining: int = Field(ge=0)
     consumed_count: int = Field(ge=0)
     revoked_at: datetime | None
-    revocation_reason: str | None
+    # Bounded machine-readable revocation code; never free text.
+    revocation_code: str | None
     state: Literal["ACTIVE", "NOT_YET_VALID", "EXPIRED", "REVOKED", "EXHAUSTED"]
 
 

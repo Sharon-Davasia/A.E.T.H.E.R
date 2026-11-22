@@ -18,7 +18,7 @@ Adds:
 | Area | Artifact |
 |---|---|
 | Authoritative grant binding | `ApprovedOperation.recovery_class` (defaults to the most conservative class) now participates in `exact_approval_scope_digest` |
-| Issuance prerequisites | `aether/core/grants/issuance.py` — opaque `AuthorizingProof`, `GrantIssuer`, `TestOnlyAuthorizingProof` |
+| Issuance prerequisites | `aether/core/grants/attestation.py` — `AuthorizationAttestation` data contract + injected `AttestationVerifier`; `aether/core/grants/issuance.py` — `GrantIssuer`. Nothing test-only is exported. |
 | Validation | `aether/core/grants/validation.py` — pure, fail-closed `check_grant_scope` with reason codes |
 | Durable persistence | `aether/core/grants/ledger.py` — `GrantLedger` (schema v2 only, verifies fingerprints, never migrates) |
 | Policy integration | `PolicyBroker(..., grant_authority=...)` — deny-by-default, execution still disabled |
@@ -53,11 +53,13 @@ Legend: **MS** = Master Specification clause area; **test** = test function in
 
 | Requirement | Code | Tests |
 |---|---|---|
-| `NON_AUTHORIZING_AUDIT_RECORD` is review evidence only | `issuance.py` requires `AuthorizingProof`; ledger never reads `approval_records` | `test_issuance_requires_authorizing_proof_never_review_evidence` |
+| `NON_AUTHORIZING_AUDIT_RECORD` is review evidence only | `issuance.py` requires a verified `AuthorizationAttestation`; the ledger never reads `approval_records` | `test_issuance_requires_attestation_never_review_evidence`, `test_synthetic_preview_review_cannot_produce_a_grant` |
 | A renderer `APPROVE` / client claim of `trusted-electron` never authorizes | no IPC/HTTP issuer exists; proof cannot be constructed directly | `test_authorizing_proof_cannot_be_constructed_by_production_code`, `test_only_test_simulation_subclass_ships` |
 | A model proposal never authorizes | `GrantIssuer` only accepts a persisted plan + proof | `test_issuance_requires_current_persisted_plan` |
 | A synthetic dev preview never authorizes | dev seams are untouched; no grant path reads them | `test_synthetic_preview_review_cannot_produce_a_grant` |
-| Explicit user action authenticated at the Electron-main/backend boundary | `AuthorizingProof` capability contract (documented, **no production subclass**) | `test_only_test_simulation_subclass_ships`, `test_no_production_module_issues_grants_or_exposes_ipc` |
+| Explicit user action authenticated at the Electron-main/backend boundary | `attestation.py` contract + injected verifier; production ships `NullAttestationVerifier` only | `test_production_verifier_denies_all_issuance`, `test_production_package_exports_no_test_only_or_inheritance_path` |
+| Attestation binds task / plan revision+hash / preview / scope / issuer / freshness | `issuance.py::_check_attestation` replays every binding field | `test_attestation_must_bind_this_exact_authorization`, `test_attestation_from_another_task_cannot_authorize`, `test_attestation_expiry_must_cover_the_grant`, `test_forged_origin_and_expired_attestation_are_rejected_by_contract` |
+| Python class identity is not a trust boundary | trust = validated data + injected verifier; no `isinstance` gate, no shipped subclass | `test_production_package_exports_no_test_only_or_inheritance_path`, `test_attestation_is_validated_data_not_a_duck_typed_object` |
 | Production issuance disabled where the mechanism is absent | no production subclass; `GrantIssuer` is unreachable from API/desktop | same two tests |
 | No ambiguous second approval; Stage 3 approve button not upgraded | `apps/desktop` unchanged | desktop suite unchanged (55/55 Node, 6/6 Python) |
 
@@ -103,11 +105,24 @@ closed check passed*, and nothing was authorized, consumed or executed. Consumpt
 are durable and adversarially tested **before** an executor could rely on them; the
 policy broker never consumes.
 
-**Issuance is disabled.** `AuthorizingProof.__init__` refuses direct construction, and
-the only subclass shipped is `TestOnlyAuthorizingProof`. A production authorizing
-interaction (authenticated user gesture → Electron main → backend attestation) does not
-exist, so no production code path can obtain proof. A test in the suite scans the whole
-`aether` package to prove nothing outside `core/grants` constructs a proof or an issuer.
+**Issuance is disabled.** Authorization is a *data* contract plus an injected verifier,
+not an inheritance hierarchy:
+
+* `AuthorizationAttestation` (frozen, `extra="forbid"`, `strict=True`) binds the
+  authorization identity, trusted authority id, exact task, plan revision/hash, the preview
+  id and digest the user saw, the approved-scope digest, and its own ≤60-minute window.
+* `GrantIssuer` re-derives the scope digest from the grant it is about to persist and
+  requires the attestation to match task, plan revision, plan hash and scope digest
+  exactly, to have been authorized no later than the grant's issue time, and to expire no
+  earlier than the grant does.
+* The trust decision is `AttestationVerifier.verify(...)`, injected at construction.
+  Production ships `NullAttestationVerifier` (`PRODUCTION_ATTESTATION_VERIFIER`), which
+  rejects everything, so **production issuance is disabled**. A claim whose
+  `authority_id` does not match the configured verifier is refused before verification.
+* Nothing test-only is exported: `aether.core.grants.__all__` contains no
+  `AuthorizingProof`/`TestOnly*` names, and the test simulation lives only in
+  `backend/tests/stage4_support.py`. A source-scan test asserts no module outside
+  `core/grants` constructs an issuer or an attestation.
 
 **Review evidence is not authority.** The ledger never reads `approval_records`; the
 Stage 3 channel, the Stage 2 approve button and the synthetic dev seeds
@@ -133,13 +148,26 @@ consumption table and `CONSUMED` events.
 
 `backend/aether/core/persistence/proposed_migrations/0002_phase2b_stage4_grants.sql`
 
-- SHA-256: `a91b431cd84ced700b443df8ed0ecce45316f5f9737d768d8f313cc59d1c18cb`
+- SHA-256: `d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c`
+  (supersedes the earlier proposed `a91b431c…`, which is **not** approved and must be
+  discarded)
 - Full version-2 schema fingerprint (30 objects, computed like
-  `SQLiteTaskStore._verify_schema`): `f68447f63fe0c61313a8df30d09b572f74352f6860bcaf1678f06bf6565283f2`
+  `SQLiteTaskStore._verify_schema`): `dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788`
+  (30 objects, unchanged count; supersedes `f68447f6…`)
 - New objects: `exact_approval_grants`, `exact_approval_grant_state`,
   `exact_approval_grant_events`, `exact_approval_grant_consumptions`, two indexes, and
   seven triggers (append-only events/consumptions, immutable grant scope, no-delete and
   guarded-update on state).
+- Columns added by the review corrections:
+  `exact_approval_grants.issuance_digest` (full immutable authorization intent, S4-2) and
+  `exact_approval_grants.issued_by` (bounded issuer code, S4-5);
+  `exact_approval_grant_consumptions.risk_tier`, `.arguments_sha256`,
+  `.expected_effect_sha256`, `.resource_versions_digest`, `.action_digest`,
+  `.consumed_by` (complete action binding, S4-3);
+  `exact_approval_grant_events.reason_code` and
+  `exact_approval_grant_state.revocation_code` replace free-text revocation reasons with
+  bounded machine-readable codes (`CHECK … GLOB '[A-Z]*'`), plus
+  `CHECK ((revoked_at IS NULL) = (revocation_code IS NULL))` (S4-5).
 - It lives in `proposed_migrations/`, is **not** in `migrations/`, is **not** in
   `_EXPECTED_MIGRATIONS`, and no production fingerprint references it.
 
@@ -168,10 +196,10 @@ Environment: `/tmp/aether-stage4-venv` (Python 3.11), editable backend install.
 
 | Check | Result |
 |---|---|
-| `pytest tests` | **333 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 47 (46 new + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
+| `pytest tests` | **375 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 89 (88 in `test_phase2b_stage4_grants.py` + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
 | `ruff check .` | passed |
 | `ruff format --check` (Stage 4 files) | passed |
-| `mypy` (strict) | passed, 71 source files |
+| `mypy` (strict) | passed, 72 source files |
 | Backend wheel/migration pins | unchanged (`0001` = `70907729…`, schema `02f3cac7…`) |
 | Desktop `npm run check` | passed — ESLint clean, both TS projects, renderer build, **61 Node tests** (54 pass / 7 skipped by design), **6/6** Python child tests, Electron build |
 | `scripts/generate_stage2_golden.py --check` | up to date |
@@ -191,26 +219,65 @@ in-process Python plus SQLite; the Windows acceptance items in
 
 | Adversarial scenario (task requirement) | Test |
 |---|---|
-| Forged approval origin | `test_authorizing_proof_cannot_be_constructed_by_production_code`, `test_ledger_rejects_tampered_migration_ledger_and_schema` |
-| Audit-only APPROVE misused as authorization | `test_issuance_requires_authorizing_proof_never_review_evidence` |
-| Task / plan / step substitution | `test_substitution_of_task_plan_step_or_effect_denies` |
+| Forged approval origin | `test_production_verifier_denies_all_issuance`, `test_attestation_must_bind_this_exact_authorization`, `test_forged_origin_and_expired_attestation_are_rejected_by_contract`, `test_production_package_exports_no_test_only_or_inheritance_path` |
+| Audit-only APPROVE misused as authorization | `test_issuance_requires_attestation_never_review_evidence` |
+| Task / plan / step substitution | `test_substitution_of_task_plan_step_or_effect_denies`, `test_attestation_from_another_task_cannot_authorize` |
 | Resource substitution | `test_resource_substitution_scope_widening_and_stale_versions_deny` |
 | Stale content/state versions | same test (stale `observed_version`, unversioned ref) |
 | Scope widening | `test_resource_substitution_scope_widening_and_stale_versions_deny`, `test_no_wildcard_or_blanket_tier_grant_can_be_built`, `test_duplicate_issuance_is_idempotent_and_conflicts_on_scope_change` |
 | Grant expiry | `test_expiry_denies_consume_and_reports_state`, `test_expired_revoked_exhausted_or_absent_grants_deny` |
 | Exhaustion | `test_exhaustion_replay_and_duplicate_consumption`, `test_concurrent_consumption_never_overspends` |
-| Revocation | `test_revocation_blocks_use_and_is_idempotent`, `test_scope_row_and_ledgers_are_immutable` |
-| Replay | `test_exhaustion_replay_and_duplicate_consumption` (idempotent replay, conflicting replay) |
-| Duplicate issuance | `test_duplicate_issuance_is_idempotent_and_conflicts_on_scope_change` |
+| Revocation | `test_revocation_is_bounded_code_and_idempotent`, `test_scope_rows_and_ledgers_are_immutable` |
+| Replay (issuance) | `test_replay_with_changed_authorization_terms_is_a_conflict`, `test_replay_with_changed_issuer_identity_is_a_conflict`, `test_supplied_scope_digest_is_verified_independently`, `test_duplicate_issuance_is_idempotent_only_for_identical_terms` |
+| Replay (consumption) | `test_exact_consumption_replay_is_idempotent`, `test_consumption_replay_with_changed_action_terms_fails_closed`, `test_consumption_replay_binding_survives_reopen` |
+| Superseded plan / invalidated consent | `test_issued_grant_is_denied_after_the_plan_advances`, `test_use_is_denied_once_the_task_leaves_consent_states`, `test_issuance_refuses_tasks_outside_consent_states_and_invalidated_consent`, `test_issuance_rechecks_the_plan_inside_its_transaction`, `test_current_plan_check_and_decrement_are_atomic_under_concurrency` |
+| Ownership / audit privacy | `test_ledger_shares_the_store_connection_and_lock`, `test_ledger_write_is_rolled_back_with_the_task_transaction`, `test_standalone_ledger_cannot_take_ownership_from_a_store`, `test_standalone_ledgers_are_mutually_exclusive`, `test_read_only_handle_verifies_and_cannot_write`, `test_free_text_audit_metadata_is_refused`, `test_consumption_consumer_code_is_bounded` |
+| Duplicate issuance | `test_duplicate_issuance_is_idempotent_only_for_identical_terms` |
 | Crash / restart integrity | `test_crash_restart_preserves_committed_state` |
-| Concurrency | `test_concurrent_consumption_never_overspends` |
+| Concurrency | `test_concurrent_consumption_never_overspends`, `test_current_plan_check_and_decrement_are_atomic_under_concurrency` |
 | Transactional failure | `test_transactional_failure_leaves_no_partial_consumption` |
 | Unsupported T3 requests | `test_t3_requests_remain_denied_even_with_a_maximum_grant` |
 | Synthetic development-source isolation | `test_synthetic_preview_review_cannot_produce_a_grant` |
-| No production issuer / no IPC route | `test_no_production_module_issues_grants_or_exposes_ipc`, `test_only_test_simulation_subclass_ships` |
+| No production issuer / no IPC route | `test_no_production_module_issues_grants_or_exposes_ipc`, `test_production_package_exports_no_test_only_or_inheritance_path` |
 | Ledger never migrates | `test_grant_ledger_never_applies_migrations` |
 
 ---
+
+## 6b. Independent-review corrections (S4-1 … S4-5)
+
+The first review of PR #13 requested five corrections. All are implemented on the same
+branch; none enables issuance, execution or a migration.
+
+| Finding | Code-level resolution | Tests |
+|---|---|---|
+| **S4-1** — `AuthorizingProof` accepted arbitrary subclasses and test-only proof was exported; the proof bound no task/plan/preview/scope | Replaced the capability-class hierarchy with `AuthorizationAttestation` (frozen, strict, `extra="forbid"`) binding authorization id, authority id, task, plan revision/hash, preview id + digest, scope digest and a ≤60-min window. Trust is an injected `AttestationVerifier`; production ships only `NullAttestationVerifier`, so issuance is disabled. `issuance.py` re-derives the scope digest and replays every binding field, refusing a mismatched authority label before any verification. No test-only class is exported; the simulation lives in `backend/tests/stage4_support.py`. | `test_production_package_exports_no_test_only_or_inheritance_path`, `test_production_verifier_denies_all_issuance`, `test_attestation_is_validated_data_not_a_duck_typed_object`, `test_attestation_must_bind_this_exact_authorization`, `test_attestation_from_another_task_cannot_authorize`, `test_attestation_expiry_must_cover_the_grant`, `test_forged_origin_and_expired_attestation_are_rejected_by_contract` |
+| **S4-2** — issuance replay keyed on a scope digest that excluded immutable authorization terms | `issue()` now verifies the *supplied* digest against the computed one and persists `issuance_digest = issuance_intent_digest(scope_digest, task, plan revision/hash, tier, issued/expiry, initial uses, issuer)`. Replay with any changed term is `GrantConflictError`; identical replay stays idempotent. `_grant_from_row` recomputes the intent digest from persisted columns on every load. | `test_supplied_scope_digest_is_verified_independently`, `test_replay_with_changed_authorization_terms_is_a_conflict`, `test_replay_with_changed_issuer_identity_is_a_conflict`, `test_issuance_intent_digest_covers_every_immutable_term` |
+| **S4-3** — consumption replay ignored risk tier, argument/effect hashes and resource versions | Consumptions now persist and compare a complete `action_digest` (plus the individual `risk_tier`, `arguments_sha256`, `expected_effect_sha256`, `resource_versions_digest`, `consumed_by` columns). Identical retry returns the committed consumption; any changed action field raises `GrantConflictError`, including after reopen. | `test_exact_consumption_replay_is_idempotent`, `test_consumption_replay_with_changed_action_terms_fails_closed`, `test_consumption_replay_binding_survives_reopen`, `test_consumption_action_digest_covers_every_action_field` |
+| **S4-4** — validation trusted caller-supplied historical plan identities | Issuance requires the task to exist in a consent-bearing state, be free of fresh-consent blockers, and match the **current** persisted plan; it re-checks the task pointer *inside* the issuing transaction. Consumption re-reads the task state/plan pointer inside the decrement transaction (`GRANT_PLAN_SUPERSEDED` / `TASK_STATE_NOT_AUTHORIZABLE`). `GrantAuthority` accepts an optional store and performs the same current-plan check after scope validation. Recovery class is compared with the persisted plan step's trusted value. | `test_issued_grant_is_denied_after_the_plan_advances`, `test_use_is_denied_once_the_task_leaves_consent_states`, `test_issuance_refuses_tasks_outside_consent_states_and_invalidated_consent`, `test_issuance_rechecks_the_plan_inside_its_transaction`, `test_current_plan_check_and_decrement_are_atomic_under_concurrency`, `test_recovery_class_comes_from_the_trusted_plan_step` |
+| **S4-5** — second connection risked weakening store ownership; audit text was unrestricted | `GrantLedger.open(store)` **shares** the store's owner lock and single connection and reuses the store's `BEGIN IMMEDIATE` transaction (location verified before/after commit), so ownership, atomicity and recovery invariants are untouched; one ledger per store. `read_only()` is an explicit `mode=ro` verification handle and the path-only constructor refuses while a store owns the database. Event `detail` is restricted to allow-listed keys with boolean/integer/bounded-code/digest/timestamp values; revocation and consumer identity are bounded codes (`REVOCATION_CODES`, `CONSUMED_BY_CODES`) with `CHECK … GLOB` constraints, never free text. | `test_ledger_shares_the_store_connection_and_lock`, `test_ledger_write_is_rolled_back_with_the_task_transaction`, `test_store_still_enforces_single_owner_while_ledger_is_open`, `test_standalone_ledger_cannot_take_ownership_from_a_store`, `test_standalone_ledgers_are_mutually_exclusive`, `test_read_only_handle_verifies_and_cannot_write`, `test_free_text_audit_metadata_is_refused`, `test_consumption_consumer_code_is_bounded` |
+
+### Migration-control outcome
+
+The proposed migration's **bytes changed** for S4-2/S4-3/S4-5 and the artefacts were
+regenerated, not carried over:
+
+- proposed migration SHA-256: `d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c`
+  (previous, now **unapproved and superseded**: `a91b431c…`)
+- complete version-2 schema fingerprint: `dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788`
+  (previous: `f68447f6…`), still 30 objects
+- the file remains in `proposed_migrations/`, unregistered, unfingerprinted by
+  `SQLiteTaskStore`, and every test applies it only through a `monkeypatch`-scoped
+  temporary migrations directory.
+
+### Windows-specific acceptance items for this design (not Linux-inferred)
+
+- POSIX shares the database inode for the owner lock; Windows uses the `msvcrt` sidecar.
+  The shared-ownership design means the ledger never opens a lock of its own in production,
+  but the store's Windows sidecar semantics (contention, pathname replacement) still need
+  target-machine verification.
+- Windows ACLs (rather than POSIX `0600`) must be verified for the database and, in
+  standalone/read-only diagnostics, for the sidecar and `mode=ro` handle.
+- Junction/reparse and volume-identity checks are exercised on POSIX only here.
 
 ## 7. Disabled capabilities and remaining limitations
 
@@ -220,6 +287,9 @@ in-process Python plus SQLite; the Windows acceptance items in
   production planner/narrative source) is still absent.
 - **T3 unavailable**, permanently, until a dedicated authorization design and its
   prerequisites are separately approved.
+- **Attestation trust:** `AuthorizationAttestation` is a *claim*. Its trustworthiness is
+  entirely the injected verifier's responsibility; the repair path is a production verifier
+  backed by an authenticated channel, not a data-shape check.
 - **Trust boundary:** a same-user local attacker with write access to the database file
   can still tamper with it; the ledger detects schema, digest, accounting and migration
   tampering and fails closed, but SQLite is not a hardware root of trust. No claim is
@@ -238,8 +308,9 @@ in-process Python plus SQLite; the Windows acceptance items in
    bytes, then merge.
 2. **Trustworthy production plan/preview source + authorizing UI integration** — an
    authenticated authorizing interaction at the Electron-main/backend boundary that can
-   mint an `AuthorizingProof`, plus the planner/narrative source that makes previews
-   non-synthetic. Until this exists, issuance stays disabled.
+   assert trust (a production `AttestationVerifier` bound to an authenticated
+   Electron-main→backend attestation, plus the planner/narrative source that makes previews
+   non-synthetic). Until both exist, issuance stays disabled.
 3. **Windows-safe read/search/open adapters (Phase 2C)** — T0/T1 execution with receipts
    and Windows path/ACL/reparse validation on the target laptop.
 4. **Exact approved recoverable edits (Phase 2D)** — T2 execution bound to a consumed

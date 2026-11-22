@@ -1,19 +1,37 @@
 """Durable, transactional exact-approval-grant ledger (schema version 2).
 
 Security posture mirrors ``SQLiteTaskStore``: raw-path validation, private
-file permissions, fixed WAL/synchronous/secure_delete pragmas, integrity
-checks, and fail-closed schema verification by exact SHA-256 fingerprint.
-The ledger **never applies or registers migrations** — production databases
-at schema version 1 fail closed with :class:`GrantUnavailableError` until
-the proposed ``0002_phase2b_stage4_grants.sql`` migration is separately
-approved, merged and applied.
+file permissions, fixed pragmas, integrity checks, and fail-closed schema
+verification by exact SHA-256 fingerprint. The ledger **never applies or
+registers migrations** — databases below version 2 fail closed with
+:class:`GrantUnavailableError` until the proposed
+``0002_phase2b_stage4_grants.sql`` migration is separately approved, merged
+and applied.
 
-Consumption is a compare-and-decrement inside ``BEGIN IMMEDIATE``: a grant
-can never be spent below zero, a revoked/expired/exhausted grant can never
-be spent, and a retried consumption with the same idempotency identity
-returns the recorded outcome without double-spending. Crash behavior is
-all-or-nothing per transaction; committed effects survive restart, and an
-uncommitted consumption leaves no trace.
+Ownership and transaction design (independent review S4-5)
+-----------------------------------------------------------
+The task store owns one database at a time; its single-owner lock and
+storage-identity checks are never weakened.
+
+* :meth:`GrantLedger.open` requires a live :class:`SQLiteTaskStore` for the
+  same absolute database path and **shares** its already-held owner lock and
+  connection. The ledger never opens a second lock, never opens a second
+  connection to the same file, and never takes ownership away from the store.
+* The store's location verification, its ``BEGIN IMMEDIATE`` transaction (with
+  rollback and post-commit re-verification), and its lock release order are
+  reused unchanged, so grant writes cannot interleave with task writes inside
+  one transaction and crash recovery stays all-or-nothing.
+* :meth:`GrantLedger.read_only` exists for read-only verification (no owner
+  lock, no transaction) and is documented as not an authorization path.
+* :meth:`GrantLedger` (path-only construction) is retained **only** for tests
+  and for read-only diagnostics against a database no store has open. It is
+  not used for production issuance and takes its own lock when available.
+
+Consumption is a compare-and-decrement inside the store's transaction: a
+grant can never be spent below zero, a revoked/expired/exhausted grant can
+never be spent, and a retried consumption with the same idempotency identity
+returns the recorded outcome without double-spending — but only when *every*
+action-defining field matches.
 """
 
 from __future__ import annotations
@@ -29,7 +47,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import ValidationError
@@ -48,11 +66,15 @@ from aether.core.grants.validation import check_grant_scope
 from aether.core.persistence.sqlite_store import (
     PersistenceError,
     _check_safe_storage_path,
+    _inspect_storage_volume,
     _validate_raw_database_path,
 )
 
-_EXPECTED_SCHEMA_SHA256_V2 = "f68447f63fe0c61313a8df30d09b572f74352f6860bcaf1678f06bf6565283f2"
-_PROPOSED_MIGRATION_SHA256 = "a91b431cd84ced700b443df8ed0ecce45316f5f9737d768d8f313cc59d1c18cb"
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from aether.core.persistence.sqlite_store import SQLiteTaskStore
+
+_EXPECTED_SCHEMA_SHA256_V2 = "dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788"
+_PROPOSED_MIGRATION_SHA256 = "d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c"
 _MIGRATION_NAME_V2 = "0002_phase2b_stage4_grants"
 _REQUIRED_V2_TABLES = frozenset(
     {
@@ -88,6 +110,21 @@ _REQUIRED_V2_TRIGGERS = frozenset(
     }
 )
 
+# Revocation and consumption sources are bounded machine-readable codes, never
+# free text: nothing secret-bearing can be persisted into grant metadata.
+REVOCATION_CODES = frozenset(
+    {
+        "SUPERSEDED_BY_PLAN",
+        "TASK_TERMINATED",
+        "CONSENT_REVOKED",
+        "USER_CANCELLED",
+        "SCOPE_INVALIDATED",
+        "ADMINISTRATIVE",
+    }
+)
+CONSUMED_BY_CODES = frozenset({"policy_check", "execution_adapter", "test_simulation"})
+_ISSUER_CODE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
+
 
 def _canonical_json(value: object) -> str:
     return json.dumps(
@@ -97,6 +134,10 @@ def _canonical_json(value: object) -> str:
         separators=(",", ":"),
         allow_nan=False,
     )
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _timestamp(value: datetime) -> str:
@@ -112,10 +153,103 @@ def _parse_timestamp(value: str) -> datetime:
     return parsed
 
 
+def _resource_versions_digest(resource_versions: dict[str, str]) -> str:
+    """Canonical digest of the sorted (resource_id, observed_version) set."""
+
+    return _sha256_text(
+        _canonical_json(
+            [[resource_id, version] for resource_id, version in sorted(resource_versions.items())]
+        )
+    )
+
+
+def issuance_intent_digest(
+    *,
+    scope_digest: str,
+    task_id: UUID,
+    plan_revision: int,
+    plan_hash: str,
+    max_tier: int,
+    issued_at: datetime,
+    expires_at: datetime,
+    uses_remaining: int,
+    issued_by: str,
+) -> str:
+    """Digest of the full immutable authorization intent (S4-2).
+
+    ``exact_approval_scope_digest`` covers the approved operations only. The
+    issuance identity must additionally bind the tier ceiling, the issue and
+    expiry times, the initial use bound and the trusted issuer identity, so a
+    replay under one issuance key with changed terms can never be accepted as
+    the same authorization.
+    """
+
+    return _sha256_text(
+        _canonical_json(
+            {
+                "scope_digest": scope_digest,
+                "task_id": str(task_id),
+                "plan_revision": plan_revision,
+                "plan_hash": plan_hash.casefold(),
+                "max_tier": int(max_tier),
+                "issued_at": _timestamp(issued_at),
+                "expires_at": _timestamp(expires_at),
+                "uses_remaining": int(uses_remaining),
+                "issued_by": issued_by,
+            }
+        )
+    )
+
+
+def consumption_action_digest(
+    *,
+    approval_id: UUID,
+    task_id: UUID,
+    plan_revision: int,
+    plan_hash: str,
+    step_id: UUID,
+    capability_id: str,
+    risk_tier: RiskTier,
+    arguments_sha256: str,
+    expected_effect_sha256: str,
+    resource_versions_digest: str,
+    consumed_by: str,
+) -> str:
+    """Digest of every action-defining field of one consumption (S4-3).
+
+    ``consumed_by`` is included so one consumer cannot adopt another
+    consumer's committed consumption identity.
+    """
+
+    return _sha256_text(
+        _canonical_json(
+            {
+                "approval_id": str(approval_id),
+                "task_id": str(task_id),
+                "plan_revision": int(plan_revision),
+                "plan_hash": plan_hash.casefold(),
+                "step_id": str(step_id),
+                "capability_id": capability_id,
+                "risk_tier": int(risk_tier),
+                "arguments_sha256": arguments_sha256.casefold(),
+                "expected_effect_sha256": expected_effect_sha256.casefold(),
+                "resource_versions_digest": resource_versions_digest,
+                "consumed_by": consumed_by,
+            }
+        )
+    )
+
+
 class GrantLedger:
     """Schema-v2 grant store. Fails closed on any verification mismatch."""
 
-    def __init__(self, database_path: Path | str) -> None:
+    def __init__(
+        self,
+        database_path: Path | str,
+        *,
+        _connection: sqlite3.Connection | None = None,
+        _shared_transaction: Any = None,
+    ) -> None:
         try:
             raw_database_path = os.fspath(database_path)
         except TypeError as exc:
@@ -123,9 +257,6 @@ class GrantLedger:
         if not isinstance(raw_database_path, str):
             raise GrantIntegrityError("database path must be text or a path-like object")
         self.database_path = Path(raw_database_path).expanduser()
-        # Path safety is the same fail-closed validation the task store uses;
-        # any rejection is reported as a grant-ledger integrity failure so the
-        # ledger never degrades into "probably fine" behavior.
         try:
             _validate_raw_database_path(raw_database_path)
             _validate_raw_database_path(os.fspath(self.database_path))
@@ -142,42 +273,212 @@ class GrantLedger:
             _check_safe_storage_path(self.database_path)
         except PersistenceError as exc:
             raise GrantIntegrityError("grant ledger storage path is redirected or unsafe") from exc
-        if os.name != "nt" and self.database_path.exists():
-            self.database_path.chmod(0o600)
         self._lock = threading.RLock()
         self._closed = False
+        self._owns_connection = _connection is None
+        self._owns_lock = False
+        self._owner_lock_file: Any = None
+        self._store: SQLiteTaskStore | None = None
+        if _connection is not None:
+            # Shared mode: the store owns the only connection and owner lock.
+            self._connection = _connection
+            self._shared_transaction = _shared_transaction
+        else:
+            # Standalone mode: tests and read-only diagnostics only.
+            if os.name != "nt" and self.database_path.exists():
+                self.database_path.chmod(0o600)
+            try:
+                self._acquire_owner_lock()
+                self._connection = sqlite3.connect(
+                    self.database_path,
+                    timeout=5.0,
+                    isolation_level=None,
+                    check_same_thread=False,
+                )
+                self._connection.row_factory = sqlite3.Row
+                self._connection.execute("PRAGMA foreign_keys = ON")
+                self._connection.execute("PRAGMA busy_timeout = 5000")
+                self._connection.execute("PRAGMA synchronous = FULL")
+                self._connection.execute("PRAGMA secure_delete = ON")
+                self._shared_transaction = None
+            except (sqlite3.Error, OSError) as exc:
+                self._release_quietly()
+                raise GrantIntegrityError("grant ledger initialization failed closed") from exc
         try:
-            self._connection = sqlite3.connect(
-                self.database_path,
+            self._check_integrity()
+            self._verify_v2_schema()
+            self._check_integrity()
+        except (GrantUnavailableError, GrantIntegrityError):
+            self._release_quietly()
+            raise
+        except sqlite3.Error as exc:
+            self._release_quietly()
+            raise GrantIntegrityError("grant ledger initialization failed closed") from exc
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def open(cls, store: SQLiteTaskStore) -> GrantLedger:
+        """Open the ledger for a live store, **sharing** its lock and connection.
+
+        This is the only supported path for operations that write grants. It
+        requires the store to be open, verifies that this ledger targets the
+        very same database file, and reuses the store's own transaction, which
+        already verifies storage location before and after every commit.
+        """
+
+        database_path = getattr(store, "database_path", None)
+        if database_path is None:
+            raise GrantUnavailableError("grant ledger requires an open task store")
+        if getattr(store, "_closed", True):
+            raise GrantUnavailableError("grant ledger requires an open task store")
+        connection = getattr(store, "_connection", None)
+        if connection is None:
+            raise GrantUnavailableError("grant ledger requires the store's own connection")
+        previous = getattr(store, "_stage4_grant_ledger", None)
+        if previous is not None and not previous._closed:
+            raise GrantUnavailableError(
+                "a grant ledger is already open for this store; close it before opening another"
+            )
+        ledger = cls(
+            database_path,
+            _connection=connection,
+            _shared_transaction=store._transaction,
+        )
+        ledger._store = store
+        try:
+            store._stage4_grant_ledger = ledger  # type: ignore[attr-defined]
+        except AttributeError:  # pragma: no cover - unexpected store shape
+            raise GrantUnavailableError("task store cannot host a grant ledger") from None
+        return ledger
+
+    @classmethod
+    def read_only(cls, database_path: Path | str) -> GrantLedger:
+        """Read-only verification handle. Never authorizes and never writes.
+
+        Uses ``mode=ro`` so SQLite itself refuses writes. Requires exclusive
+        access, so callers must not hold a store open on the same database.
+        """
+
+        instance = cls.__new__(cls)
+        instance.database_path = Path(os.fspath(database_path)).expanduser()
+        try:
+            _validate_raw_database_path(os.fspath(instance.database_path))
+            _check_safe_storage_path(instance.database_path)
+        except PersistenceError as exc:
+            raise GrantIntegrityError(
+                "grant ledger database path failed safety validation"
+            ) from exc
+        if not instance.database_path.exists():
+            raise GrantUnavailableError("grant ledger database does not exist")
+        instance._lock = threading.RLock()
+        instance._closed = False
+        instance._owns_connection = True
+        instance._owns_lock = False
+        instance._owner_lock_file = None
+        instance._store = None
+        instance._shared_transaction = None
+        try:
+            instance._connection = sqlite3.connect(
+                f"file:{instance.database_path}?mode=ro",
+                uri=True,
                 timeout=5.0,
                 isolation_level=None,
                 check_same_thread=False,
             )
-            self._connection.row_factory = sqlite3.Row
-            self._connection.execute("PRAGMA foreign_keys = ON")
-            self._connection.execute("PRAGMA busy_timeout = 5000")
-            self._connection.execute("PRAGMA synchronous = FULL")
-            self._connection.execute("PRAGMA secure_delete = ON")
-            self._check_integrity()
-            self._verify_v2_schema()
-            self._check_integrity()
+            instance._connection.row_factory = sqlite3.Row
+            instance._check_integrity()
+            instance._verify_v2_schema()
         except (sqlite3.Error, OSError) as exc:
-            self._release_quietly()
-            raise GrantIntegrityError("grant ledger initialization failed closed") from exc
-        except GrantUnavailableError:
-            self._release_quietly()
+            instance._release_quietly()
+            raise GrantIntegrityError("grant ledger read-only open failed closed") from exc
+        return instance
+
+    # ------------------------------------------------------------------
+    # Owner lock (standalone mode only)
+    # ------------------------------------------------------------------
+
+    def _acquire_owner_lock(self) -> None:
+        lock_path = (
+            self.database_path
+            if os.name != "nt"
+            else self.database_path.with_name(self.database_path.name + ".owner.lock")
+        )
+        _check_safe_storage_path(lock_path)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        import importlib
+
+        try:
+            descriptor = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise GrantUnavailableError(
+                "another process owns this database (standalone grant ledger lock unavailable)"
+            ) from exc
+        try:
+            volume = _inspect_storage_volume(self.database_path)
+            if os.name != "nt":
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(descriptor, 0o600)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            if os.name == "nt":
+                windows_locking = importlib.import_module("msvcrt")
+                windows_locking.locking(descriptor, windows_locking.LK_NBLCK, 1)
+            else:
+                posix_locking = importlib.import_module("fcntl")
+                posix_locking.flock(descriptor, posix_locking.LOCK_EX | posix_locking.LOCK_NB)
+            if _inspect_storage_volume(lock_path) != volume:
+                raise OSError("lock volume changed")
+            self._owner_lock_file = os.fdopen(descriptor, "r+b", buffering=0)
+            self._owns_lock = True
+        except OSError as exc:
+            os.close(descriptor)
+            raise GrantUnavailableError("another process owns this database") from exc
+        except Exception:
+            os.close(descriptor)
             raise
-        except GrantIntegrityError:
-            self._release_quietly()
-            raise
+
+    def _release_owner_lock(self) -> None:
+        lock_file = self._owner_lock_file
+        if lock_file is None:
+            return
+        self._owner_lock_file = None
+        self._owns_lock = False
+
+        def unlock() -> None:
+            if os.name == "nt":
+                import importlib
+
+                windows_locking = importlib.import_module("msvcrt")
+                windows_locking.locking(lock_file.fileno(), windows_locking.LK_UNLCK, 1)
+            else:
+                import importlib
+
+                posix_locking = importlib.import_module("fcntl")
+                posix_locking.flock(lock_file.fileno(), posix_locking.LOCK_UN)
+
+        with contextlib.suppress(OSError, ValueError):
+            unlock()
+        with contextlib.suppress(OSError):
+            lock_file.close()
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             try:
-                self._connection.close()
+                if self._owns_connection:
+                    self._connection.close()
             finally:
+                self._release_owner_lock()
+                store = self._store
+                if store is not None and getattr(store, "_stage4_grant_ledger", None) is self:
+                    store._stage4_grant_ledger = None  # type: ignore[attr-defined]
+                self._store = None
                 self._closed = True
 
     def __enter__(self) -> GrantLedger:
@@ -222,7 +523,7 @@ class GrantLedger:
         if not _REQUIRED_V2_TABLES.issubset(tables) or not _REQUIRED_V2_TRIGGERS.issubset(triggers):
             raise GrantIntegrityError("database schema objects are missing for schema version 2")
         descriptor = [(row["type"], row["name"], _normalize_schema_sql(row["sql"])) for row in rows]
-        schema_hash = hashlib.sha256(_canonical_json(descriptor).encode("utf-8")).hexdigest()
+        schema_hash = _sha256_text(_canonical_json(descriptor))
         if schema_hash != _EXPECTED_SCHEMA_SHA256_V2:
             raise GrantIntegrityError("database schema integrity fingerprint mismatch")
         migration = self._connection.execute(
@@ -234,11 +535,14 @@ class GrantLedger:
             raise GrantIntegrityError("schema migration ledger checksum mismatch")
 
     def _release_quietly(self) -> None:
-        with contextlib.suppress(sqlite3.Error, AttributeError):
-            self._connection.close()
+        with contextlib.suppress(sqlite3.Error, AttributeError, OSError):
+            if getattr(self, "_owns_connection", True) and hasattr(self, "_connection"):
+                self._connection.close()
+        if getattr(self, "_owns_lock", False):
+            self._release_owner_lock()
 
     # ------------------------------------------------------------------
-    # Issuance (transactional, idempotent on the issuance identity)
+    # Issuance (transactional, idempotent on the full authorization intent)
     # ------------------------------------------------------------------
 
     def issue(
@@ -249,65 +553,119 @@ class GrantLedger:
         issuance_key: UUID,
         issued_by: str,
     ) -> GrantIssuanceOutcome:
-        with self._lock, self._transaction():
-            existing = self._connection.execute(
-                "SELECT approval_id, scope_digest FROM exact_approval_grants "
+        # S4-2: the supplied digest is verified independently, never trusted.
+        actual_digest = exact_approval_scope_digest(grant)
+        if not isinstance(scope_digest, str) or scope_digest != actual_digest:
+            raise GrantIntegrityError(
+                "supplied scope digest does not match the grant's computed scope digest"
+            )
+        if not isinstance(issued_by, str) or not _ISSUER_CODE.fullmatch(issued_by):
+            raise GrantIntegrityError("issued_by must be a bounded machine-readable code")
+        normalized_issuer = issued_by.lower()
+        intent_digest = issuance_intent_digest(
+            scope_digest=actual_digest,
+            task_id=grant.task_id,
+            plan_revision=grant.plan_revision,
+            plan_hash=grant.plan_hash,
+            max_tier=int(grant.max_tier),
+            issued_at=grant.issued_at,
+            expires_at=grant.expires_at,
+            uses_remaining=grant.uses_remaining,
+            issued_by=normalized_issuer,
+        )
+        with self._lock, self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT approval_id, scope_digest, issuance_digest FROM exact_approval_grants "
                 "WHERE issuance_key = ?",
                 (str(issuance_key),),
             ).fetchone()
             if existing is not None:
-                if existing["scope_digest"] != scope_digest:
+                if existing["issuance_digest"] != intent_digest:
                     raise GrantConflictError(
-                        "issuance identity was replayed with a different grant scope"
+                        "issuance identity was replayed with different authorization terms"
                     )
                 return GrantIssuanceOutcome(
                     approval_id=UUID(existing["approval_id"]),
-                    scope_digest=scope_digest,
+                    scope_digest=actual_digest,
                     replayed=True,
                 )
+            duplicate = connection.execute(
+                "SELECT 1 FROM exact_approval_grants WHERE approval_id = ?",
+                (str(grant.approval_id),),
+            ).fetchone()
+            if duplicate is not None:
+                raise GrantConflictError("approval id already identifies a persisted grant")
+            # S4-4: re-verify the task's *current* plan pointer and consent
+            # state inside the issuing transaction, so a plan change that
+            # raced the pre-check cannot be persisted as a live grant.
+            task_row = connection.execute(
+                "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?",
+                (str(grant.task_id),),
+            ).fetchone()
+            if task_row is None:
+                raise GrantDeniedError(
+                    "TASK_NOT_AVAILABLE", "the authorization target task does not exist"
+                )
+            if (
+                int(task_row["plan_revision"]) != grant.plan_revision
+                or task_row["plan_hash"] != grant.plan_hash.casefold()
+            ):
+                raise GrantDeniedError(
+                    "GRANT_PLAN_SUPERSEDED",
+                    "the task's current plan changed while issuing this grant",
+                )
+            if task_row["state"] not in ("PREVIEW_READY", "AWAITING_APPROVAL"):
+                raise GrantDeniedError(
+                    "TASK_STATE_NOT_AUTHORIZABLE",
+                    "the task left a consent-bearing state while issuing this grant",
+                )
             scope_json = _canonical_json(grant.model_dump(mode="json"))
-            self._connection.execute(
+            connection.execute(
                 "INSERT INTO exact_approval_grants ("
                 "approval_id, task_id, plan_revision, plan_hash, scope_digest, scope_json,"
-                " max_tier, approval_origin, issued_at, expires_at, issued_by,"
+                " issuance_digest, max_tier, approval_origin, issued_at, expires_at, issued_by,"
                 " issuance_key, created_at"
-                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     str(grant.approval_id),
                     str(grant.task_id),
                     grant.plan_revision,
                     grant.plan_hash.casefold(),
-                    scope_digest,
+                    actual_digest,
                     scope_json,
+                    intent_digest,
                     int(grant.max_tier),
                     grant.approval_origin,
                     _timestamp(grant.issued_at),
                     _timestamp(grant.expires_at),
-                    issued_by,
+                    normalized_issuer,
                     str(issuance_key),
                     _timestamp(datetime.now(UTC)),
                 ),
             )
-            self._connection.execute(
+            connection.execute(
                 "INSERT INTO exact_approval_grant_state ("
                 "approval_id, initial_uses_remaining, uses_remaining, consumed_count,"
-                " revoked_at, revocation_reason"
+                " revoked_at, revocation_code"
                 ") VALUES (?,?,?,0,NULL,NULL)",
                 (str(grant.approval_id), grant.uses_remaining, grant.uses_remaining),
             )
             self._append_event_unlocked(
+                connection,
                 str(grant.approval_id),
                 "ISSUED",
-                {
+                reason_code=None,
+                detail={
                     "approval_id": str(grant.approval_id),
-                    "scope_digest": scope_digest,
-                    "issued_by": issued_by,
+                    "scope_digest": actual_digest,
+                    "issuance_digest": intent_digest,
+                    "issued_by": normalized_issuer,
                     "uses_remaining": grant.uses_remaining,
                 },
             )
             return GrantIssuanceOutcome(
                 approval_id=grant.approval_id,
-                scope_digest=scope_digest,
+                scope_digest=actual_digest,
                 replayed=False,
             )
 
@@ -326,6 +684,7 @@ class GrantLedger:
         with self._lock:
             row = self._grant_row(approval_id)
             grant, state = self._grant_view(approval_id, row)
+
             grant_state: Literal["ACTIVE", "NOT_YET_VALID", "EXPIRED", "REVOKED", "EXHAUSTED"]
             if grant.revoked_at is not None:
                 grant_state = "REVOKED"
@@ -350,7 +709,7 @@ class GrantLedger:
                 uses_remaining=grant.uses_remaining,
                 consumed_count=state["consumed_count"],
                 revoked_at=grant.revoked_at,
-                revocation_reason=state["revocation_reason"],
+                revocation_code=state["revocation_code"],
                 state=grant_state,
             )
 
@@ -381,33 +740,36 @@ class GrantLedger:
         self,
         approval_id: UUID,
         *,
-        reason: str,
+        reason_code: str,
         now: datetime | None = None,
     ) -> GrantStatus:
         now = now or datetime.now(UTC)
-        if not isinstance(reason, str) or not reason.strip() or len(reason) > 256:
+        if not isinstance(reason_code, str) or reason_code not in REVOCATION_CODES:
             raise GrantDeniedError(
-                "REVOCATION_REASON_INVALID", "revocation reason must be 1..256 chars"
+                "REVOCATION_CODE_INVALID",
+                "revocation reason must be one of the bounded machine-readable codes",
             )
-        with self._lock, self._transaction():
-            row = self._connection.execute(
+        with self._lock, self._transaction() as connection:
+            row = connection.execute(
                 "SELECT revoked_at FROM exact_approval_grant_state WHERE approval_id = ?",
                 (str(approval_id),),
             ).fetchone()
             if row is None:
                 raise GrantNotFoundError("no persisted grant exists for the given approval id")
             if row["revoked_at"] is None:
-                updated = self._connection.execute(
-                    "UPDATE exact_approval_grant_state SET revoked_at = ?, revocation_reason = ? "
+                updated = connection.execute(
+                    "UPDATE exact_approval_grant_state SET revoked_at = ?, revocation_code = ? "
                     "WHERE approval_id = ? AND revoked_at IS NULL",
-                    (_timestamp(now), reason, str(approval_id)),
+                    (_timestamp(now), reason_code, str(approval_id)),
                 )
                 if updated.rowcount != 1:
                     raise GrantIntegrityError("grant revocation lost its compare-and-set")
                 self._append_event_unlocked(
+                    connection,
                     str(approval_id),
                     "REVOKED",
-                    {"reason": reason, "revoked_at": _timestamp(now)},
+                    reason_code=reason_code,
+                    detail={"revoked_at": _timestamp(now)},
                 )
             # Idempotent: revoking an already-revoked grant returns current state.
         return self.status(approval_id, now=now)
@@ -430,29 +792,41 @@ class GrantLedger:
         arguments_sha256: str,
         expected_effect_sha256: str,
         resource_versions: dict[str, str],
+        consumed_by: str,
         now: datetime | None = None,
     ) -> GrantConsumption:
         now = now or datetime.now(UTC)
-        with self._lock, self._transaction():
-            existing = self._connection.execute(
+        if consumed_by not in CONSUMED_BY_CODES:
+            raise GrantDeniedError(
+                "CONSUMER_CODE_INVALID", "consumed_by must be a bounded machine-readable code"
+            )
+        resources_digest = _resource_versions_digest(resource_versions)
+        action_digest = consumption_action_digest(
+            approval_id=approval_id,
+            task_id=task_id,
+            plan_revision=plan_revision,
+            plan_hash=plan_hash,
+            step_id=step_id,
+            capability_id=capability_id,
+            risk_tier=risk_tier,
+            arguments_sha256=arguments_sha256,
+            expected_effect_sha256=expected_effect_sha256,
+            resource_versions_digest=resources_digest,
+            consumed_by=consumed_by,
+        )
+        with self._lock, self._transaction() as connection:
+            existing = connection.execute(
                 "SELECT * FROM exact_approval_grant_consumptions WHERE consumption_id = ?",
                 (str(consumption_id),),
             ).fetchone()
             if existing is not None:
-                if (
-                    existing["approval_id"] != str(approval_id)
-                    or existing["task_id"] != str(task_id)
-                    or int(existing["plan_revision"]) != plan_revision
-                    or existing["plan_hash"].casefold() != plan_hash.casefold()
-                    or existing["step_id"] != str(step_id)
-                    or existing["capability_id"] != capability_id
-                ):
+                if existing["action_digest"] != action_digest:
                     raise GrantConflictError(
-                        "consumption identity was replayed with different action data"
+                        "consumption identity was replayed with different action terms"
                     )
                 replayed = self._consumption_from_row(existing)
                 return replayed.model_copy(update={"replayed": True})
-            row = self._connection.execute(
+            row = connection.execute(
                 "SELECT * FROM exact_approval_grants WHERE approval_id = ?",
                 (str(approval_id),),
             ).fetchone()
@@ -474,7 +848,14 @@ class GrantLedger:
             )
             if not check.ok:
                 raise GrantDeniedError(check.reason_code, "grant does not authorize this action")
-            decremented = self._connection.execute(
+            self._check_current_task_binding(
+                connection,
+                grant=grant,
+                task_id=task_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+            )
+            decremented = connection.execute(
                 "UPDATE exact_approval_grant_state "
                 "SET uses_remaining = uses_remaining - 1, consumed_count = consumed_count + 1 "
                 "WHERE approval_id = ? AND uses_remaining > 0 AND revoked_at IS NULL",
@@ -485,11 +866,13 @@ class GrantLedger:
                     "GRANT_EXHAUSTED", "grant use was lost to a concurrent transition"
                 )
             after = state["uses_remaining"] - 1
-            self._connection.execute(
+            connection.execute(
                 "INSERT INTO exact_approval_grant_consumptions ("
                 "consumption_id, approval_id, task_id, plan_revision, plan_hash,"
-                " step_id, capability_id, consumed_at, uses_remaining_after"
-                ") VALUES (?,?,?,?,?,?,?,?,?)",
+                " step_id, capability_id, risk_tier, arguments_sha256,"
+                " expected_effect_sha256, resource_versions_digest, action_digest,"
+                " consumed_by, consumed_at, uses_remaining_after"
+                ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     str(consumption_id),
                     str(approval_id),
@@ -498,17 +881,26 @@ class GrantLedger:
                     plan_hash.casefold(),
                     str(step_id),
                     capability_id,
+                    int(risk_tier),
+                    arguments_sha256.casefold(),
+                    expected_effect_sha256.casefold(),
+                    resources_digest,
+                    action_digest,
+                    consumed_by,
                     _timestamp(now),
                     after,
                 ),
             )
             self._append_event_unlocked(
+                connection,
                 str(approval_id),
                 "CONSUMED",
-                {
+                reason_code=None,
+                detail={
                     "consumption_id": str(consumption_id),
                     "step_id": str(step_id),
                     "capability_id": capability_id,
+                    "action_digest": action_digest,
                     "uses_remaining_after": after,
                 },
             )
@@ -520,6 +912,10 @@ class GrantLedger:
                 plan_hash=plan_hash.casefold(),
                 step_id=step_id,
                 capability_id=capability_id,
+                risk_tier=risk_tier,
+                arguments_sha256=arguments_sha256.casefold(),
+                expected_effect_sha256=expected_effect_sha256.casefold(),
+                consumed_by=consumed_by,
                 consumed_at=now,
                 uses_remaining_after=after,
                 replayed=False,
@@ -529,10 +925,46 @@ class GrantLedger:
     # Internals
     # ------------------------------------------------------------------
 
+    def _check_current_task_binding(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        grant: ExactApprovalGrant,
+        task_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+    ) -> None:
+        """S4-4: a grant cannot be spent once the task's current plan moved.
+
+        Caller-supplied historical plan identities are not sufficient: the
+        task's *current* pointer must still be the plan revision/hash the
+        grant was issued for, and the task must still be in a consent-bearing
+        state. Both reads happen inside the same transaction as the decrement.
+        """
+
+        if grant.task_id != task_id:
+            raise GrantDeniedError("GRANT_TASK_MISMATCH", "grant task does not match the use")
+        row = connection.execute(
+            "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?", (str(task_id),)
+        ).fetchone()
+        if row is None:
+            raise GrantDeniedError("TASK_NOT_AVAILABLE", "the granted task no longer exists")
+        if int(row["plan_revision"]) != plan_revision or row["plan_hash"] != plan_hash.casefold():
+            raise GrantDeniedError(
+                "GRANT_PLAN_SUPERSEDED",
+                "the task's current plan revision no longer matches this grant",
+            )
+        if row["state"] not in ("PREVIEW_READY", "AWAITING_APPROVAL"):
+            raise GrantDeniedError(
+                "TASK_STATE_NOT_AUTHORIZABLE",
+                "the task is no longer in a state that carries live user consent",
+            )
+
     def _grant_view(
         self, approval_id: UUID, row: sqlite3.Row
     ) -> tuple[ExactApprovalGrant, sqlite3.Row]:
         """Load the immutable scope and its mutable state, cross-verified."""
+
         state_row: sqlite3.Row | None = self._connection.execute(
             "SELECT * FROM exact_approval_grant_state WHERE approval_id = ?",
             (str(approval_id),),
@@ -567,11 +999,10 @@ class GrantLedger:
         """Rebuild the grant from verified evidence.
 
         The persisted scope JSON is the *immutable approved scope*: its digest
-        is recomputed and compared, and every scope-bearing column is
-        cross-checked. Mutable lifecycle state (uses and revocation) comes
-        from the separate state row, so spending a use never rewrites the
-        hashed scope; instead the reconstructed grant is rebuilt from both and
-        the two must agree on the approval binding.
+        is recomputed and compared, every scope-bearing column is cross-checked,
+        and the stored issuance-intent digest is recomputed from the persisted
+        columns. Mutable lifecycle state comes from the separate state row, so
+        spending a use never rewrites the hashed scope.
         """
 
         try:
@@ -597,6 +1028,19 @@ class GrantLedger:
             raise GrantIntegrityError("persisted grant approval origin mismatch")
         if row["approval_origin"] != "trusted-electron":
             raise GrantIntegrityError("persisted grant approval origin is not trusted")
+        expected_intent = issuance_intent_digest(
+            scope_digest=digest,
+            task_id=scoped.task_id,
+            plan_revision=scoped.plan_revision,
+            plan_hash=scoped.plan_hash,
+            max_tier=int(scoped.max_tier),
+            issued_at=_parse_timestamp(row["issued_at"]),
+            expires_at=_parse_timestamp(row["expires_at"]),
+            uses_remaining=int(state["initial_uses_remaining"]),
+            issued_by=str(row["issued_by"]),
+        )
+        if expected_intent != row["issuance_digest"]:
+            raise GrantIntegrityError("persisted issuance intent digest mismatch")
         if str(state["approval_id"]) != row["approval_id"]:
             raise GrantIntegrityError("persisted grant state row mismatch")
         initial = int(state["initial_uses_remaining"])
@@ -624,26 +1068,60 @@ class GrantLedger:
             plan_hash=row["plan_hash"],
             step_id=UUID(row["step_id"]),
             capability_id=row["capability_id"],
+            risk_tier=RiskTier(int(row["risk_tier"])),
+            arguments_sha256=row["arguments_sha256"],
+            expected_effect_sha256=row["expected_effect_sha256"],
+            consumed_by=row["consumed_by"],
             consumed_at=_parse_timestamp(row["consumed_at"]),
             uses_remaining_after=int(row["uses_remaining_after"]),
             replayed=False,
         )
 
-    def _append_event_unlocked(self, approval_id: str, event: str, detail: dict[str, Any]) -> None:
-        seq_row = self._connection.execute(
+    def _append_event_unlocked(
+        self,
+        connection: sqlite3.Connection,
+        approval_id: str,
+        event: str,
+        *,
+        reason_code: str | None,
+        detail: dict[str, Any],
+    ) -> None:
+        """Append one audit event with bounded, non-secret metadata.
+
+        ``detail`` values are restricted to booleans, integers, bounded codes
+        and lowercase hex digests/UUIDs. Free text never reaches the database,
+        and any value that looks like a secret aborts the write.
+        """
+
+        for key, value in detail.items():
+            if not _SAFE_DETAIL_KEY.fullmatch(key):
+                raise GrantIntegrityError("grant event detail key is not allow-listed")
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                continue
+            if isinstance(value, str):
+                if _SAFE_DETAIL_VALUE.fullmatch(value):
+                    continue
+                raise GrantIntegrityError(
+                    f"grant event detail {key!r} is not a bounded code, hash or identifier"
+                )
+            raise GrantIntegrityError(f"grant event detail {key!r} has an unsupported type")
+        seq_row = connection.execute(
             "SELECT COALESCE(MAX(grant_seq), 0) + 1 AS next_seq "
             "FROM exact_approval_grant_events WHERE approval_id = ?",
             (approval_id,),
         ).fetchone()
-        self._connection.execute(
+        connection.execute(
             "INSERT INTO exact_approval_grant_events ("
-            "id, approval_id, grant_seq, event, detail_json, created_at"
-            ") VALUES (?,?,?,?,?,?)",
+            "id, approval_id, grant_seq, event, reason_code, detail_json, created_at"
+            ") VALUES (?,?,?,?,?,?,?)",
             (
                 str(uuid4()),
                 approval_id,
                 int(seq_row["next_seq"]),
                 event,
+                reason_code,
                 _canonical_json(detail),
                 _timestamp(datetime.now(UTC)),
             ),
@@ -652,6 +1130,19 @@ class GrantLedger:
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         self._require_open()
+        if self._shared_transaction is not None:
+            # Shared mode reuses the store's transaction: its lock, its
+            # BEGIN IMMEDIATE, its rollback and its before/after location
+            # verification. The ledger never opens its own transaction on a
+            # database another component owns.
+            with self._shared_transaction() as connection:
+                original = self._connection
+                self._connection = connection
+                try:
+                    yield connection
+                finally:
+                    self._connection = original
+            return
         try:
             self._connection.execute("BEGIN IMMEDIATE")
         except sqlite3.Error as exc:
@@ -659,7 +1150,8 @@ class GrantLedger:
         try:
             yield self._connection
         except BaseException:
-            self._connection.execute("ROLLBACK")
+            if self._connection.in_transaction:
+                self._connection.execute("ROLLBACK")
             raise
         else:
             self._connection.execute("COMMIT")
@@ -668,21 +1160,37 @@ class GrantLedger:
         if self._closed:
             raise GrantUnavailableError("grant ledger is closed")
 
-    def events(self, approval_id: UUID) -> tuple[tuple[int, str, dict[str, Any]], ...]:
+    def events(self, approval_id: UUID) -> tuple[tuple[int, str, str | None, dict[str, Any]], ...]:
         """Read-only audit view used by tests and recovery verification."""
+
         with self._lock:
             rows = self._connection.execute(
-                "SELECT grant_seq, event, detail_json, created_at "
+                "SELECT grant_seq, event, reason_code, detail_json, created_at "
                 "FROM exact_approval_grant_events WHERE approval_id = ? ORDER BY grant_seq",
                 (str(approval_id),),
             ).fetchall()
             return tuple(
-                (int(row["grant_seq"]), row["event"], json.loads(row["detail_json"]))
+                (
+                    int(row["grant_seq"]),
+                    row["event"],
+                    row["reason_code"],
+                    json.loads(row["detail_json"]),
+                )
                 for row in rows
             )
 
 
 _WHITESPACE = re.compile(r"\s+")
+_SAFE_DETAIL_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+# Lowercase hex digests, UUIDs, bounded uppercase codes and small integers only.
+_SAFE_DETAIL_VALUE = re.compile(
+    r"^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    r"|[0-9a-f]{64}"
+    r"|[A-Z][A-Z0-9_]{0,63}"
+    r"|[a-z][a-z0-9_.:-]{0,63}"
+    r"|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?"
+    r"(?:Z|[+-][0-9]{2}:[0-9]{2}))$"
+)
 
 
 def _normalize_schema_sql(sql: str) -> str:

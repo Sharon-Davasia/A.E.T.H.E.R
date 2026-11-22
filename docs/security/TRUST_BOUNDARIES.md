@@ -79,12 +79,16 @@ merged; Stage 4 is a new branch from merged `main`.
   `allowed=False, reason_code="GRANT_VALIDATED_EXECUTOR_NOT_ENABLED"`, meaning the persisted
   grant matched the proposed action exactly and nothing was authorized, consumed or executed.
   There is no execution adapter, no mutation, no shell and no renderer IPC route in this stage.
-- **Production issuance is disabled.** `AuthorizingProof` is an opaque capability that refuses
-  direct construction and ships **no production subclass**; only `TestOnlyAuthorizingProof`
-  exists, for tests. A renderer `APPROVE`, a client claim of `trusted-electron`, a persisted
+- **Production issuance is disabled by an injected trust seam, not by class identity.**
+  `AuthorizationAttestation` is validated *data* binding the authorization identity, trusted
+  authority id, exact task, plan revision/hash, preview id/digest, approved-scope digest and a
+  ≤60-minute window. Trust is decided by an injected `AttestationVerifier`; production ships
+  only `NullAttestationVerifier`, which rejects everything. No proof subclass ships, no
+  `isinstance` check grants trust, and nothing test-only is exported (the simulation lives in
+  the test suite). A renderer `APPROVE`, a client claim of `trusted-electron`, a persisted
   `NON_AUTHORIZING_AUDIT_RECORD`, a model proposal, a synthetic dev preview and any
-  `AETHER_REVIEW_*` development seam can never produce a grant. A source-scan test asserts no
-  module outside `aether/core/grants` constructs a proof or an issuer.
+  `AETHER_REVIEW_*` development seam can never produce a grant. Source-scan tests assert no
+  module outside `aether/core/grants` constructs an issuer or an attestation.
 - **The trusted authorizing interaction does not exist yet.** The Master-required path —
   explicit user gesture authenticated at the Electron-main/backend boundary, plus a production
   planner/narrative source — is future work. Until it exists, issuance stays disabled and the
@@ -109,10 +113,22 @@ merged; Stage 4 is a new branch from merged `main`.
   `GrantUnavailableError`.
 - **Proposed migration requires separate approval.**
   `backend/aether/core/persistence/proposed_migrations/0002_phase2b_stage4_grants.sql`
-  (SHA-256 `a91b431c…`) is inert. Applying it also requires updating the store's
+  (SHA-256 `d2a02f54…`; the earlier `a91b431c…` proposal is superseded and unapproved) is inert. Applying it also requires updating the store's
   `_EXPECTED_MIGRATIONS`, `_EXPECTED_SCHEMA_SHA256` and `_CRITICAL_TRIGGER_NAMES` plus tests,
   as one separately approved change. Until then `SQLiteTaskStore` stays pinned to version 1 and
   rejects version-2 databases.
+- **One owner, one connection.** `GrantLedger.open(store)` *shares* the store's already-held
+  owner lock and its single connection; it never opens a second connection or a second lock.
+  Grant writes join the store's `BEGIN IMMEDIATE` transaction, which re-verifies the database
+  location before and after each commit, so grant and task writes cannot interleave and crash
+  recovery stays all-or-nothing. `GrantLedger.read_only()` is a `mode=ro` verification handle
+  that is not an authorization path; the path-only `GrantLedger(...)` constructor exists for
+  tests/diagnostics and refuses to open while a store owns the database.
+- **Audit metadata is bounded.** Grant events store only allow-listed keys whose values are
+  booleans, small integers, lowercase hex digests/UUIDs, bounded codes or ISO timestamps.
+  Revocation and consumer identity are bounded machine-readable codes (`REVOCATION_CODES`,
+  `CONSUMED_BY_CODES`), never free text, so no secret-bearing string can reach grant
+  metadata.
 - **Trust limitations.** SQLite is not a hardware root of trust: a same-user attacker with write
   access to the file can tamper with it, though schema/digest/accounting/migration tampering is
   detected and fails closed. Expiry comparisons trust the caller-supplied clock; there is no

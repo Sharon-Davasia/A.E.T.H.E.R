@@ -4,6 +4,11 @@ The broker never loads grants on its own, never consumes a grant (consumption
 happens at execution time, which does not exist yet) and never converts review
 evidence into authorization. This module only *validates* a persisted grant
 against one exact proposed action and reports a verdict.
+
+Independent review S4-4: a persisted grant is not evaluated in isolation.
+Validation also requires the task's *current* persisted plan, when a task
+store is supplied, so caller-supplied historical plan identities cannot
+re-authorize an action after the plan moved on.
 """
 
 from __future__ import annotations
@@ -25,6 +30,11 @@ from aether.core.grants.errors import (
 )
 from aether.core.grants.ledger import GrantLedger
 from aether.core.grants.validation import GrantCheck, check_grant_scope
+from aether.core.persistence import PersistentTaskState
+
+_CONSENT_STATES = frozenset(
+    {PersistentTaskState.PREVIEW_READY, PersistentTaskState.AWAITING_APPROVAL}
+)
 
 
 def canonical_arguments_sha256(arguments: Mapping[str, object]) -> str:
@@ -61,10 +71,14 @@ class GrantRequest:
 class GrantAuthority:
     """Validates one proposed action against the persisted grant ledger."""
 
-    def __init__(self, ledger: GrantLedger | None) -> None:
+    def __init__(self, ledger: GrantLedger | None, *, store: object | None = None) -> None:
         # A missing ledger is the production configuration in this phase:
         # grant validation fails closed with GRANT_AUTHORITY_UNAVAILABLE.
         self._ledger = ledger
+        # Optional current-plan authority. When supplied, the task's live state
+        # and current plan pointer are consulted; a grant for a superseded
+        # plan or a task that left consent-bearing states denies.
+        self._store = store
 
     def check_action(
         self,
@@ -96,7 +110,7 @@ class GrantAuthority:
             return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", grant_request.approval_id)
         except Exception:  # fail closed on any unexpected ledger failure
             return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", grant_request.approval_id)
-        return check_grant_scope(
+        scope = check_grant_scope(
             grant,
             now=now,
             task_id=task_id,
@@ -109,6 +123,52 @@ class GrantAuthority:
             expected_effect_sha256=grant_request.expected_effect_sha256,
             resource_versions=resource_versions,
         )
+        if not scope.ok:
+            return scope
+        # Only after the grant itself matches the claimed binding do we ask the
+        # task's *current* persisted plan: a grant that matched its own stated
+        # plan but has since been superseded must still deny.
+        current = self._current_plan_check(
+            task_id,
+            approval_id=grant_request.approval_id,
+            plan_revision=grant_request.plan_revision,
+            plan_hash=grant_request.plan_hash,
+        )
+        if current is not None:
+            return current
+        return scope
+
+    def _current_plan_check(
+        self,
+        task_id: UUID,
+        *,
+        approval_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+    ) -> GrantCheck | None:
+        """Validate against the task's current persisted plan, when available."""
+
+        store = self._store
+        if store is None:
+            return None
+        try:
+            task = store.get_task(task_id)  # type: ignore[attr-defined]
+        except KeyError:
+            return GrantCheck(False, "TASK_NOT_AVAILABLE", approval_id)
+        except Exception:
+            return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", approval_id)
+        if PersistentTaskState(task.state) not in _CONSENT_STATES:
+            return GrantCheck(False, "TASK_STATE_NOT_AUTHORIZABLE", approval_id)
+        if int(task.plan_revision) != plan_revision or (task.plan_hash or "").casefold() != (
+            plan_hash.casefold()
+        ):
+            return GrantCheck(False, "GRANT_PLAN_SUPERSEDED", approval_id)
+        try:
+            if store.is_stage2_preview_blocked(task_id):  # type: ignore[attr-defined]
+                return GrantCheck(False, "CONSENT_INVALIDATED", approval_id)
+        except Exception:
+            return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", approval_id)
+        return None
 
 
 __all__ = ["GrantAuthority", "GrantRequest", "canonical_arguments_sha256"]
