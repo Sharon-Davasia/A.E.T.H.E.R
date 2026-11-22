@@ -119,12 +119,19 @@ class MutationIntent:
 
 @dataclass(frozen=True, slots=True)
 class Reconciliation:
-    """What reconciliation concluded about one intent, with its evidence."""
+    """What reconciliation concluded about one unaccounted mutation.
 
-    intent_id: UUID
+    ``intent_id`` identifies the journal intent when there is one. An orphaned
+    grant consumption has no intent, so ``intent_id`` is ``None`` and
+    ``consumption_id`` carries the identity that was actually found. Keeping the
+    two separate means a report can never imply an intent existed when it did not.
+    """
+
+    intent_id: UUID | None
     verdict: ReconciliationVerdict
     reason_code: str
     detail: str
+    consumption_id: UUID | None = None
 
 
 class MutationJournal:
