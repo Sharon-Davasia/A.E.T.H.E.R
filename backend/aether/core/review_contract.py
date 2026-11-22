@@ -50,10 +50,7 @@ def to_electron_contract(value: object) -> object:
     if isinstance(value, list):
         return [to_electron_contract(item) for item in value]
     if isinstance(value, dict):
-        return {
-            CAMEL_CASE.get(key, key): to_electron_contract(item)
-            for key, item in value.items()
-        }
+        return {CAMEL_CASE.get(key, key): to_electron_contract(item) for key, item in value.items()}
     return value
 
 

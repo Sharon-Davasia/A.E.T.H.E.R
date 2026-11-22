@@ -107,9 +107,7 @@ def test_recovery_class_binding_is_part_of_the_approved_scope() -> None:
     changed = grant.model_copy(
         update={
             "operations": (
-                grant.operations[0].model_copy(
-                    update={"recovery_class": RecoveryClass.REVERSIBLE}
-                ),
+                grant.operations[0].model_copy(update={"recovery_class": RecoveryClass.REVERSIBLE}),
             )
         }
     )

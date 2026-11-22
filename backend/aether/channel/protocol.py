@@ -28,9 +28,9 @@ HELLO_REQUEST_ID = "00000000-0000-4000-8000-000000000000"
 
 
 def canonical(value: object) -> bytes:
-    return json.dumps(
-        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
-    ).encode("utf-8")
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
+        "utf-8"
+    )
 
 
 def read_exact(stream: object, size: int) -> bytes:

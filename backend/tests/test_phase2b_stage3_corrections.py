@@ -134,16 +134,16 @@ class ServiceProcess:
 
 
 def get_ready_preview(child: ServiceProcess, seq: int) -> dict[str, object]:
-    response = child.request(
-        seq, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID}
-    )
+    response = child.request(seq, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
     assert response["kind"] == "review.preview"
     payload = response["payload"]
     assert payload["status"] == "ready", payload
     return payload["preview"]
 
 
-def outcome_request(preview: dict[str, object], outcome: str, acknowledged: bool) -> dict[str, object]:
+def outcome_request(
+    preview: dict[str, object], outcome: str, acknowledged: bool
+) -> dict[str, object]:
     return {
         "reviewRequestId": preview["reviewRequestId"],
         "taskId": preview["taskId"],
@@ -176,9 +176,7 @@ def seed_narrative(tmp_path: Path) -> Path:
 
 def counts(db: Path) -> tuple[int, int]:
     with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
-        decisions = int(
-            connection.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0]
-        )
+        decisions = int(connection.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0])
         events = int(connection.execute("SELECT COUNT(*) FROM task_events").fetchone()[0])
     return decisions, events
 
@@ -296,7 +294,9 @@ def test_reconcile_with_drifted_plan_hash_is_denied(db_path: Path) -> None:
 def test_reconcile_repeats_without_creating_new_stale_decisions(db_path: Path) -> None:
     child = ServiceProcess(db_path)
     preview = get_ready_preview(child, 1)
-    stale_request = outcome_request(dict(preview, planRevision=int(preview["planRevision"]) + 1), "APPROVE", True)
+    stale_request = outcome_request(
+        dict(preview, planRevision=int(preview["planRevision"]) + 1), "APPROVE", True
+    )
     recorded = child.request(2, str(uuid4()), "review.record_outcome", stale_request)
     assert recorded["payload"]["resolution"] == "STALE"
     before = counts(db_path)
@@ -401,7 +401,12 @@ def test_narrative_deleted_mid_session_fails_closed_and_recovers(
     assert child.ping(4)["kind"] == "demo.pong"
     # Restore the source; the permitted request succeeds again.
     narrative.write_text(
-        json.dumps({"task_id": FIXED_TASK_ID, "narrative": build_synthetic_narrative().model_dump(mode="json")}),
+        json.dumps(
+            {
+                "task_id": FIXED_TASK_ID,
+                "narrative": build_synthetic_narrative().model_dump(mode="json"),
+            }
+        ),
         encoding="utf-8",
     )
     preview = child.request(5, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
@@ -475,9 +480,7 @@ def test_narrative_replaced_by_other_task_fails_closed(db_path: Path, tmp_path: 
     assert child.close() == 0
 
 
-def test_narrative_unreadable_by_permissions_fails_closed(
-    db_path: Path, tmp_path: Path
-) -> None:
+def test_narrative_unreadable_by_permissions_fails_closed(db_path: Path, tmp_path: Path) -> None:
     if os.geteuid() == 0:
         pytest.skip("permission checks are meaningless as root")
     narrative = seed_narrative(tmp_path)
@@ -576,7 +579,12 @@ def test_hardened_launch_ignores_pythonhome_and_pythonusersite(tmp_path: Path) -
         "PYTHONUSERBASE": str(tmp_path / "does-not-exist"),
     }
     result = subprocess.run(
-        [sys.executable, *HARDENED_FLAGS, "-c", "import aether.channel.service; print('IMPORT_OK')"],
+        [
+            sys.executable,
+            *HARDENED_FLAGS,
+            "-c",
+            "import aether.channel.service; print('IMPORT_OK')",
+        ],
         cwd=BACKEND_ROOT,
         env=env,
         capture_output=True,

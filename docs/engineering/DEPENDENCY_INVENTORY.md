@@ -13,6 +13,7 @@
 | Pydantic v2 | Typed requests, decisions and manifest validation | MIT |
 | Structlog | Structured diagnostics | Apache-2.0; prompts/responses are not logged |
 | HTTPX | Async local llama.cpp transport | BSD; `trust_env=False`, numeric loopback-only URL |
+| cryptography | AES-256-GCM for the Phase 2 Undo Vault (`core/vault/undo_vault.py`) | Apache-2.0 OR BSD-3-Clause; OpenSSL-backed. Used **only** for snapshot encryption at rest. It never authorizes an action, and no key material is logged or stored in the task database. |
 
 ## Development and benchmark extras
 
@@ -41,11 +42,11 @@ The master spec states the upstream Qwen checkpoint is Apache-2.0. That is not t
 
 | Component | Role | Licence / attention |
 |---|---|---|
-| Electron/React/Vite | Desktop UI | Deferred; audit release notices |
+| Electron/React/Vite | Desktop trusted review surface | In use (Phase 2B Stage 3+). The Electron main process is the trusted UI boundary; the renderer is untrusted and has no Node integration. Audit release notices before distribution. |
 | Gemma 4 E4B | Possible model challenger | Deferred; exact checkpoint terms and benchmark review |
-| pywinauto / pywin32 | Windows controls | Not present; real OS actions remain denied |
+| pywinauto / pywin32 | Windows controls | Not present; no generic OS control. Phase 2 filesystem capability is bounded and typed instead. |
 | Playwright, Office/PDF tools | App integrations | Deferred |
-| SQLite/FTS5 persistent memory | Storage | Deferred |
+| SQLite (stdlib `sqlite3`) | Phase 2 task/plan/grant/receipt persistence, schema v1 | In use since Phase 2B. v2 migrations exist but are **not active** (`ACTIVE_SCHEMA_VERSION=1`). |
 | Groq/RSI providers | Remote inference | Prohibited in Phase 1; no integration or fallback |
 
 ## Supply-chain controls

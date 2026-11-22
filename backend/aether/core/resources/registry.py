@@ -131,6 +131,24 @@ class ResourceRegistry:
         self._aliases[normalized_alias] = root.root_id
         return root
 
+    def known_resources(self) -> tuple[ResolvedResource, ...]:
+        """Return every resource this registry has issued, in issuance order.
+
+        Used by executors that receive a resource *id* rather than a reference:
+        an id the registry never issued must fail closed, so the registry — not
+        the caller — remains the authority on which identities exist.
+        """
+
+        return tuple(self._resources.values())
+
+    def resource_by_id(self, resource_id: str) -> ResolvedResource:
+        """Return a previously issued resource or raise ``resource_id_not_registered``."""
+
+        resource = self._resources.get(resource_id)
+        if resource is None:
+            raise ResourceRegistryError("resource_id_not_registered")
+        return resource
+
     def root_by_alias(self, alias: str) -> RegisteredRoot:
         root_id = self._aliases.get(alias.strip().casefold())
         if root_id is None:
