@@ -1,6 +1,6 @@
 # AETHER OS — Trust Boundaries (Phase 1 foundation)
 
-**Status:** Phase 1 boundaries plus the merged Phase 2A resource/policy contract foundation, merged Phase 2B-1 persistence, and Stages 2–3 non-authorizing review-evidence presentation and transport; still no filesystem execution, trusted approval grants or mutations.
+**Status:** Phase 1 boundaries plus the merged Phase 2A resource/policy contract foundation, merged Phase 2B-1 persistence, merged Phase 2B-2 Stages 2–3 non-authorizing review-evidence presentation and transport, and the Stage 4 exact-approval-grant *foundation* (capability contracts, fail-closed validation and a schema-version-2 ledger that is proposed, not applied). Still no filesystem execution, no production grant issuance and no mutations.
 
 ## Phase 1 process and module layout
 
@@ -68,3 +68,133 @@ Stage 3 transports the Stage 2 review evidence over the Stage 1 authenticated ch
 - Stage 3 is Linux-verified only; no Windows execution or security acceptance is claimed. Requirements-to-test mapping lives in the Stage 3 desktop README section and the PR description.
 - **Digest verification ownership:** the renderer is never the verification or approval authority. The trusted main-process provider on the authenticated channel (future milestone) must recompute and verify the canonical digest, preview ID and review request ID against backend-supplied values before returning a preview to the renderer and before recording any outcome. Node-side verification helpers (`shared/review-integrity.ts`) are pinned to the backend by a generated golden fixture and are never imported by renderer code. Until a trusted provider exists, the default provider is fail-closed and no preview can be shown or recorded.
 - Stage 2 outcomes distinguish review evidence from authorization: the full-diff acknowledgement is required for APPROVE only; REJECT/REVISE/CANCELLED never imply inspection or acceptance. Audit events persist the requested outcome (`requested_outcome`) so replay with a changed outcome or changed preview data fails closed, including across store close/reopen.
+
+## Phase 2B Stage 4 — exact approval-grant foundation (authorizes nothing)
+
+Stage 4 implements the durable machinery an exact grant will need and keeps authorization
+unavailable. Merge state: Phase 2B-1 (PR #7–#10), Stage 2 (PR #11) and Stage 3 (PR #12) are
+merged; Stage 4 is a new branch from merged `main`.
+
+- **Authorization ceiling.** The strongest T2 outcome the broker can now produce is
+  `allowed=False, reason_code="GRANT_VALIDATED_EXECUTOR_NOT_ENABLED"`, meaning the persisted
+  grant matched the proposed action exactly and nothing was authorized, consumed or executed.
+  There is no execution adapter, no mutation, no shell and no renderer IPC route in this stage.
+- **Production issuance is disabled by an injected trust seam, not by class identity.**
+  `AuthorizationAttestation` is validated *data* binding the authorization identity, trusted
+  authority id, exact task, plan revision/hash, preview id/digest, approved-scope digest and a
+  ≤60-minute window. Trust is decided by an injected `AttestationVerifier`; production ships
+  only `NullAttestationVerifier`, which rejects everything. No proof subclass ships, no
+  `isinstance` check grants trust, and nothing test-only is exported (the simulation lives in
+  the test suite). A renderer `APPROVE`, a client claim of `trusted-electron`, a persisted
+  `NON_AUTHORIZING_AUDIT_RECORD`, a model proposal, a synthetic dev preview and any
+  `AETHER_REVIEW_*` development seam can never produce a grant. Source-scan tests assert no
+  module outside `aether/core/grants` constructs an issuer or an attestation.
+- **The trusted authorizing interaction does not exist yet, and neither does a production
+  preview source.** The Master-required path —
+  explicit user gesture authenticated at the Electron-main/backend boundary, plus a production
+  planner/narrative source — is future work. Until it exists, issuance stays disabled and the
+  Stage 3 approve button is untouched (not upgraded into a second, ambiguous approval).
+- **Production issuance is denied by configuration, not by credential (S4-9).**
+  `IssuancePermit` is *not* authentication: it is an ordinary Python object, and no field
+  check on it can establish that a verifier or preview source ever ran.
+  `GrantLedger.open(store)` — the production configuration — therefore refuses **all** new
+  grant issuance with `GRANT_ISSUANCE_DISABLED`, decided from the ledger's own configuration
+  *before* any permit is inspected or spent. No caller-supplied permit changes this, including
+  a correctly labelled, correctly bound one or one minted by `authorize_issuance()` itself;
+  zero grant/state/event/consumption rows are written. Reads, status, revocation and
+  consumption of existing grants are unaffected. The single central decision
+  (`aether.core.grants.authorization.authorize_issuance`) plus the attestation and
+  authoritative-preview contracts are preserved for future integration and exercised on the
+  test-scoped path. Enabling production issuance requires implementing and separately
+  reviewing the authenticated authorizing boundary and changing this gate in code — it is not
+  a runtime flag, constructor argument, environment variable or permit kind.
+  Test-only persistence requires three independent conditions (test-scoped ledger instance,
+  allow-listed requesting module, `test_simulation` permit), none reachable from a production
+  configuration, and neither the factory nor `open_tests_scoped` is exported from
+  `aether.core.grants`. No Python object, subclass check, private name or module constant is
+  claimed to be an unforgeable capability: arbitrary in-process code can reach module
+  internals, and the guarantee is the structural one above — production has no verifier and
+  no preview source, so the decision cannot succeed. `GrantLedger.open` also takes the
+  store's lock for construction and its initial integrity/schema reads.
+- **Authorization is established before storage, and storage cannot authorize (S4-6).**
+  `GrantLedger.issue()` no longer exists. The single write primitive is private
+  (`GrantLedger._persist_verified_grant`) and requires a single-use `IssuancePermit` that
+  only `GrantIssuer.issue()` mints, after both trust decisions succeed. A permit is bound to
+  one scope digest and one issuer identity and is consumed on first use; passing `None`, an
+  ordinary object, a namespace or any other stand-in raises `AUTHORIZATION_EVIDENCE_REQUIRED`
+  before the database is touched. Python class identity and inheritance remain irrelevant:
+  there is no capability class, no subclass check, and the permit is valued by its data plus
+  its one-shot state, not by its type. Test-only simulation stays in `backend/tests/`.
+- **Preview identity is verified against authoritative evidence (S4-6).** The
+  `preview_id`/`preview_digest` inside an attestation is a *claim*. `GrantIssuer` resolves the
+  authoritative preview for that exact task/plan revision/hash through an injected
+  `PreviewAuthority` and requires them to match (`PREVIEW_IDENTITY_MISMATCH`,
+  `PREVIEW_SOURCE_MISMATCH`, `PREVIEW_SOURCE_UNAVAILABLE`). No production preview source
+  exists in this phase, so the shipped default is `NullPreviewAuthority`, which always raises:
+  the verification is explicitly *unavailable* and production issuance stays disabled. A
+  preview value carried in the attestation alone never authorizes anything. No authorizing
+  IPC or trusted renderer→backend grant channel was added.
+- **Fresh consent is checked inside the writing transaction (S4-7).** Both the grant insert
+  and the use decrement call `GrantLedger._check_fresh_consent`, which reuses the store's
+  existing Stage 2 predicate (`SQLiteTaskStore.is_stage2_preview_blocked`, i.e. the
+  `APPROVAL_PREVIEW_REVOKED` / `requires_fresh_plan_and_consent` audit semantics) on the
+  transaction's own connection. A revocation that lands after the pre-check, or after
+  issuance but before use, denies with `CONSENT_INVALIDATED` and leaves no grant row, no
+  consumption row and no decrement — even when task state and plan identity are unchanged.
+  A standalone ledger (no owning store) cannot verify consent and fails closed with
+  `CONSENT_AUTHORITY_UNAVAILABLE`.
+- **No success without current-plan authority (S4-8).** `GrantAuthority` fails closed with
+  `GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED` when it has no store, so scope verification can
+  never report success without checking the authoritative current task/plan; historical
+  grants deny after supersession regardless. Grant reads and current task/plan/consent reads
+  happen inside one consistent snapshot under the store's lock, and `GrantLedger.open(store)`
+  adopts that same lock (`ledger._lock is store._lock`), so an unsynchronized read cannot
+  observe uncommitted task or grant state. The one-owner/one-connection design is unchanged:
+  still exactly one connection and one serialization mechanism.
+- **Issuance prerequisites (all enforced).** A verified attestation and an authoritative
+  preview match; the *current persisted* plan loaded
+  through the store's integrity-verifying path (never a caller-supplied plan); exact
+  step/capability/tier/argument-hash/effect-hash/resource-version/recovery-class binding;
+  lifetime ≤ 60 minutes; 1–8 uses; no T3; and an idempotent issuance identity whose replay
+  with a different scope is a conflict rather than a second grant.
+- **Scope is immutable; state is separate.** Approved scope (digest, JSON, plan revision/hash,
+  tier ceiling, approval origin, issuance identity, issued/expiry times) lives in
+  `exact_approval_grants`, protected by a no-update trigger. Uses and revocation live in
+  `exact_approval_grant_state`, whose guarded-update trigger permits only −1 use/+1 consumption
+  or a one-way revocation. Spending a use can never rewrite the hashed scope. Lifecycle events
+  and consumption rows are append-only.
+- **Verification, not assumption.** `GrantLedger` refuses to open unless `user_version = 2`,
+  the exact 30-object schema fingerprint matches the pinned value, the version-2 migration-ledger
+  row matches the proposed file's SHA-256, and `quick_check`/`foreign_key_check` pass. Persisted
+  scope JSON is re-validated through Pydantic, its digest recomputed, and use accounting must
+  agree across the state row, the consumption table and `CONSUMED` events. The ledger never
+  applies or registers a migration; version-1 databases fail closed with
+  `GrantUnavailableError`.
+- **Proposed migration requires separate approval.**
+  `backend/aether/core/persistence/proposed_migrations/0002_phase2b_stage4_grants.sql`
+  (SHA-256 `d2a02f54…`; the earlier `a91b431c…` proposal is superseded and unapproved) is inert. Applying it also requires updating the store's
+  `_EXPECTED_MIGRATIONS`, `_EXPECTED_SCHEMA_SHA256` and `_CRITICAL_TRIGGER_NAMES` plus tests,
+  as one separately approved change. Until then `SQLiteTaskStore` stays pinned to version 1 and
+  rejects version-2 databases.
+- **One owner, one connection.** `GrantLedger.open(store)` *shares* the store's already-held
+  owner lock and its single connection; it never opens a second connection or a second lock.
+  Grant writes join the store's `BEGIN IMMEDIATE` transaction, which re-verifies the database
+  location before and after each commit, so grant and task writes cannot interleave and crash
+  recovery stays all-or-nothing. `GrantLedger.read_only()` is a `mode=ro` verification handle
+  that is not an authorization path; the path-only `GrantLedger(...)` constructor exists for
+  tests/diagnostics and refuses to open while a store owns the database.
+- **Audit metadata is bounded.** Grant events store only allow-listed keys whose values are
+  booleans, small integers, lowercase hex digests/UUIDs, bounded codes or ISO timestamps.
+  Revocation and consumer identity are bounded machine-readable codes (`REVOCATION_CODES`,
+  `CONSUMED_BY_CODES`), never free text, so no secret-bearing string can reach grant
+  metadata.
+- **Trust limitations.** SQLite is not a hardware root of trust: a same-user attacker with write
+  access to the file can tamper with it, though schema/digest/accounting/migration tampering is
+  detected and fails closed. Expiry comparisons trust the caller-supplied clock; there is no
+  attested time source. Consumption is not yet bound to a real action, so "one use = one action"
+  is proven transactionally, not end-to-end.
+- Stage 4 is Linux-verified only (401 passed / 1 skipped backend, desktop `npm run check`,
+  golden fixture check). No Windows filesystem, ACL, reparse, process or resource-security
+  behavior is inferred from those results; the Windows acceptance items remain open. T3 remains
+  unavailable until a dedicated authorization design and its prerequisites are separately approved.
+  Details and the requirements→code→test matrix: `docs/engineering/PHASE2B_STAGE4_GRANTS.md`.

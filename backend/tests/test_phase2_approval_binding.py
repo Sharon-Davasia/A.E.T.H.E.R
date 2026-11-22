@@ -16,6 +16,7 @@ from aether.core.contracts.approval import (
     exact_operation_matches,
 )
 from aether.core.contracts.policy import RiskTier
+from aether.core.contracts.receipt import RecoveryClass
 
 _NOW = datetime(2026, 11, 15, 12, 0, tzinfo=UTC)
 
@@ -96,6 +97,23 @@ def test_any_plan_operation_or_resource_drift_invalidates_binding(
     override: dict[str, object],
 ) -> None:
     assert _matches(_grant(), **override) is False
+
+
+def test_recovery_class_binding_is_part_of_the_approved_scope() -> None:
+    grant = _grant()
+    assert _matches(grant, recovery_class=RecoveryClass.IRREVERSIBLE) is True
+    assert _matches(grant, recovery_class=RecoveryClass.REVERSIBLE) is False
+    assert _matches(grant, recovery_class=RecoveryClass.SNAPSHOT_RESTORABLE) is False
+    changed = grant.model_copy(
+        update={
+            "operations": (
+                grant.operations[0].model_copy(
+                    update={"recovery_class": RecoveryClass.REVERSIBLE}
+                ),
+            )
+        }
+    )
+    assert exact_approval_scope_digest(changed) != exact_approval_scope_digest(grant)
 
 
 def test_expired_revoked_and_consumed_grants_cannot_be_reused() -> None:
