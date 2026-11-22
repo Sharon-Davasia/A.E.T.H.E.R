@@ -482,3 +482,58 @@ export function reviewRequestFor(
     fullDiffAcknowledged,
   };
 }
+// ---------------------------------------------------------------------------
+// Stage 3 authenticated review channel wire contract.
+//
+// These parsers cover the exact payloads the trusted backend-hosted channel
+// service returns for `review.get_preview` (`review.preview`) and
+// `review.record_outcome` (`review.outcome` / `review.error`). The renderer
+// never consumes these directly; the trusted main-process provider owns them.
+// All shapes are exact-keyed and fail closed.
+// ---------------------------------------------------------------------------
+
+const WIRE_REASON = /^[a-z][a-z0-9_.-]{0,63}$/;
+
+export interface ReviewPreviewReady {
+  readonly status: 'ready';
+  readonly preview: ExactPreview;
+}
+
+export interface ReviewPreviewUnavailable {
+  readonly status: 'unavailable';
+  readonly reason: string;
+}
+
+export type ReviewGetResponse = ReviewPreviewReady | ReviewPreviewUnavailable;
+
+export function parseReviewGetResponse(value: unknown): ReviewGetResponse {
+  const item = record(value);
+  const status = item.status;
+  if (status === 'ready') {
+    keys(item, ['status', 'preview']);
+    return { status: 'ready', preview: parseExactPreview(item.preview) };
+  }
+  if (status === 'unavailable') {
+    keys(item, ['status', 'reason']);
+    const reason = item.reason;
+    if (typeof reason !== 'string' || !WIRE_REASON.test(reason)) {
+      throw new Error('review unavailable reason is malformed');
+    }
+    return { status: 'unavailable', reason };
+  }
+  throw new Error('review preview response is invalid');
+}
+
+export interface ReviewErrorResponse {
+  readonly reason: string;
+}
+
+export function parseReviewErrorResponse(value: unknown): ReviewErrorResponse {
+  const item = record(value);
+  keys(item, ['reason']);
+  const reason = item.reason;
+  if (typeof reason !== 'string' || !WIRE_REASON.test(reason)) {
+    throw new Error('review error reason is malformed');
+  }
+  return { reason };
+}

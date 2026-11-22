@@ -15,7 +15,6 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 from uuid import UUID, uuid5
 
 from aether.core.approval_review import (
@@ -112,31 +111,9 @@ def test_fixture_digest_payload_matches_backend_canonical_bytes() -> None:
 def test_fixture_preview_payload_matches_backend_electron_contract() -> None:
     fixture = _load_fixture()
     preview = build_preview(_golden_plan(), _golden_narrative())
-    expected = _electron_contract(json.loads(preview.model_dump_json()))
-    expected.update(  # identity trio carried by the renderer contract
-        {
-            "previewId": str(preview.preview_id),
-            "previewDigest": preview.preview_digest,
-            "reviewRequestId": str(preview.review_request_id),
-        }
-    )
-    assert expected == fixture["preview"]
+    from aether.core.review_contract import electron_preview_payload
 
-
-def _electron_contract(value: object) -> dict[str, Any]:
-    """Load the documented snake_case -> camelCase mapping from the generator."""
-
-    import importlib.util
-    from typing import cast
-
-    spec = importlib.util.spec_from_file_location(
-        "generate_stage2_golden",
-        REPO_ROOT / "scripts" / "generate_stage2_golden.py",
-    )
-    assert spec and spec.loader
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return cast(dict[str, Any], module.to_electron_contract(value))
+    assert electron_preview_payload(preview) == fixture["preview"]
 
 
 def test_fixture_identity_fields_match_backend_uuid5() -> None:

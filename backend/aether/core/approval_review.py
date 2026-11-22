@@ -537,6 +537,21 @@ def _result_from_write(
     )
 
 
+def review_result_from_write(
+    write: Stage2ReviewWrite,
+    *,
+    request: ReviewOutcomeRequest,
+) -> ReviewResult:
+    """Build the audit-only result for one (replayed) persisted write.
+
+    Reconciliation uses this to reconstruct the exact acknowledgement for a
+    previously persisted decision without re-reading or re-presenting any
+    preview. No state is consulted or changed here.
+    """
+
+    return _result_from_write(write, request=request)
+
+
 class PreviewReviewService:
     """Coordinates exact preview display and non-authorizing audit outcomes."""
 
@@ -660,4 +675,5 @@ __all__ = [
     "ReviewUnavailableError",
     "build_preview",
     "preview_id_for_digest",
+    "review_result_from_write",
 ]

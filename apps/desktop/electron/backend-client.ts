@@ -4,6 +4,7 @@ import {
   encodeFrame, FrameDecoder, parseEnvelope, PROTOCOL_VERSION, SessionGuard, signEnvelope,
   verifyEnvelopeMac,
 } from '../shared/channel';
+import type { ReviewOutcomeRequest } from '../shared/review';
 
 const MAX_PENDING = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
@@ -18,6 +19,16 @@ export interface BackendLaunchSpec {
   args: string[];
   cwd: string;
   env: NodeJS.ProcessEnv;
+  /** Overrides the pinned runtime expectation for this launch (development). */
+  expectedPythonVersion?: string;
+}
+
+/** Machine-readable review failure delivered by the authenticated channel. */
+export class ReviewChannelError extends Error {
+  constructor(readonly reason: string) {
+    super(`review request failed (${reason})`);
+    this.name = 'ReviewChannelError';
+  }
 }
 export type SpawnFactory = (executable: string, args: string[], options: SpawnOptions) => Child;
 export interface BackendClientOptions {
@@ -38,6 +49,7 @@ interface Pending {
   resolve: (payload: unknown) => void;
   reject: (error: Error) => void;
   timer: NodeJS.Timeout;
+  expectedKinds: readonly string[];
 }
 interface Session {
   readonly child: Child;
@@ -54,6 +66,7 @@ interface Session {
   handshakeTimer: NodeJS.Timeout | undefined;
   sendSequence: number;
   sendChain: Promise<void>;
+  expectedPythonVersion: string;
 }
 
 function deferred<T>(): Deferred<T> {
@@ -168,6 +181,7 @@ export class BackendClient {
       handshakeTimer: undefined,
       sendSequence: 1,
       sendChain: Promise.resolve(),
+      expectedPythonVersion: spec.expectedPythonVersion ?? this.expectedPythonVersion,
     };
     session.guard = new SessionGuard({
       key, session: session.sessionId, inboundDirection: 'child-to-parent', firstSequence: 1,
@@ -203,7 +217,7 @@ export class BackendClient {
       this.clearHandshakeTimer(session);
       session.challenge.fill(0);
       this.state = 'ready';
-      this.message = 'Authenticated synthetic channel ready';
+      this.message = 'Authenticated local backend channel ready';
       return this.status();
     } catch (error) {
       if (this.active === session) this.failSession(session, asError(error));
@@ -218,26 +232,105 @@ export class BackendClient {
     }
   }
 
-  async ping(): Promise<string> {
-    const session = this.active;
-    if (!session || session.phase !== 'ready') throw backendError('backend channel is not ready');
+  private async request(
+    session: Session,
+    kind: string,
+    payload: unknown,
+    expectedKinds: readonly string[],
+  ): Promise<unknown> {
     if (session.pending.size >= MAX_PENDING) throw backendError('backend request capacity reached');
     const requestId = randomUUID();
-    const payload = await new Promise<unknown>((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
         session.pending.delete(requestId);
         reject(backendError('backend request timed out'));
         this.failSession(session, backendError('backend request timed out'));
       }, this.requestTimeoutMs);
-      session.pending.set(requestId, { resolve, reject, timer });
-      this.send(session, 'demo.ping', requestId, { text: 'synthetic-only' })
+      session.pending.set(requestId, { resolve, reject, timer, expectedKinds });
+      this.send(session, kind, requestId, payload)
         .catch(() => this.failSession(session, backendError('backend channel write failed')));
     });
+  }
+
+  private reviewSession(): Session {
+    const session = this.active;
+    if (!session || session.phase !== 'ready') throw backendError('backend channel is not ready');
+    return session;
+  }
+
+  async ping(): Promise<string> {
+    const session = this.reviewSession();
+    const payload = await this.request(session, 'demo.ping', { text: 'synthetic-only' }, ['demo.pong']);
     if (payload === null || typeof payload !== 'object' || (payload as { text?: unknown }).text !== 'synthetic-only') {
       this.failSession(session, backendError('invalid synthetic backend response'));
       throw backendError('invalid synthetic backend response');
     }
-    return 'Authenticated synthetic control message completed. No approval or file action is available.';
+    return 'Authenticated control ping completed. No approval or file action is available.';
+  }
+
+  /**
+   * Ask the trusted backend to present the exact preview for one reviewable
+   * persisted task. The payload is returned unparsed; the trusted main-process
+   * review provider owns all review semantics and verification.
+   */
+  async reviewGetPreview(taskId: string): Promise<unknown> {
+    if (typeof taskId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(taskId)) {
+      throw backendError('malformed review task identity');
+    }
+    const session = this.reviewSession();
+    return this.request(session, 'review.get_preview', { task_id: taskId }, ['review.preview', 'review.error']);
+  }
+
+  private static outcomeWirePayload(request: ReviewOutcomeRequest) {
+    return {
+      reviewRequestId: request.reviewRequestId,
+      taskId: request.taskId,
+      planRevision: request.planRevision,
+      planHash: request.planHash,
+      previewId: request.previewId,
+      previewDigest: request.previewDigest,
+      outcome: request.outcome,
+      fullDiffAcknowledged: request.fullDiffAcknowledged,
+    } as const;
+  }
+
+  private validateReviewOutcomeRequest(request: ReviewOutcomeRequest): void {
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const SHA256 = /^[0-9a-f]{64}$/;
+    if (
+      !UUID.test(request.reviewRequestId) || !UUID.test(request.taskId) || !UUID.test(request.previewId)
+      || !SHA256.test(request.planHash) || !SHA256.test(request.previewDigest)
+      || !Number.isSafeInteger(request.planRevision) || request.planRevision < 1
+      || (request.outcome !== 'APPROVE' && request.outcome !== 'REVISE' && request.outcome !== 'REJECT' && request.outcome !== 'CANCELLED')
+      || typeof request.fullDiffAcknowledged !== 'boolean'
+    ) {
+      throw backendError('malformed review outcome request');
+    }
+  }
+
+  /**
+   * Submit one exact bounded review outcome. The provider re-verifies the
+   * preview before calling this and strictly parses the acknowledgement
+   * afterwards; the renderer is never the verification authority.
+   */
+  async reviewRecordOutcome(request: ReviewOutcomeRequest): Promise<unknown> {
+    this.validateReviewOutcomeRequest(request);
+    const session = this.reviewSession();
+    return this.request(session, 'review.record_outcome', BackendClient.outcomeWirePayload(request), ['review.outcome', 'review.error']);
+  }
+
+  /**
+   * Audit-only reconciliation: ask the backend whether one previously
+   * submitted exact request was persisted. Read-only on the backend side —
+   * no decision is created, no state changes. Resolves with the persisted
+   * acknowledgement (`review.outcome`); rejects with `ReviewChannelError`
+   * with reason `not_recorded` when definitively nothing is persisted, or
+   * with another bounded reason otherwise.
+   */
+  async reviewGetOutcome(request: ReviewOutcomeRequest): Promise<unknown> {
+    this.validateReviewOutcomeRequest(request);
+    const session = this.reviewSession();
+    return this.request(session, 'review.get_outcome', BackendClient.outcomeWirePayload(request), ['review.outcome', 'review.error']);
   }
 
   stop(): Promise<void> {
@@ -307,8 +400,8 @@ export class BackendClient {
       if (payload?.challenge !== session.challenge.toString('hex') || payload.protocol !== PROTOCOL_VERSION) {
         throw backendError('backend startup challenge mismatch');
       }
-      if (payload.pythonVersion !== this.expectedPythonVersion) {
-        throw backendError(`unsupported backend Python runtime; expected ${this.expectedPythonVersion}`);
+      if (payload.pythonVersion !== session.expectedPythonVersion) {
+        throw backendError(`unsupported backend Python runtime; expected ${session.expectedPythonVersion}`);
       }
       session.hello.resolve();
       return;
@@ -316,9 +409,18 @@ export class BackendClient {
     if (session.phase !== 'ready') return;
     session.guard?.accept(envelope);
     const pending = session.pending.get(envelope.requestId);
-    if (!pending || envelope.kind !== 'demo.pong') throw backendError('unsolicited or invalid backend response');
+    if (!pending || !pending.expectedKinds.includes(envelope.kind)) {
+      throw backendError('unsolicited or invalid backend response');
+    }
     session.pending.delete(envelope.requestId);
     clearTimeout(pending.timer);
+    if (envelope.kind === 'review.error') {
+      const reason = (envelope.payload as { reason?: unknown } | null | undefined)?.reason;
+      pending.reject(new ReviewChannelError(
+        typeof reason === 'string' && /^[a-z][a-z0-9_.-]{0,63}$/.test(reason) ? reason : 'review_unavailable',
+      ));
+      return;
+    }
     pending.resolve(envelope.payload);
   }
 

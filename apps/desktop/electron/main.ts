@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
-import { createFailClosedReviewProvider } from './review';
+import { createChannelReviewProvider } from './channel-review-provider';
 import { parseReviewOutcomeRequest } from '../shared/review';
 
 const APP_ROOT = app.getAppPath();
@@ -11,30 +11,83 @@ const RENDERER_FILE = resolve(join(APP_ROOT, 'dist', 'index.html'));
 const PRELOAD_FILE = resolve(join(APP_ROOT, 'dist-electron', 'electron', 'preload.js'));
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
 const backend = new BackendClient({ launchSpec: resolveBackendLaunchSpec });
-const reviewProvider = createFailClosedReviewProvider();
+const reviewProvider = createChannelReviewProvider({ backend, resolveTaskId: configuredReviewTaskId });
 let mainWindow: BrowserWindow | undefined;
 let shuttingDown = false;
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const PYTHON_VERSION = /^\d{1,2}\.\d{1,2}\.\d{1,3}$/;
+// Fixed synthetic task id used only by the development seed scenario
+// (`aether.channel.dev_seed`). Never set in packaged builds.
+const DEV_SEED_TASK_ID = '123e4567-e89b-42d3-a456-4266141740a1';
+
+/**
+ * Development-only trusted review task selection. Packaged builds never read
+ * it: without an explicit, validated main-process configuration the review
+ * surface fails closed. The renderer never chooses the task.
+ */
+function configuredReviewTaskId(): string | undefined {
+  if (app.isPackaged) return undefined;
+  const value = process.env.AETHER_REVIEW_TASK_ID;
+  if (typeof value === 'string' && UUID.test(value)) return value;
+  if (process.env.AETHER_REVIEW_DEV_SEED === 'synthetic-review') return DEV_SEED_TASK_ID;
+  return undefined;
+}
+
 function resolveBackendLaunchSpec(): BackendLaunchSpec {
-  const executable = app.isPackaged
+  const packaged = app.isPackaged;
+  const executable = packaged
     ? join(process.resourcesPath, 'backend', process.platform === 'win32' ? 'python.exe' : 'python')
     : process.env.AETHER_DEV_PYTHON;
   if (!executable || !isAbsolute(executable)) throw new Error('Backend runtime is not configured');
   const absoluteExecutable = resolve(executable);
-  const script = app.isPackaged
-    ? join(process.resourcesPath, 'backend', 'channel_child.py')
-    : join(APP_ROOT, 'backend', 'channel_child.py');
+  // The trusted backend-hosted channel service. The launch uses the hardened
+  // `-P -I -B -u` flags: `-I` implies `-E` (ignore PYTHON* environment
+  // variables, including PYTHONPATH and PYTHONHOME) and `-s` (suppress user
+  // site-packages); `-P` (Python >= 3.11, safe_path) keeps the current working
+  // directory and the script directory off sys.path. Imports therefore resolve
+  // only through the selected interpreter's own installation metadata. Note:
+  // `-I` does NOT prove every module physically lives in site-packages — an
+  // editable development install (pip/uv editable) legitimately imports the
+  // AETHER source checkout through a `.pth`/editable-finder installed in the
+  // venv; that is a controlled mechanism of the selected interpreter, not a
+  // run-time path injection. Development: trusted selected interpreter with a
+  // controlled editable or installed AETHER package. Packaged release
+  // (future): non-editable, verified package installation with independent
+  // import-provenance and integrity checks as the Master Spec requires;
+  // bundling is not implemented in this PR.
+  const backendRoot = packaged
+    ? join(process.resourcesPath, 'backend')
+    : resolve(join(APP_ROOT, '..', '..', 'backend'));
   const runtimeDir = dirname(absoluteExecutable);
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows';
   const env: NodeJS.ProcessEnv = process.platform === 'win32'
     ? { SYSTEMROOT: systemRoot, WINDIR: systemRoot, PATH: `${runtimeDir};${join(systemRoot, 'System32')}` }
     : { PATH: `${runtimeDir}:/usr/bin:/bin`, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
-  return {
+  if (!packaged) {
+    // Development-only, absolute-path passthroughs for the trusted review
+    // source. The renderer can neither see nor influence them. Without them
+    // the review surface reports unavailable by design.
+    const db = process.env.AETHER_REVIEW_DB;
+    if (db && isAbsolute(db)) env.AETHER_REVIEW_DB = db;
+    const narrative = process.env.AETHER_REVIEW_NARRATIVE;
+    if (narrative && isAbsolute(narrative)) env.AETHER_REVIEW_NARRATIVE = narrative;
+    if (process.env.AETHER_REVIEW_DEV_SEED === 'synthetic-review') {
+      env.AETHER_REVIEW_DEV_SEED = 'synthetic-review';
+    }
+  }
+  const spec: BackendLaunchSpec = {
     executable: absoluteExecutable,
-    args: ['-I', '-S', '-B', '-u', resolve(script)],
-    cwd: dirname(resolve(script)),
+    args: ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service'],
+    // cwd is inert for imports under -P (kept only for deterministic diagnostics).
+    cwd: backendRoot,
     env,
   };
+  const pythonVersion = process.env.AETHER_DEV_PYTHON_VERSION;
+  if (!packaged && typeof pythonVersion === 'string' && PYTHON_VERSION.test(pythonVersion)) {
+    spec.expectedPythonVersion = pythonVersion;
+  }
+  return spec;
 }
 
 function validateInvoke(event: IpcMainInvokeEvent): void {

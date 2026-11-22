@@ -935,6 +935,45 @@ class SQLiteTaskStore:
                 latest_plan_sequence,
             )
 
+    def find_stage2_review_outcome(
+        self,
+        task_id: UUID,
+        *,
+        review_request_id: UUID,
+        requested_outcome: str,
+        plan_revision: int,
+        plan_hash: str,
+        preview_id: UUID,
+        preview_digest: str,
+    ) -> Stage2ReviewWrite | None:
+        """Read-only lookup of a persisted Stage 2 review outcome.
+
+        Returns the persisted write for one exact immutable request identity
+        (idempotent_replay is True), or None when nothing was ever recorded.
+        Unlike ``record_stage2_review_outcome`` this never writes, never
+        transitions state and never appends an audit event: it exists so an
+        audit-only reconciliation can confirm a previously persisted decision
+        whose acknowledgement was lost. Identity replayed with different data
+        or a different outcome raises ReviewConflictError; a stored audit
+        record or event that fails integrity validation raises
+        PersistenceIntegrityError. No grant is issued, stored or consumed.
+        """
+
+        if requested_outcome not in {"APPROVE", "REVISE", "REJECT", "CANCELLED"}:
+            raise ValueError("Stage 2 requested outcome is invalid")
+        with self._lock:
+            self._verify_database_location()
+            return self._existing_stage2_review(
+                self._connection,
+                task_id,
+                review_request_id=review_request_id,
+                requested_outcome=requested_outcome,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                preview_id=preview_id,
+                preview_digest=preview_digest,
+            )
+
     def _existing_stage2_review(
         self,
         connection: sqlite3.Connection,
