@@ -34,7 +34,7 @@ import { previewIdForDigest, reviewRequestIdForDigest, verifyExactPreviewDigest 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const BACKEND_ROOT = resolve(ROOT, '..', '..', 'backend');
 const DEV_SEED_TASK_ID = '123e4567-e89b-42d3-a456-4266141740a1';
-const SKIP_REASON = 'no Python interpreter with aether.channel.service importable (set AETHER_DEV_PYTHON)';
+const SKIP_REASON = 'no Python interpreter with aether installed importable (set AETHER_DEV_PYTHON to an environment with the backend package installed, e.g. backend/.venv)';
 
 function probePython(): { executable: string; version: string } | undefined {
   const repoVenv = process.platform === 'win32'
@@ -49,8 +49,8 @@ function probePython(): { executable: string; version: string } | undefined {
     try {
       execFileSync(
         executable,
-        ['-B', '-c', 'import aether.channel.service'],
-        { encoding: 'utf8', env: { ...process.env, PYTHONPATH: BACKEND_ROOT }, stdio: ['ignore', 'pipe', 'pipe'] },
+        ['-P', '-I', '-B', '-c', 'import aether.channel.service'],
+        { encoding: 'utf8', env: { PATH: dirname(executable) }, stdio: ['ignore', 'pipe', 'pipe'] },
       );
       const version = execFileSync(
         executable,
@@ -71,6 +71,9 @@ function probePython(): { executable: string; version: string } | undefined {
 const probed = probePython();
 const SKIP = !probed;
 
+// The launch contract under test matches electron/main.ts: hardened `-P -I`
+// flags, no PYTHONPATH/PYTHONHOME inheritance, the backend package must be
+// importable from the interpreter's own site-packages.
 function launchSpecFor(executable: string, env: NodeJS.ProcessEnv): BackendLaunchSpec {
   const runtimeDir = dirname(executable);
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows';
@@ -79,9 +82,9 @@ function launchSpecFor(executable: string, env: NodeJS.ProcessEnv): BackendLaunc
     : { PATH: `${runtimeDir}:/usr/bin:/bin`, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
   return {
     executable,
-    args: ['-B', '-u', '-m', 'aether.channel.service'],
+    args: ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service'],
     cwd: BACKEND_ROOT,
-    env: { ...base, PYTHONPATH: BACKEND_ROOT, ...env },
+    env: { ...base, ...env },
     expectedPythonVersion: probed?.version,
   };
 }
@@ -92,10 +95,17 @@ function makeWorkspace(): { dir: string; db: string } {
   return { dir, db: join(dir, 'development.db') };
 }
 
-function trackingSpawnFactory(children: ChildProcessWithoutNullStreams[]): SpawnFactory {
+interface CapturedSpawn {
+  executable: string;
+  args: readonly string[];
+  env: NodeJS.ProcessEnv;
+}
+
+function trackingSpawnFactory(children: ChildProcessWithoutNullStreams[], captured: CapturedSpawn[] = []): SpawnFactory {
   return (executable, args, options) => {
     const child = spawn(executable, args, options) as ChildProcessWithoutNullStreams;
     children.push(child);
+    captured.push({ executable, args: [...args], env: { ...(options?.env as NodeJS.ProcessEnv) } });
     return child;
   };
 }
@@ -199,6 +209,129 @@ test('missing development database fails closed with an unavailable preview', { 
       await client.stop();
     }
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('spawned service uses the exact hardened launch contract', { skip: SKIP && SKIP_REASON }, async () => {
+  const { dir, db } = makeWorkspace();
+  const children: ChildProcessWithoutNullStreams[] = [];
+  const captured: CapturedSpawn[] = [];
+  const spec = launchSpecFor(probed!.executable, { AETHER_REVIEW_DB: db, AETHER_REVIEW_DEV_SEED: 'synthetic-review' });
+  const client = new BackendClient({ launchSpec: () => spec, spawnFactory: trackingSpawnFactory(children, captured), expectedPythonVersion: probed!.version });
+  try {
+    assert.equal((await client.start()).state, 'ready');
+    assert.equal(captured.length, 1);
+    assert.deepEqual(captured[0]!.args, ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service']);
+    assert.equal('PYTHONPATH' in captured[0]!.env, false, 'the child must not inherit PYTHONPATH');
+    assert.equal('PYTHONHOME' in captured[0]!.env, false, 'the child must not inherit PYTHONHOME');
+    assert.equal('PYTHONUSERBASE' in captured[0]!.env, false, 'the child must not inherit PYTHONUSERBASE');
+    assert.deepEqual(children[0]!.spawnargs.slice(1), ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service']);
+  } finally {
+    await client.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('hardened launch ignores a shadow aether package on PYTHONPATH', { skip: SKIP && SKIP_REASON }, async () => {
+  const { dir, db } = makeWorkspace();
+  const shadow = join(dir, 'shadow');
+  const { mkdirSync, writeFileSync } = await import('node:fs');
+  mkdirSync(join(shadow, 'aether', 'channel'), { recursive: true });
+  writeFileSync(join(shadow, 'aether', '__init__.py'), '');
+  writeFileSync(join(shadow, 'aether', 'channel', '__init__.py'), '');
+  writeFileSync(join(shadow, 'aether', 'channel', 'service.py'),
+    "import sys\nsys.stderr.write('SENTINEL-SHADOW-PACKAGE\\n')\nsys.exit(3)\n");
+  const runtimeDir = dirname(probed!.executable);
+  const spec: BackendLaunchSpec = {
+    executable: probed!.executable,
+    args: ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service'],
+    cwd: BACKEND_ROOT,
+    // The launch contract under test explicitly does NOT forward PYTHONPATH;
+    // a poisoned parent environment must not leak into the child either.
+    env: { PATH: `${runtimeDir}`, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', AETHER_REVIEW_DB: db, AETHER_REVIEW_DEV_SEED: 'synthetic-review' },
+    expectedPythonVersion: probed!.version,
+  };
+  const client = new BackendClient({ launchSpec: () => spec, expectedPythonVersion: probed!.version });
+  try {
+    assert.equal((await client.start()).state, 'ready');
+    const response = await client.reviewGetPreview(DEV_SEED_TASK_ID);
+    assert.equal(parseReviewGetResponse(response).status, 'ready');
+  } finally {
+    await client.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lost acknowledgement is reconciled against persisted audit evidence', { skip: SKIP && SKIP_REASON }, async () => {
+  const { dir, db } = makeWorkspace();
+  const children: ChildProcessWithoutNullStreams[] = [];
+  const spec = launchSpecFor(probed!.executable, { AETHER_REVIEW_DB: db, AETHER_REVIEW_DEV_SEED: 'synthetic-review' });
+  const client = new BackendClient({ launchSpec: () => spec, spawnFactory: trackingSpawnFactory(children), expectedPythonVersion: probed!.version });
+  try {
+    assert.equal((await client.start()).state, 'ready');
+    const provider = createChannelReviewProvider({ backend: client, resolveTaskId: () => DEV_SEED_TASK_ID });
+    const state = await provider.getReview();
+    assert.equal(state.status, 'ready');
+    if (state.status !== 'ready') return;
+    const request = reviewRequestFor(state.preview, 'REJECT', false);
+
+    // Simulate a lost acknowledgement: the decision IS persisted server-side,
+    // but the client observes a transport failure.
+    const lossyBackend = {
+      status: client.status.bind(client),
+      reviewGetPreview: client.reviewGetPreview.bind(client),
+      reviewGetOutcome: client.reviewGetOutcome.bind(client),
+      reviewRecordOutcome: async (req: typeof request) => {
+        await client.reviewRecordOutcome(req); // persists audit evidence
+        throw new Error('simulated lost acknowledgement');
+      },
+    };
+    const lossyProvider = createChannelReviewProvider({ backend: lossyBackend, resolveTaskId: () => DEV_SEED_TASK_ID });
+    const reconciled = await lossyProvider.recordOutcome(request);
+    assert.equal(reconciled.resolution, 'REJECT');
+    assert.equal(reconciled.requestedOutcome, 'REJECT');
+    assert.equal(reconciled.idempotentReplay, true);
+    assert.equal(reconciled.granted, false);
+    assert.equal(reconciled.auditPersisted, true);
+  } finally {
+    await client.stop();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('previously rejected outcome reconciles after a full process restart', { skip: SKIP && SKIP_REASON }, async () => {
+  const { dir, db } = makeWorkspace();
+  // First process: present the preview and record REJECT.
+  const first = new BackendClient({ launchSpec: () => launchSpecFor(probed!.executable, { AETHER_REVIEW_DB: db, AETHER_REVIEW_DEV_SEED: 'synthetic-review' }), expectedPythonVersion: probed!.version });
+  let request;
+  try {
+    assert.equal((await first.start()).state, 'ready');
+    const provider = createChannelReviewProvider({ backend: first, resolveTaskId: () => DEV_SEED_TASK_ID });
+    const state = await provider.getReview();
+    assert.equal(state.status, 'ready');
+    if (state.status !== 'ready') return;
+    request = reviewRequestFor(state.preview, 'REJECT', false);
+    const acknowledgement = await provider.recordOutcome(request);
+    assert.equal(acknowledgement.resolution, 'REJECT');
+  } finally {
+    await first.stop();
+  }
+  // Second process (simulating a restart): the preview is no longer
+  // presentable; the exact request reconciles from persisted audit evidence.
+  const second = new BackendClient({ launchSpec: () => launchSpecFor(probed!.executable, { AETHER_REVIEW_DB: db, AETHER_REVIEW_DEV_SEED: 'synthetic-review' }), expectedPythonVersion: probed!.version });
+  try {
+    assert.equal((await second.start()).state, 'ready');
+    const provider = createChannelReviewProvider({ backend: second, resolveTaskId: () => DEV_SEED_TASK_ID });
+    assert.equal((await provider.getReview()).status, 'unavailable', 'denied task is not presentable');
+    const reconciled = await provider.recordOutcome(request!);
+    assert.equal(reconciled.resolution, 'REJECT');
+    assert.equal(reconciled.requestedOutcome, 'REJECT');
+    assert.equal(reconciled.idempotentReplay, true);
+    assert.equal(reconciled.granted, false);
+    assert.equal(reconciled.executionAvailable, false);
+  } finally {
+    await second.stop();
     rmSync(dir, { recursive: true, force: true });
   }
 });

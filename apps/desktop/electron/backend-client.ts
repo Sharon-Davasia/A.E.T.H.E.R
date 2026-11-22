@@ -281,14 +281,8 @@ export class BackendClient {
     return this.request(session, 'review.get_preview', { task_id: taskId }, ['review.preview', 'review.error']);
   }
 
-  /**
-   * Submit one exact bounded review outcome. The provider re-verifies the
-   * preview before calling this and strictly parses the acknowledgement
-   * afterwards; the renderer is never the verification authority.
-   */
-  async reviewRecordOutcome(request: ReviewOutcomeRequest): Promise<unknown> {
-    const session = this.reviewSession();
-    const payload = {
+  private static outcomeWirePayload(request: ReviewOutcomeRequest) {
+    return {
       reviewRequestId: request.reviewRequestId,
       taskId: request.taskId,
       planRevision: request.planRevision,
@@ -297,8 +291,46 @@ export class BackendClient {
       previewDigest: request.previewDigest,
       outcome: request.outcome,
       fullDiffAcknowledged: request.fullDiffAcknowledged,
-    };
-    return this.request(session, 'review.record_outcome', payload, ['review.outcome', 'review.error']);
+    } as const;
+  }
+
+  private validateReviewOutcomeRequest(request: ReviewOutcomeRequest): void {
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const SHA256 = /^[0-9a-f]{64}$/;
+    if (
+      !UUID.test(request.reviewRequestId) || !UUID.test(request.taskId) || !UUID.test(request.previewId)
+      || !SHA256.test(request.planHash) || !SHA256.test(request.previewDigest)
+      || !Number.isSafeInteger(request.planRevision) || request.planRevision < 1
+      || (request.outcome !== 'APPROVE' && request.outcome !== 'REVISE' && request.outcome !== 'REJECT' && request.outcome !== 'CANCELLED')
+      || typeof request.fullDiffAcknowledged !== 'boolean'
+    ) {
+      throw backendError('malformed review outcome request');
+    }
+  }
+
+  /**
+   * Submit one exact bounded review outcome. The provider re-verifies the
+   * preview before calling this and strictly parses the acknowledgement
+   * afterwards; the renderer is never the verification authority.
+   */
+  async reviewRecordOutcome(request: ReviewOutcomeRequest): Promise<unknown> {
+    this.validateReviewOutcomeRequest(request);
+    const session = this.reviewSession();
+    return this.request(session, 'review.record_outcome', BackendClient.outcomeWirePayload(request), ['review.outcome', 'review.error']);
+  }
+
+  /**
+   * Audit-only reconciliation: ask the backend whether one previously
+   * submitted exact request was persisted. Read-only on the backend side —
+   * no decision is created, no state changes. Resolves with the persisted
+   * acknowledgement (`review.outcome`); rejects with `ReviewChannelError`
+   * with reason `not_recorded` when definitively nothing is persisted, or
+   * with another bounded reason otherwise.
+   */
+  async reviewGetOutcome(request: ReviewOutcomeRequest): Promise<unknown> {
+    this.validateReviewOutcomeRequest(request);
+    const session = this.reviewSession();
+    return this.request(session, 'review.get_outcome', BackendClient.outcomeWirePayload(request), ['review.outcome', 'review.error']);
   }
 
   stop(): Promise<void> {

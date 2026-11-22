@@ -41,9 +41,16 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
     : process.env.AETHER_DEV_PYTHON;
   if (!executable || !isAbsolute(executable)) throw new Error('Backend runtime is not configured');
   const absoluteExecutable = resolve(executable);
-  // The trusted backend-hosted channel service. Development runs against the
-  // source tree (aether importable via PYTHONPATH); packaged builds bundle the
-  // backend package next to the bundled interpreter.
+  // The trusted backend-hosted channel service. The launch uses the hardened
+  // `-P -I -B -u` flags: `-I` implies `-E` (ignore PYTHON* environment
+  // variables, including PYTHONPATH and PYTHONHOME) and `-s` (suppress user
+  // site-packages); `-P` (Python >= 3.11, safe_path) keeps the current working
+  // directory and the script directory off sys.path. The interpreter must
+  // therefore have the `aether` package INSTALLED — the backend project venv
+  // in development (stage3 exposes no path injection), a wheel bundled into
+  // the interpreter at build time in packaged builds (future work; bundling
+  // is not implemented yet). No source-path or cwd import is available to
+  // the child at run time by construction.
   const backendRoot = packaged
     ? join(process.resourcesPath, 'backend')
     : resolve(join(APP_ROOT, '..', '..', 'backend'));
@@ -52,7 +59,6 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
   const env: NodeJS.ProcessEnv = process.platform === 'win32'
     ? { SYSTEMROOT: systemRoot, WINDIR: systemRoot, PATH: `${runtimeDir};${join(systemRoot, 'System32')}` }
     : { PATH: `${runtimeDir}:/usr/bin:/bin`, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
-  env.PYTHONPATH = backendRoot;
   if (!packaged) {
     // Development-only, absolute-path passthroughs for the trusted review
     // source. The renderer can neither see nor influence them. Without them
@@ -67,7 +73,8 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
   }
   const spec: BackendLaunchSpec = {
     executable: absoluteExecutable,
-    args: ['-B', '-u', '-m', 'aether.channel.service'],
+    args: ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service'],
+    // cwd is inert for imports under -P (kept only for deterministic diagnostics).
     cwd: backendRoot,
     env,
   };

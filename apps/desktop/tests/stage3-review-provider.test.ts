@@ -12,6 +12,7 @@ import {
   createChannelReviewProvider,
   type ReviewChannelBackend,
 } from '../electron/channel-review-provider';
+import { ReviewChannelError } from '../electron/backend-client';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FIXTURE_PATH = path.join(root, 'tests', 'fixtures', 'stage2-exact-preview.golden.json');
@@ -40,11 +41,13 @@ interface StubOptions {
   readonly outcome?: () => unknown;
   readonly outcomeThrows?: boolean;
   readonly state?: string;
+  readonly outcomeStatus?: () => unknown;
 }
 
 function stubBackend(options: StubOptions = {}) {
   const calls: string[] = [];
   const outcomeRequests: ReviewOutcomeRequest[] = [];
+  const outcomeStatusRequests: ReviewOutcomeRequest[] = [];
   const backend: ReviewChannelBackend = {
     status: () => ({ state: options.state ?? 'ready', message: 'test' }),
     async reviewGetPreview(taskId: string): Promise<unknown> {
@@ -58,8 +61,14 @@ function stubBackend(options: StubOptions = {}) {
       if (options.outcomeThrows) throw new Error('transport failed');
       return options.outcome ? options.outcome() : goldenAck();
     },
+    async reviewGetOutcome(request: ReviewOutcomeRequest): Promise<unknown> {
+      calls.push('status');
+      outcomeStatusRequests.push(request);
+      if (options.outcomeStatus) return options.outcomeStatus();
+      throw new ReviewChannelError('not_recorded');
+    },
   };
-  return { backend, calls, outcomeRequests };
+  return { backend, calls, outcomeRequests, outcomeStatusRequests };
 }
 
 test('getReview presents the verified golden preview when the channel is ready', async () => {
@@ -154,9 +163,9 @@ test('recordOutcome re-verifies before recording and sends the exact request', a
   assert.deepEqual(outcomeRequests, [request]);
 });
 
-test('recordOutcome refuses a drifted (digest-invalidated) preview without sending anything', async () => {
+test('a drifted (digest-invalidated) preview reconciles against audit evidence and fails closed', async () => {
   let fetches = 0;
-  const { backend, outcomeRequests } = stubBackend({
+  const stubbed = stubBackend({
     response: () => {
       fetches += 1;
       if (fetches === 1) return { status: 'ready', preview: goldenPreview() };
@@ -166,15 +175,18 @@ test('recordOutcome refuses a drifted (digest-invalidated) preview without sendi
       return { status: 'ready', preview: drifted };
     },
   });
+  const { backend, outcomeRequests } = stubbed;
+  const { outcomeStatusRequests: statusRequests } = stubbed;
   const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
   const state = await provider.getReview();
   assert.equal(state.status, 'ready');
   if (state.status !== 'ready') return;
   const request = reviewRequestFor(state.preview, 'APPROVE', true);
-  // The drifted payload no longer verifies, so the provider fails closed before
-  // any decision byte is sent.
-  await assert.rejects(provider.recordOutcome(request), /unavailable/);
+  // The drifted payload no longer verifies, so no decision byte is sent;
+  // reconciliation finds no persisted audit record and fails closed.
+  await assert.rejects(provider.recordOutcome(request), /previous outcome was not recorded/);
   assert.deepEqual(outcomeRequests, [], 'no decision is sent when the persisted preview drifted');
+  assert.deepEqual(statusRequests, [request], 'reconciliation consults persisted audit evidence only');
 });
 
 test('recordOutcome refuses a request that does not match the verified preview', async () => {
@@ -207,18 +219,24 @@ test('recordOutcome fails closed when the backend drops before recording', async
   await assert.rejects(provider.recordOutcome(request), /not connected/);
 });
 
-test('recordOutcome propagates transport failure instead of issuing a receipt', async () => {
-  const { backend } = stubBackend({ outcomeThrows: true });
+test('transport loss with no persisted record fails closed without a receipt', async () => {
+  const { backend, outcomeStatusRequests, outcomeRequests } = stubBackend({ outcomeThrows: true });
   const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
   const state = await provider.getReview();
   assert.equal(state.status, 'ready');
   if (state.status !== 'ready') return;
   const request = reviewRequestFor(state.preview, 'REJECT', false);
-  await assert.rejects(provider.recordOutcome(request), /could not record/);
+  await assert.rejects(provider.recordOutcome(request), /previous outcome was not recorded/);
+  // The decision was sent exactly once; reconciliation never resubmits it.
+  assert.deepEqual(outcomeRequests, [request]);
+  assert.deepEqual(outcomeStatusRequests, [request]);
 });
 
 test('recordOutcome rejects a forged or mismatched acknowledgement', async () => {
-  const forgedGrant = stubBackend({ outcome: () => goldenAck({ granted: true }) });
+  const forgedGrant = stubBackend({
+    outcome: () => goldenAck({ granted: true }),
+    outcomeStatus: () => goldenAck({ granted: true }),
+  });
   const providerA = createChannelReviewProvider({ backend: forgedGrant.backend, resolveTaskId: () => TASK_ID });
   const stateA = await providerA.getReview();
   if (stateA.status !== 'ready') return assert.fail('expected ready');
@@ -232,7 +250,10 @@ test('recordOutcome rejects a forged or mismatched acknowledgement', async () =>
   const requestB = reviewRequestFor(stateB.preview, 'APPROVE', true);
   await assert.rejects(providerB.recordOutcome(requestB), /does not match/);
 
-  const unaudited = stubBackend({ outcome: () => goldenAck({ auditPersisted: false }) });
+  const unaudited = stubBackend({
+    outcome: () => goldenAck({ auditPersisted: false }),
+    outcomeStatus: () => goldenAck({ auditPersisted: false }),
+  });
   const providerC = createChannelReviewProvider({ backend: unaudited.backend, resolveTaskId: () => TASK_ID });
   const stateC = await providerC.getReview();
   if (stateC.status !== 'ready') return assert.fail('expected ready');
@@ -256,4 +277,130 @@ test('golden acknowledgement round-trips through the renderer parser unchanged',
   const ack = parseReviewAcknowledgement(goldenAck());
   assert.equal(ack.resolution, 'APPROVE');
   assert.equal(ack.authority, 'NON_AUTHORIZING_AUDIT_RECORD');
+});
+
+test('lost acknowledgement after a terminal transition is reconciled from audit evidence', async () => {
+  const { backend, outcomeRequests, outcomeStatusRequests } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({ resolution: 'REJECT', requestedOutcome: 'REJECT', idempotentReplay: true, message: 'Preview rejected. No grant was issued and no action may execute.' }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'REJECT', false);
+  const acknowledgement = await provider.recordOutcome(request);
+  assert.equal(acknowledgement.resolution, 'REJECT');
+  assert.equal(acknowledgement.idempotentReplay, true);
+  assert.equal(acknowledgement.granted, false);
+  assert.deepEqual(outcomeRequests, [], 'no new decision is sent when the preview is not presentable');
+  assert.deepEqual(outcomeStatusRequests, [request]);
+});
+
+test('lost acknowledgement on the wire is reconciled instead of re-sent', async () => {
+  const { backend, outcomeRequests, outcomeStatusRequests } = stubBackend({
+    outcomeThrows: true,
+    outcomeStatus: () => goldenAck({ idempotentReplay: true }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const state = await provider.getReview();
+  if (state.status !== 'ready') return assert.fail('expected ready');
+  const request = reviewRequestFor(state.preview, 'APPROVE', true);
+  const acknowledgement = await provider.recordOutcome(request);
+  assert.equal(acknowledgement.resolution, 'APPROVE');
+  assert.equal(acknowledgement.idempotentReplay, true);
+  assert.equal(acknowledgement.granted, false);
+  assert.deepEqual(outcomeRequests, [request], 'the decision was sent exactly once');
+  assert.deepEqual(outcomeStatusRequests, [request]);
+});
+
+test('an unparsable record response falls back to reconciliation', async () => {
+  const { backend, outcomeStatusRequests } = stubBackend({
+    outcome: () => ({ garbage: true }),
+    outcomeStatus: () => goldenAck({ idempotentReplay: true }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const state = await provider.getReview();
+  if (state.status !== 'ready') return assert.fail('expected ready');
+  const request = reviewRequestFor(state.preview, 'APPROVE', true);
+  const acknowledgement = await provider.recordOutcome(request);
+  assert.equal(acknowledgement.resolution, 'APPROVE');
+  assert.equal(acknowledgement.idempotentReplay, true);
+  assert.deepEqual(outcomeStatusRequests, [request]);
+});
+
+test('reconciliation never reconciles a drifted submission', async () => {
+  const { backend, outcomeStatusRequests, outcomeRequests } = stubBackend();
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const state = await provider.getReview();
+  if (state.status !== 'ready') return assert.fail('expected ready');
+  const stale = reviewRequestFor(state.preview, 'APPROVE', true);
+  const drifted = { ...stale, planHash: '0'.repeat(64) };
+  await assert.rejects(provider.recordOutcome(drifted), /currently persisted/);
+  assert.deepEqual(outcomeRequests, []);
+  assert.deepEqual(outcomeStatusRequests, [], 'drift refusal does not reconcile');
+});
+
+test('reconciliation rejects conflicting or forged audit evidence', async () => {
+  const mismatched = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({ requestedOutcome: 'REJECT', resolution: 'REJECT' }),
+  });
+  const providerA = createChannelReviewProvider({ backend: mismatched.backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'APPROVE', true);
+  await assert.rejects(providerA.recordOutcome(request), /does not match/);
+
+  const forgedGrant = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({ granted: true }),
+  });
+  const providerB = createChannelReviewProvider({ backend: forgedGrant.backend, resolveTaskId: () => TASK_ID });
+  await assert.rejects(providerB.recordOutcome(request), /invalid acknowledgement/);
+
+  const conflict = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => { throw new ReviewChannelError('review_conflict'); },
+  });
+  const providerC = createChannelReviewProvider({ backend: conflict.backend, resolveTaskId: () => TASK_ID });
+  await assert.rejects(providerC.recordOutcome(request), /could not confirm/);
+
+  const unavailable = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => { throw new ReviewChannelError('review_unavailable'); },
+  });
+  const providerD = createChannelReviewProvider({ backend: unavailable.backend, resolveTaskId: () => TASK_ID });
+  await assert.rejects(providerD.recordOutcome(request), /could not confirm/);
+});
+
+test('reconciliation outcome data travels through the wire parsers unchanged', async () => {
+  const { backend } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'preview_too_large' }),
+    outcomeStatus: () => goldenAck({ idempotentReplay: true }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'APPROVE', true);
+  const acknowledgement = await provider.recordOutcome(request);
+  assert.equal(acknowledgement.auditPersisted, true);
+  assert.equal(acknowledgement.authority, 'NON_AUTHORIZING_AUDIT_RECORD');
+  assert.equal(acknowledgement.executionAvailable, false);
+});
+
+test('a terminal REJECT replay reconciles through the trusted provider', async () => {
+  // Simulates: REJECT was persisted (task now DENIED), the renderer still
+  // holds the request, and the user clicks the button again after a restart.
+  const { backend, outcomeStatusRequests, outcomeRequests } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({
+      resolution: 'REJECT',
+      requestedOutcome: 'REJECT',
+      idempotentReplay: true,
+      message: 'Preview rejected. No grant was issued and no action may execute.',
+    }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'REJECT', false);
+  const acknowledgement = await provider.recordOutcome(request);
+  assert.equal(acknowledgement.resolution, 'REJECT');
+  assert.equal(acknowledgement.requestedOutcome, 'REJECT');
+  assert.equal(acknowledgement.idempotentReplay, true);
+  assert.equal(acknowledgement.granted, false);
+  assert.deepEqual(outcomeRequests, []);
+  assert.deepEqual(outcomeStatusRequests, [request]);
 });

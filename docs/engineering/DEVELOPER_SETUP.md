@@ -20,7 +20,7 @@ cd ..
 .\scripts\verify.ps1
 ```
 
-The verifier runs Ruff lint/format, strict mypy, pytest, imports and authenticated FastAPI health checks. No model, network inference or GPU is needed. One optional actual-runtime integration test is skipped unless explicitly enabled and configured; a skip is not a model validation pass.
+The verifier runs Ruff lint/format, strict mypy, pytest, imports and authenticated FastAPI health checks. No model, network inference or GPU is needed. One optional actual-runtime integration test is skipped unless explicitly enabled and configured; a skip is not a model validation pass. The normal `uv sync` editable install also satisfies the Stage 3 desktop service launch contract: the hardened `-P -I -B -u -m aether.channel.service` child imports `aether` from the interpreter's own site-packages, so the backend environment must be the one selected by `AETHER_DEV_PYTHON`; do not rely on `PYTHONPATH`/source directories (they are ignored by design).
 
 ## Start authenticated local API
 
