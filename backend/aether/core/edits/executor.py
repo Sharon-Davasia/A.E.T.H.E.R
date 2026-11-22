@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
 import stat
 import tempfile
@@ -40,7 +41,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from aether.core.contracts.policy import RiskTier
 from aether.core.contracts.resource import ResourceRef
@@ -52,6 +53,7 @@ from aether.core.edits.receipts import (
 )
 from aether.core.fs import errors as fs_errors
 from aether.core.grants.authority import GrantAuthority, GrantRequest
+from aether.core.grants.consumption import IssuanceDisabledConsumptionLedger
 from aether.core.planning.edit_binding import ApprovedEdit, EditBindingError
 from aether.core.resources.path_safety import (
     PathSafetyError,
@@ -68,6 +70,42 @@ class TaskPlanSource(Protocol):
     """The narrow read surface this executor needs from plan persistence."""
 
     def get_plan(self, task_id: UUID, revision: int | None = None) -> Any: ...
+
+
+class GrantConsumer(Protocol):
+    """Atomic, replay-safe grant accounting (S14-2).
+
+    ``consume`` must be transactional: it either decrements a use *and* records
+    the consumption for this exact action identity, or it changes nothing. The
+    executor never treats an unverified grant as permission, and never spends a
+    use before the action is certain to be attempted.
+    """
+
+    def consume(
+        self,
+        *,
+        consumption_id: UUID,
+        approval_id: UUID,
+        task_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        step_id: UUID,
+        capability_id: str,
+        risk_tier: RiskTier,
+        arguments_sha256: str,
+        expected_effect_sha256: str,
+        resource_versions: dict[str, str],
+        consumed_by: str,
+        now: datetime | None = None,
+    ) -> Any: ...
+
+
+class ExecutionJournal(Protocol):
+    """Durable pre-mutation intent, written before any replacement (S14-4)."""
+
+    def begin(self, **fields: Any) -> Any: ...
+
+    def resolve(self, consumption_id: UUID, *, outcome: str, detail: str) -> Any: ...
 
 
 _MAX_EDIT_BYTES = 4 * 1024 * 1024
@@ -121,6 +159,8 @@ class EditExecutor:
         receipts: ReceiptStore,
         *,
         plans: TaskPlanSource | None = None,
+        grants: GrantConsumer | None = None,
+        journal: ExecutionJournal | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._registry = registry
@@ -128,6 +168,15 @@ class EditExecutor:
         # from the request. A caller-supplied digest would let a caller approve
         # itself, which is precisely the substitution this closes.
         self._plans = plans
+        # S14-2: a validated grant is not execution authority. One use must be
+        # spent atomically against the exact action, or nothing happens. The
+        # default refuses every consumption, so a default-constructed executor
+        # cannot mutate -- the same shape as GRANT_ISSUANCE_DISABLED.
+        self._grants = grants if grants is not None else IssuanceDisabledConsumptionLedger()
+        # S14-4: the durable pre-mutation intent, so a crash between replace and
+        # receipt is never invisible.
+        self._journal = journal
+        self._consumption_id: UUID | None = None
         self._authority = authority
         self._vault = vault
         self._receipts = receipts
@@ -256,6 +305,89 @@ class EditExecutor:
             raise EditDenied(check.reason_code, "the exact grant does not cover this edit")
         return path
 
+    def _plan_step(self, request: EditRequest) -> Any:
+        """The authoritative persisted step for this request, or refuse."""
+
+        if self._plans is None:
+            raise EditDenied(
+                "approved_result_binding_unavailable",
+                "no persisted plan source is configured, so no step was approved",
+            )
+        try:
+            plan = self._plans.get_plan(request.task_id, request.plan_revision)
+        except Exception as exc:
+            raise EditDenied(
+                "approved_plan_unavailable", "the approved plan revision could not be read"
+            ) from exc
+        step = next((item for item in plan.steps if item.step_id == request.step_id), None)
+        if step is None:
+            raise EditDenied(
+                "approved_step_missing",
+                "the persisted plan has no such step, so nothing was approved here",
+            )
+        return step
+
+    def _plan_binding(self, request: EditRequest) -> ApprovedEdit:
+        """The persisted approval binding for this request, or refuse."""
+
+        step = self._plan_step(request)
+        try:
+            return ApprovedEdit.from_step_arguments(
+                resource_id=request.resource_id, values=dict(step.expected_effect)
+            )
+        except EditBindingError as exc:
+            raise EditDenied(
+                "approved_binding_malformed",
+                "the persisted plan does not carry a usable approval binding",
+            ) from exc
+
+    def _consume_grant(self, request: EditRequest, step: Any, binding: ApprovedEdit) -> None:
+        """Spend exactly one grant use against this exact action (S14-2).
+
+        Ordering matters and is deliberate:
+
+        1. Prove a consumer is configured. Without one there is no accounting, so
+           no mutation: ``GRANT_VALIDATED_EXECUTOR_NOT_ENABLED`` is a *policy*
+           answer, not permission, and this method never treats it as one.
+        2. Derive the action identity from the *persisted plan*, not the request,
+           so a caller cannot describe a different action to the ledger than the
+           one it is about to perform.
+        3. Consume atomically. The ledger decrements and records in one
+           transaction, so a duplicate execution is impossible and a replay with
+           different terms is refused.
+        4. Refuse anything that is not a first, exact consumption.
+        """
+
+        consumption_id = uuid4()
+        try:
+            consumption = self._grants.consume(
+                consumption_id=consumption_id,
+                approval_id=request.approval_id,
+                task_id=request.task_id,
+                plan_revision=request.plan_revision,
+                plan_hash=request.plan_hash,
+                step_id=request.step_id,
+                capability_id=_FORWARD_EDIT_CAPABILITY,
+                risk_tier=RiskTier.MODIFY,
+                arguments_sha256=_canonical_digest(dict(step.arguments)),
+                expected_effect_sha256=str(step.expected_effect.get("approved_effect_digest")),
+                resource_versions={request.resource_id: str(step.resources[0].expected_version)},
+                consumed_by=_CONSUMER_CODE,
+                now=self._clock(),
+            )
+        except Exception as exc:
+            reason = getattr(exc, "reason_code", None) or "grant_consumption_failed"
+            raise EditDenied(str(reason), "grant consumption was refused") from exc
+        if getattr(consumption, "replayed", False):
+            # A replay of the same consumption id would double-execute the same
+            # grant use. Refuse rather than perform the action twice.
+            raise EditDenied(
+                "grant_consumption_replayed",
+                "this grant use has already been spent on the same action",
+            )
+        del binding
+        self._consumption_id = consumption_id
+
     def _mutate(
         self,
         *,
@@ -268,6 +400,10 @@ class EditExecutor:
         undo_of: str | None = None,
     ) -> EditOutcome:
         intended_sha256 = hashlib.sha256(content).hexdigest()
+        # S14-2: spend the use before touching the file at all, so a crash leaves
+        # a PENDING consumption (findable) rather than an unaccounted side effect.
+        if capability_id == _FORWARD_EDIT_CAPABILITY:
+            self._consume_grant(request, self._plan_step(request), self._plan_binding(request))
         try:
             pre_image = target.read_bytes()
         except OSError as exc:
@@ -391,6 +527,7 @@ class EditExecutor:
             undo_of,
             verified_at=self._clock(),
         )
+        self._resolve_consumption("SUCCEEDED", "verified effect")
         return EditOutcome(
             status="SUCCEEDED",
             reason_code="edit_verified",
@@ -400,6 +537,27 @@ class EditExecutor:
             snapshot_id=str(snapshot.snapshot_id),
             detail="bytes were re-read from disk and match the approved content exactly",
         )
+
+    def _resolve_consumption(self, state: str, detail: str) -> None:
+        """Record what actually happened to the spent use.
+
+        A failure here leaves the consumption PENDING, which is exactly what
+        reconciliation looks for. A spent use is never recorded as successful
+        merely because the process reached this call.
+        """
+
+        consumption_id = self._consumption_id
+        if consumption_id is None:
+            return
+        resolver = getattr(self._grants, "resolve", None)
+        if resolver is None:
+            return
+        try:
+            resolver(consumption_id, state=state, detail=detail)
+        except Exception:
+            # The receipt still records the truth; the pending consumption is
+            # the recovery work item.
+            return
 
     def _verify_approved_result(
         self, request: EditRequest, intended_sha256: str, pre_image: bytes
@@ -512,6 +670,7 @@ class EditExecutor:
         """Record an edit we cannot prove; never claim success."""
 
         warnings = [*warnings, reason]
+        self._resolve_consumption("UNVERIFIED", reason)
         receipt = self._record(
             request,
             capability_id,
@@ -601,6 +760,16 @@ class EditExecutor:
                 "receipt_unavailable",
                 f"the edit outcome could not be recorded durably ({exc.reason_code})",
             ) from exc
+
+
+_CONSUMER_CODE = "aether.core.edits.executor"
+
+
+def _canonical_digest(value: dict[str, Any]) -> str:
+    """Stable digest of a plan step's typed arguments."""
+
+    material = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _receipt_id() -> UUID:

@@ -122,9 +122,42 @@ def resolve(registry: ResourceRegistry, *parts: str) -> str:
     return resource.ref.resource_id
 
 
+class ConsumptionHarness:
+    """A real consumption ledger plus the budget an edit will spend.
+
+    Tests that exercise the executor need genuine accounting, because S14-2
+    makes a validated grant without a spendable budget a refusal. This harness
+    creates no grant and widens no scope: it records a budget of a given size,
+    which is exactly what an accepted approval would have produced.
+    """
+
+    def __init__(self, tmp_path, *, clock=None, uses: int = 1, plan_hash: str = "a" * 64):
+        from aether.core.grants.consumption import ConsumptionLedger
+
+        self.ledger = ConsumptionLedger(tmp_path / "consumption.sqlite3", clock=clock)
+        self.uses = uses
+        self.plan_hash = plan_hash
+
+    def bind(
+        self, *, approval_id, task_id, plan_revision: int = 1, now=None, plan_hash=None
+    ) -> None:
+        self.ledger.grant_budget(
+            approval_id=approval_id,
+            task_id=task_id,
+            plan_revision=plan_revision,
+            plan_hash=plan_hash or self.plan_hash,
+            uses=self.uses,
+            now=now,
+        )
+
+    def close(self) -> None:
+        self.ledger.close()
+
+
 __all__ = [
     "ALL_CAPABILITIES",
     "READ_CAPABILITIES",
+    "ConsumptionHarness",
     "FixedVolumeInspector",
     "FixtureTree",
     "build_registry",

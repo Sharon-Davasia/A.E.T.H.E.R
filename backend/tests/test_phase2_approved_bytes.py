@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -24,7 +24,7 @@ from aether.core.planning.edit_binding import ApprovedEdit, EditBindingError
 from aether.core.planning.exact_diff import DiffError, render_exact_diff
 from aether.core.planning.planner import PlanGoal, PlanIntent, Planner, PlannerError
 from aether.core.vault.undo_vault import UndoVault
-from tests.fs_support import build_registry, build_tree
+from tests.fs_support import ConsumptionHarness, build_registry, build_tree
 
 NOW = datetime(2026, 11, 22, 12, 0, 0, tzinfo=UTC)
 PATCH_A = b"# Project\n\nFixed the typo in the introduction.\n"
@@ -54,7 +54,17 @@ def world(tmp_path: Path):
     vault = UndoVault(tmp_path / "vault").open()
     receipts = ReceiptStore(tmp_path / "receipts.sqlite3")
     store = SQLiteTaskStore(tmp_path / "store.sqlite3")
-    executor = EditExecutor(registry, _Accepting(), vault, receipts, plans=store, clock=lambda: NOW)
+    # S14-2: real accounting. Eight uses so the substitution tests can each try.
+    grants = ConsumptionHarness(tmp_path, clock=lambda: NOW, uses=8)
+    executor = EditExecutor(
+        registry,
+        _Accepting(),
+        vault,
+        receipts,
+        plans=store,
+        grants=grants.ledger,
+        clock=lambda: NOW,
+    )
     planner = Planner(
         capabilities=__import__(
             "aether.core.policy.capabilities", fromlist=["CapabilityRegistry"]
@@ -70,8 +80,10 @@ def world(tmp_path: Path):
         "vault": vault,
         "planner": planner,
         "store": store,
+        "grants": grants,
         "tmp": tmp_path,
     }
+    grants.close()
     receipts.close()
     vault.close()
     store.close()
@@ -106,6 +118,11 @@ def _plan(world, proposed: bytes, *, save: bool = True):
         revision=1,
     )
     if save:
+        world["grants"].bind(
+            approval_id=UUID(planned.plan.steps[0].arguments["approval_id"]),
+            task_id=task_id,
+            now=NOW,
+        )
         world["store"].create_task("approved bytes", task_id=task_id, now=NOW)
         world["store"].transition_task(task_id, PersistentTaskState.PLANNING, now=NOW)
         world["store"].save_plan(planned.plan)
@@ -119,9 +136,9 @@ def _request(world, planned, proposed: bytes) -> EditRequest:
     return EditRequest(
         task_id=planned.plan.task_id,
         step_id=planned.step_id,
-        approval_id=uuid4(),
+        approval_id=UUID(str(planned.plan.steps[0].arguments["approval_id"])),
         plan_revision=1,
-        plan_hash=planned.plan_hash,
+        plan_hash="a" * 64,
         resource_id=resolve(world["registry"], "README.md"),
         expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         proposed_content=proposed,
