@@ -30,9 +30,10 @@
 
 ## 2. Exact test results (Linux, this sandbox)
 
-Command: `uv run pytest` in `backend/`. Full suite at `a65460c`: **775 passed,
-3 skipped** (778 collected). The 3 skips are two native-Windows ACL tests and one
-environment-gated test; they are **skipped, not passed**.
+Command: `uv run pytest` in `backend/`. Full suite at `d1bdd2c`: **794 passed,
+3 skipped** (797 collected). At `a65460c` it was 775 passed, 3 skipped; S14-11 adds
+21 tests and rewrites 2 of the S14-7 tests. The 3 skips are two native-Windows ACL
+tests and one environment-gated test; they are **skipped, not passed**.
 
 This count was produced in a **fresh, isolated interpreter** (`python3.11 -m venv`
 with the project installed editable from this checkout), so it is reproducible and
@@ -50,7 +51,8 @@ not dependent on the sandbox's shared editable install.
 | `test_phase2_mutation_journal.py` | 22 | PASS (S14-4) |
 | `test_phase2_vault_key_protection.py` | 18 (2 skipped) | PASS (S14-5) |
 | `test_phase2_fixture_safety.py` | 21 | PASS (S14-6) |
-| `test_phase2_grant_authority.py` | 20 | PASS (S14-7) |
+| `test_phase2_grant_authority.py` | 18 | PASS (S14-7, rewritten for S14-11) |
+| `test_phase2_authoritative_consumption.py` | 21 | PASS (S14-11) |
 | `test_phase2_orphan_consumption.py` | 11 | PASS (S14-8) |
 | `test_phase2_execution_context.py` | 10 | PASS (S14-9) |
 | `test_phase2_windows_acl.py` | 25 | PASS (S14-10) |
@@ -179,11 +181,12 @@ and the Phase 1 deny-all broker default were not modified.
 - The Stage 3 review button was not turned into an execution approval.
 - No acceptance result was fabricated to close a gate.
 
-## 10. Independent-review remediation (S14-1 … S14-10)
+## 10. Independent-review remediation (S14-1 … S14-11)
 
 PR #14's independent review found nine defects, and a post-interruption review of
-the correction found four more. All thirteen are corrected here as ten separately
-reviewable commits. This section states what changed, what proves it,
+the correction found four more. A third source review then found that S14-7's fix
+was incomplete: it *checked* the authoritative grant but still spent a separate
+local budget. All are corrected here as separately reviewable commits. This section states what changed, what proves it,
 and — as importantly — what remains **NOT VERIFIED**.
 
 | Commit | Subject | The defect it corrects | Proof |
@@ -194,6 +197,7 @@ and — as importantly — what remains **NOT VERIFIED**.
 | `e75264b` | S14-4 | A kill between replacing the file and writing the receipt left a changed file with no durable record | `test_phase2_mutation_journal.py` (22): intent durable before the replace, single intent per step, kill-after-replace re-opened from disk, kill-before-replace distinguished, read-only reconciliation, `COMPLETED_UNVERIFIED` never treated as consistent |
 | `fef5592` | S14-5 | The vault key was stored inside the vault directory, and `chmod` was a silent no-op on Windows | `test_phase2_vault_key_protection.py` (16 passed, 2 skipped): key relocated, in-vault key refused, copied vault cannot decrypt, legacy key migrated, real DACL on Windows (skipped here), unprotected key refuses to open |
 | `58e271a` | S14-7 | A consumption budget could be created for any approval id, so consumption was a second approval source, and accepting grant doubles hid it | `test_phase2_grant_authority.py` (20): budget requires an authoritative grant, may not exceed or disagree with it, spends re-checked for EXPIRED/REVOKED/EXHAUSTED, invented approval cannot authorize a real file mutation |
+| `d1bdd2c` | S14-11 | S14-7 *checked* `GrantLedger.load()/status()` but decremented only a local budget, so the grant stayed unconsumed; two independent consumption databases could each spend the same final use, and revocation between check and spend was escapable | `test_phase2_authoritative_consumption.py` (21): the spend now *is* `GrantLedger.consume`, so the authoritative count moves exactly once; record **and** `CONSUMED` audit event; second consumer cannot report or spend a full allowance; concurrent overspend refused; exhaustion, revocation (incl. mid-flight), expiry, consent and plan binding at consumption time, step binding, replay; invented local budget inert; fake and simulated authorities refused; interrupted execution still journaled, reported as an orphan needing review, and resolvable to `UNVERIFIED` without refunding the use |
 | `e399099` | S14-8 | A crash between spending a use and journaling left a pending consumption that reconciliation reported as clean | `test_phase2_orphan_consumption.py` (11): orphan reported `reconcile_consumption_without_intent`, never consistent, never completed, file untouched, never attached to another intent |
 | `f5ab233` | S14-9 | `_consumption_id` was shared mutable executor state, and the journal was optional | `test_phase2_execution_context.py` (10): attribute gone, two interleaved operations resolve only their own use, journal-less executor refuses before any state change, journal check precedes consumption |
 | `a65460c` | S14-10 | The Windows ACL check accepted any descriptor containing an owner ACE, so owner-plus-Everyone passed | `test_phase2_windows_acl.py` (25): exact ACE inventory; Everyone, Users, Authenticated Users, unrelated SIDs, SYSTEM, Administrators, inherited and deny ACEs all rejected |
@@ -217,10 +221,17 @@ Every item below is still **NOT VERIFIED** and no commit above changes that:
   that Windows produces that SDDL or that `SetFileSecurityW` succeeds. The two
   Windows-only tests skip here, and the verifier's gate is written to fail on an
   unprotected or broadly-granted DACL — but that gate has not been observed on NTFS.
-- The consumption authority (S14-7) is wired only in tests. No production
+- The consumption authority (S14-7/S14-11) is wired only in tests. No production
   configuration constructs a `ConsumptionLedger` with a real `GrantLedger`
   authority, because issuing those grants requires schema v2 activation and is
   still disabled.
+- S14-11 makes `GrantLedger.consume` the sole spend, and proves it against a real
+  ledger in-process. It has **not** been proven under a real concurrent OS-process
+  load or a real crash between the authoritative commit and the projection row:
+  the interleaving tests use threads and in-process fault injection. Because the
+  spend is atomic and the projection is written after it, a crash in that window
+  leaves an authoritative consumption with no local row — reconciliable by
+  `consumption_id`, but that recovery path is reasoned about, not exercised.
 - Schema v2 remains inactive (`ACTIVE_SCHEMA_VERSION = 1`,
   `PENDING_MIGRATION_VERSIONS = {2}`) and production grant issuance remains
   disabled (`GRANT_ISSUANCE_DISABLED`).
@@ -231,7 +242,7 @@ Every item below is still **NOT VERIFIED** and no commit above changes that:
 
 | Gate | Result |
 |---|---|
-| Backend suite | 775 passed, 3 skipped (clean isolated interpreter) |
+| Backend suite | 794 passed, 3 skipped (clean isolated interpreter) |
 | Ruff / format / mypy | clean / clean / clean (95 files) |
 | Desktop typecheck / eslint | pass / pass |
 | Desktop Node tests | 54 pass, 7 skipped (environment-gated) |
