@@ -46,6 +46,7 @@ from uuid import UUID, uuid4
 from aether.core.contracts.policy import RiskTier
 from aether.core.contracts.resource import ResourceRef
 from aether.core.contracts.tool import ToolRequest
+from aether.core.edits.journal import JournalError, MutationJournal
 from aether.core.edits.receipts import (
     ActionReceiptRecord,
     ReceiptError,
@@ -98,14 +99,6 @@ class GrantConsumer(Protocol):
         consumed_by: str,
         now: datetime | None = None,
     ) -> Any: ...
-
-
-class ExecutionJournal(Protocol):
-    """Durable pre-mutation intent, written before any replacement (S14-4)."""
-
-    def begin(self, **fields: Any) -> Any: ...
-
-    def resolve(self, consumption_id: UUID, *, outcome: str, detail: str) -> Any: ...
 
 
 _MAX_EDIT_BYTES = 4 * 1024 * 1024
@@ -161,7 +154,7 @@ class EditExecutor:
         *,
         plans: TaskPlanSource | None = None,
         grants: GrantConsumer | None = None,
-        journal: ExecutionJournal | None = None,
+        journal: MutationJournal | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._registry = registry
@@ -528,6 +521,21 @@ class EditExecutor:
                 f"a verified pre-image is required before mutation ({exc.reason_code})",
             ) from exc
 
+        # S14-4: the durable intent is written AFTER the snapshot (so the
+        # recovery path has an image to restore) and BEFORE the replace (so a
+        # crash can never leave a changed file with no record of why). If the
+        # intent cannot be written, nothing is mutated.
+        journal_id = self._begin_journal(
+            request,
+            capability_id=capability_id,
+            resource_id=request.resource_id,
+            target_path=target,
+            pre_sha256=pre_sha256,
+            intended_sha256=intended_sha256,
+            snapshot_id=snapshot.snapshot_id,
+            consumption_id=self._consumption_id,
+        )
+
         warnings: list[str] = list(extra_warnings)
         try:
             self._atomic_replace(target, content, pre_image)
@@ -542,6 +550,7 @@ class EditExecutor:
                 denied.reason_code,
                 extra=undo_of,
             )
+            self._resolve_journal(journal_id, "FAILED", denied.reason_code)
             return EditOutcome(
                 status="FAILED",
                 reason_code=denied.reason_code,
@@ -551,6 +560,11 @@ class EditExecutor:
                 snapshot_id=str(snapshot.snapshot_id),
                 detail="the replacement failed; the original content is unchanged",
             )
+
+        # The replace is done but not yet proven. Recording this narrows the
+        # crash window to "bytes written, verification not finished", which
+        # reconciliation can interpret.
+        self._journal_replaced_unverified(journal_id)
 
         # Verification: re-read from disk, never trust the write call.
         try:
@@ -567,6 +581,7 @@ class EditExecutor:
                 "readback_failed",
                 warnings,
                 undo_of,
+                journal_id,
             )
         if post_sha256 != intended_sha256 or observed != content:
             return self._unverified(
@@ -579,6 +594,7 @@ class EditExecutor:
                 "verification_mismatch",
                 warnings,
                 undo_of,
+                journal_id,
             )
 
         # The verified effect happened, so the receipt is recorded *now*. A
@@ -598,6 +614,7 @@ class EditExecutor:
             verified_at=self._clock(),
         )
         self._resolve_consumption("SUCCEEDED", "verified effect")
+        self._resolve_journal(journal_id, "VERIFIED", "verified effect")
         return EditOutcome(
             status="SUCCEEDED",
             reason_code="edit_verified",
@@ -607,6 +624,69 @@ class EditExecutor:
             snapshot_id=str(snapshot.snapshot_id),
             detail="bytes were re-read from disk and match the approved content exactly",
         )
+
+    def _begin_journal(
+        self,
+        request: EditRequest,
+        *,
+        capability_id: str,
+        resource_id: str,
+        target_path: Path,
+        pre_sha256: str,
+        intended_sha256: str,
+        snapshot_id: UUID,
+        consumption_id: UUID | None,
+    ) -> UUID | None:
+        """Write the durable intent, or refuse the mutation.
+
+        A journal that cannot record the intent must not let the write proceed:
+        an unrecorded mutation is the failure mode this closes.
+        """
+
+        if self._journal is None:
+            return None
+        try:
+            intent = self._journal.begin(
+                task_id=request.task_id,
+                step_id=request.step_id,
+                approval_id=request.approval_id,
+                capability_id=capability_id,
+                resource_id=resource_id,
+                target_path=target_path,
+                resource_version=request.expected_sha256,
+                pre_sha256=pre_sha256,
+                intended_post_sha256=intended_sha256,
+                expected_effect_sha256=request.expected_effect_sha256,
+                snapshot_id=snapshot_id,
+                consumption_id=consumption_id,
+            )
+        except JournalError as exc:
+            raise EditDenied(
+                exc.reason_code,
+                "a durable intent is required before mutation, and it could not be recorded",
+            ) from exc
+        return intent.intent_id
+
+    def _journal_replaced_unverified(self, journal_id: UUID | None) -> None:
+        if self._journal is None or journal_id is None:
+            return
+        try:
+            self._journal.record_replaced_unverified(
+                journal_id, "replaced; verification not yet recorded"
+            )
+        except JournalError:
+            # The intent still exists, which is what reconciliation needs.
+            return
+
+    def _resolve_journal(self, journal_id: UUID | None, state: str, detail: str) -> None:
+        if self._journal is None or journal_id is None:
+            return
+        try:
+            self._journal.resolve(journal_id, state=state, detail=detail)  # type: ignore[arg-type]
+
+        except JournalError:
+            # An unresolved intent is the reconciliation work list; never mask it.
+            return
 
     def _resolve_consumption(self, state: str, detail: str) -> None:
         """Record what actually happened to the spent use.
@@ -736,11 +816,13 @@ class EditExecutor:
         reason: str,
         warnings: list[str],
         undo_of: str | None,
+        journal_id: UUID | None = None,
     ) -> EditOutcome:
         """Record an edit we cannot prove; never claim success."""
 
         warnings = [*warnings, reason]
         self._resolve_consumption("UNVERIFIED", reason)
+        self._resolve_journal(journal_id, "REPLACED_UNVERIFIED", reason)
         receipt = self._record(
             request,
             capability_id,
