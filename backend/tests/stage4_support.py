@@ -326,19 +326,26 @@ def persist_with_permit(
     grant,  # type: ignore[no-untyped-def]
     *,
     scope_digest: str,
-    issuance_key,
-    issued_by: str,  # type: ignore[no-untyped-def]
+    issuance_key,  # type: ignore[no-untyped-def]
+    issued_by: str,
 ):
-    """Test-only: store a grant with a freshly minted single-use permit.
+    """Test-only: store a grant through the central test-authorization factory.
 
-    Normal production code reaches storage only through ``GrantIssuer.issue``;
-    ledger-semantics tests need the storage primitive directly, so they mint the
-    permit here instead of pretending to be an authorization decision.
+    Production reaches storage only through ``GrantIssuer.issue`` (the trusted
+    decision); low-level ledger-semantics tests use the test-only factory, and
+    the ledger accepts that permit only on a test-scoped instance. The
+    production-configured ledger refuses it, which is asserted separately.
     """
 
-    from aether.core.grants.ledger import IssuancePermit
+    from aether.core.grants.authorization import authorize_test_persistence
 
-    permit = IssuancePermit._mint(scope_digest=scope_digest, issued_by=issued_by)
+    permit = authorize_test_persistence(
+        scope_digest=scope_digest,
+        issued_by=issued_by,
+        task_id=grant.task_id,
+        plan_revision=grant.plan_revision,
+        plan_hash=grant.plan_hash,
+    )
     return ledger._persist_verified_grant(
         grant,
         permit=permit,

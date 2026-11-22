@@ -133,6 +133,40 @@ REVOCATION_CODES = frozenset(
 CONSUMED_BY_CODES = frozenset({"policy_check", "execution_adapter", "test_simulation"})
 _ISSUER_CODE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 
+# S4-9: trust sources a permit may record (see aether.core.grants.authorization).
+_TRUSTED_TRUST_SOURCE = "trusted_verifier"
+_TEST_TRUST_SOURCE = "test_simulation"
+
+# S4-9: the only modules allowed to request or spend test-only persistence.
+# Both spellings are listed because pytest may import the Stage 4 test modules
+# either package-rooted (``tests.…``) or top-level (prepend/rootdir import).
+# The canonical set lives here; ``authorization`` imports it rather than
+# keeping a second copy that could drift.
+TEST_AUTHORIZATION_MODULES = frozenset(
+    {
+        "tests.stage4_support",
+        "tests.test_phase2b_stage4_grants",
+        "stage4_support",
+        "test_phase2b_stage4_grants",
+    }
+)
+
+
+assert not any(name.startswith("aether.") for name in TEST_AUTHORIZATION_MODULES), (
+    "test-only authorization must never be reachable from the shipped package"
+)
+
+
+def _caller_module_name(depth: int = 1) -> str:
+    import sys
+
+    name = sys._getframe(depth).f_globals.get("__name__", "")
+    return name if isinstance(name, str) else ""
+
+
+def _is_permitted_test_authorizer(module_name: str) -> bool:
+    return module_name in TEST_AUTHORIZATION_MODULES
+
 
 def _canonical_json(value: object) -> str:
     return json.dumps(
@@ -249,33 +283,69 @@ def consumption_action_digest(
 
 
 class IssuancePermit:
-    """One-shot proof that the trusted authorization decision already happened.
+    """Proof that a trust decision was made, plus which kind of decision it was.
 
-    Minted only by :meth:`GrantIssuer.issue`, after the injected attestation
-    verifier *and* the authoritative preview source both succeeded for this
-    exact grant and scope. Storage accepts nothing else, so authorization can
-    never be established by the write path itself, by a label, by a subclass or
-    by an ordinary caller-created object.
+    The permit is *not* itself authentication (independent review S4-9). It
+    records the outcome of the central decision in
+    :mod:`aether.core.grants.authorization`:
 
-    The permit is an in-process, same-thread value: it proves that *this*
-    process performed the trusted decision immediately before the write. It is
-    not a durable token and is never persisted.
+    * ``trust_source="trusted_verifier"`` — minted by
+      :func:`aether.core.grants.authorization.authorize_issuance` after the
+      injected attestation verifier and the authoritative preview source both
+      accepted this exact grant. Accepted by any ledger.
+    * ``trust_source="test_simulation"`` — minted by
+      :func:`aether.core.grants.authorization.authorize_test_persistence` for
+      low-level persistence tests. Accepted **only** by a ledger opened with
+      :meth:`GrantLedger.open_tests_scoped`, which the default production
+      configuration never uses.
+
+    Permits are single-use, bound to one scope digest plus issuer identity, and
+    never persisted.
     """
 
     _scope_digest: str
     _issuer: str
+    _trust_source: str
+    _test_requester: str | None
+    _binding: dict[str, object]
     _consumed: bool
 
     def __init__(self, *, scope_digest: str, issued_by: str) -> None:
-        raise TypeError("IssuancePermit is minted only by GrantIssuer.issue")
+        raise TypeError(
+            "IssuancePermit is minted only by aether.core.grants.authorization; "
+            "constructing a permit is not authorization"
+        )
 
     @classmethod
-    def _mint(cls, *, scope_digest: str, issued_by: str) -> IssuancePermit:
+    def _mint(
+        cls,
+        *,
+        scope_digest: str,
+        issued_by: str,
+        trust_source: str,
+        test_requester: str | None,
+        binding: dict[str, object],
+    ) -> IssuancePermit:
         permit = object.__new__(cls)
         permit._scope_digest = scope_digest
         permit._issuer = issued_by
+        permit._trust_source = trust_source
+        permit._test_requester = test_requester
+        permit._binding = dict(binding)
         permit._consumed = False
         return permit
+
+    @property
+    def trust_source(self) -> str:
+        return self._trust_source
+
+    @property
+    def test_requester(self) -> str | None:
+        return self._test_requester
+
+    @property
+    def binding(self) -> dict[str, object]:
+        return dict(self._binding)
 
     def _claim(self, *, scope_digest: str, issued_by: str) -> None:
         if self._consumed:
@@ -334,6 +404,10 @@ class GrantLedger:
         self._owns_lock = False
         self._owner_lock_file: Any = None
         self._store: SQLiteTaskStore | None = None
+        # S4-9: "production" accepts only permits from the trusted authorization
+        # decision. Only ``open_tests_scoped`` relaxes this, and only for
+        # allow-listed test modules.
+        self._trust_source_policy: str = "production"
         if _connection is not None:
             # Shared mode: the store owns the only connection and owner lock.
             self._connection = _connection
@@ -397,20 +471,45 @@ class GrantLedger:
             raise GrantUnavailableError(
                 "a grant ledger is already open for this store; close it before opening another"
             )
-        ledger = cls(
-            database_path,
-            _connection=connection,
-            _shared_transaction=store._transaction,
-        )
-        ledger._store = store
-        # One shared connection means one synchronization mechanism: adopt the
-        # store's lock so grant reads and grant writes serialize with every
-        # task/plan/audit operation on that connection (S4-8).
-        ledger._lock = store._lock
-        try:
-            store._stage4_grant_ledger = ledger  # type: ignore[attr-defined]
-        except AttributeError:  # pragma: no cover - unexpected store shape
-            raise GrantUnavailableError("task store cannot host a grant ledger") from None
+        # S4-9: hold the store's own lock for construction *and* the initial
+        # integrity/schema reads, not only afterwards. Those reads use the
+        # store's single connection, so without the lock another thread could be
+        # mid-transaction on it and the ledger would validate uncommitted state.
+        with store._lock:
+            ledger = cls(
+                database_path,
+                _connection=connection,
+                _shared_transaction=store._transaction,
+            )
+            ledger._store = store
+            # One shared connection means one synchronization mechanism: adopt
+            # the store's lock so grant reads and grant writes serialize with
+            # every task/plan/audit operation on that connection (S4-8).
+            ledger._lock = store._lock
+            try:
+                store._stage4_grant_ledger = ledger  # type: ignore[attr-defined]
+            except AttributeError:  # pragma: no cover - unexpected store shape
+                raise GrantUnavailableError("task store cannot host a grant ledger") from None
+        return ledger
+
+    @classmethod
+    def open_tests_scoped(cls, store: SQLiteTaskStore) -> GrantLedger:
+        """Open a **test-only** ledger that also accepts simulated persistence.
+
+        Isolated from every production-capable configuration: the extra
+        acceptance applies to this instance only, is reachable solely through
+        allow-listed test modules, and the default :meth:`open` never sets it.
+        Used for low-level ledger semantics (replay, rollback, immutability)
+        that must not require fabricating an attestation.
+        """
+
+        requester = _caller_module_name(2)  # skip this classmethod frame
+        if not _is_permitted_test_authorizer(requester):
+            raise GrantUnavailableError(
+                "test-only grant-ledger configuration is not available to core modules"
+            )
+        ledger = cls.open(store)
+        ledger._trust_source_policy = "test_scoped"
         return ledger
 
     @classmethod
@@ -439,6 +538,9 @@ class GrantLedger:
         instance._owner_lock_file = None
         instance._store = None
         instance._shared_transaction = None
+        # Read-only handles never write, so the policy is irrelevant; set it
+        # explicitly so the attribute always exists.
+        instance._trust_source_policy = "production"
         try:
             instance._connection = sqlite3.connect(
                 f"file:{instance.database_path}?mode=ro",
@@ -621,9 +723,9 @@ class GrantLedger:
         database interaction.
         """
 
-        # Exact type, and the base implementation is called explicitly: a
-        # subclass cannot inherit into authorization, and overriding ``_claim``
-        # changes nothing (S4-6).
+        # S4-9: the gate is the *decision* that produced the permit, not the
+        # object. The base implementation is called explicitly so a subclass
+        # cannot inherit into authorization or override the claim.
         if type(permit) is not IssuancePermit:
             raise GrantIssuanceDenied(
                 "AUTHORIZATION_EVIDENCE_REQUIRED",
@@ -631,6 +733,7 @@ class GrantLedger:
                 "direct issuance is not an authorization path",
             )
         IssuancePermit._claim(permit, scope_digest=scope_digest, issued_by=issued_by)
+        self._check_permit_trust(permit, grant=grant, issuance_key=issuance_key)
         # S4-2: the supplied digest is verified independently, never trusted.
         actual_digest = exact_approval_scope_digest(grant)
         if not isinstance(scope_digest, str) or scope_digest != actual_digest:
@@ -1038,6 +1141,66 @@ class GrantLedger:
             raise GrantDeniedError(
                 "TASK_STATE_NOT_AUTHORIZABLE",
                 "the task is no longer in a state that carries live user consent",
+            )
+
+    def _check_permit_trust(
+        self,
+        permit: IssuancePermit,
+        *,
+        grant: ExactApprovalGrant,
+        issuance_key: UUID,
+    ) -> None:
+        """S4-9: only the central decision may authorize a write on this ledger.
+
+        The default (production-configured) ledger accepts nothing but a
+        ``trusted_verifier`` permit, which only
+        :func:`aether.core.grants.authorization.authorize_issuance` mints after
+        the verifier and authoritative preview source both succeeded. A
+        ``test_simulation`` permit needs an explicitly test-scoped ledger *and*
+        an allow-listed requesting module, so test-only persistence cannot be
+        reached by the production configuration.
+        """
+
+        source = permit.trust_source
+        if source == _TRUSTED_TRUST_SOURCE:
+            binding = permit.binding
+            if (
+                binding.get("task_id") != str(grant.task_id)
+                or binding.get("plan_revision") != grant.plan_revision
+                or str(binding.get("plan_hash", "")).casefold() != grant.plan_hash.casefold()
+                or binding.get("issuance_key") != str(issuance_key)
+            ):
+                raise GrantIssuanceDenied(
+                    "ISSUANCE_PERMIT_MISMATCH",
+                    "the authorization decision does not cover this exact grant",
+                )
+            return
+        if source != _TEST_TRUST_SOURCE:
+            raise GrantIssuanceDenied(
+                "AUTHORIZATION_EVIDENCE_REQUIRED",
+                "grant storage requires a permit from a recognized authorization decision",
+            )
+        # Test-only path.
+        if self._trust_source_policy != "test_scoped":
+            raise GrantIssuanceDenied(
+                "AUTHORIZATION_EVIDENCE_REQUIRED",
+                "the default grant-ledger configuration accepts only permits from the trusted "
+                "authorization decision; test-only persistence requires a test-scoped ledger",
+            )
+        requester = permit.test_requester
+        if not isinstance(requester, str) or not _is_permitted_test_authorizer(requester):
+            raise GrantIssuanceDenied(
+                "AUTHORIZATION_EVIDENCE_REQUIRED",
+                "test-only persistence was requested by a module that is not allow-listed",
+            )
+        binding = permit.binding
+        if (
+            binding.get("task_id") != str(grant.task_id)
+            or binding.get("plan_revision") != grant.plan_revision
+            or str(binding.get("plan_hash", "")).casefold() != grant.plan_hash.casefold()
+        ):
+            raise GrantIssuanceDenied(
+                "ISSUANCE_PERMIT_MISMATCH", "the test permit does not cover this exact grant"
             )
 
     def _check_fresh_consent(self, connection: sqlite3.Connection, task_id: UUID) -> None:

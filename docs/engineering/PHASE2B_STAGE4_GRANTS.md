@@ -196,10 +196,10 @@ Environment: `/tmp/aether-stage4-venv` (Python 3.11), editable backend install.
 
 | Check | Result |
 |---|---|
-| `pytest tests` | **390 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 104 (103 in `test_phase2b_stage4_grants.py` + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
+| `pytest tests` | **398 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 112 (111 in `test_phase2b_stage4_grants.py` + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
 | `ruff check .` | passed |
 | `ruff format --check` (Stage 4 files) | passed |
-| `mypy` (strict) | passed, 72 source files |
+| `mypy` (strict) | passed, 73 source files |
 | Backend wheel/migration pins | unchanged (`0001` = `70907729…`, schema `02f3cac7…`) |
 | Desktop `npm run check` | passed — ESLint clean, both TS projects, renderer build, **61 Node tests** (54 pass / 7 skipped by design), **6/6** Python child tests, Electron build |
 | `scripts/generate_stage2_golden.py --check` | up to date |
@@ -263,9 +263,75 @@ implemented on the same branch; still no issuance, execution, IPC or migration.
 
 | Finding | Code-level resolution | Tests |
 |---|---|---|
-| **S4-6** — `GrantLedger.issue()` could persist a grant with no verified authorization evidence | Authorization is now established *before* storage and storage is not an authorization path. `GrantLedger.issue()` is removed; the only write primitive is the private `GrantLedger._persist_verified_grant(...)`, whose first argument is a `permit:` keyword that accepts nothing but a single-use `IssuancePermit`. Permits are mintable only through `IssuancePermit._mint()` inside `GrantIssuer.issue()`, are bound to the exact scope digest and issuer identity, and are consumed on first use (`ISSUANCE_PERMIT_ALREADY_USED` / `ISSUANCE_PERMIT_MISMATCH`). Anything else — `None`, a plain object, a namespace, a subclass-like stand-in — is refused with `AUTHORIZATION_EVIDENCE_REQUIRED` before a database handle is touched. Preview identity is now verified against **authoritative preview evidence**: new `PreviewAuthority` contract plus `AuthoritativePreview`; `GrantIssuer` requires the attestation's `preview_id`/`preview_digest` to equal what the injected source resolves for this task/revision/hash (`PREVIEW_IDENTITY_MISMATCH`, `PREVIEW_SOURCE_MISMATCH`). The shipped default is `NullPreviewAuthority`, which raises `PREVIEW_SOURCE_UNAVAILABLE`: no production preview source exists in this phase, so that verification is explicitly unavailable and production issuance stays disabled rather than silently skipped. Class identity/inheritance is still never an authentication boundary, and the only simulation (`SimulatedAttestationVerifier`, `SimulatedPreviewAuthority`) lives in `backend/tests/stage4_support.py`. No authorizing IPC was added. | `test_no_ledger_entry_point_can_persist_a_grant_without_authorization`, `test_issuance_permit_is_single_use_and_bound_to_its_scope`, `test_production_default_has_no_preview_source_and_stays_disabled`, `test_permit_subclass_cannot_inherit_authorization_and_override_is_ignored`, `test_forged_preview_identity_is_rejected_against_authoritative_evidence`, `test_verified_preview_identity_is_required_for_successful_issuance`, `test_preview_source_failures_fail_closed`, `test_production_verifier_denies_all_issuance`, `test_no_production_module_issues_grants_or_exposes_ipc` (now also scans for `_persist_verified_grant` / `IssuancePermit`) |
+| **S4-6** — `GrantLedger.issue()` could persist a grant with no verified authorization evidence | Authorization is now established *before* storage and storage is not an authorization path. `GrantLedger.issue()` is removed; the only write primitive is the private `GrantLedger._persist_verified_grant(...)`, whose first argument is a `permit:` keyword that accepts nothing but a single-use `IssuancePermit`. Permits are minted only by the central decision (§6d, S4-9), are bound to the exact scope digest and issuer identity, and are consumed on first use (`ISSUANCE_PERMIT_ALREADY_USED` / `ISSUANCE_PERMIT_MISMATCH`). Anything else — `None`, a plain object, a namespace, a subclass-like stand-in — is refused with `AUTHORIZATION_EVIDENCE_REQUIRED` before a database handle is touched. Preview identity is now verified against **authoritative preview evidence**: new `PreviewAuthority` contract plus `AuthoritativePreview`; `GrantIssuer` requires the attestation's `preview_id`/`preview_digest` to equal what the injected source resolves for this task/revision/hash (`PREVIEW_IDENTITY_MISMATCH`, `PREVIEW_SOURCE_MISMATCH`). The shipped default is `NullPreviewAuthority`, which raises `PREVIEW_SOURCE_UNAVAILABLE`: no production preview source exists in this phase, so that verification is explicitly unavailable and production issuance stays disabled rather than silently skipped. Class identity/inheritance is still never an authentication boundary, and the only simulation (`SimulatedAttestationVerifier`, `SimulatedPreviewAuthority`) lives in `backend/tests/stage4_support.py`. No authorizing IPC was added. | `test_no_ledger_entry_point_can_persist_a_grant_without_authorization`, `test_issuance_permit_is_single_use_and_bound_to_its_scope`, `test_production_default_has_no_preview_source_and_stays_disabled`, `test_permit_subclass_cannot_inherit_authorization_and_override_is_ignored`, `test_forged_preview_identity_is_rejected_against_authoritative_evidence`, `test_verified_preview_identity_is_required_for_successful_issuance`, `test_preview_source_failures_fail_closed`, `test_production_verifier_denies_all_issuance`, `test_no_production_module_issues_grants_or_exposes_ipc` (now also scans for `_persist_verified_grant` / `IssuancePermit`) |
 | **S4-7** — revocation/fresh-consent was checked only before the transaction | `GrantLedger._check_fresh_consent()` runs inside the same transaction as the grant insert **and** inside the decrement transaction, delegating to the store's existing Stage 2 predicate `SQLiteTaskStore.is_stage2_preview_blocked()` (the `APPROVAL_PREVIEW_REVOKED` / `requires_fresh_plan_and_consent` event semantics). No second consent system. It additionally refuses if the store's connection is not the transaction's connection (`CONSENT_AUTHORITY_UNAVAILABLE`), so the check cannot silently read outside the write. Denials are `CONSENT_INVALIDATED` with no grant row, no consumption row and no use decrement; a revocation after issuance denies use even when task state and plan identity are unchanged. | `test_revocation_between_issuance_precheck_and_transaction_denies` (asserts the denial came from the in-transaction check), `test_revocation_after_issuance_denies_consumption_without_decrement`, `test_consent_check_is_shared_with_the_store_not_reimplemented`, `test_standalone_ledger_cannot_verify_consent_and_fails_closed` |
 | **S4-8** — `GrantAuthority(store=None)` skipped current-plan checks; shared-connection reads were unsynchronized | `GrantAuthority.check_action` fails closed with `GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED` when no current-plan authority is supplied — no success is reportable without checking the authoritative current task/plan. Grant load and the current task/plan/consent reads now happen inside one consistent snapshot guarded by the store's lock, so historical grants deny after supersession and a reader cannot observe uncommitted task/grant state. `GrantLedger.open(store)` adopts the store's `_lock` as its own (`ledger._lock is store._lock`), keeping the single-owner/one-connection design: there is still exactly one connection and one serialization mechanism. | `test_grant_authority_without_store_fails_closed`, `test_historical_grant_denies_after_supersession_without_store`, `test_shared_connection_reads_take_the_store_lock`, `test_reader_cannot_observe_an_uncommitted_grant_write` |
+
+## 6d. Third-round correction (S4-9) — trust provenance, not permit objects
+
+The third review accepted S4-7 and S4-8 and found that S4-6 was still only partially
+resolved: `IssuancePermit._mint()` was callable by ordinary Python code, so a permit object
+(and the tests that used one) proved nothing about whether a verifier or preview source ever
+ran. `IssuancePermit` is therefore no longer treated as authentication at all. Trust is the
+outcome of a **single decision procedure**, in one module:
+
+`backend/aether/core/grants/authorization.py` — the only two factories for a permit:
+
+| Factory | Outcome | Accepted by |
+|---|---|---|
+| `authorize_issuance(attestation, grant=…, scope_digest=…, attestations=…, previews=…)` | `trust_source="trusted_verifier"`, bound to task/plan/scope/issuance identity | any ledger |
+| `authorize_test_persistence(...)` | `trust_source="test_simulation"`, records the requesting module | **only** `GrantLedger.open_tests_scoped(store)` **and** an allow-listed test module |
+
+Consequences:
+
+- **One decision.** `authorize_issuance` owns the whole authorization test — attested-field
+  replay against the exact grant, the injected `AttestationVerifier`, and the authoritative
+  `PreviewAuthority` — and mints a permit only if all of it passes. `GrantIssuer` no longer
+  contains attestation or preview checks; it builds the exact grant from persisted state,
+  calls the gate, and persists. There is no second copy of the checks to drift and no
+  caller-supplied path around it. Operation/plan binding moved to the same module
+  (`check_operation_binding`) so the trust-relevant checks live together.
+- **Production storage fails closed on provenance.** `GrantLedger.open(store)` (the default,
+  production-configured entry point) sets `_trust_source_policy = "production"` and
+  `_check_permit_trust` rejects every permit that is not a `trusted_verifier` decision bound
+  to this exact task, plan revision/hash and issuance identity — denied with
+  `AUTHORIZATION_EVIDENCE_REQUIRED` / `ISSUANCE_PERMIT_MISMATCH` before any write. Grant
+  rows, state rows, events and consumptions all stay at zero on the denied path (asserted).
+- **Default-deny preserved.** Production still ships `NullAttestationVerifier` +
+  `NullPreviewAuthority`, so `authorize_issuance` always raises
+  (`AUTHORIZATION_SOURCE_NOT_TRUSTED` / `PREVIEW_SOURCE_UNAVAILABLE`). No production
+  verifier and no production preview source exist; the authenticated Electron main → backend
+  interaction remains unimplemented and no authorizing IPC was added.
+- **Test simulation isolated.** Low-level ledger semantics (replay, rollback, immutability)
+  still use real persistence, via `authorize_test_persistence` + `open_tests_scoped`. Three
+  independent conditions are required (test-scoped ledger instance, allow-listed requesting
+  module, `test_simulation` permit), none of which exists in a production configuration. The
+  allow-list (`TEST_AUTHORIZATION_MODULES`) is canonical in `ledger.py` and asserted at
+  import time to contain no `aether.` module; `open_tests_scoped` and
+  `authorize_test_persistence` are not exported from `aether.core.grants`.
+- **Stated trusted-code assumptions.** This is an in-process Python boundary, not an OS
+  capability. Arbitrary code *running inside the backend process* can reach module internals;
+  no object, subclass check, private name or module constant is claimed to be unforgeable.
+  What is guaranteed is structural: the production-configured storage boundary only accepts
+  the output of the central decision, and that decision's only success path requires a
+  verifier and preview source that production does not have. The module docstring states this
+  explicitly rather than implying stronger guarantees.
+- **Opening is serialized too.** `GrantLedger.open(store)` now performs construction *and*
+  its initial `quick_check`/`foreign_key_check`/schema-fingerprint reads under the store's
+  lock, not only after adopting it, so an opening ledger cannot validate uncommitted
+  state from another thread's in-flight transaction.
+
+| Requirement | Tests |
+|---|---|
+| Direct permit construction cannot create a grant through the default production-configured ledger; zero grant rows, grant events and consumptions | `test_direct_permit_construction_cannot_write_through_the_default_ledger` (also asserts zero `exact_approval_grant_state` rows), `test_permit_minting_is_not_authorization`, `test_permit_subclass_cannot_inherit_authorization_and_override_is_ignored`, `test_no_ledger_entry_point_can_persist_a_grant_without_authorization` |
+| The central decision is the only source of a trusted permit; the decision binds the exact authorization | `test_central_decision_is_the_only_source_of_a_trusted_permit`, `test_trusted_decision_permit_is_bound_to_the_exact_authorization` |
+| Test-only mechanisms are isolated from production-capable configurations | `test_test_only_configuration_is_isolated_from_the_shipped_package`, `test_production_package_exports_no_test_only_authorization_surface`, `test_no_production_module_issues_grants_or_exposes_ipc` |
+| `open()` integrity/schema reads run under the store lock | `test_open_runs_initial_integrity_reads_under_the_store_lock`, `test_open_serializes_with_a_concurrent_store_transaction` |
+| Positive synthetic issuance and exact idempotent replay still work | `test_verified_preview_identity_is_required_for_successful_issuance`, `test_issued_grant_is_denied_after_the_plan_advances` (fresh-revision issuance), `test_replay_with_changed_authorization_terms_is_a_conflict`, `test_replay_with_changed_issuer_identity_is_a_conflict`, `test_issuance_permit_is_single_use_and_bound_to_its_scope` |
+
+### Migration-control outcome (third round)
+
+Unchanged again: no schema delta was required, so the proposed artefacts stand as reported.
 
 ### Migration-control outcome (second round)
 

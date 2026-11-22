@@ -94,6 +94,21 @@ merged; Stage 4 is a new branch from merged `main`.
   explicit user gesture authenticated at the Electron-main/backend boundary, plus a production
   planner/narrative source — is future work. Until it exists, issuance stays disabled and the
   Stage 3 approve button is untouched (not upgraded into a second, ambiguous approval).
+- **Trust provenance, not permit objects (S4-9).** `IssuancePermit` is *not* authentication.
+  The single decision procedure lives in `aether.core.grants.authorization`: only
+  `authorize_issuance()` mints a `trusted_verifier` permit, and only after the attested field
+  replay, the injected `AttestationVerifier` and the authoritative `PreviewAuthority` all
+  succeed. `GrantLedger.open(store)` — the production configuration — accepts **only** that
+  permit, bound to the exact task, plan revision/hash and issuance identity; anything else is
+  `AUTHORIZATION_EVIDENCE_REQUIRED` with zero grant/state/event/consumption rows written.
+  Test-only persistence requires three independent conditions (test-scoped ledger instance,
+  allow-listed requesting module, `test_simulation` permit), none reachable from a production
+  configuration, and neither the factory nor `open_tests_scoped` is exported from
+  `aether.core.grants`. No Python object, subclass check, private name or module constant is
+  claimed to be an unforgeable capability: arbitrary in-process code can reach module
+  internals, and the guarantee is the structural one above — production has no verifier and
+  no preview source, so the decision cannot succeed. `GrantLedger.open` also takes the
+  store's lock for construction and its initial integrity/schema reads.
 - **Authorization is established before storage, and storage cannot authorize (S4-6).**
   `GrantLedger.issue()` no longer exists. The single write primitive is private
   (`GrantLedger._persist_verified_grant`) and requires a single-use `IssuancePermit` that
@@ -171,7 +186,7 @@ merged; Stage 4 is a new branch from merged `main`.
   detected and fails closed. Expiry comparisons trust the caller-supplied clock; there is no
   attested time source. Consumption is not yet bound to a real action, so "one use = one action"
   is proven transactionally, not end-to-end.
-- Stage 4 is Linux-verified only (390 passed / 1 skipped backend, desktop `npm run check`,
+- Stage 4 is Linux-verified only (398 passed / 1 skipped backend, desktop `npm run check`,
   golden fixture check). No Windows filesystem, ACL, reparse, process or resource-security
   behavior is inferred from those results; the Windows acceptance items remain open. T3 remains
   unavailable until a dedicated authorization design and its prerequisites are separately approved.

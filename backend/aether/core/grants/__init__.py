@@ -10,15 +10,26 @@ Deliberately *not* exported: anything test-only. Test simulations live in the
 test suite, and authorization trust is decided by an injected
 :class:`~aether.core.grants.attestation.AttestationVerifier` — never by Python
 class identity or inheritance.
+
+S4-9: the *only* production-capable write path is
+:class:`~aether.core.grants.issuance.GrantIssuer` → the central decision in
+``aether.core.grants.authorization`` → ``GrantLedger``. The test-only
+authorization factory is not exported here and is reachable only from
+allow-listed test modules on a test-scoped ledger.
 """
 
 from aether.core.grants.attestation import (
     PRODUCTION_ATTESTATION_VERIFIER,
+    PRODUCTION_PREVIEW_AUTHORITY,
     AttestationRejected,
     AttestationVerifier,
+    AuthoritativePreview,
     AuthorizationAttestation,
     IssuanceBinding,
     NullAttestationVerifier,
+    NullPreviewAuthority,
+    PreviewAuthority,
+    PreviewSourceUnavailable,
 )
 from aether.core.grants.authority import GrantAuthority, GrantRequest, canonical_arguments_sha256
 from aether.core.grants.errors import (
