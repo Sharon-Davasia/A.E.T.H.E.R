@@ -121,11 +121,41 @@ def _activate(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sqlite_store, "PENDING_MIGRATION_VERSIONS", frozenset())
 
 
+CRLF_BYTES = b"\r\n"
+
+
 def _scratch_migrations(destination: Path, *names: str) -> Path:
     destination.mkdir(parents=True)
     for name in names or (MIGRATION_V1.name, MIGRATION_V2.name):
         shutil.copyfile(MIGRATIONS / name, destination / name)
     return destination
+
+
+def _assert_written_bytes_match_pin(path: Path, intended: str) -> None:
+    """Prove the bytes on disk are the bytes whose digest the test pins.
+
+    The checksum pinned for the store is computed from ``intended``. If the write
+    path alters the file -- newline translation being the one that bit us -- the
+    digest on disk disagrees with the pinned digest, and the store refuses the file
+    as a *checksum* mismatch instead of reaching the failure the test is about.
+    Asserting on the bytes actually written keeps that mistake visible here rather
+    than surfacing as an inscrutable checksum error on another platform.
+
+    This proves exactly one thing: the file on disk is the UTF-8 encoding of
+    ``intended``, byte for byte. Hence the digest the test pins is the digest of
+    the file the store will read.
+    """
+
+    written = path.read_bytes()
+    expected = intended.encode("utf-8")
+    crlf = written.count(CRLF_BYTES)
+    assert written == expected, (
+        "the migration file on disk is not the byte sequence the test intended to "
+        f"write: {len(written)} bytes on disk vs {len(expected)} intended "
+        f"({crlf} CRLF sequences found; newline translation mangles a checksum pin)"
+    )
+    assert CRLF_BYTES not in written, "the file contains CRLF; the write re-encoded it"
+    assert hashlib.sha256(written).hexdigest() == hashlib.sha256(expected).hexdigest()
 
 
 def _v1_database(database: Path) -> SQLiteTaskStore:
@@ -513,14 +543,19 @@ def test_upgrade_failure_rolls_back_atomically(
     SQLiteTaskStore(database).close()  # realistic v1 database
     original = (migrations / MIGRATION_V2.name).read_text(encoding="utf-8")
     broken = original.replace("CREATE TABLE exact_approval_grants", "CREATE TABLE", 1)
-    (migrations / MIGRATION_V2.name).write_text(broken, encoding="utf-8")
+    # ``write_text`` applies newline translation, so on Windows every LF became
+    # CRLF and the file no longer hashed to the value pinned below: the store then
+    # refused it as a *checksum* mismatch and never reached the SQL failure this
+    # test is about. Writing bytes keeps the file identical on every platform.
+    (migrations / MIGRATION_V2.name).write_bytes(broken.encode("utf-8"))
+    _assert_written_bytes_match_pin(migrations / MIGRATION_V2.name, broken)
 
     # The pin no longer matches the (syntactically broken) file, so point the
     # registry at the tampered bytes to exercise the *SQL* failure path.
     monkeypatch.setitem(
         _EXPECTED_MIGRATIONS,
         2,
-        (MIGRATION_V2.name, hashlib.sha256(broken.encode()).hexdigest()),
+        (MIGRATION_V2.name, hashlib.sha256(broken.encode("utf-8")).hexdigest()),
     )
     _activate(monkeypatch)
     with pytest.raises(PersistenceIntegrityError, match=r"migration .* failed"):
@@ -547,15 +582,26 @@ def test_interrupted_migration_leaves_no_half_applied_schema(
     SQLiteTaskStore(database).close()
     original = (migrations / MIGRATION_V2.name).read_text(encoding="utf-8")
     truncated = original[: original.index("CREATE TABLE exact_approval_grant_state")]
-    (migrations / MIGRATION_V2.name).write_text(truncated, encoding="utf-8")
+    # Bytes, not text: see the note in test_upgrade_failure_rolls_back_atomically.
+    (migrations / MIGRATION_V2.name).write_bytes(truncated.encode("utf-8"))
+    _assert_written_bytes_match_pin(migrations / MIGRATION_V2.name, truncated)
     monkeypatch.setitem(
         _EXPECTED_MIGRATIONS,
         2,
-        (MIGRATION_V2.name, hashlib.sha256(truncated.encode()).hexdigest()),
+        (MIGRATION_V2.name, hashlib.sha256(truncated.encode("utf-8")).hexdigest()),
     )
     _activate(monkeypatch)
-    with pytest.raises(PersistenceIntegrityError):
+    # Pin the *specific* failure, not "some integrity error". The truncated script
+    # is still valid SQL and runs to completion; it simply no longer ends with
+    # ``PRAGMA user_version = 2``, so it must be refused by the version-bump check
+    # and rolled back. Accepting any PersistenceIntegrityError would also pass if
+    # the file were rejected earlier as a checksum mismatch, which is a different
+    # bug entirely -- and is exactly what the CRLF defect produced on Windows.
+    with pytest.raises(PersistenceIntegrityError) as refused:
         SQLiteTaskStore(database, migrations_dir=migrations)
+    assert "did not advance schema version" in str(refused.value), (
+        f"expected the version-bump rollback path, got: {refused.value}"
+    )
 
     with sqlite3.connect(database) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
