@@ -1,27 +1,34 @@
 # AETHER OS — Phase 2 native Windows acceptance verifier
 #
+# *** DO NOT RUN THIS ON A MACHINE HOLDING REAL DATA UNTIL ITS SAFETY HAS BEEN
+# *** INDEPENDENTLY REVIEWED. See docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md
+#
 # Run from the repository root on the target Windows 11 machine:
 #     powershell -ExecutionPolicy Bypass -File .\scripts\verify_phase2.ps1
 #
-# Contract (deliberate and enforced below):
-#   * Runs as a NORMAL user. No elevation, no admin-only operations.
-#   * Operates only on a disposable fixture under D:\Projects. It never reads,
-#     writes or lists the user's real documents or source projects.
-#   * Every mandatory step is exit-code checked; any failure ends with a
-#     nonzero exit status.
-#   * Skips and unsupported cases are recorded as NOT VERIFIED. This script
-#     never converts a skip, a missing tool or an uninstalled extra into a pass.
-#   * Evidence is written under .cache\phase2-evidence as sanitized text: no
-#     environment dumps, no tokens, no file contents beyond fixture hashes.
+# Safety contract enforced by construction (not by convention):
+#   * Never elevated. Refuses to run as Administrator.
+#   * Deletes nothing itself. All fixture creation, ownership proof and deletion
+#     is delegated to aether.core.acceptance.fixture_safety, which is covered by
+#     negative tests proving sibling prefixes, unmarked directories, junctions
+#     and arbitrary paths are refused.
+#   * A pre-existing directory is never adopted, reused or deleted.
+#   * Skips and unexecuted mandatory scenarios are recorded NOT VERIFIED.
+#     Exit code 2 means "incomplete", and incomplete is not a pass.
 #
-# This script does NOT claim Phase 2 acceptance by itself. It produces evidence
-# that is scored against docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md.
+# What this script can and cannot establish:
+#   It CAN establish that the automated gates pass on Windows and that the
+#   native safety probes behave correctly.
+#   It CANNOT establish that a human approved an edit in the live Electron UI,
+#   that a real power loss was survived, or that no cloud traffic occurred.
+#   Those stay NOT VERIFIED until a human demonstrates them.
 
 [CmdletBinding()]
 param(
-    [string]$FixtureRoot = 'D:\Projects\AETHER-Phase2-Fixture',
+    [string]$Base = 'D:\Projects',
     [string]$EvidenceRoot = '.cache\phase2-evidence',
-    [switch]$SkipDesktop
+    [switch]$SkipDesktop,
+    [switch]$SkipBackend
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,17 +37,18 @@ Set-Location $root
 
 $script:Results = @()
 $script:Failures = 0
+$script:NotVerified = 0
 
 function Write-Section {
     param([string]$Name)
     Write-Host "`n== $Name ==" -ForegroundColor Cyan
 }
 
-# Record one outcome. Status is PASS, FAIL or NOT VERIFIED (never inferred).
+# Record one outcome. PASS / FAIL / NOT VERIFIED only. Never inferred.
 function Add-Result {
     param(
         [Parameter(Mandatory = $true)][string]$Requirement,
-        [Parameter(Mandatory = $true)][string]$Status,
+        [Parameter(Mandatory = $true)][ValidateSet('PASS', 'FAIL', 'NOT VERIFIED')][string]$Status,
         [string]$Evidence = ''
     )
     $script:Results += [pscustomobject]@{
@@ -48,16 +56,13 @@ function Add-Result {
         Status      = $Status
         Evidence    = $Evidence
     }
-    $colour = switch ($Status) {
-        'PASS' { 'Green' }
-        'FAIL' { 'Red' }
-        default { 'Yellow' }
+    switch ($Status) {
+        'PASS' { Write-Host ("  [PASS]        {0}" -f $Requirement) -ForegroundColor Green }
+        'FAIL' { Write-Host ("  [FAIL]        {0} :: {1}" -f $Requirement, $Evidence) -ForegroundColor Red; $script:Failures++ }
+        default { Write-Host ("  [NOT VERIFIED] {0} :: {1}" -f $Requirement, $Evidence) -ForegroundColor Yellow; $script:NotVerified++ }
     }
-    Write-Host ("  [{0}] {1}" -f $Status, $Requirement) -ForegroundColor $colour
-    if ($Status -eq 'FAIL') { $script:Failures++ }
 }
 
-# Run one mandatory command. Nonzero exit is a FAIL, not a warning.
 function Invoke-Mandatory {
     param(
         [Parameter(Mandatory = $true)][string]$Requirement,
@@ -66,109 +71,136 @@ function Invoke-Mandatory {
     )
     Push-Location $WorkingDirectory
     try {
-        & $Command 2>&1 | Tee-Object -Variable output | Out-Host
+        & $Command 2>&1 | Out-Host
         $code = $LASTEXITCODE
+    }
+    catch {
+        Push-Location $root
+        Add-Result -Requirement $Requirement -Status 'FAIL' -Evidence "threw: $($_.Exception.Message)"
+        Pop-Location
+        return
     }
     finally {
         Pop-Location
     }
     if ($code -ne 0) {
         Add-Result -Requirement $Requirement -Status 'FAIL' -Evidence "exit code $code"
-        return $false
     }
-    Add-Result -Requirement $Requirement -Status 'PASS' -Evidence 'exit code 0'
-    return $true
+    else {
+        Add-Result -Requirement $Requirement -Status 'PASS' -Evidence 'exit code 0'
+    }
+}
+
+# Run the reviewed fixture module and return its parsed JSON, or $null on refusal.
+function Invoke-FixtureModule {
+    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    Push-Location (Join-Path $root 'backend')
+    try {
+        $raw = & uv run python -m aether.core.acceptance.fixture_safety @Arguments 2>&1
+        $code = $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+    if ($code -ne 0) { return $null }
+    try { return $raw | ConvertFrom-Json } catch { return $null }
 }
 
 function Assert-Environment {
     Write-Section 'Environment'
     $os = Get-CimInstance Win32_OperatingSystem
-    $isWindows11 = $os.Caption -match 'Windows 11'
     Add-Result -Requirement 'Target OS is Windows 11' `
-        -Status $(if ($isWindows11) { 'PASS' } else { 'FAIL' }) `
+        -Status $(if ($os.Caption -match 'Windows 11') { 'PASS' } else { 'FAIL' }) `
         -Evidence $os.Caption
 
     $elevated = ([Security.Principal.WindowsPrincipal] `
         [Security.Principal.WindowsIdentity]::GetCurrent()
     ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    Add-Result -Requirement 'Runs as a normal (non-elevated) user' `
-        -Status $(if ($elevated) { 'FAIL' } else { 'PASS' }) `
-        -Evidence 'IsInRole(Administrator) = ' + $elevated
+    if ($elevated) {
+        Add-Result -Requirement 'Runs as a normal (non-elevated) user' -Status 'FAIL' `
+            -Evidence 'administrator token detected'
+        throw 'Refusing to run elevated: acceptance must reflect a normal user session.'
+    }
+    Add-Result -Requirement 'Runs as a normal (non-elevated) user' -Status 'PASS'
 
     $gitSha = (& git rev-parse HEAD) 2>$null
-    $dirty = (& git status --porcelain) 2>$null
     Add-Result -Requirement 'Exact git revision recorded' `
         -Status $(if ($gitSha) { 'PASS' } else { 'FAIL' }) -Evidence $gitSha
+    $dirty = (& git status --porcelain) 2>$null
     Add-Result -Requirement 'Working tree clean at verification time' `
         -Status $(if ([string]::IsNullOrWhiteSpace($dirty)) { 'PASS' } else { 'FAIL' }) `
         -Evidence $(if ([string]::IsNullOrWhiteSpace($dirty)) { 'clean' } else { 'DIRTY' })
 
-    foreach ($tool in @(@{ Name = 'Python'; Cmd = 'python' }, @{ Name = 'Node'; Cmd = 'node' })) {
+    foreach ($tool in @(
+            @{ Name = 'Python'; Cmd = 'python' },
+            @{ Name = 'Node'; Cmd = 'node' },
+            @{ Name = 'npm'; Cmd = 'npm' },
+            @{ Name = 'uv'; Cmd = 'uv' })) {
         $version = (& $tool.Cmd --version) 2>$null
         Add-Result -Requirement "$($tool.Name) available" `
             -Status $(if ($version) { 'PASS' } else { 'FAIL' }) -Evidence $version
     }
-    $uvVersion = (& uv --version) 2>$null
-    Add-Result -Requirement 'uv available (locked toolchain)' `
-        -Status $(if ($uvVersion) { 'PASS' } else { 'FAIL' }) -Evidence $uvVersion
 }
 
-function Assert-FixtureClosed {
-    # The verifier must never touch real user data. Refuse anything that is not
-    # the explicit disposable fixture root.
-    Write-Section 'Fixture containment'
-    $expectedPrefix = 'D:\Projects\AETHER-Phase2-Fixture'
-    $resolved = [System.IO.Path]::GetFullPath($FixtureRoot)
-    if (-not $resolved.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
-        Add-Result -Requirement 'Fixture is a disposable D:\Projects path' -Status 'FAIL' `
-            -Evidence $resolved
-        throw "Refusing to run: fixture root must be under $expectedPrefix"
+function New-SafeFixture {
+    Write-Section 'Disposable fixture (owned, provable containment)'
+    if (-not (Test-Path -LiteralPath $Base -PathType Container)) {
+        Add-Result -Requirement 'Fixture base directory exists' -Status 'FAIL' -Evidence $Base
+        throw "Base directory $Base does not exist. Choose an explicit disposable base."
     }
-    Add-Result -Requirement 'Fixture is a disposable D:\Projects path' -Status 'PASS' `
-        -Evidence $resolved
-    if (Test-Path $resolved) {
-        Remove-Item -Recurse -Force $resolved
+    Add-Result -Requirement 'Fixture base directory exists' -Status 'PASS' -Evidence $Base
+
+    # Negative control: prove the containment rule refuses a sibling prefix
+    # before trusting it with a real creation.
+    $sibling = "$Base-Other"
+    $refusal = Invoke-FixtureModule -Arguments @('cleanup', '--base', $Base, '--dir', $sibling, '--token', 'probe')
+    if ($null -eq $refusal) {
+        Add-Result -Requirement 'Containment refuses a sibling prefix path' -Status 'PASS' `
+            -Evidence 'refused as designed'
     }
-    New-Item -ItemType Directory -Path $resolved -Force | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $resolved 'src') -Force | Out-Null
-    Set-Content -Path (Join-Path $resolved 'README.md') -Value '# Fixture' -Encoding utf8
-    Set-Content -Path (Join-Path $resolved 'src\module.py') -Value 'def f(): return 1' -Encoding utf8
-    Add-Result -Requirement 'Disposable fixture created' -Status 'PASS' -Evidence $resolved
+    else {
+        Add-Result -Requirement 'Containment refuses a sibling prefix path' -Status 'FAIL' `
+            -Evidence 'the containment module accepted a sibling path'
+    }
+
+    $created = Invoke-FixtureModule -Arguments @('create', '--base', $Base)
+    if ($null -eq $created -or -not $created.directory) {
+        Add-Result -Requirement 'Disposable fixture created' -Status 'FAIL' -Evidence 'creation refused'
+        throw 'Fixture creation failed; no destructive action will be attempted.'
+    }
+    $script:FixtureDirectory = $created.directory
+    $script:FixtureToken = $created.token
+    Add-Result -Requirement 'Disposable fixture created' -Status 'PASS' -Evidence $script:FixtureDirectory
+
+    New-Item -ItemType Directory -Path (Join-Path $script:FixtureDirectory 'src') -Force | Out-Null
+    Set-Content -Path (Join-Path $script:FixtureDirectory 'README.md') -Value "# Fixture`n`nThe quick brown fox.`n" -Encoding utf8
+    Set-Content -Path (Join-Path $script:FixtureDirectory 'src\module.py') -Value "def f(): return 1`n" -Encoding utf8
+    Add-Result -Requirement 'Fixture content written' -Status 'PASS'
 }
 
 function Assert-Backend {
-    Write-Section 'Backend quality gates (Linux-equivalent, native Windows)'
+    if ($SkipBackend) {
+        Add-Result -Requirement 'Backend gates' -Status 'NOT VERIFIED' -Evidence '-SkipBackend'
+        return
+    }
+    Write-Section 'Backend gates (native Windows)'
     $backend = Join-Path $root 'backend'
-    $pytestBase = Join-Path $root '.cache\pytest-tmp'
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $pytestBase) | Out-Null
-
-    Invoke-Mandatory -Requirement 'uv sync (locked)' -WorkingDirectory $backend -Command {
-        uv sync --all-extras --locked
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Ruff lint' -WorkingDirectory $backend -Command {
-        uv run ruff check .
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Ruff formatting' -WorkingDirectory $backend -Command {
-        uv run ruff format --check .
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Strict mypy' -WorkingDirectory $backend -Command {
-        uv run mypy
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Full pytest suite' -WorkingDirectory $backend -Command {
-        uv run pytest --basetemp $pytestBase
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Phase 2C filesystem capabilities' -WorkingDirectory $backend -Command {
-        uv run pytest tests/test_phase2c_filesystem.py --basetemp $pytestBase
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Phase 2D edits, receipts and undo' -WorkingDirectory $backend -Command {
-        uv run pytest tests/test_phase2d_edits.py --basetemp $pytestBase
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Phase 2B trusted approval chain' -WorkingDirectory $backend -Command {
-        uv run pytest tests/test_phase2b_trusted_approval.py --basetemp $pytestBase
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Persistence and migration integrity' -WorkingDirectory $backend -Command {
-        uv run pytest tests/test_phase2b_persistence.py --basetemp $pytestBase
-    } | Out-Null
+    $temp = Join-Path $script:FixtureDirectory 'pytest-tmp'
+    Invoke-Mandatory -Requirement 'uv sync (locked)' -WorkingDirectory $backend -Command { uv sync --all-extras --locked }
+    Invoke-Mandatory -Requirement 'Ruff lint' -WorkingDirectory $backend -Command { uv run ruff check . }
+    Invoke-Mandatory -Requirement 'Ruff formatting' -WorkingDirectory $backend -Command { uv run ruff format --check . }
+    Invoke-Mandatory -Requirement 'Strict mypy' -WorkingDirectory $backend -Command { uv run mypy }
+    Invoke-Mandatory -Requirement 'Full pytest suite' -WorkingDirectory $backend -Command { uv run pytest --basetemp $temp }
+    foreach ($suite in @(
+            @{ Name = '2C filesystem capabilities'; Path = 'tests/test_phase2c_filesystem.py' },
+            @{ Name = '2C capability session'; Path = 'tests/test_phase2c_session.py' },
+            @{ Name = '2D edits, receipts, undo'; Path = 'tests/test_phase2d_edits.py' },
+            @{ Name = '2B trusted approval chain'; Path = 'tests/test_phase2b_trusted_approval.py' },
+            @{ Name = 'Persistence and migration'; Path = 'tests/test_phase2b_persistence.py' },
+            @{ Name = 'Fixture safety (S14-6)'; Path = 'tests/test_phase2_fixture_safety.py' })) {
+        Invoke-Mandatory -Requirement $suite.Name -WorkingDirectory $backend `
+            -Command ([scriptblock]::Create("uv run pytest $($suite.Path) --basetemp `"$temp`""))
+    }
 }
 
 function Assert-Desktop {
@@ -178,33 +210,24 @@ function Assert-Desktop {
     }
     Write-Section 'Desktop application gates'
     $desktop = Join-Path $root 'apps\desktop'
-    Invoke-Mandatory -Requirement 'Desktop lint' -WorkingDirectory $desktop -Command {
-        npm run lint
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Desktop typecheck' -WorkingDirectory $desktop -Command {
-        npm run typecheck
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Desktop Node tests' -WorkingDirectory $desktop -Command {
-        npm test
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Desktop Python security tests' -WorkingDirectory $desktop -Command {
-        npm run test:python
-    } | Out-Null
-    Invoke-Mandatory -Requirement 'Electron build' -WorkingDirectory $desktop -Command {
-        npm run build:electron
-    } | Out-Null
+    Invoke-Mandatory -Requirement 'Desktop lint' -WorkingDirectory $desktop -Command { npm run lint }
+    Invoke-Mandatory -Requirement 'Desktop typecheck' -WorkingDirectory $desktop -Command { npm run typecheck }
+    Invoke-Mandatory -Requirement 'Desktop Node tests' -WorkingDirectory $desktop -Command { npm test }
+    Invoke-Mandatory -Requirement 'Desktop Python security tests' -WorkingDirectory $desktop -Command { npm run test:python }
+    Invoke-Mandatory -Requirement 'Electron build' -WorkingDirectory $desktop -Command { npm run build:electron }
 }
 
-function Assert-NativeWindowsBehaviour {
-    Write-Section 'Native Windows behaviour (cannot be inferred from Linux)'
+function Assert-NativeProbes {
+    Write-Section 'Native Windows safety probes'
     $backend = Join-Path $root 'backend'
+    $probePath = Join-Path $backend 'windows_phase2_probe.py'
+    $fixture = $script:FixtureDirectory
 
-    # Reparse points, ACLs, msvcrt locking and volume identity are Windows-only
-    # behaviours. These run as explicit, named checks so a skip is visible.
-    $windowsFixture = @'
-import json, os, stat, sys
+    $probe = @'
+import json, os, sys
 from pathlib import Path
 
+fixture = Path(sys.argv[1])
 report = {"checks": []}
 
 def check(name, fn):
@@ -213,19 +236,15 @@ def check(name, fn):
     except Exception as exc:
         report["checks"].append({"name": name, "status": "FAIL", "detail": f"{type(exc).__name__}: {exc}"})
 
-sys.path.insert(0, ".")
-os.environ.setdefault("AETHER_WINDOWS_FIXTURE", sys.argv[1])
-fixture = Path(sys.argv[1])
-
-def reparse_point_refused():
+def junction_refused():
     from aether.core.resources.path_safety import PathSafetyError, reject_reparse_components
     target = fixture / "junction-target"
     target.mkdir(exist_ok=True)
     (target / "leak.txt").write_text("outside", encoding="utf-8")
     link = fixture / "junction-link"
-    if link.exists():
+    if link.exists() or link.is_symlink():
         os.rmdir(link)
-    subprocess_result = os.system(f'mklink /J "{link}" "{target}" >nul 2>&1')
+    os.system(f'mklink /J "{link}" "{target}" >nul 2>&1')
     if not link.exists():
         raise RuntimeError("could not create a junction for the test")
     try:
@@ -234,17 +253,14 @@ def reparse_point_refused():
         return "junction refused"
     raise AssertionError("a junction was NOT refused")
 
-def acl_is_owner_only():
-    from aether.core.vault.undo_vault import UndoVault
-    vault = UndoVault(fixture / "vault")
-    vault.open()
-    key = Path(fixture / "vault" / "vault.key")
-    if not key.exists():
-        raise AssertionError("vault key was not created")
-    vault.close()
-    return "vault created (ACL inspected separately below)"
+def volume_identity():
+    from aether.core.resources.path_safety import inspect_volume
+    info = inspect_volume(fixture)
+    if not info.volume_id.startswith("win-volume:"):
+        raise AssertionError(f"unexpected volume identity {info.volume_id}")
+    return info.volume_id
 
-def msvcrt_owner_lock():
+def owner_lock():
     from aether.core.persistence.sqlite_store import SQLiteTaskStore
     db = fixture / "lock-probe.sqlite3"
     first = SQLiteTaskStore(db)
@@ -257,67 +273,65 @@ def msvcrt_owner_lock():
     finally:
         first.close()
 
-def volume_identity():
-    from aether.core.resources.path_safety import inspect_volume
-    info = inspect_volume(fixture)
-    if not info.volume_id.startswith("win-volume:"):
-        raise AssertionError(f"unexpected volume identity {info.volume_id}")
-    return info.volume_id
+def acl_owner_only():
+    from aether.core.vault.undo_vault import UndoVault
+    vault = UndoVault(fixture / "vault").open()
+    try:
+        key = Path(fixture) / "vault" / "vault.key"
+        if not key.exists():
+            raise AssertionError("vault key was not created")
+        return "vault created; ACL checked separately"
+    finally:
+        vault.close()
 
-check("junction escape refused", reparse_point_refused)
-check("vault creation", acl_is_owner_only)
-check("msvcrt owner lock", msvcrt_owner_lock)
+check("junction escape refused", junction_refused)
 check("volume identity", volume_identity)
+check("database owner lock", owner_lock)
+check("vault creation", acl_owner_only)
 print(json.dumps(report))
 '@
-    $probePath = Join-Path $backend 'windows_phase2_probe.py'
-    Set-Content -Path $probePath -Value $windowsFixture -Encoding utf8
+    Set-Content -Path $probePath -Value $probe -Encoding utf8
     try {
-        $json = & uv run --directory $backend python $probePath $FixtureRoot 2>&1
-        $exit = $LASTEXITCODE
+        Push-Location $backend
+        $raw = & uv run python $probePath $fixture 2>&1
+        $code = $LASTEXITCODE
+        Pop-Location
         $parsed = $null
-        try { $parsed = $json | ConvertFrom-Json } catch { $parsed = $null }
-        if ($exit -ne 0 -or $null -eq $parsed) {
-            Add-Result -Requirement 'Native Windows probe executed' -Status 'FAIL' `
-                -Evidence "exit $exit"
+        try { $parsed = $raw | ConvertFrom-Json } catch { $parsed = $null }
+        if ($code -ne 0 -or $null -eq $parsed) {
+            Add-Result -Requirement 'Native probe executed' -Status 'FAIL' -Evidence "exit $code"
         }
         else {
             foreach ($check in $parsed.checks) {
                 Add-Result -Requirement ("Native: " + $check.name) `
-                    -Status $check.status -Evidence $check.detail
+                    -Status $(if ($check.status -eq 'PASS') { 'PASS' } else { 'FAIL' }) `
+                    -Evidence $check.detail
             }
         }
     }
     finally {
-        Remove-Item -Path $probePath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
     }
+}
 
-    # ACL inspection is deliberately separate so its own result is visible.
-    $aclScript = @'
-$ErrorActionPreference = "Stop"
-$fixture = $args[0]
-$key = Join-Path $fixture "vault\vault.key"
-if (-not (Test-Path $key)) { Write-Output "NO_KEY"; exit 3 }
-$acl = (Get-Acl $key).Access | Where-Object { $_.IdentityReference -notlike "*SYSTEM*" -and $_.IdentityReference -notlike "*Administrators*" }
-$unexpected = $acl | Where-Object { $_.FileSystemRights -match "Write|Modify|FullControl" -and $_.IdentityReference -ne "$env:USERDOMAIN\$env:USERNAME" }
-if ($unexpected) { Write-Output "UNEXPECTED_GRANTS"; exit 4 }
-Write-Output "OWNER_ONLY"
-'@
-    $aclPath = Join-Path $env:TEMP "aether_acl_probe_$PID.ps1"
-    Set-Content -Path $aclPath -Value $aclScript -Encoding utf8
-    try {
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $aclPath $FixtureRoot
-        if ($LASTEXITCODE -eq 0) {
-            Add-Result -Requirement 'Native: vault key ACL is owner-only' -Status 'PASS' `
-                -Evidence 'OWNER_ONLY'
-        }
-        else {
-            Add-Result -Requirement 'Native: vault key ACL is owner-only' -Status 'FAIL' `
-                -Evidence "exit $LASTEXITCODE"
-        }
-    }
-    finally {
-        Remove-Item -Path $aclPath -Force -ErrorAction SilentlyContinue
+function Assert-HumanRequired {
+    Write-Section 'Scenarios this script CANNOT verify'
+    # These are mandatory and are NOT satisfied by any automated check.
+    $human = @(
+        'Live Electron UI approval: a human clicking Approve and the backend verifying that gesture',
+        'Exact patch shown to the human before approval, and that approving patch A cannot apply patch B',
+        'T2 mutation refused before approval, then applied only after that approval (live, not synthetic)',
+        'Grant denial for forged, expired, revoked, exhausted and replayed grants (live ledger)',
+        'Receipts survive a real application restart',
+        'Undo restores the exact original, and refuses to overwrite a newer user edit',
+        'Truthful crash recovery: a real process kill or power loss between replace and receipt',
+        'Zero unauthorized mutation and zero unauthorized disclosure observed across the whole run',
+        'No unauthorized cloud traffic, observed on the machine (not asserted by a test)',
+        'Undo Vault key ACL protection reviewed on NTFS'
+    )
+    foreach ($item in $human) {
+        Add-Result -Requirement $item -Status 'NOT VERIFIED' `
+            -Evidence 'requires a human demo / real interruption; not automatable here'
     }
 }
 
@@ -334,22 +348,23 @@ function Write-Evidence {
         os_caption       = (Get-CimInstance Win32_OperatingSystem).Caption
         python_version   = (& python --version)
         node_version     = (& node --version)
-        fixture_root     = $FixtureRoot
+        fixture          = $script:FixtureDirectory
         results          = $script:Results
         failures         = $script:Failures
-        not_verified     = @($script:Results | Where-Object { $_.Status -eq 'NOT VERIFIED' }).Count
+        not_verified     = $script:NotVerified
+        verifier_reviewed = $false
     }
     $summary | ConvertTo-Json -Depth 5 | Set-Content -Path $jsonPath -Encoding utf8
 
     $lines = @(
-        '# AETHER OS Phase 2 — native Windows evidence',
+        '# AETHER OS Phase 2 - native Windows evidence',
         '',
         "Generated (UTC): $($summary.generated_at_utc)",
         "Git SHA: $($summary.git_sha)",
         "OS: $($summary.os_caption)",
         "Python: $($summary.python_version)",
         "Node: $($summary.node_version)",
-        "Fixture: $($summary.fixture_root)",
+        "Fixture: $($summary.fixture)",
         '',
         '| Requirement | Status | Evidence |',
         '|---|---|---|'
@@ -358,10 +373,10 @@ function Write-Evidence {
         $lines += "| $($row.Requirement) | $($row.Status) | $($row.Evidence) |"
     }
     $lines += ''
-    $lines += "Failures: $($script:Failures); Not verified: $($summary.not_verified)"
+    $lines += "Failures: $($script:Failures); Not verified: $($script:NotVerified)"
     $lines += ''
-    $lines += 'This file records WHAT RAN. It does not itself mark Phase 2 complete;'
-    $lines += 'score it against docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md.'
+    $lines += 'This file records WHAT RAN and WHAT DID NOT. It is evidence, not acceptance.'
+    $lines += 'Score it against docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md.'
     Set-Content -Path $mdPath -Value $lines -Encoding utf8
 
     Write-Host "`nEvidence written:" -ForegroundColor Yellow
@@ -369,24 +384,51 @@ function Write-Evidence {
     Write-Host "  $mdPath"
 }
 
+function Remove-SafeFixture {
+    Write-Section 'Fixture cleanup (ownership proven)'
+    if (-not $script:FixtureDirectory -or -not $script:FixtureToken) {
+        Add-Result -Requirement 'Fixture cleanup' -Status 'NOT VERIFIED' -Evidence 'no owned fixture'
+        return
+    }
+    $removed = Invoke-FixtureModule -Arguments @(
+        'cleanup', '--base', $Base, '--dir', $script:FixtureDirectory, '--token', $script:FixtureToken
+    )
+    if ($null -eq $removed) {
+        Add-Result -Requirement 'Fixture cleanup' -Status 'FAIL' `
+            -Evidence 'ownership verification refused cleanup; the directory was left in place'
+        return
+    }
+    Add-Result -Requirement 'Fixture cleanup' -Status 'PASS' -Evidence $script:FixtureDirectory
+}
+
 Write-Host '== AETHER OS Phase 2 native Windows acceptance ==' -ForegroundColor Cyan
-Assert-Environment
-Assert-FixtureClosed
-Assert-Backend
-Assert-Desktop
-Assert-NativeWindowsBehaviour
-Write-Evidence
+Write-Host 'NOTE: this script records evidence. It does not declare acceptance.' -ForegroundColor Yellow
+$script:FixtureDirectory = $null
+$script:FixtureToken = $null
+
+try {
+    Assert-Environment
+    New-SafeFixture
+    Assert-Backend
+    Assert-Desktop
+    Assert-NativeProbes
+    Assert-HumanRequired
+}
+finally {
+    Remove-SafeFixture
+    Write-Evidence
+}
 
 Write-Host ''
 if ($script:Failures -gt 0) {
-    Write-Host "PHASE 2 WINDOWS ACCEPTANCE: FAILED ($($script:Failures) failure(s))" -ForegroundColor Red
+    Write-Host "PHASE 2 WINDOWS EVIDENCE: FAILED ($($script:Failures) failure(s))" -ForegroundColor Red
     exit 1
 }
-$notVerified = @($script:Results | Where-Object { $_.Status -eq 'NOT VERIFIED' }).Count
-if ($notVerified -gt 0) {
-    Write-Host "PHASE 2 WINDOWS ACCEPTANCE: INCOMPLETE ($notVerified NOT VERIFIED)" -ForegroundColor Yellow
-    Write-Host 'Phase 2 must not be declared complete while any item is NOT VERIFIED.'
+if ($script:NotVerified -gt 0) {
+    Write-Host "PHASE 2 WINDOWS EVIDENCE: INCOMPLETE ($($script:NotVerified) NOT VERIFIED)" -ForegroundColor Yellow
+    Write-Host 'Phase 2 must not be declared complete while any mandatory item is NOT VERIFIED.'
     exit 2
 }
-Write-Host 'PHASE 2 WINDOWS ACCEPTANCE: PASSED' -ForegroundColor Green
+Write-Host 'PHASE 2 WINDOWS EVIDENCE: all automated items passed' -ForegroundColor Green
+Write-Host 'This is still not acceptance unless the human-required items were demonstrated separately.'
 exit 0
