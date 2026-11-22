@@ -32,7 +32,7 @@ Ordered. Each row is one PR. "Depends on" must merge first.
 | A | **Schema-v2 migration, inactive** | `2b60708` | `persistence/sqlite_store.py`, `0002_*.sql`, `stage4_support.py`, `test_phase2b_persistence.py`, `test_phase2b_stage4_migration.py`, `docs/engineering/PHASE2B_STAGE4_*.md`, `STATUS.md`, `TRUST_BOUNDARIES.md` | – (base) |
 | B | **Phase 2B–E workstreams** | `470fea9` | `core/fs/*`, `core/edits/*`, `core/planning/*`, `core/vault/*`, `channel/*`, `broker.py`, `registry.py`, `review_contract.py`, `pyproject.toml`, docs | A |
 | C | **S14-6 — verifier safety** | `1b2f9c8` | `core/acceptance/fixture_safety.py`, `fs/session.py`, `test_phase2_fixture_safety.py`, `test_phase2c_session.py`, `verify_phase2.ps1`, `PHASE2_WINDOWS_ACCEPTANCE.md` | B |
-| D | **S14-5 — vault key + Windows ACL** | `fef5592` | `core/security/file_permissions.py`, `vault/undo_vault.py`, `test_phase2_vault_key_protection.py`, `verify_phase2.ps1`, `PHASE2_WINDOWS_ACCEPTANCE.md` | **C only** (verified clean) |
+| D | **S14-5 — vault key + Windows ACL** | `fef5592` | `core/security/file_permissions.py`, `vault/undo_vault.py`, `test_phase2_vault_key_protection.py`, `verify_phase2.ps1`, `PHASE2_WINDOWS_ACCEPTANCE.md` | C — **and it must stay in the chain**: PR L builds on `file_permissions.py`, which D creates |
 | E | **S14-1 — approved byte binding** | `36a4063` | `exact_diff.py`, `edit_binding.py`, `planner.py`, `edits/executor.py`, `test_phase2_approved_bytes.py`, 3 adapted suites | C |
 | F | **S14-2 — grant consumption** | `fb58b49` | `grants/consumption.py`, `edits/executor.py`, `tests/fs_support.py`, `stage4_support.py`, `test_phase2_grant_consumption.py`, 3 adapted suites | E |
 | G | **S14-3 — undo authorization** | `ac0f39c` | `policy/capabilities.py`, `planner.py`, `edits/executor.py`, `test_phase2_undo_authorization.py`, 2 adapted suites | F |
@@ -40,7 +40,7 @@ Ordered. Each row is one PR. "Depends on" must merge first.
 | I | **S14-7 — single grant authority** | `58e271a` | `grants/consumption.py`, `tests/fs_support.py`, `test_phase2_grant_authority.py`, `test_phase2_grant_consumption.py`, `test_phase2d_edits.py` | H |
 | J | **S14-8 — orphan consumption** | `e399099` | `edits/journal.py`, `edits/reconcile.py`, `test_phase2_orphan_consumption.py` | I |
 | K | **S14-9 — operation state + mandatory journal** | `f5ab233` | `edits/executor.py`, `edits/journal.py`, `test_phase2_execution_context.py`, 6 adapted suites | J |
-| L | **S14-10 — exact Windows ACL** | `a65460c` | `core/security/file_permissions.py`, `test_phase2_windows_acl.py`, `verify_phase2.ps1` | K (and D) |
+| L | **S14-10 — exact Windows ACL** | `a65460c` | `core/security/file_permissions.py`, `test_phase2_windows_acl.py`, `verify_phase2.ps1` | K **and** D — `file_permissions.py` is *created by D*, so L cannot apply to `main` alone |
 | M | **Acceptance report** | `9a1334f`, *pending* | `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | L |
 
 ---
@@ -62,10 +62,39 @@ predicted.
 | `36a4063 → fb58b49 → ac0f39c → e75264b` | **clean** |
 
 Every S14 commit from **S14-2 onward** edits `backend/aether/core/edits/executor.py`
-in overlapping regions, so **E → L is a strict chain**. Only **D (S14-5)** is
-genuinely independent. Do not reorder the chain: the conflicts sit in the
-authorization and mutation core, where a hand-resolved split would risk changing
-security behaviour for a reviewer's convenience.
+in overlapping regions, so **E → L is a strict chain**. Do not reorder the chain:
+the conflicts sit in the authorization and mutation core, where a hand-resolved
+split would risk changing security behaviour for a reviewer's convenience.
+
+#### D is *not* independent — it is a chain link (corrected)
+
+An earlier revision of this plan called D (S14-5, `fef5592`) "C only, verified
+clean" and branched it off C as a dead end. Both statements are true and
+insufficient: `fef5592` applies cleanly onto C, **and** it *creates*
+`backend/aether/core/security/file_permissions.py`, which L (S14-10, `a65460c`)
+then modifies by 263 lines. A branch that has D but never feeds L, alongside an L
+that never sees D, produces a PR L that cannot apply:
+
+```
+$ git worktree add /tmp/wt-Lsolo 02dff4b
+$ git apply --check <L.patch>
+error: backend/aether/core/security/file_permissions.py: No such file or directory
+error: scripts/verify_phase2.ps1: No such file or directory
+```
+
+**Measured correction.** D is carried *inline* in the E→L chain, immediately after
+C, which is where history already has it (`fef5592` sits between `e75264b` and
+`9a1334f`). Cherry-picking the whole sequence onto `1b2f9c8` in that order:
+
+```
+fef5592 36a4063 fb58b49 ac0f39c e75264b 58e271a e399099 f5ab233 a65460c d1bdd2c
+=> every pick clean, no conflicts, including D and L
+=> isolated tests: 794 passed, 3 skipped, 0 failed; ruff + mypy clean
+```
+
+So the dependency needs no separate integration branch and no rebase of L: **D is
+PR D in the main chain, and PR L's base transitively contains it.** The one thing
+that must not happen is treating D as a side branch off C while L hangs off K.
 
 ### Can the oversized Phase 2 commit (`470fea9`) be split?
 
@@ -113,6 +142,22 @@ sandbox's main checkout.
 | J (I + S14-8) | **740 passed, 3 skipped, 0 failed** |
 | K (J + S14-9) | **750 passed, 3 skipped, 0 failed** |
 | L (K + S14-10) | **775 passed, 3 skipped, 0 failed** |
+| M (L + S14-11) | **794 passed, 3 skipped, 0 failed** |
+
+**Dependency-correct chain, re-verified (S14-11).** The individual tips above were
+measured before the D→L defect was found, and D was measured as a side branch off
+C. Rebuilt as one linear sequence carrying D inline, each pick clean:
+
+```
+1b2f9c8 -> fef5592 -> 36a4063 -> fb58b49 -> ac0f39c -> e75264b
+        -> 58e271a -> e399099 -> f5ab233 -> a65460c -> d1bdd2c
+```
+
+Tip of that chain, in a fresh `python3.11 -m venv` installed editable from the
+worktree: **794 passed, 3 skipped, 0 failed**, ruff `All checks passed!`,
+`ruff format --check` 144 files, `mypy aether` 95 files clean. This is the number
+that matters for the split: it proves the linear dependency applies, not just that
+each commit is individually plausible.
 
 **No exclusions.** An earlier revision of this plan deselected
 `test_hardened_launch_import_origin_comes_from_selected_interpreter` because it
@@ -123,7 +168,14 @@ then passes, and it is now included in every count above. Excluding a test to ma
 a split look green was the wrong answer.
 
 The skips are: two native-Windows ACL tests (need NTFS) and one environment-gated
-tests; they are skipped, not passed.
+test; they are skipped, not passed.
+
+**Isolated-environment prerequisite.** A fresh venv must install the declared `dev`
+extra *and* `hatchling`, or the numbers shift for reasons unrelated to the code:
+`pip install -e ".[dev]" httpx hatchling`. Without `pytest-asyncio` the async model
+suites fail outright (8+8+5 failures that look like regressions); without
+`hatchling` `test_phase2b_stage4_migration.py:724` skips and reports 4 skips
+instead of 3. Neither is a code defect, and neither should be reported as one.
 
 ---
 
@@ -176,7 +228,13 @@ gh pr create --base split/pr14-phase2-workstreams --head split/pr14-s14-6-verifi
   --title "S14-6: make the Windows verifier non-destructive and honest" --fill
 ```
 
-### 5.5 PR D — S14-5, vault key + Windows ACL (independent of the S14 chain)
+### 5.5 PR D — S14-5, vault key + Windows ACL (first link after C)
+
+D is a normal link in the chain, not a side branch: PR L modifies the
+`file_permissions.py` that D creates, so everything from E onward builds on D.
+Branching D off C and leaving it there while E also branches off C would make L
+unappliable — and it would force the reviewer of L to imagine a file they cannot
+see.
 
 ```bash
 git switch -c split/pr14-s14-5-vault-key split/pr14-s14-6-verifier
@@ -186,17 +244,17 @@ gh pr create --base split/pr14-s14-6-verifier --head split/pr14-s14-5-vault-key 
   --title "S14-5: vault key outside the vault, real owner-only ACLs on Windows" --fill
 ```
 
-### 5.6 PR E — S14-1 (branch from C, not D)
+### 5.6 PR E — S14-1 (branch from D, not C)
 
 ```bash
-git switch -c split/pr14-s14-1-approved-bytes split/pr14-s14-6-verifier
+git switch -c split/pr14-s14-1-approved-bytes split/pr14-s14-5-vault-key
 git cherry-pick -x 36a4063
 git push -u origin split/pr14-s14-1-approved-bytes
-gh pr create --base split/pr14-s14-6-verifier --head split/pr14-s14-1-approved-bytes \
+gh pr create --base split/pr14-s14-5-vault-key --head split/pr14-s14-1-approved-bytes \
   --title "S14-1: bind every edited byte to the approved preview" --fill
 ```
 
-### 5.7 PRs F–L — the strict chain
+### 5.7 PRs F–M — the strict chain
 
 ```bash
 # F
@@ -223,9 +281,24 @@ git cherry-pick -x e399099 && git push -u origin split/pr14-s14-8-orphan-consump
 git switch -c split/pr14-s14-9-operation-state split/pr14-s14-8-orphan-consumption
 git cherry-pick -x f5ab233 && git push -u origin split/pr14-s14-9-operation-state
 
-# L
+# L -- its base (K) transitively contains D, which created file_permissions.py
 git switch -c split/pr14-s14-10-windows-acl split/pr14-s14-9-operation-state
 git cherry-pick -x a65460c && git push -u origin split/pr14-s14-10-windows-acl
+
+# M -- S14-11, the authoritative-consumption correction (replaces S14-7's model)
+git switch -c split/pr14-s14-11-authoritative-consumption split/pr14-s14-10-windows-acl
+git cherry-pick -x d1bdd2c && git push -u origin split/pr14-s14-11-authoritative-consumption
+
+# N -- acceptance report
+git switch -c split/pr14-acceptance-report split/pr14-s14-11-authoritative-consumption
+git cherry-pick -x 03e11e8 && git push -u origin split/pr14-acceptance-report
+```
+
+Before opening **L**, confirm its base really carries D:
+
+```bash
+git merge-base --is-ancestor fef5592 split/pr14-s14-10-windows-acl && echo "D present"
+test -f backend/aether/core/security/file_permissions.py && echo "file present"
 ```
 
 Open each with `gh pr create --fill` and a base of the previous PR's branch.
