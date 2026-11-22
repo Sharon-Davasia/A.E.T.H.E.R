@@ -15,12 +15,14 @@ hardened launch with the real wire protocol.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -475,14 +477,9 @@ def test_narrative_replaced_by_other_task_fails_closed(db_path: Path, tmp_path: 
     assert child.close() == 0
 
 
-def test_narrative_unreadable_by_permissions_fails_closed(
-    db_path: Path, tmp_path: Path
-) -> None:
-    if os.geteuid() == 0:
-        pytest.skip("permission checks are meaningless as root")
-    narrative = seed_narrative(tmp_path)
-    child = ServiceProcess(db_path, narrative=narrative)
-    narrative.chmod(0)
+def _assert_unavailable_but_channel_usable(child: ServiceProcess) -> None:
+    """Both review operations must fail closed while the channel stays usable."""
+
     preview = child.request(1, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
     assert preview["payload"] == {"status": "unavailable", "reason": "review_unavailable"}
     request = outcome_request(
@@ -501,7 +498,106 @@ def test_narrative_unreadable_by_permissions_fails_closed(
     assert ack["kind"] == "review.error"
     assert ack["payload"] == {"reason": "review_unavailable"}
     assert child.ping(3)["kind"] == "demo.pong"
-    narrative.chmod(0o600)
+
+
+def _assert_read_is_denied(narrative: Path) -> None:
+    """Prove the denial is in force, so the assertions below cannot pass vacuously."""
+
+    try:
+        with open(narrative, "rb"):
+            pass
+    except PermissionError:
+        return
+    pytest.fail(
+        "read access was not denied; a passing fail-closed assertion below would "
+        "prove nothing about unreadable narratives"
+    )
+
+
+def test_narrative_unreadable_by_permissions_fails_closed(db_path: Path, tmp_path: Path) -> None:
+    """An unreadable trusted narrative fails closed on POSIX mode-bit denial.
+
+    ``chmod(0)`` establishes denial only where the mode bits govern access: on
+    POSIX a non-root process is refused with ``EACCES`` and the assertions below
+    are meaningful. On Windows the stored mode carries nothing but the read-only
+    attribute, so ``chmod(0)`` leaves the file fully readable and the service
+    would correctly serve a preview -- which is why this test could not pass
+    there. The Windows case is covered separately by
+    ``test_narrative_unreadable_by_windows_acl_fails_closed``.
+    """
+
+    if os.name != "posix":
+        pytest.skip("POSIX mode-bit denial does not exist on this platform")
+    if os.geteuid() == 0:
+        pytest.skip("permission checks are meaningless as root")
+    narrative = seed_narrative(tmp_path)
+    child = ServiceProcess(db_path, narrative=narrative)
+    original_mode = stat.S_IMODE(narrative.stat().st_mode)
+    try:
+        narrative.chmod(0)
+        _assert_read_is_denied(narrative)
+        _assert_unavailable_but_channel_usable(child)
+    finally:
+        # Restore even if an assertion above fails, so the temporary tree is left
+        # in a readable state for the rest of the suite.
+        with contextlib.suppress(OSError):
+            narrative.chmod(original_mode)
+    assert child.close() == 0
+
+
+def _icacls(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run the platform ``icacls`` tool, skipping if it is genuinely unavailable."""
+
+    # Windows environment variable lookup is case-insensitive; SYSTEMROOT is the
+    # canonical spelling and is what the platform always sets.
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    tool = Path(system_root) / "System32" / "icacls.exe"
+    if not tool.is_file():
+        pytest.skip(f"{tool} is unavailable; cannot set a real Windows ACL")
+    return subprocess.run([str(tool), *arguments], capture_output=True, text=True, timeout=30)
+
+
+def _deny_read_windows(path: Path) -> None:
+    """Deny the current user read access to *path* with an explicit deny ACE."""
+
+    user = os.environ.get("USERNAME")
+    if not user:
+        pytest.skip("USERNAME is unset; cannot target a deny ACE at the current user")
+    applied = _icacls(str(path), "/deny", f"{user}:(R)")
+    if applied.returncode != 0:
+        pytest.skip(
+            "a deny ACE could not be applied in this environment "
+            f"(exit {applied.returncode}): {applied.stdout.strip()} {applied.stderr.strip()}"
+        )
+
+
+def _clear_windows_acl(path: Path) -> None:
+    with contextlib.suppress(Exception):
+        _icacls(str(path), "/reset")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows access-denial semantics required")
+def test_narrative_unreadable_by_windows_acl_fails_closed(db_path: Path, tmp_path: Path) -> None:
+    """Windows: a real deny ACE removes read access, so the service fails closed.
+
+    This is the Windows counterpart of the POSIX test above. ``icacls`` applies an
+    explicit deny ACE for the current user because ``chmod`` cannot express Windows
+    access denial: the process is then refused at ``open`` by the ACL, which is the
+    real condition the fail-closed path exists to survive.
+
+    If the environment cannot apply or observe that denial -- SYSTEM, an
+    unexpected privilege, or a filesystem without ACLs -- the test skips with the
+    reason rather than passing vacuously.
+    """
+
+    narrative = seed_narrative(tmp_path)
+    child = ServiceProcess(db_path, narrative=narrative)
+    try:
+        _deny_read_windows(narrative)
+        _assert_read_is_denied(narrative)
+        _assert_unavailable_but_channel_usable(child)
+    finally:
+        _clear_windows_acl(narrative)
     assert child.close() == 0
 
 
