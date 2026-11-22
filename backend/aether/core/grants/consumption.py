@@ -51,15 +51,73 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Protocol
 from uuid import UUID, uuid4
 
 from aether.core.contracts.policy import RiskTier
+from aether.core.grants.ledger import _is_permitted_test_authorizer
 
 CONSUMPTION_STATES = frozenset({"PENDING", "SUCCEEDED", "FAILED", "UNVERIFIED", "RECONCILED"})
+
 CONSUMED_BY_CODES = frozenset({"aether.core.edits.executor"})
 
 ConsumptionState = Literal["PENDING", "SUCCEEDED", "FAILED", "UNVERIFIED", "RECONCILED"]
+
+
+# The only states in which an authoritative grant may be spent against.
+_SPENDABLE_GRANT_STATES = frozenset({"ACTIVE"})
+
+
+# S14-7: the modules permitted to open simulated consumption authority. This is
+# a separate allow-list from the Stage 4 grant one and deliberately does not
+# extend it: simulated *persistence* for the authoritative ledger and simulated
+# *consumption* are different capabilities, and widening the Stage 4 list would
+# let more tests fabricate trusted grants. Both lists are assert-checked below.
+CONSUMPTION_TEST_MODULES = frozenset(
+    {
+        "tests.fs_support",
+        "tests.test_phase2_grant_consumption",
+        "tests.test_phase2_mutation_journal",
+        "tests.test_phase2_undo_authorization",
+        "tests.test_phase2_approved_bytes",
+        "tests.test_phase2_end_to_end",
+        "tests.test_phase2d_edits",
+        "fs_support",
+        "test_phase2_grant_consumption",
+        "test_phase2_mutation_journal",
+        "test_phase2_undo_authorization",
+        "test_phase2_approved_bytes",
+        "test_phase2_end_to_end",
+        "test_phase2d_edits",
+    }
+)
+
+assert not any(name.startswith("aether.") for name in CONSUMPTION_TEST_MODULES), (
+    "simulated consumption must never be reachable from the shipped package"
+)
+
+
+def _caller_is_permitted_test_module() -> bool:
+    """Whether any frame in the calling stack may open simulated consumption.
+
+    A fixed frame offset is fragile: the factory is reached through fixtures and
+    helpers of differing depth. Scanning the stack is not weaker here, because it
+    still requires an allow-listed test module to be *in* the call chain, and the
+    shipped package contains none of those names by construction.
+    """
+
+    import sys
+
+    frame: Any = sys._getframe(1)
+    while frame is not None:
+        name = frame.f_globals.get("__name__", "")
+        if isinstance(name, str) and (
+            name in CONSUMPTION_TEST_MODULES or _is_permitted_test_authorizer(name)
+        ):
+            return True
+        frame = frame.f_back
+    return False
+
 
 _SCHEMA = (
     """
@@ -105,6 +163,39 @@ class ConsumptionError(Exception):
     def __init__(self, reason_code: str, message: str) -> None:
         self.reason_code = reason_code
         super().__init__(f"{reason_code}: {message}")
+
+
+class GrantAuthoritySource(Protocol):
+    """What consumption needs from the authoritative Stage 4 grant ledger (S14-7).
+
+    A consumption budget records what an *already issued* grant allows. It must
+    never be able to invent that allowance, so every budget registration and
+    every spend is checked against this narrow read surface of the real,
+    schema-v2 grant ledger. Only two questions are asked:
+
+    * does a persisted grant exist for this approval, and is it usable now?
+    * does that grant actually authorize this exact action?
+
+    Anything the authority does not positively answer is a refusal. The protocol
+    is deliberately narrow so no caller can widen a scope through it.
+    """
+
+    def load(self, approval_id: UUID) -> object:
+        """The persisted grant, or raise if there is none."""
+
+    def status(self, approval_id: UUID, *, now: datetime | None = None) -> object:
+        """Current lifecycle state of the grant, or raise if there is none."""
+
+
+class GrantAuthorityUnavailable(ConsumptionError):
+    """No authoritative grant source is configured, so nothing may be spent."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "GRANT_AUTHORITY_UNAVAILABLE",
+            "consumption requires the authoritative Stage 4 grant ledger; without it a "
+            "budget would be a second, unverified approval source",
+        )
 
 
 def _timestamp(value: datetime) -> str:
@@ -197,8 +288,20 @@ class ConsumptionLedger:
     what already exists.
     """
 
-    def __init__(self, database: Path | str, *, clock: object | None = None) -> None:
+    def __init__(
+        self,
+        database: Path | str,
+        *,
+        authority: GrantAuthoritySource | None = None,
+        clock: object | None = None,
+    ) -> None:
         self._lock = threading.RLock()
+        # S14-7: this ledger records what an already-issued grant allows. It is
+        # NOT a second authority. Without the authoritative grant ledger it can
+        # neither register a budget nor spend one, so a consumption database on
+        # its own can never authorize a mutation.
+        self._authority = authority
+        self._simulated_authority = False
         self._clock = clock or (lambda: datetime.now(UTC))
         self._connection = sqlite3.connect(
             str(database), isolation_level=None, check_same_thread=False
@@ -209,6 +312,35 @@ class ConsumptionLedger:
             self._connection.execute("PRAGMA foreign_keys=ON")
             for statement in _SCHEMA:
                 self._connection.execute(statement)
+
+    @classmethod
+    def open_tests_scoped(
+        cls,
+        database: Path | str,
+        *,
+        clock: object | None = None,
+    ) -> ConsumptionLedger:
+        """Open a **test-only** ledger that accepts simulated grant authority.
+
+        S14-7 keeps the authoritative Stage 4 grant ledger as the only source of
+        a spendable allowance. Some accounting semantics (replay, races, crash
+        windows, reconciliation) must be tested without fabricating a trusted
+        attestation, which the Stage 4 ledger rightly refuses.
+
+        This factory mirrors ``GrantLedger.open_tests_scoped``: it is reachable
+        only from allow-listed test modules, grants nothing, and cannot be
+        obtained from the shipped package. The instance it returns is marked as
+        simulated so a caller can see that its authority was not production.
+        """
+
+        if not _caller_is_permitted_test_module():
+            raise ConsumptionError(
+                "test-only consumption is not available to core modules",
+                "simulated consumption authority is reachable only from tests",
+            )
+        ledger = cls(database, clock=clock)
+        ledger._simulated_authority = True
+        return ledger
 
     def close(self) -> None:
         with self._lock:
@@ -237,6 +369,22 @@ class ConsumptionLedger:
         timestamp = _timestamp(now or self._clock())  # type: ignore[operator]
         if uses < 0:
             raise ConsumptionError("consumption_uses_invalid", "uses must not be negative")
+        # S14-7: a budget is a *copy* of an authoritative allowance, never a
+        # source of one. Refuse to register a budget the real grant ledger does
+        # not back, and refuse one larger than that grant actually permits.
+        authoritative = self._authoritative_scope(
+            approval_id,
+            now=now or self._clock(),  # type: ignore[operator]
+        )
+        if authoritative is not None:
+            self._check_budget_against_grant(
+                authoritative,
+                approval_id=approval_id,
+                task_id=task_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                uses=uses,
+            )
         with self._lock, self._transaction() as connection:
             row = connection.execute(
                 "SELECT initial_uses FROM capability_grant_budgets WHERE approval_id = ?",
@@ -262,6 +410,48 @@ class ConsumptionLedger:
                     uses,
                     timestamp,
                 ),
+            )
+
+    @staticmethod
+    def _check_budget_against_grant(
+        grant: object,
+        *,
+        approval_id: UUID,
+        task_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        uses: int,
+    ) -> None:
+        """A budget may not describe an allowance the grant does not contain."""
+
+        if getattr(grant, "approval_id", None) != approval_id:
+            raise ConsumptionError(
+                "consumption_budget_grant_mismatch",
+                "the authoritative grant is for a different approval",
+            )
+        if getattr(grant, "task_id", None) != task_id:
+            raise ConsumptionError(
+                "consumption_budget_grant_mismatch",
+                "the authoritative grant is for a different task",
+            )
+        if getattr(grant, "plan_revision", None) != plan_revision:
+            raise ConsumptionError(
+                "consumption_budget_grant_mismatch",
+                "the authoritative grant covers a different plan revision",
+            )
+        granted_hash = str(getattr(grant, "plan_hash", "")).casefold()
+        if granted_hash != plan_hash.casefold():
+            raise ConsumptionError(
+                "consumption_budget_grant_mismatch",
+                "the authoritative grant covers a different plan hash",
+            )
+        granted_uses = int(getattr(grant, "uses_remaining", 0) or 0)
+        if uses > granted_uses:
+            # Never widen: a budget larger than the grant would allow more
+            # spendable uses than the approval actually granted.
+            raise ConsumptionError(
+                "consumption_budget_exceeds_grant",
+                "the requested budget allows more uses than the authoritative grant",
             )
 
     def revoke(self, approval_id: UUID, *, now: datetime | None = None) -> None:
@@ -301,6 +491,11 @@ class ConsumptionLedger:
                 "consumption_consumer_invalid", "consumed_by must be an allow-listed code"
             )
         timestamp = _timestamp(now or self._clock())  # type: ignore[operator]
+        # S14-7: the authoritative grant is re-checked on every spend, not just
+        # when the budget was registered. A grant revoked, expired or exhausted
+        # between registration and now must stop the spend even though the local
+        # budget row still shows uses remaining.
+        self._authoritative_scope(approval_id, now=now or self._clock())  # type: ignore[operator]
         identity = action_identity(
             task_id=task_id,
             plan_revision=plan_revision,
@@ -447,6 +642,46 @@ class ConsumptionLedger:
         return int(row["uses_remaining"])
 
     # -- internals ---------------------------------------------------------
+
+    def _require_authority(self) -> GrantAuthoritySource | None:
+        if self._authority is not None:
+            return self._authority
+        if self._simulated_authority:
+            # Test-scoped only: no authoritative grant is consulted, and the
+            # instance is reachable solely through ``open_tests_scoped``.
+            return None
+        raise GrantAuthorityUnavailable()
+
+    def _authoritative_scope(self, approval_id: UUID, *, now: datetime) -> object:
+        """The persisted grant, proven usable, or a refusal.
+
+        Every spend goes through here before a budget is touched, so a budget row
+        that exists without a live grant behind it is inert.
+        """
+
+        authority = self._require_authority()
+        if authority is None:
+            return None
+        try:
+            grant = authority.load(approval_id)
+        except Exception as exc:
+            raise ConsumptionError(
+                "GRANT_NOT_FOUND", "no authoritative grant exists for this approval"
+            ) from exc
+        try:
+            status = authority.status(approval_id, now=now)
+        except Exception as exc:
+            raise ConsumptionError(
+                "GRANT_NOT_FOUND", "the authoritative grant state is unavailable"
+            ) from exc
+        state = str(getattr(status, "state", ""))
+        if state not in _SPENDABLE_GRANT_STATES:
+            # EXPIRED / REVOKED / EXHAUSTED / NOT_YET_VALID / unknown: all refuse.
+            raise ConsumptionError(
+                f"GRANT_{state}" if state else "GRANT_STATE_UNKNOWN",
+                "the authoritative grant does not permit a spend now",
+            )
+        return grant
 
     @contextlib.contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:

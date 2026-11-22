@@ -25,6 +25,7 @@ import pytest
 
 from aether.core.contracts.policy import RiskTier
 from aether.core.edits.executor import EditDenied, EditExecutor, EditRequest
+from aether.core.edits.journal import MutationJournal
 from aether.core.edits.receipts import ReceiptStore
 from aether.core.grants.consumption import (
     ConsumptionError,
@@ -72,9 +73,12 @@ def world(tmp_path: Path):
         capabilities=frozenset({"fs.inspect_file", "fs.apply_approved_edit"}),
     )
     store = SQLiteTaskStore(tmp_path / "store.sqlite3")
-    ledger = ConsumptionLedger(tmp_path / "consumption.sqlite3", clock=lambda: NOW)
+    ledger = ConsumptionLedger.open_tests_scoped(
+        tmp_path / "consumption.sqlite3", clock=lambda: NOW
+    )
     vault = UndoVault(tmp_path / "vault").open()
     receipts = ReceiptStore(tmp_path / "receipts.sqlite3")
+    journal = MutationJournal(tmp_path / "journal.sqlite3", clock=lambda: NOW)
     executor = EditExecutor(
         registry,
         _Accepting(),
@@ -82,6 +86,7 @@ def world(tmp_path: Path):
         receipts,
         plans=store,
         grants=ledger,
+        journal=journal,
         clock=lambda: NOW,
     )
     planner = Planner(
@@ -98,8 +103,10 @@ def world(tmp_path: Path):
         "receipts": receipts,
         "executor": executor,
         "planner": planner,
+        "journal": journal,
         "tmp": tmp_path,
     }
+    journal.close()
     receipts.close()
     ledger.close()
     vault.close()
@@ -199,12 +206,15 @@ def test_an_executor_without_a_consumption_ledger_cannot_mutate(world) -> None:
 
     prepared = _prepare(world)
     before = world["tree"].readme.read_bytes()
+    # S14-9: the journal is configured, so the *consumption* default is what
+    # refuses here -- which is the property this test is about.
     default_executor = EditExecutor(
         world["registry"],
         _Accepting(),
         world["vault"],
         world["receipts"],
         plans=world["store"],
+        journal=world["journal"],
         clock=lambda: NOW,
     )
     with pytest.raises(EditDenied) as refused:
@@ -306,7 +316,9 @@ def test_a_grant_for_another_plan_revision_cannot_be_spent(world) -> None:
     # The plan is persisted under its real hash; the budget claims another one.
     prepared = _prepare(world)
     world["ledger"].close()
-    world["ledger"] = ConsumptionLedger(world["tmp"] / "other.sqlite3", clock=lambda: NOW)
+    world["ledger"] = ConsumptionLedger.open_tests_scoped(
+        world["tmp"] / "other.sqlite3", clock=lambda: NOW
+    )
     world["ledger"].grant_budget(
         approval_id=prepared["approval_id"],
         task_id=prepared["task_id"],
@@ -322,6 +334,7 @@ def test_a_grant_for_another_plan_revision_cannot_be_spent(world) -> None:
         world["receipts"],
         plans=world["store"],
         grants=world["ledger"],
+        journal=world["journal"],
         clock=lambda: NOW,
     )
     before = world["tree"].readme.read_bytes()
@@ -350,6 +363,7 @@ def test_a_failed_grant_check_spends_nothing(world) -> None:
         world["receipts"],
         plans=world["store"],
         grants=world["ledger"],
+        journal=world["journal"],
         clock=lambda: NOW,
     )
     with pytest.raises(EditDenied) as refused:
