@@ -30,7 +30,9 @@
 
 ## 2. Exact test results (Linux, this sandbox)
 
-Command: `uv run pytest` in `backend/`. Full suite: **589 passed, 1 skipped**.
+Command: `uv run pytest` in `backend/`. Full suite: **709 passed, 3 skipped**
+(712 collected). The 3 skips are the two native-Windows ACL tests and one
+environment-gated test; they are **skipped, not passed**.
 
 | Suite | Tests | Result |
 |---|---|---|
@@ -38,11 +40,17 @@ Command: `uv run pytest` in `backend/`. Full suite: **589 passed, 1 skipped**.
 | `test_phase2b_stage2.py` | 29 | PASS |
 | `test_phase2b_stage3.py` | 16 | PASS |
 | `test_phase2b_stage3_corrections.py` | — | PASS |
+| `test_phase2_approved_bytes.py` | 24 | PASS (S14-1) |
+| `test_phase2_grant_consumption.py` | 19 | PASS (S14-2) |
+| `test_phase2_undo_authorization.py` | 16 | PASS (S14-3) |
+| `test_phase2_mutation_journal.py` | 22 | PASS (S14-4) |
+| `test_phase2_vault_key_protection.py` | 18 (2 skipped) | PASS (S14-5) |
+| `test_phase2_fixture_safety.py` | 21 | PASS (S14-6) |
 | `test_phase2b_stage4_grants.py` | 114 | PASS |
 | `test_phase2b_stage4_migration.py` | 28 | PASS |
 | `test_phase2b_trusted_approval.py` | 32 | PASS (new) |
 | `test_phase2c_filesystem.py` | 51 | PASS (new) |
-| `test_phase2c_session.py` | 11 | PASS (new) |
+| `test_phase2c_session.py` | 13 | PASS (new) |
 | `test_phase2d_edits.py` | 33 | PASS (new) |
 | `test_phase2_end_to_end.py` | 25 | PASS (new) |
 | `test_phase2_workspace_surface.py` | 8 | PASS (new) |
@@ -151,7 +159,7 @@ under an actual process kill. Those are in the Windows verifier.
 ## 8. Phase 1 status
 
 Unchanged and still green: Phase 0/1 deny-all policy, offline contract, model
-gateway and manifest tests all pass within the 589-test run. `GRANT_ISSUANCE_DISABLED`
+gateway and manifest tests all pass within the 712-test run. `GRANT_ISSUANCE_DISABLED`
 and the Phase 1 deny-all broker default were not modified.
 
 ## 9. What has NOT been done, deliberately
@@ -162,3 +170,53 @@ and the Phase 1 deny-all broker default were not modified.
 - No environment flag, model output or renderer message can authorize anything.
 - The Stage 3 review button was not turned into an execution approval.
 - No acceptance result was fabricated to close a gate.
+
+## 10. Independent-review remediation (S14-1 … S14-6)
+
+PR #14's independent review found nine defects. They are corrected here as six
+separately reviewable commits. This section states what changed, what proves it,
+and — as importantly — what remains **NOT VERIFIED**.
+
+| Commit | Subject | The defect it corrects | Proof |
+|---|---|---|---|
+| `36a4063` | S14-1 | The user was asked to approve a patch they had not been shown, and the approved post-image was not bound to the plan or the grant | `test_phase2_approved_bytes.py` (24): real `render_exact_diff`, post-image digest bound into `PlanStep.expected_effect`, verified immediately before mutation, same-pre/different-post substitution refused |
+| `fb58b49` | S14-2 | A validated grant was treated as execution authority; consumption was not atomic and a retry could double-spend | `test_phase2_grant_consumption.py` (19): default-deny, one-use-one-action, replay refused, thread race for the last use, use spent before the target is read, `GRANT_VALIDATED_EXECUTOR_NOT_ENABLED` can never authorize |
+| `ac0f39c` | S14-3 | Undo was authorized through the forward-edit capability and could overwrite a newer user edit | `test_phase2_undo_authorization.py` (16): distinct `fs.undo_edit`, edit approval refused for undo (`approved_capability_mismatch`), current bytes compared to the receipt's verified post-image, newer edit refused as `undo_conflict_newer_content` |
+| `e75264b` | S14-4 | A kill between replacing the file and writing the receipt left a changed file with no durable record | `test_phase2_mutation_journal.py` (22): intent durable before the replace, single intent per step, kill-after-replace re-opened from disk, kill-before-replace distinguished, read-only reconciliation, `COMPLETED_UNVERIFIED` never treated as consistent |
+| `fef5592` | S14-5 | The vault key was stored inside the vault directory, and `chmod` was a silent no-op on Windows | `test_phase2_vault_key_protection.py` (16 passed, 2 skipped): key relocated, in-vault key refused, copied vault cannot decrypt, legacy key migrated, real DACL on Windows (skipped here), unprotected key refuses to open |
+| `1b2f9c8` | S14-6 | The Windows verifier deleted fixtures outside its own containment and could report unverifiable checks as passing | `test_phase2_fixture_safety.py` (21): `assert_contained`, `assert_no_redirection`, marker-bound `FixtureLease`, source scan forbidding recursive deletes, PASS/FAIL/NOT VERIFIED only |
+
+### What this remediation does not prove
+
+Every item below is still **NOT VERIFIED** and no commit above changes that:
+
+- No real mutation path is wired into the running application. The executor and
+  journal are exercised by tests only; `chat_service.py` still wires nothing.
+- The Electron approval surface has not been demonstrated by a human clicking
+  approve. The automated tests drive the chain programmatically.
+- No real process kill, power loss or forced unmount has been performed. The
+  crash tests simulate the kill in-process and re-open the stores from disk; the
+  *simulation* is honest about its own limits, but it is not a real interruption.
+- The native Windows DACL has not been executed on Windows in this session. The
+  two Windows-only tests skip here and the verifier's gate is written to fail if
+  the ACL is not protected — but that failure has not been observed on NTFS.
+- Schema v2 remains inactive (`ACTIVE_SCHEMA_VERSION = 1`,
+  `PENDING_MIGRATION_VERSIONS = {2}`) and production grant issuance remains
+  disabled (`GRANT_ISSUANCE_DISABLED`).
+
+**Phase 2 is therefore not complete, and this report does not claim it is.**
+
+### Gates at the time of writing
+
+| Gate | Result |
+|---|---|
+| Backend suite | 709 passed, 3 skipped |
+| Ruff / format / mypy | clean / clean / clean (95 files) |
+| Desktop typecheck / eslint | pass / pass |
+| Desktop Node tests | 54 pass, 7 skipped (environment-gated) |
+| Desktop Python security tests | 6 pass |
+| Electron build | pass |
+| Schema v2 | **still inactive** |
+| Production grant issuance | **still disabled** |
+| Live mutation path | **still absent** |
+| Phase 3 | **not started** |
