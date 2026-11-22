@@ -34,10 +34,16 @@ class PolicyBroker:
         capabilities: CapabilityRegistry | None = None,
         resources: ResourceRegistry | None = None,
         grant_authority: GrantAuthority | None = None,
+        executors: frozenset[str] = frozenset(),
     ) -> None:
         self._capabilities = capabilities
         self._resources = resources
         self._grant_authority = grant_authority
+        # Capability ids for which a real, bounded execution adapter is wired in
+        # *this process*. Declaring one is an explicit integration act: the
+        # default is empty, so a broker built without this argument authorizes
+        # nothing and every capability answers NOT_AVAILABLE.
+        self._executors = executors
 
     def evaluate(
         self,
@@ -149,11 +155,27 @@ class PolicyBroker:
                 requires_approval=False,
                 approval_id=str(grant.approval_id),
             )
-        return self._deny(
-            definition.risk_tier,
-            "CAPABILITY_EXECUTOR_NOT_AVAILABLE",
-            "The capability contract is registered but no execution adapter is enabled.",
-            definition.risk_tier >= RiskTier.MODIFY,
+        if definition.capability_id not in self._executors:
+            return self._deny(
+                definition.risk_tier,
+                "CAPABILITY_EXECUTOR_NOT_AVAILABLE",
+                "The capability contract is registered but no execution adapter is enabled.",
+                False,
+            )
+        # A typed T0/T1 observation adapter is wired and the resource scope was
+        # verified above. This authorizes the caller to *invoke that adapter* --
+        # nothing more. The adapter still performs its own bounded, canonical
+        # re-verification before touching the filesystem.
+        return PolicyDecision(
+            allowed=True,
+            risk_tier=definition.risk_tier,
+            reason_code="CAPABILITY_AUTHORIZED",
+            reason=(
+                "A bounded read-tier execution adapter is enabled for this capability "
+                "and the resource scope was verified against the registry."
+            ),
+            requires_approval=False,
+            approval_id=None,
         )
 
     def evaluate_rsi_send(self) -> PolicyDecision:

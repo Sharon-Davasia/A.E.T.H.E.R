@@ -75,7 +75,12 @@ def _validate_diff_text(value: str) -> str:
     if any(character == "\x7f" for character in value):
         raise ValueError("full diff must not contain control characters")
     if any(
-        not (character == "\n" or character == "\t" or " " <= character <= "~" or ord(character) >= 160)
+        not (
+            character == "\n"
+            or character == "\t"
+            or " " <= character <= "~"
+            or ord(character) >= 160
+        )
         for character in value
     ):
         raise ValueError("full diff must not contain control characters")
@@ -188,9 +193,7 @@ class PreviewStep(BaseModel):
     expected_effect_json: str = Field(min_length=2, max_length=4000)
     resource_ids: tuple[str, ...] = ()
     risk_tier: RiskTier
-    recovery_class: Literal[
-        "REVERSIBLE", "SNAPSHOT_RESTORABLE", "COMPENSATABLE", "IRREVERSIBLE"
-    ]
+    recovery_class: Literal["REVERSIBLE", "SNAPSHOT_RESTORABLE", "COMPENSATABLE", "IRREVERSIBLE"]
 
     @field_validator("expected_state_json", "expected_effect_json")
     @classmethod
@@ -240,9 +243,7 @@ class ExactPreview(BaseModel):
         "T2_MUTATE_RECOVERABLE",
         "T3_HIGH_CONSEQUENCE",
     ]
-    recovery_class: Literal[
-        "REVERSIBLE", "SNAPSHOT_RESTORABLE", "COMPENSATABLE", "IRREVERSIBLE"
-    ]
+    recovery_class: Literal["REVERSIBLE", "SNAPSHOT_RESTORABLE", "COMPENSATABLE", "IRREVERSIBLE"]
     resources: tuple[PreviewResource, ...] = ()
     steps: tuple[PreviewStep, ...] = Field(min_length=1, max_length=256)
     full_diff: tuple[PreviewDiff, ...] = Field(default=(), max_length=16)

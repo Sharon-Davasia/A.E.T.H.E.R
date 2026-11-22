@@ -1093,9 +1093,13 @@ class SQLiteTaskStore:
                 or record.preview_id != preview_id
                 or record.preview_digest != preview_digest
             ):
-                raise ReviewConflictError("review request identity was replayed with different data")
+                raise ReviewConflictError(
+                    "review request identity was replayed with different data"
+                )
             if requested_outcome != resolution:
-                raise ReviewConflictError("review request identity was replayed with a different outcome")
+                raise ReviewConflictError(
+                    "review request identity was replayed with a different outcome"
+                )
             return Stage2ReviewWrite(
                 resolution=resolution,
                 requested_outcome=requested_outcome,
@@ -1134,12 +1138,18 @@ class SQLiteTaskStore:
                 or metadata.get("preview_id") != str(preview_id)
                 or metadata.get("preview_digest") != preview_digest
             ):
-                raise ReviewConflictError("review request identity was replayed with different data")
+                raise ReviewConflictError(
+                    "review request identity was replayed with different data"
+                )
             stored_outcome = metadata.get("requested_outcome")
             if stored_outcome is None:
-                raise PersistenceIntegrityError("stored Stage 2 audit event is missing its requested outcome")
+                raise PersistenceIntegrityError(
+                    "stored Stage 2 audit event is missing its requested outcome"
+                )
             if stored_outcome != requested_outcome:
-                raise ReviewConflictError("review request identity was replayed with a different outcome")
+                raise ReviewConflictError(
+                    "review request identity was replayed with a different outcome"
+                )
             return Stage2ReviewWrite(
                 resolution=resolution,
                 requested_outcome=requested_outcome,
@@ -1356,6 +1366,36 @@ class SQLiteTaskStore:
         except (ValidationError, ValueError) as exc:
             raise PersistenceIntegrityError("stored approval audit record is invalid") from exc
         return record
+
+    def record_observation_event(
+        self,
+        task_id: UUID,
+        event_type: str,
+        *,
+        values: dict[str, str | int | float | bool | None] | None = None,
+        step_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> UUID:
+        """Append one non-state-changing audit event for a capability action.
+
+        Read-tier capabilities (inspect/read/search/open) do not transition the
+        task, but they must still be auditable. This is the narrow, validated
+        entry point for that: it never changes task state, it rejects unknown
+        event names through the same ``_EVENT_NAME`` rule as every other event,
+        and it runs inside the store's transaction and lock.
+        """
+
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            event_id = self._append_event(
+                connection,
+                task_id,
+                event_type,
+                EventMetadata(values=dict(values or {})),
+                now=timestamp,
+                step_id=step_id,
+            )
+        return event_id
 
     def list_events(self, task_id: UUID, *, after_sequence: int = 0) -> tuple[StoredTaskEvent, ...]:
         with self._lock:
