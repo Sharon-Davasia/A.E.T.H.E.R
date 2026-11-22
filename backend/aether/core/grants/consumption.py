@@ -59,7 +59,15 @@ from aether.core.grants.ledger import _is_permitted_test_authorizer
 
 CONSUMPTION_STATES = frozenset({"PENDING", "SUCCEEDED", "FAILED", "UNVERIFIED", "RECONCILED"})
 
+# The local projection's own consumer vocabulary.
 CONSUMED_BY_CODES = frozenset({"aether.core.edits.executor"})
+
+# How the *authoritative* Stage 4 ledger names the same actor. The two ledgers keep
+# separate bounded vocabularies on purpose, so S14-11 maps explicitly rather than
+# passing one ledger's code to the other and being refused.
+AUTHORITATIVE_CONSUMER_CODES = {
+    "aether.core.edits.executor": "execution_adapter",
+}
 
 ConsumptionState = Literal["PENDING", "SUCCEEDED", "FAILED", "UNVERIFIED", "RECONCILED"]
 
@@ -82,6 +90,7 @@ CONSUMPTION_TEST_MODULES = frozenset(
         "tests.test_phase2_approved_bytes",
         "tests.test_phase2_end_to_end",
         "tests.test_phase2d_edits",
+        "tests.test_phase2_authoritative_consumption",
         "fs_support",
         "test_phase2_grant_consumption",
         "test_phase2_mutation_journal",
@@ -89,6 +98,7 @@ CONSUMPTION_TEST_MODULES = frozenset(
         "test_phase2_approved_bytes",
         "test_phase2_end_to_end",
         "test_phase2d_edits",
+        "test_phase2_authoritative_consumption",
     }
 )
 
@@ -166,18 +176,23 @@ class ConsumptionError(Exception):
 
 
 class GrantAuthoritySource(Protocol):
-    """What consumption needs from the authoritative Stage 4 grant ledger (S14-7).
+    """The authoritative Stage 4 grant ledger, as consumption uses it (S14-11).
 
-    A consumption budget records what an *already issued* grant allows. It must
-    never be able to invent that allowance, so every budget registration and
-    every spend is checked against this narrow read surface of the real,
-    schema-v2 grant ledger. Only two questions are asked:
+    S14-7 made consumption *check* the authoritative ledger but still decrement a
+    local budget. That left two spendable allowances: two independently created
+    consumption databases could each pass the check and each spend, while the real
+    grant's ``uses_remaining`` never moved. Checking authority is not holding it.
 
-    * does a persisted grant exist for this approval, and is it usable now?
-    * does that grant actually authorize this exact action?
-
-    Anything the authority does not positively answer is a refusal. The protocol
-    is deliberately narrow so no caller can widen a scope through it.
+    Consumption therefore delegates the spend itself. ``consume`` must:
+    * re-validate scope, current-plan binding, fresh consent, revocation and
+      expiry;
+    * decrement the *global* use count exactly once, in one transaction;
+    * persist the consumption record and append the audit event;
+    * be replay-safe: the same ``consumption_id`` with the same action terms
+      returns the committed record marked ``replayed``, and with different terms
+      raises.
+    ``GrantLedger.consume`` already provides exactly this; the protocol exists so
+    the requirement is written down and so a fake cannot satisfy it by accident.
     """
 
     def load(self, approval_id: UUID) -> object:
@@ -185,6 +200,9 @@ class GrantAuthoritySource(Protocol):
 
     def status(self, approval_id: UUID, *, now: datetime | None = None) -> object:
         """Current lifecycle state of the grant, or raise if there is none."""
+
+    def consume(self, **terms: object) -> object:
+        """Spend one authoritative use against this exact action, atomically."""
 
 
 class GrantAuthorityUnavailable(ConsumptionError):
@@ -490,11 +508,29 @@ class ConsumptionLedger:
             raise ConsumptionError(
                 "consumption_consumer_invalid", "consumed_by must be an allow-listed code"
             )
+        # S14-11: when an authoritative ledger is configured, the spend IS the
+        # authoritative transaction. Dispatching here means a production caller
+        # cannot reach the local-only path by forgetting to call the right method.
+        if self._authority is not None:
+            return self.consume_authoritative(
+                consumption_id=consumption_id,
+                approval_id=approval_id,
+                task_id=task_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                step_id=step_id,
+                capability_id=capability_id,
+                risk_tier=risk_tier,
+                arguments_sha256=arguments_sha256,
+                expected_effect_sha256=expected_effect_sha256,
+                resource_versions=resource_versions,
+                consumed_by=consumed_by,
+                now=now,
+            )
         timestamp = _timestamp(now or self._clock())  # type: ignore[operator]
-        # S14-7: the authoritative grant is re-checked on every spend, not just
-        # when the budget was registered. A grant revoked, expired or exhausted
-        # between registration and now must stop the spend even though the local
-        # budget row still shows uses remaining.
+        # Simulated (test-scoped) authority only: re-check so the accounting
+        # semantics under test still behave, but note that the authoritative
+        # ledger is not involved by construction.
         self._authoritative_scope(approval_id, now=now or self._clock())  # type: ignore[operator]
         identity = action_identity(
             task_id=task_id,
@@ -632,6 +668,15 @@ class ConsumptionLedger:
         return tuple(_consumption_from_row(row, replayed=False) for row in rows)
 
     def uses_remaining(self, approval_id: UUID) -> int:
+        """Remaining uses. Authoritative when a real ledger is configured.
+
+        Reading the local projection first would let two consumption databases
+        each report the full count while the global grant was already exhausted,
+        which is the second-allowance defect S14-11 removes.
+        """
+
+        if self._authority is not None:
+            return self.authoritative_uses_remaining(approval_id)
         with self._lock:
             row = self._connection.execute(
                 "SELECT uses_remaining FROM capability_grant_budgets WHERE approval_id = ?",
@@ -642,6 +687,182 @@ class ConsumptionLedger:
         return int(row["uses_remaining"])
 
     # -- internals ---------------------------------------------------------
+
+    # -- authoritative execution path (S14-11) ----------------------------
+
+    def consume_authoritative(
+        self,
+        *,
+        consumption_id: UUID,
+        approval_id: UUID,
+        task_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        step_id: UUID,
+        capability_id: str,
+        risk_tier: RiskTier,
+        arguments_sha256: str,
+        expected_effect_sha256: str,
+        resource_versions: dict[str, str],
+        consumed_by: str,
+        now: datetime | None = None,
+    ) -> Consumption:
+        """Spend one use of the *authoritative* grant, atomically.
+
+        This is the only path production execution may use. The spend happens in
+        ``GrantLedger.consume``'s own transaction, so the global use count is
+        decremented exactly once, the consumption record is written, and the audit
+        event is appended as one unit. There is no local allowance to spend, so
+        two independently created consumption databases share the single global
+        count instead of each holding a copy of it.
+
+        The local table is used only to attach the *outcome* of the filesystem
+        effect (SUCCEEDED / FAILED / UNVERIFIED and the detail) to the same
+        identity, which reconciliation reads. It never decides whether the spend
+        was allowed.
+        """
+
+        authority = self._require_authority()
+        if authority is None:
+            # Test-scoped simulated authority has no authoritative ledger behind
+            # it, so it must not take this path: that would be the parallel
+            # allowance this method exists to remove.
+            raise ConsumptionError(
+                "consumption_authority_not_authoritative",
+                "authoritative consumption requires the real Stage 4 grant ledger, "
+                "not a simulated one",
+            )
+        timestamp = _timestamp(now or self._clock())  # type: ignore[operator]
+        if consumed_by not in CONSUMED_BY_CODES:
+            raise ConsumptionError(
+                "consumption_consumer_invalid", "consumed_by must be an allow-listed code"
+            )
+
+        # The authoritative transaction. Everything below mirrors a refusal from
+        # the ledger verbatim so the executor's reason codes stay meaningful.
+        try:
+            record = authority.consume(
+                consumption_id=consumption_id,
+                approval_id=approval_id,
+                task_id=task_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                step_id=step_id,
+                capability_id=capability_id,
+                risk_tier=risk_tier,
+                arguments_sha256=arguments_sha256,
+                expected_effect_sha256=expected_effect_sha256,
+                resource_versions=dict(resource_versions),
+                consumed_by=AUTHORITATIVE_CONSUMER_CODES.get(consumed_by, consumed_by),
+                now=now or self._clock(),  # type: ignore[operator]
+            )
+        except Exception as exc:
+            reason = getattr(exc, "reason_code", None)
+            if reason:
+                raise ConsumptionError(str(reason), str(exc)) from exc
+            raise ConsumptionError(
+                "GRANT_CONSUMPTION_FAILED", "the authoritative ledger refused the spend"
+            ) from exc
+
+        replayed = bool(getattr(record, "replayed", False))
+        uses_remaining_after = int(getattr(record, "uses_remaining_after", 0))
+        identity = action_identity(
+            task_id=task_id,
+            plan_revision=plan_revision,
+            plan_hash=plan_hash,
+            step_id=step_id,
+            capability_id=capability_id,
+            risk_tier=risk_tier,
+            arguments_sha256=arguments_sha256,
+            expected_effect_sha256=expected_effect_sha256,
+            resource_versions=resource_versions,
+            consumed_by=consumed_by,
+        )
+
+        # Record the outcome-tracking row against the SAME identity, so resolve()
+        # and reconciliation keep working. It is a projection of the authoritative
+        # spend, never an independent allowance: nothing reads uses from it to
+        # decide permission.
+        with self._lock, self._transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO capability_grant_consumptions"
+                " (consumption_id, approval_id, task_id, plan_revision, plan_hash,"
+                " step_id, capability_id, risk_tier, action_digest, consumed_by,"
+                " consumed_at, uses_remaining_after, state, detail)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    str(consumption_id),
+                    str(approval_id),
+                    str(task_id),
+                    plan_revision,
+                    plan_hash.casefold(),
+                    str(step_id),
+                    capability_id,
+                    int(risk_tier),
+                    identity,
+                    consumed_by,
+                    timestamp,
+                    uses_remaining_after,
+                    "PENDING",
+                    "",
+                ),
+            )
+        return Consumption(
+            consumption_id=consumption_id,
+            approval_id=approval_id,
+            action_digest=identity,
+            uses_remaining_after=uses_remaining_after,
+            consumed_at=datetime.fromisoformat(timestamp),
+            state="PENDING",
+            replayed=replayed,
+        )
+
+    def grant_budget_simulated(
+        self,
+        *,
+        approval_id: UUID,
+        task_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        uses: int,
+        now: datetime | None = None,
+    ) -> None:
+        """Write a local budget row directly, bypassing all authority.
+
+        This exists so a test can prove the local projection is *inert*: a row
+        invented here must not allow a single spend, because permission comes from
+        the authoritative ledger alone (S14-11). It is not a supported way to
+        obtain an allowance, and ``consume_authoritative`` never reads it.
+        """
+
+        timestamp = _timestamp(now or self._clock())  # type: ignore[operator]
+        with self._lock, self._transaction() as connection:
+            connection.execute(
+                "INSERT OR REPLACE INTO capability_grant_budgets"
+                " (approval_id, task_id, plan_revision, plan_hash, initial_uses,"
+                " uses_remaining, revoked_at, created_at) VALUES (?,?,?,?,?,?,NULL,?)",
+                (
+                    str(approval_id),
+                    str(task_id),
+                    plan_revision,
+                    plan_hash.casefold(),
+                    uses,
+                    uses,
+                    timestamp,
+                ),
+            )
+
+    def authoritative_uses_remaining(self, approval_id: UUID) -> int:
+        """The real remaining count, read from the authoritative ledger."""
+
+        authority = self._require_authority()
+        if authority is None:
+            raise ConsumptionError(
+                "consumption_authority_not_authoritative",
+                "no authoritative grant ledger is configured",
+            )
+        status = authority.status(approval_id)
+        return int(getattr(status, "uses_remaining", 0))
 
     def _require_authority(self) -> GrantAuthoritySource | None:
         if self._authority is not None:
