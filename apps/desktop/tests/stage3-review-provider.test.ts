@@ -4,10 +4,16 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
+  parseExactPreview,
   parseReviewAcknowledgement,
   reviewRequestFor,
   type ReviewOutcomeRequest,
 } from '../shared/review';
+import {
+  previewIdForDigest,
+  reviewDigestFor,
+  reviewRequestIdForDigest,
+} from '../shared/review-integrity';
 import {
   createChannelReviewProvider,
   type ReviewChannelBackend,
@@ -403,4 +409,103 @@ test('a terminal REJECT replay reconciles through the trusted provider', async (
   assert.equal(acknowledgement.granted, false);
   assert.deepEqual(outcomeRequests, []);
   assert.deepEqual(outcomeStatusRequests, [request]);
+});
+
+// ---------------------------------------------------------------------------
+// S3-4 — trusted task binding and request identity before reconciliation
+// ---------------------------------------------------------------------------
+
+const OTHER_TASK_ID = '22222222-2222-4222-8222-222222222222';
+
+function foreignPersistedRequest(): ReturnType<typeof reviewRequestFor> {
+  const mutated = { ...(goldenPreview() as Record<string, unknown>), taskId: OTHER_TASK_ID };
+  const digest = reviewDigestFor(parseExactPreview(mutated));
+  mutated.previewDigest = digest;
+  mutated.previewId = previewIdForDigest(digest);
+  mutated.reviewRequestId = reviewRequestIdForDigest(digest);
+  return reviewRequestFor(parseExactPreview(mutated), 'APPROVE', true);
+}
+
+test('S3-4: a different task\'s otherwise valid request never reaches reconciliation', async () => {
+  const { backend, calls, outcomeStatusRequests, outcomeRequests } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({ idempotentReplay: true }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const foreign = foreignPersistedRequest();
+  assert.equal(foreign.taskId, OTHER_TASK_ID);
+  await assert.rejects(provider.recordOutcome(foreign), /different task/);
+  assert.deepEqual(calls, [], 'no backend call of any kind is made for another task');
+  assert.deepEqual(outcomeRequests, []);
+  assert.deepEqual(outcomeStatusRequests, [], 'review.get_outcome is never called for another task');
+});
+
+test('S3-4: a different task is rejected even when a preview for the trusted task is presentable', async () => {
+  const { backend, calls, outcomeRequests, outcomeStatusRequests } = stubBackend();
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const foreign = foreignPersistedRequest();
+  await assert.rejects(provider.recordOutcome(foreign), /different task/);
+  assert.deepEqual(calls, []);
+  assert.deepEqual(outcomeRequests, []);
+  assert.deepEqual(outcomeStatusRequests, []);
+});
+
+test('S3-4: a request whose digest does not derive its preview/request ids is rejected before reconciliation', async () => {
+  const { backend, outcomeStatusRequests, outcomeRequests, calls } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({ idempotentReplay: true }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'APPROVE', true);
+  const tampered = { ...request, previewDigest: '0'.repeat(64) };
+  await assert.rejects(provider.recordOutcome(tampered), /identity does not match its preview digest/);
+  assert.deepEqual(outcomeStatusRequests, [], 'no reconciliation call for an identity-forged request');
+  assert.deepEqual(outcomeRequests, []);
+  assert.deepEqual(calls.filter((entry) => entry === 'status'), []);
+});
+
+test('S3-4: same-task exact request still reconciles after a terminal transition (positive control)', async () => {
+  const { backend, outcomeStatusRequests, outcomeRequests } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({
+      resolution: 'REJECT',
+      requestedOutcome: 'REJECT',
+      idempotentReplay: true,
+      message: 'Preview rejected. No grant was issued and no action may execute.',
+    }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'REJECT', false);
+  const acknowledgement = await provider.recordOutcome(request);
+  assert.equal(acknowledgement.resolution, 'REJECT');
+  assert.equal(acknowledgement.idempotentReplay, true);
+  assert.deepEqual(outcomeRequests, []);
+  assert.deepEqual(outcomeStatusRequests, [request], 'the same-task exact request is reconciled');
+});
+
+// ---------------------------------------------------------------------------
+// S3-5 — replay-only acknowledgement on the reconciliation path
+// ---------------------------------------------------------------------------
+
+test('S3-5: a non-replay acknowledgement from reconciliation is rejected even when schema-valid', async () => {
+  const { backend } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({ idempotentReplay: false }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'APPROVE', true);
+  await assert.rejects(provider.recordOutcome(request), /not a replay confirmation/);
+});
+
+test('S3-5: a schema-valid replay acknowledgement with all fields consistent is accepted', async () => {
+  const { backend } = stubBackend({
+    response: () => ({ status: 'unavailable', reason: 'review_unavailable' }),
+    outcomeStatus: () => goldenAck({ idempotentReplay: true }),
+  });
+  const provider = createChannelReviewProvider({ backend, resolveTaskId: () => TASK_ID });
+  const request = reviewRequestFor(goldenPreview() as never, 'APPROVE', true);
+  const acknowledgement = await provider.recordOutcome(request);
+  assert.equal(acknowledgement.idempotentReplay, true);
+  assert.equal(acknowledgement.granted, false);
+  assert.equal(acknowledgement.authority, 'NON_AUTHORIZING_AUDIT_RECORD');
 });

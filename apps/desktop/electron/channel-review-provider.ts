@@ -117,7 +117,25 @@ async function fetchVerifiedPreview(
 async function reconcileOutcome(
   backend: ReviewChannelBackend,
   request: ReviewOutcomeRequest,
+  trustedTaskId: string,
 ): Promise<ReviewAcknowledgement> {
+  // Trusted-task binding: a renderer-supplied request naming any other task
+  // never reaches the reconciliation operation, regardless of how well-formed
+  // or digest-consistent it is.
+  if (request.taskId !== trustedTaskId) {
+    throw new Error('The review request names a different task than the trusted configured task. No outcome was reconciled or recorded.');
+  }
+  // Verify the request's own identity binding: the preview id and review
+  // request id must derive from the preview digest, exactly as the backend
+  // derives them. This does not prove persistence (the backend's persisted
+  // records do), but it rejects internally inconsistent requests before any
+  // backend call is made.
+  if (
+    previewIdForDigest(request.previewDigest) !== request.previewId
+    || reviewRequestIdForDigest(request.previewDigest) !== request.reviewRequestId
+  ) {
+    throw new Error('The review request identity does not match its preview digest. No outcome was reconciled or recorded.');
+  }
   let acknowledgementPayload: unknown;
   try {
     acknowledgementPayload = await backend.reviewGetOutcome(request);
@@ -138,6 +156,13 @@ async function reconcileOutcome(
   }
   if (acknowledgement.requestedOutcome !== request.outcome) {
     throw new Error('The persisted audit record does not match the submitted review request. No successful outcome is shown.');
+  }
+  // S3-5: a successful reconciliation must be a replay confirmation. The
+  // audit-only get_outcome operation only ever reports previously persisted
+  // results, so idempotentReplay is always true on that path; anything else
+  // is rejected even if the other fields pass schema validation.
+  if (acknowledgement.idempotentReplay !== true) {
+    throw new Error('The persisted audit acknowledgement is not a replay confirmation. No successful outcome is shown.');
   }
   // The persisted acknowledgement is audit evidence only; accepting it never
   // implies authorization, and no grant is inferred or issued.
@@ -173,6 +198,11 @@ export function createChannelReviewProvider(
       }
       const taskId = currentTaskId();
       if (!taskId) throw new Error(UNCONFIGURED_MESSAGE);
+      // Trusted-task binding: reject requests for any other task before any
+      // recording or reconciliation path is considered.
+      if (request.taskId !== taskId) {
+        throw new Error('The review request names a different task than the trusted configured task. No outcome was recorded.');
+      }
       // Verify AGAIN before recording: re-fetch the current persisted preview
       // and require the submitted request to match it field for field.
       const verified = await fetchVerifiedPreview(backend, taskId);
@@ -183,7 +213,7 @@ export function createChannelReviewProvider(
         // while its acknowledgement was lost — reconcile against persisted
         // audit evidence instead of fabricating a failure or re-sending a
         // decision. No new decision is created by reconciliation.
-        return reconcileOutcome(backend, request);
+        return reconcileOutcome(backend, request, taskId);
       }
       const preview = verified.preview;
       const expected = reviewRequestFor(preview, request.outcome, request.fullDiffAcknowledged);
@@ -207,14 +237,14 @@ export function createChannelReviewProvider(
         // The acknowledgement was lost or the outcome was refused; the write
         // may or may not have landed. Confirm against persisted audit
         // evidence; never auto-resubmit a decision.
-        return reconcileOutcome(backend, request);
+        return reconcileOutcome(backend, request, taskId);
       }
       let acknowledgement: ReviewAcknowledgement;
       try {
         acknowledgement = parseReviewAcknowledgement(acknowledgementPayload);
       } catch {
         // The backend sent something unparsable; it may still have persisted.
-        return reconcileOutcome(backend, request);
+        return reconcileOutcome(backend, request, taskId);
       }
       if (acknowledgement.requestedOutcome !== request.outcome) {
         throw new Error('The acknowledgement does not match the submitted review request. No successful outcome is shown.');

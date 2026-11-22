@@ -45,12 +45,17 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
   // `-P -I -B -u` flags: `-I` implies `-E` (ignore PYTHON* environment
   // variables, including PYTHONPATH and PYTHONHOME) and `-s` (suppress user
   // site-packages); `-P` (Python >= 3.11, safe_path) keeps the current working
-  // directory and the script directory off sys.path. The interpreter must
-  // therefore have the `aether` package INSTALLED — the backend project venv
-  // in development (stage3 exposes no path injection), a wheel bundled into
-  // the interpreter at build time in packaged builds (future work; bundling
-  // is not implemented yet). No source-path or cwd import is available to
-  // the child at run time by construction.
+  // directory and the script directory off sys.path. Imports therefore resolve
+  // only through the selected interpreter's own installation metadata. Note:
+  // `-I` does NOT prove every module physically lives in site-packages — an
+  // editable development install (pip/uv editable) legitimately imports the
+  // AETHER source checkout through a `.pth`/editable-finder installed in the
+  // venv; that is a controlled mechanism of the selected interpreter, not a
+  // run-time path injection. Development: trusted selected interpreter with a
+  // controlled editable or installed AETHER package. Packaged release
+  // (future): non-editable, verified package installation with independent
+  // import-provenance and integrity checks as the Master Spec requires;
+  // bundling is not implemented in this PR.
   const backendRoot = packaged
     ? join(process.resourcesPath, 'backend')
     : resolve(join(APP_ROOT, '..', '..', 'backend'));

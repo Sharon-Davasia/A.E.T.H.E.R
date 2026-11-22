@@ -5,9 +5,16 @@ has the ``aether`` package installed (the backend project venv in development,
 a bundled build in the future). ``-I`` implies ``-E`` (ignore ``PYTHON*``
 environment variables, including ``PYTHONPATH`` and ``PYTHONHOME``) and ``-s``
 (suppress user site-packages); ``-P`` (Python >= 3.11) removes the current
-directory/script directory from ``sys.path``. The service therefore imports
-only from the interpreter's own site-packages — dependencies must be
-installed, not source-path-injected. This process is the single
+directory/script directory from ``sys.path``. Imports therefore resolve only
+through the selected interpreter's own installation metadata. ``-I`` does not
+prove every module physically resides in site-packages: an editable
+development installation legitimately imports the AETHER source checkout
+through an installed ``.pth``/editable finder. Development expects a trusted,
+selected interpreter with a controlled editable or installed AETHER package;
+packaged releases (future) must use a non-editable, verified package
+installation with independent import-provenance and integrity verification as
+required by the Master Specification. No uncontrolled ``PYTHONPATH``,
+user-site or cwd injection exists at run time. This process is the single
 trusted backend peer for the Electron desktop's authenticated channel at this
 build stage. It performs the Stage 1 bootstrap (MAGIC, session id, per-launch
 HMAC key, challenge) and speaks the same canonical-JSON envelope protocol; on

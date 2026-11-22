@@ -584,3 +584,50 @@ def test_hardened_launch_ignores_pythonhome_and_pythonusersite(tmp_path: Path) -
     )
     assert result.returncode == 0, result.stderr
     assert "IMPORT_OK" in result.stdout
+
+
+def test_hardened_launch_import_origin_comes_from_selected_interpreter(tmp_path: Path) -> None:
+    """S3-6: report where `aether.channel.service` actually resolves from.
+
+    Two legitimate outcomes exist: (a) an editable development install, where
+    the module file resolves to the source checkout through a `.pth`/editable
+    finder installed in the interpreter's site-packages, or (b) a genuine
+    non-editable installation inside the interpreter's site-packages. In both
+    cases resolution must come from the interpreter's installation metadata —
+    never from the current working directory, an empty path entry, or any
+    shadow directory. `-I` alone does not prove physical module location.
+    """
+
+    decoy = tmp_path / "cwd-decoy"
+    decoy.mkdir()
+    result = subprocess.run(
+        [
+            sys.executable,
+            *HARDENED_FLAGS,
+            "-c",
+            "import aether.channel.service as s; print(s.__file__)",
+        ],
+        cwd=decoy,
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    origin = Path(result.stdout.strip()).resolve()
+    interpreter_site = None
+    site_result = subprocess.run(
+        [sys.executable, "-c", "import site; print(site.getsitepackages()[0])"],
+        capture_output=True,
+        check=True,
+        text=True,
+    )
+    interpreter_site = Path(site_result.stdout.strip()).resolve()
+    backend_root = Path(BACKEND_ROOT).resolve()
+    source_origin = backend_root in origin.parents
+    installed_origin = interpreter_site in origin.parents
+    assert source_origin or installed_origin, (
+        f"aether.channel.service resolved from {origin}; expected the selected "
+        f"interpreter's installation metadata (editable: under {backend_root}, "
+        f"or installed under {interpreter_site})"
+    )
+    # Resolution must never come from the cwd decoy or an empty path entry.
+    assert decoy.resolve() not in origin.parents

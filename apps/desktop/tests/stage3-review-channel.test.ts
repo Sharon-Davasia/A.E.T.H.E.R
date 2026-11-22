@@ -72,8 +72,10 @@ const probed = probePython();
 const SKIP = !probed;
 
 // The launch contract under test matches electron/main.ts: hardened `-P -I`
-// flags, no PYTHONPATH/PYTHONHOME inheritance, the backend package must be
-// importable from the interpreter's own site-packages.
+// flags, no PYTHONPATH/PYTHONHOME inheritance. Imports resolve only through
+// the selected interpreter's own installation metadata — a controlled editable
+// install (which legitimately points back at the source checkout via .pth) or
+// a genuine installed package; no uncontrolled path injection of any kind.
 function launchSpecFor(executable: string, env: NodeJS.ProcessEnv): BackendLaunchSpec {
   const runtimeDir = dirname(executable);
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows';
