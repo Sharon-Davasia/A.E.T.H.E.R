@@ -450,6 +450,157 @@ def test_a_journaled_attempt_is_not_reported_twice(world, tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# B. S14-13: replay must not destroy a terminal outcome
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("terminal", ["SUCCEEDED", "FAILED", "UNVERIFIED"])
+def test_replay_preserves_a_terminal_projection(world, tmp_path, terminal: str) -> None:
+    """Replaying after a resolved attempt keeps that resolution.
+
+    This is the S14-13 regression. Before the fix, ``INSERT OR REPLACE`` restored
+    the row to PENDING and the record of what the first attempt concluded was
+    gone — on the path whose entire job is to refuse a second mutation.
+    """
+
+    _issue(world, uses=3)
+    plan = world["world"]
+    projection = _open_projection(tmp_path, world["ledger"])
+    try:
+        terms = _terms(plan)
+        first = projection.consume(**terms)
+        assert first.state == "PENDING"
+        projection.resolve(first.consumption_id, state=terminal, detail=f"first attempt {terminal}")
+
+        replayed = projection.consume(**terms)
+        assert replayed.replayed is True
+        assert replayed.state == terminal, "the terminal outcome must survive a replay"
+
+        # And it survives on disk, not just in the returned object.
+        rows = projection.pending()
+        assert all(item.consumption_id != first.consumption_id for item in rows)
+    finally:
+        projection.close()
+
+    # A restart must also still see the terminal state.
+    projection = _open_projection(tmp_path, world["ledger"])
+    try:
+        terms = _terms(plan)
+    finally:
+        projection.close()
+
+    # The authoritative count moved once, not twice.
+    assert world["ledger"].status(plan.approval_id, now=NOW).uses_remaining == 2
+
+
+def test_replay_after_reopen_preserves_the_terminal_state(world, tmp_path) -> None:
+    """Restart, then replay: the resolution written before the restart survives."""
+
+    _issue(world, uses=3)
+    plan = world["world"]
+    terms = _terms(plan)
+
+    projection = _open_projection(tmp_path, world["ledger"])
+    try:
+        first = projection.consume(**terms)
+        projection.resolve(first.consumption_id, state="SUCCEEDED", detail="verified effect")
+    finally:
+        projection.close()
+
+    projection = _open_projection(tmp_path, world["ledger"])
+    try:
+        replayed = projection.consume(**terms)
+        assert replayed.replayed is True
+        assert replayed.state == "SUCCEEDED"
+    finally:
+        projection.close()
+
+    assert world["ledger"].status(plan.approval_id, now=NOW).uses_remaining == 2
+
+
+def test_a_mismatched_identity_is_refused_and_the_row_is_untouched(world, tmp_path) -> None:
+    """A reused id meaning a different action is refused, not overwritten."""
+
+    _issue(world, uses=3)
+    plan = world["world"]
+    projection = _open_projection(tmp_path, world["ledger"])
+    try:
+        terms = _terms(plan)
+        first = projection.consume(**terms)
+        projection.resolve(first.consumption_id, state="SUCCEEDED", detail="verified")
+
+        # Same id, different action: a different step id changes the digest.
+        mismatched = dict(terms)
+        mismatched["step_id"] = uuid4()
+        with pytest.raises(ConsumptionError) as refused:
+            projection.consume(**mismatched)
+        assert refused.value.reason_code in {
+            "consumption_attempt_mismatch",
+            "consumption_projection_mismatch",
+        }
+
+        # The original row is still resolved.
+        replayed = projection.consume(**terms)
+        assert replayed.state == "SUCCEEDED"
+    finally:
+        projection.close()
+
+
+def test_a_missing_projection_is_created_pending_not_successful(world, tmp_path) -> None:
+    """If the projection never landed, recovery must not invent an effect.
+
+    The attempt exists and the authoritative spend exists, but the local row does
+    not. Re-running the spend against the same id is an authoritative replay; the
+    projection it creates must be PENDING, because nothing has yet proven that a
+    file changed.
+    """
+
+    _issue(world, uses=3)
+    plan = world["world"]
+    terms = _terms(plan)
+
+    busy = ConsumptionLedger(
+        tmp_path / "consume.sqlite3",
+        authority=_CrashAfterCommitAuthority(world["ledger"]),
+        clock=lambda: NOW,
+    )
+    try:
+        with pytest.raises(_CrashAfterSpend):
+            busy.consume(**terms)
+    finally:
+        busy.close()
+
+    projection = _open_projection(tmp_path, world["ledger"])
+    try:
+        recovered = projection.consume(**terms)
+        assert recovered.replayed is True
+        assert recovered.state == "PENDING", "recovery must not claim success"
+        assert [item.consumption_id for item in projection.pending()] == [terms["consumption_id"]]
+        # The use was spent once, at the original crash.
+        assert world["ledger"].status(plan.approval_id, now=NOW).uses_remaining == 2
+    finally:
+        projection.close()
+
+
+def test_replay_does_not_allow_a_second_authoritative_spend(world, tmp_path) -> None:
+    """Idempotence: replay returns the committed record and spends nothing new."""
+
+    _issue(world, uses=3)
+    plan = world["world"]
+    projection = _open_projection(tmp_path, world["ledger"])
+    try:
+        terms = _terms(plan)
+        projection.consume(**terms)
+        for _ in range(3):
+            again = projection.consume(**terms)
+            assert again.replayed is True
+        assert world["ledger"].status(plan.approval_id, now=NOW).uses_remaining == 2
+        assert len(world["ledger"].list_consumptions(plan.approval_id)) == 1
+    finally:
+        projection.close()
+
+
+# ---------------------------------------------------------------------------
 # C. The recovery surface cannot become an allowance
 # ---------------------------------------------------------------------------
 

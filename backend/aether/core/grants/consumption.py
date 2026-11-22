@@ -896,15 +896,43 @@ class ConsumptionLedger:
         uses_remaining_after: int,
         replayed: bool,
     ) -> Consumption:
-        """Record the outcome-tracking row for a spend that just committed.
+        """Attach the spend to the local outcome row without destroying it.
 
-        It is a projection of the authoritative spend, never an independent
-        allowance: nothing reads uses from it to decide permission.
+        S14-13: this used to be ``INSERT OR REPLACE``, so replaying a consumption
+        id reset a resolved ``SUCCEEDED`` / ``FAILED`` / ``UNVERIFIED`` row back to
+        ``PENDING``. That is silent evidence loss on the exact path that is
+        supposed to refuse a second mutation: the executor's replay guard reads
+        ``replayed``, but the durable record of what happened to the *first*
+        attempt had already been overwritten by the time anything could look.
+
+        So an existing row is validated, never replaced:
+
+        * a mismatched identity is refused outright;
+        * a terminal state and its detail are preserved verbatim;
+        * a PENDING row stays PENDING (the effect is still unknown).
+
+        A genuinely missing projection is created as PENDING. It is never created
+        as success: the caller has spent a use but has not yet proven an effect.
         """
 
         with self._lock, self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM capability_grant_consumptions WHERE consumption_id = ?",
+                (str(consumption_id),),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["action_digest"]) != identity:
+                    raise ConsumptionError(
+                        "consumption_projection_mismatch",
+                        "a local projection exists for this id with a different action; "
+                        "refusing to overwrite it",
+                    )
+                # Preserve whatever the first attempt concluded. A replay must not
+                # resurrect a resolved consumption, and must not erase its detail.
+                return _consumption_from_row(existing, replayed=replayed)
+
             connection.execute(
-                "INSERT OR REPLACE INTO capability_grant_consumptions"
+                "INSERT INTO capability_grant_consumptions"
                 " (consumption_id, approval_id, task_id, plan_revision, plan_hash,"
                 " step_id, capability_id, risk_tier, action_digest, consumed_by,"
                 " consumed_at, uses_remaining_after, state, detail)"
