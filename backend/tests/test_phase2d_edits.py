@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from aether.core.edits.executor import EditDenied, EditExecutor, EditRequest
+from aether.core.edits.journal import MutationJournal
 from aether.core.edits.receipts import (
     ActionReceiptRecord,
     ReceiptError,
@@ -87,7 +88,10 @@ def world(tmp_path: Path):
     vault_dir = tmp_path / "vault"
     authority = AcceptingAuthority()
     store = SQLiteTaskStore(tmp_path / "store.sqlite3")
-    ledger = ConsumptionLedger(tmp_path / "consumption.sqlite3", clock=lambda: NOW)
+    ledger = ConsumptionLedger.open_tests_scoped(
+        tmp_path / "consumption.sqlite3", clock=lambda: NOW
+    )
+    journal = MutationJournal(tmp_path / "journal.sqlite3", clock=lambda: NOW)
     with UndoVault(vault_dir) as vault, ReceiptStore(tmp_path / "receipts.sqlite3") as receipts:
         executor = EditExecutor(
             registry,
@@ -96,6 +100,7 @@ def world(tmp_path: Path):
             receipts,
             plans=store,
             grants=ledger,
+            journal=journal,
             clock=lambda: NOW,
         )
         yield {

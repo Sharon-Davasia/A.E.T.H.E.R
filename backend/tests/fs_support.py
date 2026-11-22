@@ -126,15 +126,22 @@ class ConsumptionHarness:
     """A real consumption ledger plus the budget an edit will spend.
 
     Tests that exercise the executor need genuine accounting, because S14-2
-    makes a validated grant without a spendable budget a refusal. This harness
-    creates no grant and widens no scope: it records a budget of a given size,
-    which is exactly what an accepted approval would have produced.
+    makes a validated grant without a spendable budget a refusal.
+
+    S14-7 changed what this harness may claim. The ledger it opens is
+    **test-scoped**: it does not consult the authoritative Stage 4 grant ledger,
+    which is exactly why production code cannot obtain one this way. A budget
+    registered here proves nothing about production authorization, and the
+    S14-7 suite asserts that the production constructor refuses without a real
+    grant behind it.
     """
 
     def __init__(self, tmp_path, *, clock=None, uses: int = 1, plan_hash: str = "a" * 64):
         from aether.core.grants.consumption import ConsumptionLedger
 
-        self.ledger = ConsumptionLedger(tmp_path / "consumption.sqlite3", clock=clock)
+        self.ledger = ConsumptionLedger.open_tests_scoped(
+            tmp_path / "consumption.sqlite3", clock=clock
+        )
         self.uses = uses
         self.plan_hash = plan_hash
 
