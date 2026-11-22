@@ -45,7 +45,8 @@ Ordered. Each row is one PR. "Depends on" must merge first.
 | N | **S14-12 — unprojected spend discoverable** | `3d1ade5` | `grants/consumption.py`, `edits/reconcile.py`, `test_phase2_consumption_recovery.py` | M |
 | O | **S14-13 — replay preserves terminal state** | `3149b6c` | `grants/consumption.py`, `test_phase2_consumption_recovery.py` | N |
 | P | **Vault index race (found during S14-12)** | `9194036` | `vault/undo_vault.py`, `test_phase2_vault_key_protection.py` | L (independent of M–O) |
-| Q | **Documentation set, as one reviewed commit** | `1038b1d`, `9a1334f`, `03e11e8`, `ec9452b`, *final* | `PR14_SPLITTING_PLAN.md`, `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | O, P |
+| Q | **S14-14 — complete the vault concurrency invariant** | `eb7e07e` | `vault/undo_vault.py`, `test_phase2_vault_key_protection.py` | P |
+| R | **Documentation set** | `1038b1d`, `9a1334f`, `03e11e8`, `ec9452b`, `<docs-tip>` | `PR14_SPLITTING_PLAN.md`, `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | Q |
 
 ---
 
@@ -157,7 +158,8 @@ branch HEAD, so the split preserves every file exactly.
 | N | `3d1ade5` S14-12 unprojected spend | 802 passed, 3 skipped |
 | O | `3149b6c` S14-13 replay terminal state | 809 passed, 3 skipped |
 | P | `9194036` vault index race | 810 passed, 3 skipped |
-| Q | `1038b1d` `9a1334f` `03e11e8` `ec9452b` docs + final | 810 passed, 3 skipped |
+| Q | `eb7e07e` S14-14 vault concurrency | 819 passed, 3 skipped |
+| R | `1038b1d` `9a1334f` `03e11e8` `ec9452b` + docs tip | 819 passed, 3 skipped |
 
 **0 failures at every tip.** The count rises monotonically as tests are added, and
 never falls, which is the signature of a split that preserves coverage rather than
@@ -311,31 +313,84 @@ git cherry-pick -x 3149b6c && git push -u origin split/pr14-s14-13-replay-termin
 git switch -c split/pr14-vault-index-race split/pr14-s14-13-replay-terminal-state
 git cherry-pick -x 9194036 && git push -u origin split/pr14-vault-index-race
 
-# Q -- the documentation set, in creation order (see 5.8)
-git switch -c split/pr14-docs split/pr14-vault-index-race
+# Q -- S14-14, the vault concurrency invariant
+git switch -c split/pr14-s14-14-vault-concurrency split/pr14-vault-index-race
+git cherry-pick -x eb7e07e && git push -u origin split/pr14-s14-14-vault-concurrency
+
+# R -- the documentation set, in creation order (see below)
+git switch -c split/pr14-docs split/pr14-s14-14-vault-concurrency
 git cherry-pick -x 1038b1d   # CREATES PR14_SPLITTING_PLAN.md
 git cherry-pick -x 9a1334f   # CREATES the acceptance report, .gitignore
 git cherry-pick -x 03e11e8   # modifies both
 git cherry-pick -x ec9452b   # modifies both
-git cherry-pick -x <final-docs-SHA>
+git cherry-pick -x <docs-tip>   # final docs: split preflight + S14-14 note
 git push -u origin split/pr14-docs
 ```
 
-Before opening **Q**, confirm it is a complete documentation set and not a partial
-one:
+#### Preflight: verify content, not ancestry
+
+**Do not use `git merge-base --is-ancestor` on these branches.** Cherry-picking
+rewrites commit ids, so the original SHA is never an ancestor of a split branch
+even when the change it carries is present. A check like
 
 ```bash
-git log --oneline -- split/../docs/engineering/PR14_SPLITTING_PLAN.md | wc -l   # >= 4
-test -f docs/engineering/PHASE2_ACCEPTANCE_REPORT.md && echo "report present"
-test -f docs/engineering/PR14_SPLITTING_PLAN.md && echo "plan present"
-git diff --stat main...split/pr14-docs -- docs .gitignore
+git merge-base --is-ancestor fef5592 split/pr14-s14-10-windows-acl   # WRONG
 ```
 
-Before opening **L**, confirm its base really carries D:
+fails on a correct branch and tells you nothing about whether the change landed.
+The question is not "is this commit an ancestor" but "does this branch contain the
+resulting files and patches, and do they work". So verify content and behaviour:
 
 ```bash
-git merge-base --is-ancestor fef5592 split/pr14-s14-10-windows-acl && echo "D present"
-test -f backend/aether/core/security/file_permissions.py && echo "file present"
+# 1. The file D creates must exist on L's base, and must be the version L expects.
+git switch split/pr14-s14-10-windows-acl
+test -s backend/aether/core/security/file_permissions.py || { echo "MISSING file_permissions.py (D not applied)"; exit 1; }
+test -f scripts/verify_phase2.ps1 || { echo "MISSING verify_phase2.ps1"; exit 1; }
+
+# 2. L's own change must be present in that file, not just the file.
+grep -q "def parse_sddl_dacl" backend/aether/core/security/file_permissions.py || { echo "S14-10 parser absent"; exit 1; }
+grep -q "def evaluate_windows_dacl" backend/aether/core/security/file_permissions.py || { echo "S14-10 evaluator absent"; exit 1; }
+
+# 3. D's contribution must also still be present.
+grep -q "restrict_to_owner" backend/aether/core/security/file_permissions.py || { echo "S14-5 absent"; exit 1; }
+
+# 4. Behaviour is the only real proof: the tests that cover both must pass.
+cd backend && python -m pytest tests/test_phase2_vault_key_protection.py \
+                        tests/test_phase2_windows_acl.py -q
+```
+
+The same content-and-behaviour rule replaces the ancestry idea everywhere:
+
+| Question | Wrong check | Correct check |
+|---|---|---|
+| Does L's base carry D? | `--is-ancestor fef5592` | `test -s .../file_permissions.py` **and** `pytest test_phase2_vault_key_protection.py` |
+| Does Q carry both docs? | `--is-ancestor 1038b1d` | both files non-empty **and** `git log --oneline origin/main..HEAD -- <path>` non-empty for each |
+| Is the split identical to source? | compare commit ids | `git diff --name-status <split-tip> <source-HEAD>` is **empty** |
+
+That last row is the strongest check available, and it is the one to run before
+opening any PR: if the reconstructed tree is byte-identical to the reviewed source
+HEAD, no change was lost, dropped or silently altered in the split.
+
+```bash
+# Run this on the Q tip. Empty output means the split reproduces source exactly.
+git diff --name-status HEAD <docs-tip>
+```
+
+Before opening **Q**, confirm the documentation set is complete rather than partial:
+
+```bash
+for f in docs/engineering/PR14_SPLITTING_PLAN.md docs/engineering/PHASE2_ACCEPTANCE_REPORT.md; do
+  test -s "$f" || { echo "MISSING $f"; exit 1; }
+  echo "$f: $(git log --oneline origin/main..HEAD -- "$f" | wc -l) commits"
+done
+```
+
+Before opening **L**:
+
+```bash
+test -s backend/aether/core/security/file_permissions.py || { echo "D missing"; exit 1; }
+grep -q "def parse_sddl_dacl" backend/aether/core/security/file_permissions.py || exit 1
+cd backend && python -m pytest tests/test_phase2_windows_acl.py -q
 ```
 
 Open each with `gh pr create --fill` and a base of the previous PR's branch.

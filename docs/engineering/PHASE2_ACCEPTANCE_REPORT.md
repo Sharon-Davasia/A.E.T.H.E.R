@@ -30,8 +30,8 @@
 
 ## 2. Exact test results (Linux, this sandbox)
 
-Command: `uv run pytest` in `backend/`. Full suite at `3149b6c` (and at `9194036`):
-**810 passed, 3 skipped** (813 collected). At `a65460c` it was 775; S14-11 added 21
+Command: `uv run pytest` in `backend/`. Full suite at `eb7e07e`: **819 passed,
+3 skipped** (822 collected). At `a65460c` it was 775; S14-11 added 21
 and rewrote 2 of the S14-7 tests, S14-12/13 added 15, and the vault concurrency
 regression added 1. The 3 skips are two native-Windows ACL
 tests and one environment-gated test; they are **skipped, not passed**.
@@ -50,7 +50,7 @@ not dependent on the sandbox's shared editable install.
 | `test_phase2_grant_consumption.py` | 19 | PASS (S14-2) |
 | `test_phase2_undo_authorization.py` | 16 | PASS (S14-3) |
 | `test_phase2_mutation_journal.py` | 22 | PASS (S14-4) |
-| `test_phase2_vault_key_protection.py` | 19 (2 skipped) | PASS (S14-5, +concurrency regression) |
+| `test_phase2_vault_key_protection.py` | 26 (2 skipped) | PASS (S14-5, S14-14 concurrency) |
 | `test_phase2_fixture_safety.py` | 21 | PASS (S14-6) |
 | `test_phase2_grant_authority.py` | 18 | PASS (S14-7, rewritten for S14-11) |
 | `test_phase2_authoritative_consumption.py` | 21 | PASS (S14-11) |
@@ -183,7 +183,7 @@ and the Phase 1 deny-all broker default were not modified.
 - The Stage 3 review button was not turned into an execution approval.
 - No acceptance result was fabricated to close a gate.
 
-## 10. Independent-review remediation (S14-1 … S14-13)
+## 10. Independent-review remediation (S14-1 … S14-14)
 
 PR #14's independent review found nine defects, and a post-interruption review of
 the correction found four more. A third source review then found that S14-7's fix
@@ -202,7 +202,8 @@ and — as importantly — what remains **NOT VERIFIED**.
 | `d1bdd2c` | S14-11 | S14-7 *checked* `GrantLedger.load()/status()` but decremented only a local budget, so the grant stayed unconsumed; two independent consumption databases could each spend the same final use, and revocation between check and spend was escapable | `test_phase2_authoritative_consumption.py` (21): the spend now *is* `GrantLedger.consume`, so the authoritative count moves exactly once; record **and** `CONSUMED` audit event; second consumer cannot report or spend a full allowance; concurrent overspend refused; exhaustion, revocation (incl. mid-flight), expiry, consent and plan binding at consumption time, step binding, replay; invented local budget inert; fake and simulated authorities refused; interrupted execution still journaled, reported as an orphan needing review, and resolvable to `UNVERIFIED` without refunding the use |
 | `3d1ade5` | S14-12 | The authoritative commit and the local projection are two SQLite databases, so they cannot commit together; a kill in between left a spend that no local row and no journal intent named, and reconciliation called that clean | `test_phase2_consumption_recovery.py` (8 at this commit): a durable attempt row is committed *before* the spend, so the window is observable from either side; reconciliation asks the authoritative ledger by consumption id and returns `NEEDS_REVIEW` (`reconcile_consumed_without_projection`) for a spend it finds, `NOT_APPLIED` for one it does not, and `NEEDS_REVIEW` (`reconcile_authority_unavailable`) when it cannot ask; the attempt is not an allowance and the simulated ledger is still refused |
 | `3149b6c` | S14-13 | The projection used `INSERT OR REPLACE`, so an authoritative replay reset a resolved SUCCEEDED/FAILED/UNVERIFIED row to PENDING, erasing what the first attempt concluded on the path that exists to refuse a duplicate mutation | `test_phase2_consumption_recovery.py` (7 more): replay after each terminal state and across a reopen preserves the state and its detail; a mismatched identity is refused and leaves the row intact; a missing projection recovers as PENDING, never as success; replays remain idempotent and spend nothing |
-| `9194036` | (found during S14-12) | `UndoVault.put` appended to its JSON index with an unsynchronized read-modify-write, so concurrent snapshots could drop an index record — a stored pre-image then reported as `vault_snapshot_unknown` | `test_phase2_vault_key_protection.py` (+1, now 19): 8 concurrent snapshots all readable and all present in the index; 10/10 runs fail without the lock, 8/8 pass with it. Pre-existing since S14-5, surfaced as a ~2-in-12 flake in the interleaved-executor test |
+| `eb7e07e` | S14-14 | The vault lock added with `9194036` protected only `put`'s index update: `cleanup_expired` and `collect_orphan_objects` wrote the same index unlocked, `put` wrote its object outside the critical section (so orphan collection could delete a not-yet-indexed pre-image), two processes could both write, and retention could expire a snapshot a live receipt still needs | `test_phase2_vault_key_protection.py` (26, 8 new): deterministic Event-parked interleavings for put-versus-collection and put-versus-cleanup, a structural guard that every index writer takes the lock, a single-writer ownership lock across instances (`vault_owned_by_another_writer`) released on close with readers unaffected, receipt-linked snapshots excluded from retention, quota refusing rather than evicting them, and all maintenance paths still fail-closed on a corrupt index |
+| `9194036` | interim fix | `UndoVault.put` appended to its JSON index with an unsynchronized read-modify-write, so concurrent snapshots could drop an index record — a stored pre-image then reported as `vault_snapshot_unknown` | `test_phase2_vault_key_protection.py` (+1, now 19): 8 concurrent snapshots all readable and all present in the index; 10/10 runs fail without the lock, 8/8 pass with it. Pre-existing since S14-5, surfaced as a ~2-in-12 flake in the interleaved-executor test |
 | `e399099` | S14-8 | A crash between spending a use and journaling left a pending consumption that reconciliation reported as clean | `test_phase2_orphan_consumption.py` (11): orphan reported `reconcile_consumption_without_intent`, never consistent, never completed, file untouched, never attached to another intent |
 | `f5ab233` | S14-9 | `_consumption_id` was shared mutable executor state, and the journal was optional | `test_phase2_execution_context.py` (10): attribute gone, two interleaved operations resolve only their own use, journal-less executor refuses before any state change, journal check precedes consumption |
 | `a65460c` | S14-10 | The Windows ACL check accepted any descriptor containing an owner ACE, so owner-plus-Everyone passed | `test_phase2_windows_acl.py` (25): exact ACE inventory; Everyone, Users, Authenticated Users, unrelated SIDs, SYSTEM, Administrators, inherited and deny ACEs all rejected |
@@ -247,7 +248,7 @@ Every item below is still **NOT VERIFIED** and no commit above changes that:
 
 | Gate | Result |
 |---|---|
-| Backend suite | 810 passed, 3 skipped (clean isolated interpreter) |
+| Backend suite | 819 passed, 3 skipped (clean isolated interpreter) |
 | Ruff / format / mypy | clean / clean / clean (95 files) |
 | Desktop typecheck / eslint | pass / pass |
 | Desktop Node tests | 54 pass, 7 skipped (environment-gated) |
