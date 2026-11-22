@@ -53,7 +53,7 @@ from aether.core.planning.production_verifier import ProductionAttestationVerifi
 from aether.core.policy.broker import PolicyBroker
 from aether.core.policy.capabilities import CapabilityRegistry
 from aether.core.vault.undo_vault import UndoVault
-from tests.fs_support import build_registry, build_tree, resolve
+from tests.fs_support import ConsumptionHarness, build_registry, build_tree, resolve
 from tests.test_phase2b_trusted_approval import (
     GestureNonceRegister,
     TrustedGestureAuthority,
@@ -131,7 +131,17 @@ def app(tmp_path: Path):
     authority = _AcceptingAuthority()
     vault = UndoVault(tmp_path / "vault").open()
     receipts = ReceiptStore(tmp_path / "receipts.sqlite3")
-    edits = EditExecutor(registry, authority, vault, receipts, plans=store, clock=lambda: NOW)
+    # S14-2: real accounting behind the mutation path.
+    grants = ConsumptionHarness(tmp_path, clock=lambda: NOW, uses=32)
+    edits = EditExecutor(
+        registry,
+        authority,
+        vault,
+        receipts,
+        plans=store,
+        grants=grants.ledger,
+        clock=lambda: NOW,
+    )
     task_id = uuid4()
     store.create_task("Phase 2 acceptance task", task_id=task_id, now=NOW)
     session = CapabilitySession(store=store, broker=broker, executor=fs_executor, clock=lambda: NOW)
@@ -155,8 +165,10 @@ def app(tmp_path: Path):
         "vault": vault,
         "task_id": task_id,
         "authority": authority,
+        "grants": grants,
         "pending": {"gesture": None},
     }
+    grants.close()
     receipts.close()
     vault.close()
     store.close()
@@ -187,6 +199,12 @@ def _plan_and_present(
         revision=_next_revision(store, task_id),
     )
     plan_hash = store.save_plan(revision.plan)
+    app["grants"].bind(
+        approval_id=UUID(str(revision.plan.steps[0].arguments["approval_id"])),
+        task_id=task_id,
+        now=NOW,
+        plan_hash=plan_hash,
+    )
     app["narratives"].remember(
         task_id=task_id,
         plan_revision=revision.plan.revision,
@@ -447,7 +465,7 @@ def test_08_apply_approved_edit_and_compare_exact_bytes(app) -> None:
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],
@@ -479,13 +497,20 @@ def test_09_refuse_stale_authorization_after_a_later_edit(app) -> None:
     )
     _approve(app, prepared)
     approved_sha = hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest()
-    # The user edits the file after preview.
+    # The user edits the file after preview. A fresh budget is recorded so the
+    # accounting gate passes and freshness is the check under test.
     app["tree"].readme.write_text("# changed after approval\n", encoding="utf-8")
     newer = app["tree"].readme.read_bytes()
+    app["grants"].bind(
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
+        task_id=app["task_id"],
+        now=NOW,
+        plan_hash=prepared["plan_hash"],
+    )
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],
@@ -534,7 +559,7 @@ def test_10_reject_invalid_grants(app, reason_code: str) -> None:
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],
@@ -564,7 +589,7 @@ def test_11_grant_binding_is_checked_against_the_exact_action(app) -> None:
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],
@@ -593,7 +618,7 @@ def test_12_receipts_persist_across_a_restart(app, tmp_path) -> None:
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],
@@ -632,7 +657,7 @@ def _apply_known_edit(app) -> tuple[object, bytes]:
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],
@@ -713,7 +738,7 @@ def test_15_crash_between_replace_and_verification_is_unverified(app, monkeypatc
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],
@@ -803,7 +828,7 @@ def test_17_no_unauthorized_mutation_occurred(app) -> None:
     request = EditRequest(
         task_id=app["task_id"],
         step_id=prepared["step_id"],
-        approval_id=uuid4(),
+        approval_id=UUID(str(prepared["revision"].plan.steps[0].arguments["approval_id"])),
         plan_revision=prepared["preview"].plan_revision,
         plan_hash=prepared["plan_hash"],
         resource_id=prepared["resource_id"],

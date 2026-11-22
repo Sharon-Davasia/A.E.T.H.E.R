@@ -373,6 +373,38 @@ def persist_with_permit(
     )
 
 
+def open_tests_scoped_ledger(store: SQLiteTaskStore):  # type: ignore[no-untyped-def]
+    """Open the test-scoped ledger from the allow-listed module.
+
+    ``GrantLedger.open_tests_scoped`` deliberately refuses callers outside an
+    allow-list of test modules. Rather than widening that list, tests that need a
+    real ledger behind an executor call this helper, so the gate keeps exactly
+    one door.
+
+    Test-only: production issuance stays GRANT_ISSUANCE_DISABLED.
+    """
+
+    from aether.core.grants.ledger import GrantLedger
+
+    return GrantLedger.open_tests_scoped(store)
+
+
+class RealGrantLedgerConsumer:
+    """Adapts a real GrantLedger to the executor's GrantConsumer protocol.
+
+    This is deliberately a thin adapter and not a double: the executor must
+    consume against the genuine ledger, because the whole point of S14-2 is that
+    a validated grant alone is not execution authority. Nothing here can grant
+    anything -- it can only spend a use the ledger already holds and verify.
+    """
+
+    def __init__(self, ledger) -> None:  # type: ignore[no-untyped-def]
+        self._ledger = ledger
+
+    def consume(self, **kwargs):  # type: ignore[no-untyped-def]
+        return self._ledger.consume(**kwargs)
+
+
 def apply_proposed_migration_raw(database: Path) -> None:
     """Raw-apply the proposed migration, bypassing the store entirely.
 

@@ -26,6 +26,7 @@ from aether.core.edits.receipts import (
     ReceiptError,
     ReceiptStore,
 )
+from aether.core.grants.consumption import ConsumptionLedger
 from aether.core.persistence.sqlite_store import PersistentTaskState, SQLiteTaskStore
 from aether.core.planning.planner import Planner
 from aether.core.policy.capabilities import CapabilityRegistry
@@ -79,9 +80,16 @@ def world(tmp_path: Path):
     vault_dir = tmp_path / "vault"
     authority = AcceptingAuthority()
     store = SQLiteTaskStore(tmp_path / "store.sqlite3")
+    ledger = ConsumptionLedger(tmp_path / "consumption.sqlite3", clock=lambda: NOW)
     with UndoVault(vault_dir) as vault, ReceiptStore(tmp_path / "receipts.sqlite3") as receipts:
         executor = EditExecutor(
-            registry, authority, vault, receipts, plans=store, clock=lambda: NOW
+            registry,
+            authority,
+            vault,
+            receipts,
+            plans=store,
+            grants=ledger,
+            clock=lambda: NOW,
         )
         yield {
             "tree": tree,
@@ -90,6 +98,7 @@ def world(tmp_path: Path):
             "receipts": receipts,
             "executor": executor,
             "authority": authority,
+            "grants": ledger,
             "store": store,
             "planner": Planner(
                 capabilities=CapabilityRegistry.phase2_filesystem(),
@@ -98,6 +107,7 @@ def world(tmp_path: Path):
             ),
             "tmp": tmp_path,
         }
+    ledger.close()
     store.close()
 
 
@@ -128,6 +138,16 @@ def make_request(
     resolved_approval = approval_id or uuid4()
     effect_digest = "b" * 64
     if world is not None:
+        # S14-2: record the budget this approval represents, so consumption can
+        # succeed and the check under test is the one that fires.
+        world["grants"].grant_budget(
+            approval_id=resolved_approval,
+            task_id=resolved_task,
+            plan_revision=1,
+            plan_hash="a" * 64,
+            uses=1,
+            now=NOW,
+        )
         from aether.core.planning.planner import PlanGoal, PlanIntent
 
         resource_id = resolve(registry, relative)
@@ -149,6 +169,14 @@ def make_request(
         )
         effect_digest = str(revision.plan.steps[0].expected_effect["approved_effect_digest"])
         resolved_step = revision.step_id
+        world["grants"].grant_budget(
+            approval_id=resolved_approval,
+            task_id=resolved_task,
+            plan_revision=1,
+            plan_hash="a" * 64,
+            uses=1,
+            now=NOW,
+        )
         world["store"].create_task("edit", task_id=resolved_task, now=NOW)
         world["store"].transition_task(resolved_task, PersistentTaskState.PLANNING, now=NOW)
         world["store"].save_plan(revision.plan)
@@ -296,11 +324,12 @@ def test_edit_to_a_protected_path_is_refused(tmp_path) -> None:
 
 
 def test_identical_content_is_refused_as_a_no_op(world) -> None:
-    registry, tree, executor = world["registry"], world["tree"], world["executor"]
-    request = make_request(registry, tree, content=tree.readme.read_bytes())
-    with pytest.raises(EditDenied) as denied:
-        executor.apply(request)
-    assert denied.value.reason_code == "edit_no_change"
+    registry, tree = world["registry"], world["tree"]
+    # No plan can bind "change the file to what it already is": the diff is
+    # empty, so the refusal happens at planning time rather than at mutation.
+    with pytest.raises(Exception) as denied:
+        make_request(registry, tree, content=tree.readme.read_bytes(), world=world)
+    assert getattr(denied.value, "reason_code", None) in {"diff_no_change", "edit_no_change"}
 
 
 def test_unregistered_resource_is_refused(world) -> None:
