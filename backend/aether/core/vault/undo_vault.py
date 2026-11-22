@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import stat
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -142,6 +143,14 @@ class UndoVault:
         self._clock = clock or time.time
         self._cipher: AESGCM | None = None
         self._legacy_key_migrated = False
+        # The index is a JSON file rewritten by a read-modify-write in ``put``.
+        # Two concurrent snapshots previously raced here: each read the index,
+        # each appended its own record, and the second write won -- silently
+        # dropping the first snapshot's record so that ``get`` later reported
+        # ``vault_snapshot_unknown`` for a snapshot that was genuinely stored.
+        # Observed as an intermittent failure in the interleaved-executor test,
+        # not as a data-loss report, which is exactly how this kind of bug hides.
+        self._lock = threading.RLock()
 
     def _resolve_key_path(self, key_path: Path | None) -> Path:
         candidate = (
@@ -250,19 +259,20 @@ class UndoVault:
             original_display_name=original_display_name,
             receipt_id=receipt_id,
         )
-        index = self._read_index()
-        index["records"].append(
-            _IndexEntry(
-                snapshot_id=str(record.snapshot_id),
-                content_sha256=record.content_sha256,
-                size_bytes=record.size_bytes,
-                created_at_ms=record.created_at_ms,
-                original_display_name=record.original_display_name,
-                receipt_id=record.receipt_id,
+        with self._lock:
+            index = self._read_index()
+            index["records"].append(
+                _IndexEntry(
+                    snapshot_id=str(record.snapshot_id),
+                    content_sha256=record.content_sha256,
+                    size_bytes=record.size_bytes,
+                    created_at_ms=record.created_at_ms,
+                    original_display_name=record.original_display_name,
+                    receipt_id=record.receipt_id,
+                )
             )
-        )
-        self._write_index(index)
-        self._enforce_quota(index)
+            self._write_index(index)
+            self._enforce_quota(index)
         return record
 
     def get(self, snapshot_id: UUID) -> bytes:
@@ -294,7 +304,8 @@ class UndoVault:
         return plaintext
 
     def records(self) -> tuple[SnapshotRecord, ...]:
-        index = self._read_index()
+        with self._lock:
+            index = self._read_index()
         return tuple(
             SnapshotRecord(
                 snapshot_id=UUID(entry["snapshot_id"]),

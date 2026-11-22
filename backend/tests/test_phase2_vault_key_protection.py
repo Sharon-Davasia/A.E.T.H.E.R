@@ -278,3 +278,62 @@ def test_permissions_are_not_silently_skipped_on_windows() -> None:
     body = source[start : source.index("def _atomic_write(", start)]
     assert 'os.name == "nt"' not in body
     assert "restrict_to_owner" in body
+
+
+# ---------------------------------------------------------------------------
+# E. The index is not corrupted by concurrent snapshots
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_snapshots_all_reach_the_index(vault_dir: Path) -> None:
+    """Two snapshots taken at once must both be retrievable afterwards.
+
+    This is a real defect found while testing S14-12/S14-13, not a hypothetical.
+    ``put`` appends to a JSON index with an unsynchronized read-modify-write, so
+    two concurrent snapshots could each read the index, each append its own
+    record, and let the second write win. The dropped snapshot's object was still
+    on disk, but ``get`` then raised ``vault_snapshot_unknown`` -- a stored
+    pre-image reported as never having existed.
+
+    It surfaced as an intermittent failure in the interleaved-executor test, which
+    is the worst way to find it: a data-loss bug hiding inside a flaky test. The
+    loop is bounded and the assertion is deterministic, so a regression shows up
+    as a failure rather than as sluggishness.
+    """
+
+    import threading
+
+    vault = UndoVault(vault_dir).open()
+    try:
+        barriers = threading.Barrier(8, timeout=10)
+        produced: list = []
+        errors: list[BaseException] = []
+
+        def snapshot(index: int) -> None:
+            try:
+                # Distinct content per thread, so each gets its own object.
+                payload = f"pre-image {index}".encode()
+                barriers.wait()
+                produced.append((vault.put(payload, original_display_name="f.txt"), payload))
+            except BaseException as exc:  # pragma: no cover - surfaced below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=snapshot, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+
+        assert not errors, f"a concurrent snapshot failed: {errors[0]!r}"
+        assert len(produced) == 8
+
+        # Every produced snapshot must be readable, not just present in a list.
+        for record, payload in produced:
+            assert vault.get(record.snapshot_id) == payload
+
+        indexed = {str(item.snapshot_id) for item in vault.records()}
+        assert {str(record.snapshot_id) for record, _ in produced} <= indexed, (
+            "a snapshot object was written but its index record was lost"
+        )
+    finally:
+        vault.close()
