@@ -34,12 +34,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import importlib
 import json
 import os
 import stat
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, TypedDict
@@ -151,6 +152,15 @@ class UndoVault:
         # Observed as an intermittent failure in the interleaved-executor test,
         # not as a data-loss report, which is exactly how this kind of bug hides.
         self._lock = threading.RLock()
+        # S14-14: an instance lock cannot serialize two *processes* sharing one
+        # vault directory. The index is a whole-file read-modify-write, so two
+        # concurrent writers can each read, each modify, and one silently loses
+        # the other's change -- including a snapshot record. A single-writer
+        # ownership lock, held for the life of an open vault, is the only cheap
+        # guard that actually holds across processes. Same shape as the grant
+        # ledger's owner lock.
+        self._writer_lock: int | None = None
+        self._writer_lock_path = self._directory / "vault.writer.lock"
 
     def _resolve_key_path(self, key_path: Path | None) -> Path:
         candidate = (
@@ -220,6 +230,7 @@ class UndoVault:
 
     def close(self) -> None:
         self._cipher = None
+        self._release_writer_lock()
 
     def __enter__(self) -> UndoVault:
         return self.open()
@@ -246,11 +257,6 @@ class UndoVault:
         digest = hashlib.sha256(content).hexdigest()
         snapshot_id = uuid4()
         target = self._object_path(digest)
-        if not target.exists():
-            nonce = os.urandom(_NONCE_BYTES)
-            blob = cipher.encrypt(nonce, content, digest.encode("ascii"))
-            _atomic_write(target, _RECORD_MAGIC + nonce + blob)
-            _restrict_permissions(target)
         record = SnapshotRecord(
             snapshot_id=snapshot_id,
             content_sha256=digest,
@@ -259,21 +265,61 @@ class UndoVault:
             original_display_name=original_display_name,
             receipt_id=receipt_id,
         )
-        with self._lock:
+        # The object write and the index append are ONE critical section.
+        #
+        # Writing the object first and then taking the lock (the previous
+        # arrangement) left a window in which the object existed on disk but no
+        # index entry referenced it -- indistinguishable, to
+        # ``collect_orphan_objects``, from garbage. Concurrent orphan collection
+        # could delete a pre-image that was about to become referenced, and the
+        # caller would receive a SnapshotRecord for a snapshot that no longer
+        # existed. Holding the lock across both steps means the object is never
+        # visible-but-unreferenced to another maintenance call.
+        with self._lock, self._exclusive_writer():
+            if not target.exists():
+                nonce = os.urandom(_NONCE_BYTES)
+                blob = cipher.encrypt(nonce, content, digest.encode("ascii"))
+                _atomic_write(target, _RECORD_MAGIC + nonce + blob)
+                _restrict_permissions(target)
             index = self._read_index()
-            index["records"].append(
-                _IndexEntry(
-                    snapshot_id=str(record.snapshot_id),
-                    content_sha256=record.content_sha256,
-                    size_bytes=record.size_bytes,
-                    created_at_ms=record.created_at_ms,
-                    original_display_name=record.original_display_name,
-                    receipt_id=record.receipt_id,
-                )
+            candidate = _Index(
+                records=[
+                    *index["records"],
+                    _IndexEntry(
+                        snapshot_id=str(record.snapshot_id),
+                        content_sha256=record.content_sha256,
+                        size_bytes=record.size_bytes,
+                        created_at_ms=record.created_at_ms,
+                        original_display_name=record.original_display_name,
+                        receipt_id=record.receipt_id,
+                    ),
+                ]
             )
-            self._write_index(index)
-            self._enforce_quota(index)
+            # Enforce the quota over the *candidate* index and commit only if it
+            # succeeds. Evaluating it after the write left a refused snapshot in
+            # the index when the only evictable records were receipt-linked: the
+            # caller was told the write failed while the record it was told about
+            # sat in the index, and an orphan object was left behind. A refusal
+            # must leave no trace.
+            try:
+                self._write_index(self._apply_quota(candidate))
+            except VaultError:
+                # The quota refused this snapshot. Remove the object we just
+                # encrypted, but only if nothing else still references it (another
+                # record may share the same content digest), so a refusal leaves no
+                # orphan behind.
+                self._discard_if_unreferenced(target, digest)
+                raise
         return record
+
+    def _discard_if_unreferenced(self, target: Path, digest: str) -> None:
+        """Delete an object written for a write that then failed."""
+
+        current = self._read_index()
+        if any(entry["content_sha256"] == digest for entry in current["records"]):
+            return
+        with contextlib.suppress(OSError):
+            target.unlink()
 
     def get(self, snapshot_id: UUID) -> bytes:
         """Return the verified plaintext for one snapshot, or raise."""
@@ -374,26 +420,112 @@ class UndoVault:
     def cleanup_expired(self) -> tuple[UUID, ...]:
         """Remove records past retention. Orphaned objects are collected too."""
 
-        index = self._read_index()
-        cutoff_ms = int((self._clock() - self._retention_seconds) * 1000)
-        expired = [entry for entry in index["records"] if entry["created_at_ms"] < cutoff_ms]
-        if not expired:
-            return ()
-        expired_ids = {entry["snapshot_id"] for entry in expired}
-        index["records"] = [
-            entry for entry in index["records"] if entry["snapshot_id"] not in expired_ids
-        ]
-        self._write_index(index)
-        self._collect_orphans(index)
+        # The whole read-modify-write, and the collection that follows it, is one
+        # critical section. Unlocked (the previous arrangement) two cleanups could
+        # each read the index, each remove a different expired record, and let the
+        # second write discard the first removal -- resurrecting a snapshot that
+        # was supposed to be gone. Worse, a cleanup racing ``put`` could rewrite an
+        # index that had just gained a record, dropping it.
+        with self._lock, self._exclusive_writer():
+            index = self._read_index()
+            cutoff_ms = int((self._clock() - self._retention_seconds) * 1000)
+            # Retention governs pre-images that nothing points at. A record with a
+            # ``receipt_id`` is the one copy of a pre-image that a durable action
+            # receipt can still restore, so age alone must not delete it: the
+            # receipt outlives the retention window, and expiring the snapshot
+            # would leave a SUCCEEDED receipt promising an undo that can no longer
+            # be performed. That is a silent loss of recovery evidence, so those
+            # records are excluded here rather than quietly dropped.
+            expired = [
+                entry
+                for entry in index["records"]
+                if entry["created_at_ms"] < cutoff_ms and entry["receipt_id"] is None
+            ]
+            if not expired:
+                return ()
+            expired_ids = {entry["snapshot_id"] for entry in expired}
+            index["records"] = [
+                entry for entry in index["records"] if entry["snapshot_id"] not in expired_ids
+            ]
+            self._write_index(index)
+            self._collect_orphans(index)
         return tuple(UUID(value) for value in expired_ids)
 
     def collect_orphan_objects(self) -> int:
         """Delete object files with no index entry; returns how many were removed."""
 
-        index = self._read_index()
-        return self._collect_orphans(index)
+        with self._lock, self._exclusive_writer():
+            index = self._read_index()
+            return self._collect_orphans(index)
 
     # -- internals -------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _exclusive_writer(self) -> Iterator[None]:
+        """Hold (or acquire once) the vault-directory single-writer lock.
+
+        Reentrant by construction: the lock is acquired on first use and held for
+        the lifetime of the open vault, so nested maintenance calls inside a
+        critical section do not try to re-lock the file (which would deadlock on
+        platforms where the lock is per-descriptor rather than per-process).
+        """
+
+        if self._writer_lock is not None:
+            yield
+            return
+        self._writer_lock = self._acquire_writer_lock()
+        yield
+
+    def _acquire_writer_lock(self) -> int:
+        self._directory.mkdir(parents=True, exist_ok=True)
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(self._writer_lock_path, flags, 0o600)
+        except OSError as exc:
+            raise VaultError(
+                "vault_writer_lock_unavailable",
+                "the vault directory writer lock could not be created",
+            ) from exc
+        try:
+            if os.name != "nt":
+                fchmod = getattr(os, "fchmod", None)
+                if fchmod is not None:
+                    fchmod(descriptor, 0o600)
+            if os.name == "nt":
+                windows_locking = importlib.import_module("msvcrt")
+                windows_locking.locking(descriptor, windows_locking.LK_NBLCK, 1)
+            else:
+                posix_locking = importlib.import_module("fcntl")
+                posix_locking.flock(descriptor, posix_locking.LOCK_EX | posix_locking.LOCK_NB)
+            return descriptor
+        except OSError as exc:
+            os.close(descriptor)
+            raise VaultError(
+                "vault_owned_by_another_writer",
+                "another open vault instance is writing this directory; concurrent "
+                "writers would race the index and could lose a snapshot record",
+            ) from exc
+
+    def _release_writer_lock(self) -> None:
+        descriptor = self._writer_lock
+        if descriptor is None:
+            return
+        self._writer_lock = None
+
+        def unlock() -> None:
+            if os.name == "nt":
+                windows_locking = importlib.import_module("msvcrt")
+                windows_locking.locking(descriptor, windows_locking.LK_UNLCK, 1)
+            else:
+                posix_locking = importlib.import_module("fcntl")
+                posix_locking.flock(descriptor, posix_locking.LOCK_UN)
+
+        with contextlib.suppress(OSError, ValueError):
+            unlock()
+        with contextlib.suppress(OSError):
+            os.close(descriptor)
 
     def _require_open(self) -> AESGCM:
         if self._cipher is None:
@@ -470,10 +602,16 @@ class UndoVault:
         _atomic_write(self._index, payload)
         _restrict_permissions(self._index)
 
-    def _enforce_quota(self, index: _Index) -> None:
+    def _apply_quota(self, index: _Index) -> _Index:
+        """Evict down to the quota, or refuse; never writes.
+
+        Kept separate from the write so a refusal cannot leave a half-applied
+        index behind. Returns the index that should be committed.
+        """
+
         total = sum(entry["size_bytes"] for entry in index["records"])
         if total <= self._quota_bytes:
-            return
+            return index
         # Evict oldest first, but never break a live receipt link without saying
         # so: records with a receipt are kept until nothing else can be evicted.
         ordered = sorted(
@@ -483,10 +621,27 @@ class UndoVault:
         for entry in list(ordered):
             if total <= self._quota_bytes:
                 break
+            if entry["receipt_id"] is not None:
+                # Only receipt-linked records are left. Evicting one would break a
+                # restore promise a durable receipt still makes, so the write is
+                # refused instead. Failing closed here is better than accepting a
+                # snapshot that silently costs an earlier edit its undo.
+                raise VaultError(
+                    "vault_quota_exhausted_by_receipts",
+                    "the quota can only be met by evicting snapshots that live receipts "
+                    "still reference; raise the quota or expire those receipts explicitly",
+                )
             index["records"].remove(entry)
             total -= entry["size_bytes"]
-        self._write_index(index)
-        self._collect_orphans(index)
+        return index
+
+    def _enforce_quota(self, index: _Index) -> _Index:
+        """Evict to quota and commit the result (used by maintenance paths)."""
+
+        applied = self._apply_quota(index)
+        self._write_index(applied)
+        self._collect_orphans(applied)
+        return applied
 
     def _collect_orphans(self, index: _Index) -> int:
         referenced = {entry["content_sha256"] for entry in index["records"]}
