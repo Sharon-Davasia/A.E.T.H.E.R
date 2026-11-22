@@ -72,7 +72,15 @@ class ReconciliationReport:
 
 
 class MutationReconciler:
-    """Produces an evidence-backed verdict for every open mutation intent."""
+    """Produces an evidence-backed verdict for every unaccounted mutation.
+
+    Two work lists are reconciled, not one. Open journal intents are the obvious
+    list. The other is *pending consumptions with no journal intent*: the executor
+    spends the grant use before it writes the journal intent, so a crash between
+    those two steps leaves a spent use that no intent mentions. Iterating only
+    open intents reported that state as clean, which was a silent hole in crash
+    recovery (S14-8).
+    """
 
     def __init__(
         self,
@@ -92,14 +100,49 @@ class MutationReconciler:
         self._read_target = read_target or (lambda path: path.read_bytes())
 
     def reconcile(self) -> ReconciliationReport:
-        pending_consumptions = {
-            str(getattr(item, "consumption_id", "")) for item in self._consumption.pending()
-        }
-        results = [
-            self._reconcile_one(intent, pending_consumptions)
-            for intent in self._journal.open_intents()
-        ]
+        pending = list(self._consumption.pending())
+        pending_consumptions = {str(getattr(item, "consumption_id", "")) for item in pending}
+        open_intents = self._journal.open_intents()
+
+        results = [self._reconcile_one(intent, pending_consumptions) for intent in open_intents]
+        results.extend(self._reconcile_orphans(pending, open_intents))
         return ReconciliationReport(reconciliations=tuple(results))
+
+    def _reconcile_orphans(
+        self, pending: Sequence[object], open_intents: Sequence[MutationIntent]
+    ) -> list[Reconciliation]:
+        """Report spent uses that no journal intent accounts for.
+
+        A pending consumption whose id appears in no open intent is exactly the
+        crash-between-consume-and-journal window. It is never consistent: one
+        grant use may or may not have mutated a file, and nothing on disk says
+        which. It also covers a consumption whose intent was already resolved,
+        which means the two records disagree and both need review.
+
+        Consumptions already resolved are not pending, so they do not appear
+        here; a resolved consumption is accounted for.
+        """
+
+        known = {str(intent.consumption_id) for intent in open_intents if intent.consumption_id}
+        orphans: list[Reconciliation] = []
+        for item in pending:
+            consumption_id = str(getattr(item, "consumption_id", ""))
+            if not consumption_id or consumption_id in known:
+                continue
+            orphans.append(
+                Reconciliation(
+                    intent_id=None,
+                    consumption_id=getattr(item, "consumption_id", None),
+                    verdict="NEEDS_REVIEW",
+                    reason_code="reconcile_consumption_without_intent",
+                    detail=(
+                        "a grant use was consumed but no mutation intent records it: the "
+                        "process died between spending the use and journaling the intent, "
+                        "so whether a file changed is unknown and must be reviewed"
+                    ),
+                )
+            )
+        return orphans
 
     def _reconcile_one(
         self, intent: MutationIntent, pending_consumptions: set[str]
