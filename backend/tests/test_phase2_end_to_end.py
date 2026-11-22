@@ -42,7 +42,7 @@ from aether.core.edits.receipts import ReceiptStore
 from aether.core.fs.executor import FilesystemExecutor, FsCapabilityDenied
 from aether.core.fs.session import CapabilitySession
 from aether.core.grants.attestation import AttestationRejected, IssuanceBinding
-from aether.core.persistence.sqlite_store import SQLiteTaskStore
+from aether.core.persistence.sqlite_store import PersistentTaskState, SQLiteTaskStore
 from aether.core.planning.authorizing_gesture import GestureBinding
 from aether.core.planning.planner import PlanGoal, PlanIntent, Planner
 from aether.core.planning.preview_authority import (
@@ -103,6 +103,7 @@ def app(tmp_path: Path):
                 "fs.search",
                 "fs.open_folder",
                 "fs.apply_approved_edit",
+                "fs.undo_edit",
             }
         ),
     )
@@ -669,57 +670,82 @@ def _apply_known_edit(app) -> tuple[object, bytes]:
     return outcome, original, prepared["approved_effect_digest"]
 
 
-def test_13_undo_restores_the_exact_original(app) -> None:
-    outcome, original, bound_effect = _apply_known_edit(app)
-    assert app["tree"].readme.read_bytes() != original
-    undo_request = EditRequest(
-        task_id=app["task_id"],
-        step_id=uuid4(),
-        approval_id=uuid4(),
-        plan_revision=1,
-        plan_hash="a" * 64,
-        resource_id=outcome.receipt.resource_id,
-        expected_sha256=hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
-        proposed_content=b"ignored",
-        expected_effect_sha256=bound_effect,
+def _plan_undo(app, *, outcome, original: bytes) -> tuple[EditRequest, object]:
+    """Persist an fs.undo_edit plan restoring the snapshot, and return its request."""
+
+    registry, store, planner = app["registry"], app["store"], app["planner"]
+    task_id = uuid4()
+    approval_id = uuid4()
+    resource_id = resolve(registry, "README.md")
+    revision = planner.plan(
+        task_id,
+        PlanIntent(
+            goal=PlanGoal.UNDO_EDIT,
+            resource_id=resource_id,
+            arguments={
+                "resource_id": resource_id,
+                "step_id": str(uuid4()),
+                "approval_id": str(approval_id),
+                "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
+                "receipt_id": str(outcome.receipt.receipt_id),
+                "snapshot_id": str(outcome.snapshot_id),
+            },
+            summary="Undo the recorded edit",
+            proposed_content=original,
+        ),
+        revision=1,
     )
-    # S14-1/S14-3: undo is a distinct action that must not borrow the edit
-    # approval. It is refused outright here until S14-3 registers fs.undo_edit
-    # with its own plan-bound preview; refusing is safer than reusing the edit
-    # binding. See tests/test_phase2d_edits.py for the same assertion.
-    with pytest.raises(EditDenied) as refused:
-        app["edits"].undo(
-            undo_request,
-            snapshot_id=UUID(outcome.snapshot_id),
-            receipt_id=outcome.receipt.receipt_id,
-        )
-    assert refused.value.reason_code == "undo_authorization_not_implemented"
+    plan_hash = "a" * 64
+    app["grants"].bind(approval_id=approval_id, task_id=task_id, now=NOW, plan_hash=plan_hash)
+    store.create_task("undo", task_id=task_id, now=NOW)
+    store.transition_task(task_id, PersistentTaskState.PLANNING, now=NOW)
+    store.save_plan(revision.plan)
+    request = EditRequest(
+        task_id=task_id,
+        step_id=revision.step_id,
+        approval_id=approval_id,
+        plan_revision=1,
+        plan_hash=plan_hash,
+        resource_id=resource_id,
+        expected_sha256=hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
+        proposed_content=original,
+        expected_effect_sha256=str(
+            revision.plan.steps[0].expected_effect["approved_effect_digest"]
+        ),
+    )
+    return request, revision
+
+
+def test_13_undo_restores_the_exact_original(app) -> None:
+    outcome, original, _bound_effect = _apply_known_edit(app)
     assert app["tree"].readme.read_bytes() != original
+    undo_request, _revision = _plan_undo(app, outcome=outcome, original=original)
+    restored = app["edits"].undo(
+        undo_request,
+        snapshot_id=UUID(outcome.snapshot_id),
+        receipt_id=outcome.receipt.receipt_id,
+    )
+    assert restored.status == "SUCCEEDED"
+    assert app["tree"].readme.read_bytes() == original
+    return
 
 
 def test_14_refuse_silent_overwrite_of_a_newer_user_edit(app) -> None:
-    outcome, original, bound_effect = _apply_known_edit(app)
+    outcome, original, _bound_effect = _apply_known_edit(app)
+    # The user keeps working after our edit.
     app["tree"].readme.write_text("# user wrote more\n", encoding="utf-8")
     newer = app["tree"].readme.read_bytes()
-    undo_request = EditRequest(
-        task_id=app["task_id"],
-        step_id=uuid4(),
-        approval_id=uuid4(),
-        plan_revision=1,
-        plan_hash="a" * 64,
-        resource_id=outcome.receipt.resource_id,
-        expected_sha256=hashlib.sha256(original).hexdigest(),
-        proposed_content=b"ignored",
-        expected_effect_sha256=bound_effect,
-    )
+    undo_request, _revision = _plan_undo(app, outcome=outcome, original=original)
     with pytest.raises(EditDenied) as refused:
         app["edits"].undo(
             undo_request,
             snapshot_id=UUID(outcome.snapshot_id),
             receipt_id=outcome.receipt.receipt_id,
         )
-    assert refused.value.reason_code == "STALE_TARGET"
+    # A newer edit is an explicit conflict, never a silent overwrite.
+    assert refused.value.reason_code == "undo_conflict_newer_content"
     assert app["tree"].readme.read_bytes() == newer
+    assert app["tree"].readme.read_bytes() != original
 
 
 def test_15_crash_between_replace_and_verification_is_unverified(app, monkeypatch) -> None:

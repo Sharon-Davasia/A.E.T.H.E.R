@@ -124,8 +124,17 @@ class Planner:
         if editing and intent.proposed_content is None:
             raise PlannerError(
                 "PLAN_APPROVED_BYTES_REQUIRED",
-                "an edit plan must carry the exact proposed bytes so they can be bound",
+                "an edit or undo plan must carry the exact bytes so they can be bound",
             )
+        if intent.goal is PlanGoal.UNDO_EDIT:
+            # S14-3: undo names the receipt and snapshot it restores, so the plan
+            # itself records which recorded edit is being reversed.
+            missing = {key for key in ("receipt_id", "snapshot_id") if key not in intent.arguments}
+            if missing:
+                raise PlannerError(
+                    "PLAN_UNDO_TARGET_REQUIRED",
+                    "an undo plan must name the receipt and snapshot it restores",
+                )
         if not editing and intent.proposed_content is not None:
             raise PlannerError(
                 "PLAN_UNEXPECTED_PROPOSED_CONTENT",

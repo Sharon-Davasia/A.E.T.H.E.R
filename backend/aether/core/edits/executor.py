@@ -110,6 +110,7 @@ class ExecutionJournal(Protocol):
 
 _MAX_EDIT_BYTES = 4 * 1024 * 1024
 _FORWARD_EDIT_CAPABILITY = "fs.apply_approved_edit"
+_UNDO_CAPABILITY = "fs.undo_edit"
 
 
 class EditDenied(Exception):
@@ -189,7 +190,7 @@ class EditExecutor:
 
         if len(request.proposed_content) > _MAX_EDIT_BYTES:
             raise EditDenied("edit_too_large", "proposed content exceeds the edit bound")
-        target = self._authorize(request)
+        target = self._authorize(request, capability_id=_FORWARD_EDIT_CAPABILITY)
         return self._mutate(
             target=target,
             content=request.proposed_content,
@@ -205,14 +206,21 @@ class EditExecutor:
         snapshot_id: UUID,
         receipt_id: UUID,
     ) -> EditOutcome:
-        """Restore a snapshot as a *separate authorized action*.
+        """Restore a snapshot under its own fs.undo_edit authorization (S14-3).
 
-        Undo is an edit: it needs its own grant, its own freshness check and its
-        own receipt. The snapshot's plaintext becomes the proposed content, so
-        restoration is verified exactly like a forward edit.
+        Undo is a distinct capability, not a reuse of the edit approval:
+
+        1. The target is re-authorized against the *undo* capability scope.
+        2. The receipt must exist, reference this exact snapshot, name this
+           resource, and have recorded a verified post-image.
+        3. The snapshot plaintext must hash to the receipt's pre-image.
+        4. The current file must still be the receipt's verified post-image. If it
+           is not, a newer edit happened and an ordinary undo is refused as a
+           conflict: the user edits after the edit must never be silently undone.
+        5. Only then is one fs.undo_edit use consumed, before any mutation.
         """
 
-        target = self._authorize(request)
+        target = self._authorize_undo(request, receipt_id=receipt_id, snapshot_id=snapshot_id)
         original_receipt = self._receipts.get(receipt_id)
         if original_receipt.snapshot_id != str(snapshot_id):
             raise EditDenied(
@@ -240,7 +248,55 @@ class EditExecutor:
 
     # -- internals -------------------------------------------------------
 
-    def _authorize(self, request: EditRequest) -> Path:
+    def _authorize_undo(self, request: EditRequest, *, receipt_id: UUID, snapshot_id: UUID) -> Path:
+        """Authorize an undo as its own capability, with conflict detection."""
+
+        target = self._authorize(request, capability_id=_UNDO_CAPABILITY)
+        try:
+            original = self._receipts.get(receipt_id)
+        except ReceiptError as exc:
+            raise EditDenied(
+                "undo_receipt_unavailable", "the receipt named by the undo is unreadable"
+            ) from exc
+        if original.snapshot_id != str(snapshot_id):
+            raise EditDenied(
+                "undo_receipt_snapshot_mismatch",
+                "the receipt does not reference this snapshot",
+            )
+        if original.resource_id != request.resource_id:
+            raise EditDenied(
+                "undo_receipt_resource_mismatch",
+                "the receipt belongs to a different resource",
+            )
+        if original.status != "SUCCEEDED" or original.post_sha256 is None:
+            # Only an edit whose effect was *verified* can be undone. An
+            # UNVERIFIED edit has unknown content and needs review, not undo.
+            raise EditDenied(
+                "undo_receipt_not_verified",
+                "only a verified edit can be undone as an ordinary action",
+            )
+        try:
+            current = target.read_bytes()
+        except OSError as exc:
+            raise EditDenied(fs_errors.RESOURCE_NOT_FOUND, "target is unreadable") from exc
+        current_sha = hashlib.sha256(current).hexdigest()
+        if current_sha != original.post_sha256:
+            # A newer edit (or an external change) intervened. Ordinary undo must
+            # not clobber it: this is an explicit conflict needing fresh review.
+            raise EditDenied(
+                "undo_conflict_newer_content",
+                "the file changed after the edit being undone; a fresh preview and "
+                "approval are required before restoring",
+            )
+        if request.expected_sha256 != current_sha:
+            raise EditDenied(
+                "STALE_TARGET",
+                "the undo was authorized against different current content",
+            )
+        return target
+
+    def _authorize(self, request: EditRequest, *, capability_id: str = "") -> Path:
+        """Verify grant scope and freshness; return the target path. No writes."""
         """Verify grant scope and freshness; return the target path. No writes."""
 
         try:
@@ -254,10 +310,10 @@ class EditExecutor:
             root = self._registry.root_by_id(resolved.root_id)
         except ResourceRegistryError as exc:
             raise EditDenied(fs_errors.RESOURCE_NOT_REGISTERED, str(exc)) from exc
-        if "fs.apply_approved_edit" not in root.allowed_capabilities:
+        if capability_id not in root.allowed_capabilities:
             raise EditDenied(
                 fs_errors.CAPABILITY_OUTSIDE_ROOT_SCOPE,
-                "the registered root does not permit edits",
+                "the registered root does not permit this capability",
             )
         if is_protected_path(path):
             raise EditDenied(fs_errors.PROTECTED_PATH_DENIED, "protected paths are never editable")
@@ -273,7 +329,7 @@ class EditExecutor:
         request_shape = ToolRequest(
             request_id=str(request.step_id),
             task_id=str(request.task_id),
-            capability_id="fs.apply_approved_edit",
+            capability_id=capability_id,
             arguments={
                 "resource_id": request.resource_id,
                 "step_id": str(request.step_id),
@@ -305,8 +361,15 @@ class EditExecutor:
             raise EditDenied(check.reason_code, "the exact grant does not cover this edit")
         return path
 
-    def _plan_step(self, request: EditRequest) -> Any:
-        """The authoritative persisted step for this request, or refuse."""
+    def _plan_step(
+        self, request: EditRequest, *, capability_id: str = _FORWARD_EDIT_CAPABILITY
+    ) -> Any:
+        """The authoritative persisted step for this request, or refuse.
+
+        The step's capability is checked, so an edit step cannot authorize an
+        undo and an undo step cannot authorize an edit. This is the check that
+        keeps the two capabilities from sharing authority.
+        """
 
         if self._plans is None:
             raise EditDenied(
@@ -325,12 +388,19 @@ class EditExecutor:
                 "approved_step_missing",
                 "the persisted plan has no such step, so nothing was approved here",
             )
+        if step.capability_id != capability_id:
+            raise EditDenied(
+                "approved_capability_mismatch",
+                "the persisted step authorizes a different capability than this action",
+            )
         return step
 
-    def _plan_binding(self, request: EditRequest) -> ApprovedEdit:
+    def _plan_binding(
+        self, request: EditRequest, *, capability_id: str = _FORWARD_EDIT_CAPABILITY
+    ) -> ApprovedEdit:
         """The persisted approval binding for this request, or refuse."""
 
-        step = self._plan_step(request)
+        step = self._plan_step(request, capability_id=capability_id)
         try:
             return ApprovedEdit.from_step_arguments(
                 resource_id=request.resource_id, values=dict(step.expected_effect)
@@ -341,7 +411,14 @@ class EditExecutor:
                 "the persisted plan does not carry a usable approval binding",
             ) from exc
 
-    def _consume_grant(self, request: EditRequest, step: Any, binding: ApprovedEdit) -> None:
+    def _consume_grant(
+        self,
+        request: EditRequest,
+        step: Any,
+        binding: ApprovedEdit,
+        *,
+        capability_id: str = _FORWARD_EDIT_CAPABILITY,
+    ) -> None:
         """Spend exactly one grant use against this exact action (S14-2).
 
         Ordering matters and is deliberate:
@@ -367,7 +444,7 @@ class EditExecutor:
                 plan_revision=request.plan_revision,
                 plan_hash=request.plan_hash,
                 step_id=request.step_id,
-                capability_id=_FORWARD_EDIT_CAPABILITY,
+                capability_id=capability_id,
                 risk_tier=RiskTier.MODIFY,
                 arguments_sha256=_canonical_digest(dict(step.arguments)),
                 expected_effect_sha256=str(step.expected_effect.get("approved_effect_digest")),
@@ -402,8 +479,12 @@ class EditExecutor:
         intended_sha256 = hashlib.sha256(content).hexdigest()
         # S14-2: spend the use before touching the file at all, so a crash leaves
         # a PENDING consumption (findable) rather than an unaccounted side effect.
-        if capability_id == _FORWARD_EDIT_CAPABILITY:
-            self._consume_grant(request, self._plan_step(request), self._plan_binding(request))
+        self._consume_grant(
+            request,
+            self._plan_step(request, capability_id=capability_id),
+            self._plan_binding(request, capability_id=capability_id),
+            capability_id=capability_id,
+        )
         try:
             pre_image = target.read_bytes()
         except OSError as exc:
@@ -425,18 +506,7 @@ class EditExecutor:
         # plan bound and the user approved. Checked here, immediately before any
         # mutation, so a caller cannot pair the approved pre-image with a
         # different post-image.
-        if capability_id == _FORWARD_EDIT_CAPABILITY:
-            self._verify_approved_result(request, intended_sha256, pre_image)
-        else:
-            # Undo is a distinct action with its own authorization requirement.
-            # Until S14-3 gives it a registered fs.undo_edit capability with its
-            # own plan-bound preview, it must NOT be able to reach the mutation
-            # path at all -- refusing is safer than reusing the edit binding.
-            raise EditDenied(
-                "undo_authorization_not_implemented",
-                "undo requires its own registered capability and exact approval; "
-                "it is not authorized through the edit path",
-            )
+        self._verify_approved_result(request, intended_sha256, pre_image)
 
         # Snapshot first, and verify the snapshot before touching the original.
         try:

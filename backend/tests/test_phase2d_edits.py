@@ -74,7 +74,14 @@ def world(tmp_path: Path):
     registry = build_registry(
         tree,
         capabilities=frozenset(
-            {"fs.inspect_file", "fs.read_file", "fs.search", "fs.apply_approved_edit"}
+            {
+                "fs.inspect_file",
+                "fs.read_file",
+                "fs.search",
+                "fs.apply_approved_edit",
+                # S14-3: undo is a distinct capability and needs its own scope.
+                "fs.undo_edit",
+            }
         ),
     )
     vault_dir = tmp_path / "vault"
@@ -190,6 +197,75 @@ def make_request(
         expected_sha256=expected_sha256 or hashlib.sha256(original).hexdigest(),
         proposed_content=proposed,
         expected_effect_sha256=effect_digest,
+    )
+
+
+def make_undo_request(
+    registry,
+    tree,
+    world,
+    *,
+    applied,
+    snapshot_id: UUID,
+    receipt_id: UUID,
+    relative: str = "README.md",
+) -> EditRequest:
+    """Persist an fs.undo_edit plan for restoring ``snapshot_id`` and return its request.
+
+    S14-3: undo is its own capability. This builds and persists the undo plan
+    (binding the exact bytes being restored) so the executor has authoritative
+    authority to check, exactly as it does for a forward edit.
+    """
+
+    from aether.core.planning.planner import PlanGoal, PlanIntent
+
+    restore = world["vault"].get(snapshot_id)
+    task_id = uuid4()
+    approval_id = uuid4()
+    resource_id = resolve(registry, relative)
+    revision = world["planner"].plan(
+        task_id,
+        PlanIntent(
+            goal=PlanGoal.UNDO_EDIT,
+            resource_id=resource_id,
+            arguments={
+                "resource_id": resource_id,
+                "step_id": str(uuid4()),
+                "approval_id": str(approval_id),
+                "expected_sha256": hashlib.sha256((tree.root / relative).read_bytes()).hexdigest(),
+                "receipt_id": str(receipt_id),
+                "snapshot_id": str(snapshot_id),
+            },
+            summary="Undo",
+            proposed_content=restore,
+        ),
+        revision=1,
+    )
+    plan_hash = "a" * 64
+    world["grants"].grant_budget(
+        approval_id=approval_id,
+        task_id=task_id,
+        plan_revision=1,
+        plan_hash=plan_hash,
+        uses=1,
+        now=NOW,
+    )
+    world["store"].create_task("undo", task_id=task_id, now=NOW)
+    world["store"].transition_task(task_id, PersistentTaskState.PLANNING, now=NOW)
+    world["store"].save_plan(revision.plan)
+    del applied
+    return EditRequest(
+        task_id=task_id,
+        step_id=revision.step_id,
+        approval_id=approval_id,
+        plan_revision=1,
+        plan_hash=plan_hash,
+        resource_id=resource_id,
+        expected_sha256=hashlib.sha256((tree.root / relative).read_bytes()).hexdigest(),
+        proposed_content=restore,
+        expected_effect_sha256=str(
+            revision.plan.steps[0].expected_effect["approved_effect_digest"]
+        ),
     )
 
 
@@ -439,25 +515,26 @@ def test_undo_restores_the_exact_original_bytes(world) -> None:
     applied = executor.apply(make_request(registry, tree, world=world))
     assert tree.readme.read_bytes() != original
 
-    undo_request = make_request(
+    undo_request = make_undo_request(
         registry,
         tree,
-        content=b"placeholder ignored by undo",
-        expected_sha256=hashlib.sha256(tree.readme.read_bytes()).hexdigest(),
+        world,
+        applied=applied,
+        snapshot_id=UUID(applied.snapshot_id),
+        receipt_id=applied.receipt.receipt_id,
     )
-    # S14-1/S14-3: undo is NOT authorized through the forward-edit binding. It
-    # requires its own registered fs.undo_edit capability, which lands in S14-3.
-    # Until then the mutation path refuses it outright rather than reusing the
-    # edit approval, so this asserts the refusal rather than a silent restore.
-    with pytest.raises(EditDenied) as refused:
-        executor.undo(
-            undo_request,
-            snapshot_id=UUID(applied.snapshot_id),
-            receipt_id=applied.receipt.receipt_id,
-        )
-    assert refused.value.reason_code == "undo_authorization_not_implemented"
-    # The file is untouched by the refused undo.
-    assert tree.readme.read_bytes() != original
+    restored = executor.undo(
+        undo_request,
+        snapshot_id=UUID(applied.snapshot_id),
+        receipt_id=applied.receipt.receipt_id,
+    )
+    assert restored.status == "SUCCEEDED"
+    assert tree.readme.read_bytes() == original
+    assert hashlib.sha256(tree.readme.read_bytes()).hexdigest() == applied.pre_sha256
+    # Undo produced its own receipt, linked to the edit being undone.
+    assert restored.receipt.receipt_id != applied.receipt.receipt_id
+    assert restored.receipt.detail.get("undo_of") == str(applied.receipt.receipt_id)
+    assert receipts.get(restored.receipt.receipt_id).status == "SUCCEEDED"
     assert receipts.get(applied.receipt.receipt_id).status == "SUCCEEDED"
 
 
@@ -468,11 +545,13 @@ def test_undo_refuses_to_overwrite_a_newer_user_edit(world) -> None:
     tree.readme.write_text("# A newer user edit\n", encoding="utf-8")
     newer = tree.readme.read_bytes()
 
-    undo_request = make_request(
+    undo_request = make_undo_request(
         registry,
         tree,
-        content=b"ignored",
-        expected_sha256=hashlib.sha256(applied.pre_sha256.encode()).hexdigest(),
+        world,
+        applied=applied,
+        snapshot_id=UUID(applied.snapshot_id),
+        receipt_id=applied.receipt.receipt_id,
     )
     with pytest.raises(EditDenied) as denied:
         executor.undo(
@@ -480,8 +559,8 @@ def test_undo_refuses_to_overwrite_a_newer_user_edit(world) -> None:
             snapshot_id=UUID(applied.snapshot_id),
             receipt_id=applied.receipt.receipt_id,
         )
-    assert denied.value.reason_code == "STALE_TARGET"
-    # The user's newer work is intact: undo never silently wins.
+    # A newer edit is an explicit conflict, not a silent overwrite.
+    assert denied.value.reason_code == "undo_conflict_newer_content"
     assert tree.readme.read_bytes() == newer
 
 

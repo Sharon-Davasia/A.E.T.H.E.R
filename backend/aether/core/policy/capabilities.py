@@ -42,6 +42,23 @@ class ApplyApprovedEditArguments(ResourceArguments):
     expected_sha256: str = Field(pattern=_HEX_SHA256)
 
 
+class UndoEditArguments(ResourceArguments):
+    """Undo is its own capability with its own typed scope (S14-3).
+
+    It names the receipt and snapshot being restored, so an undo can never be
+    authorized by an edit approval, and an edit approval can never restore a
+    snapshot. ``expected_sha256`` is the *current* content the undo will replace,
+    which must match the original edit's verified post-image for an ordinary undo
+    to be conflict-free.
+    """
+
+    step_id: str = Field(pattern=r"^[0-9a-fA-F-]{36}$")
+    approval_id: str = Field(pattern=r"^[0-9a-fA-F-]{36}$")
+    expected_sha256: str = Field(pattern=_HEX_SHA256)
+    receipt_id: str = Field(pattern=r"^[0-9a-fA-F-]{36}$")
+    snapshot_id: str = Field(pattern=r"^[0-9a-fA-F-]{36}$")
+
+
 @dataclass(frozen=True, slots=True)
 class CapabilityDefinition:
     capability_id: str
@@ -106,6 +123,14 @@ class CapabilityRegistry:
                 "fs.apply_approved_edit",
                 RiskTier.MODIFY,
                 ApplyApprovedEditArguments,
+                "file",
+            ),
+            # S14-3: a distinct mutation capability. Undo is never authorized by
+            # fs.apply_approved_edit, and the two cannot share a grant.
+            CapabilityDefinition(
+                "fs.undo_edit",
+                RiskTier.MODIFY,
+                UndoEditArguments,
                 "file",
             ),
         ):
