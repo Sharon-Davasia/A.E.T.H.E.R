@@ -16,6 +16,7 @@ import stat
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.resources import files
 from importlib.resources.abc import Traversable
@@ -60,6 +61,10 @@ class IllegalPersistentTransition(PersistenceError):
     """A requested persistent task-state transition is not allowed."""
 
 
+class ReviewConflictError(PersistenceError):
+    """An idempotency identity was replayed with different immutable review data."""
+
+
 class StoredTask(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
@@ -85,6 +90,36 @@ class StoredTaskEvent(BaseModel):
     step_id: UUID | None
     metadata: EventMetadata
     created_at: datetime
+
+
+@dataclass(frozen=True)
+class Stage2ReviewWrite:
+    """Internal outcome of one atomic Stage 2 audit write."""
+
+    resolution: str
+    requested_outcome: str
+    task_id: UUID
+    plan_revision: int
+    plan_hash: str
+    preview_id: UUID
+    preview_digest: str
+    review_request_id: UUID
+    event_id: UUID | None
+    decision_id: UUID | None
+    idempotent_replay: bool
+
+
+@dataclass(frozen=True)
+class Stage2ReviewRevocation:
+    """Internal result of one idempotent non-authorizing revocation event."""
+
+    task_id: UUID
+    plan_revision: int
+    plan_hash: str
+    preview_digest: str
+    revocation_id: UUID
+    event_id: UUID | None
+    already_recorded: bool
 
 
 # State vocabulary is Master Spec § Persistent state machine. The Phase 2B
@@ -201,6 +236,7 @@ _ACTIVE_RESTART_STATES = frozenset(
 )
 _EVENT_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
+_LOWER_PREVIEW_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _EXPECTED_MIGRATIONS: dict[int, tuple[str, str]] = {
     1: (
         "0001_phase2b_core.sql",
@@ -394,31 +430,16 @@ class SQLiteTaskStore:
                 raise IllegalPersistentTransition(
                     f"illegal task transition: {current} -> {to_state}"
                 )
-            finished_at = (
-                timestamp
-                if to_state
-                in {
-                    PersistentTaskState.COMPLETED,
-                    PersistentTaskState.CANCELLED,
-                    PersistentTaskState.DENIED,
-                    PersistentTaskState.FAILED,
-                }
-                else None
-            )
-            connection.execute(
-                "UPDATE tasks SET state = ?, updated_at = ?, finished_at = ?, last_error_code = ? "
-                "WHERE id = ?",
-                (to_state.value, timestamp, finished_at, error_code, str(task_id)),
-            )
             values = dict((metadata or EventMetadata()).values)
-            values["from_state"] = current.value
-            values["to_state"] = to_state.value
-            self._append_event(
+            self._commit_transition_unlocked(
                 connection,
                 task_id,
-                event,
-                EventMetadata(values=values),
+                current,
+                to_state,
+                event_type=event,
+                metadata_values=values,
                 now=timestamp,
+                error_code=error_code,
             )
         return self.get_task(task_id)
 
@@ -546,36 +567,651 @@ class SQLiteTaskStore:
                 not in {PersistentTaskState.PREVIEW_READY, PersistentTaskState.AWAITING_APPROVAL}
             ):
                 raise PersistenceError("decision does not match the current preview plan")
-            connection.execute(
-                "INSERT INTO approval_records("
-                "id, task_id, plan_revision, plan_hash, preview_id, preview_digest, decision, "
-                "authority, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    str(record.approval_id),
-                    str(record.task_id),
-                    record.plan_revision,
-                    record.plan_hash,
-                    str(record.preview_id),
-                    record.preview_digest,
-                    record.decision.value,
-                    "NON_AUTHORIZING_AUDIT_RECORD",
-                    timestamp,
-                ),
-            )
-            self._append_event(
+            self._insert_approval_decision_unlocked(connection, record, now=timestamp)
+
+    def _insert_approval_decision_unlocked(
+        self,
+        connection: sqlite3.Connection,
+        record: ApprovalDecisionRecord,
+        *,
+        now: str,
+    ) -> tuple[UUID, UUID]:
+        connection.execute(
+            "INSERT INTO approval_records("
+            "id, task_id, plan_revision, plan_hash, preview_id, preview_digest, decision, "
+            "authority, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(record.approval_id),
+                str(record.task_id),
+                record.plan_revision,
+                record.plan_hash,
+                str(record.preview_id),
+                record.preview_digest,
+                record.decision.value,
+                "NON_AUTHORIZING_AUDIT_RECORD",
+                now,
+            ),
+        )
+        event_id = self._append_event(
+            connection,
+            record.task_id,
+            "APPROVAL_DECISION_RECORDED",
+            EventMetadata(
+                values={
+                    "approval_id": str(record.approval_id),
+                    "decision": record.decision.value,
+                    "authority": "NON_AUTHORIZING_AUDIT_RECORD",
+                    "plan_revision": record.plan_revision,
+                    "plan_hash": record.plan_hash,
+                    "preview_digest": record.preview_digest,
+                    "preview_id": str(record.preview_id),
+                    "requested_outcome": record.decision.value,
+                }
+            ),
+            now=now,
+        )
+        return record.approval_id, event_id
+
+    def record_stage2_review_outcome(
+        self,
+        task_id: UUID,
+        *,
+        review_request_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        preview_id: UUID,
+        preview_digest: str,
+        requested_outcome: str,
+        preview_matches_current: bool,
+        decided_at: datetime | None = None,
+    ) -> Stage2ReviewWrite:
+        """Atomically record a non-authorizing Stage 2 review outcome.
+
+        A replay with the same immutable request identity returns the original
+        audit outcome. Reusing that identity for different review data fails
+        closed. No path here issues, stores, or consumes an approval grant.
+        """
+
+        if requested_outcome not in {"APPROVE", "REVISE", "REJECT", "CANCELLED"}:
+            raise ValueError("Stage 2 requested outcome is invalid")
+        if not isinstance(preview_matches_current, bool):
+            raise ValueError("preview_matches_current must be a boolean")
+        if _LOWER_PREVIEW_SHA256.fullmatch(preview_digest) is None:
+            raise ValueError("preview digest must be a lowercase SHA-256 digest")
+        timestamp = _timestamp(decided_at)
+        with self._transaction() as connection:
+            existing = self._existing_stage2_review(
                 connection,
-                record.task_id,
-                "APPROVAL_DECISION_RECORDED",
-                EventMetadata(
-                    values={
-                        "approval_id": str(record.approval_id),
-                        "decision": record.decision.value,
-                        "authority": "NON_AUTHORIZING_AUDIT_RECORD",
-                        "plan_revision": record.plan_revision,
-                    }
-                ),
-                now=timestamp,
+                task_id,
+                review_request_id=review_request_id,
+                requested_outcome=requested_outcome,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                preview_id=preview_id,
+                preview_digest=preview_digest,
             )
+            if existing is not None:
+                return existing
+
+            task = connection.execute(
+                "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if task is None:
+                raise KeyError("unknown task id")
+            current_state = PersistentTaskState(task["state"])
+            current_revision = int(task["plan_revision"])
+            current_hash = task["plan_hash"]
+            latest_plan_sequence = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM task_events "
+                    "WHERE task_id = ? AND event_type = 'PLAN_REVISION_SAVED'",
+                    (str(task_id),),
+                ).fetchone()[0]
+            )
+            fresh_consent_blocked = self._has_fresh_consent_blocker(
+                connection,
+                task_id,
+                latest_plan_sequence,
+            )
+
+            if not preview_matches_current:
+                event_id = self._append_stage2_event(
+                    connection,
+                    task_id,
+                    "APPROVAL_REVIEW_STALE",
+                    review_request_id=review_request_id,
+                    plan_revision=plan_revision,
+                    plan_hash=plan_hash,
+                    preview_id=preview_id,
+                    preview_digest=preview_digest,
+                    now=timestamp,
+                    requested_outcome=requested_outcome,
+                    error_code="preview_stale",
+                )
+                return Stage2ReviewWrite(
+                    resolution="STALE",
+                    requested_outcome=requested_outcome,
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    plan_hash=plan_hash,
+                    preview_id=preview_id,
+                    preview_digest=preview_digest,
+                    review_request_id=review_request_id,
+                    event_id=event_id,
+                    decision_id=None,
+                    idempotent_replay=False,
+                )
+            if (
+                current_state
+                not in {
+                    PersistentTaskState.PREVIEW_READY,
+                    PersistentTaskState.AWAITING_APPROVAL,
+                }
+                or fresh_consent_blocked
+            ):
+                event_id = self._append_stage2_event(
+                    connection,
+                    task_id,
+                    "APPROVAL_REVIEW_UNAVAILABLE",
+                    review_request_id=review_request_id,
+                    plan_revision=current_revision,
+                    plan_hash=current_hash or plan_hash,
+                    preview_id=preview_id,
+                    preview_digest=preview_digest,
+                    now=timestamp,
+                    requested_outcome=requested_outcome,
+                    error_code="review_unavailable",
+                )
+                return Stage2ReviewWrite(
+                    resolution="UNAVAILABLE",
+                    requested_outcome=requested_outcome,
+                    task_id=task_id,
+                    plan_revision=current_revision,
+                    plan_hash=current_hash or plan_hash,
+                    preview_id=preview_id,
+                    preview_digest=preview_digest,
+                    review_request_id=review_request_id,
+                    event_id=event_id,
+                    decision_id=None,
+                    idempotent_replay=False,
+                )
+
+            if requested_outcome in {"APPROVE", "REJECT"}:
+                if requested_outcome == "REJECT":
+                    self._stage2_transition_unlocked(
+                        connection,
+                        task_id,
+                        current_state,
+                        PersistentTaskState.DENIED,
+                        now=timestamp,
+                        plan_revision=current_revision,
+                        plan_hash=current_hash,
+                    )
+                decision = ApprovalDecisionRecord(
+                    approval_id=review_request_id,
+                    task_id=task_id,
+                    plan_revision=current_revision,
+                    plan_hash=current_hash or plan_hash,
+                    preview_id=preview_id,
+                    preview_digest=preview_digest,
+                    decision=ApprovalDecisionValue(requested_outcome),
+                    authority="NON_AUTHORIZING_AUDIT_RECORD",
+                    decided_at=_parse_timestamp(timestamp),
+                )
+                decision_id, event_id = self._insert_approval_decision_unlocked(
+                    connection,
+                    decision,
+                    now=timestamp,
+                )
+                resolution = requested_outcome
+            elif requested_outcome == "REVISE":
+                self._stage2_transition_unlocked(
+                    connection,
+                    task_id,
+                    current_state,
+                    PersistentTaskState.PLANNING,
+                    now=timestamp,
+                    plan_revision=current_revision,
+                    plan_hash=current_hash,
+                )
+                event_id = self._append_stage2_event(
+                    connection,
+                    task_id,
+                    "APPROVAL_REVIEW_REVISION_REQUESTED",
+                    review_request_id=review_request_id,
+                    plan_revision=current_revision,
+                    plan_hash=current_hash or plan_hash,
+                    preview_id=preview_id,
+                    preview_digest=preview_digest,
+                    now=timestamp,
+                    requested_outcome=requested_outcome,
+                    requires_fresh_plan_and_consent=True,
+                )
+                decision_id = None
+                resolution = "REVISE"
+            else:  # CANCELLED
+                self._stage2_transition_unlocked(
+                    connection,
+                    task_id,
+                    current_state,
+                    PersistentTaskState.CANCELLED,
+                    now=timestamp,
+                    plan_revision=current_revision,
+                    plan_hash=current_hash,
+                )
+                event_id = self._append_stage2_event(
+                    connection,
+                    task_id,
+                    "APPROVAL_REVIEW_CANCELLED",
+                    review_request_id=review_request_id,
+                    plan_revision=current_revision,
+                    plan_hash=current_hash or plan_hash,
+                    preview_id=preview_id,
+                    preview_digest=preview_digest,
+                    now=timestamp,
+                    requested_outcome=requested_outcome,
+                )
+                decision_id = None
+                resolution = "CANCELLED"
+            return Stage2ReviewWrite(
+                resolution=resolution,
+                requested_outcome=requested_outcome,
+                task_id=task_id,
+                plan_revision=current_revision,
+                plan_hash=current_hash or plan_hash,
+                preview_id=preview_id,
+                preview_digest=preview_digest,
+                review_request_id=review_request_id,
+                event_id=event_id,
+                decision_id=decision_id,
+                idempotent_replay=False,
+            )
+
+    def record_preview_revocation(
+        self,
+        task_id: UUID,
+        *,
+        plan_revision: int,
+        plan_hash: str,
+        preview_id: UUID,
+        preview_digest: str,
+        revocation_id: UUID,
+        reason_code: str = "review_revoked",
+        now: datetime | None = None,
+    ) -> Stage2ReviewRevocation:
+        """Idempotently append a non-authorizing invalidation event."""
+
+        if _ERROR_CODE.fullmatch(reason_code) is None:
+            raise ValueError("revocation reason must be a redacted lowercase code")
+        if _LOWER_PREVIEW_SHA256.fullmatch(preview_digest) is None:
+            raise ValueError("preview digest must be a lowercase SHA-256 digest")
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            existing = self._find_stage2_revocation(
+                connection,
+                task_id,
+                revocation_id=revocation_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                preview_id=preview_id,
+                preview_digest=preview_digest,
+            )
+            if existing is not None:
+                return Stage2ReviewRevocation(
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    plan_hash=plan_hash,
+                    preview_digest=preview_digest,
+                    revocation_id=revocation_id,
+                    event_id=existing,
+                    already_recorded=True,
+                )
+            task = connection.execute(
+                "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if task is None:
+                raise KeyError("unknown task id")
+            current_state = PersistentTaskState(task["state"])
+            if (
+                int(task["plan_revision"]) != plan_revision
+                or task["plan_hash"] != plan_hash
+                or current_state
+                not in {
+                    PersistentTaskState.PREVIEW_READY,
+                    PersistentTaskState.AWAITING_APPROVAL,
+                }
+            ):
+                raise PersistenceError("revocation does not match the current reviewable preview")
+            event_id = self._append_stage2_event(
+                connection,
+                task_id,
+                "APPROVAL_PREVIEW_REVOKED",
+                review_request_id=revocation_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                preview_id=preview_id,
+                preview_digest=preview_digest,
+                now=timestamp,
+                error_code=reason_code,
+                requires_fresh_plan_and_consent=True,
+            )
+            return Stage2ReviewRevocation(
+                task_id=task_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                preview_digest=preview_digest,
+                revocation_id=revocation_id,
+                event_id=event_id,
+                already_recorded=False,
+            )
+
+    def is_stage2_preview_blocked(self, task_id: UUID) -> bool:
+        """Return whether fresh plan/consent is required before a new review."""
+
+        with self._lock:
+            self._verify_database_location()
+            task = self._connection.execute(
+                "SELECT state, plan_revision FROM tasks WHERE id = ?", (str(task_id),)
+            ).fetchone()
+            if task is None:
+                return True
+            if PersistentTaskState(task["state"]) not in {
+                PersistentTaskState.PREVIEW_READY,
+                PersistentTaskState.AWAITING_APPROVAL,
+            }:
+                return True
+            latest_plan_sequence = int(
+                self._connection.execute(
+                    "SELECT COALESCE(MAX(seq), 0) FROM task_events "
+                    "WHERE task_id = ? AND event_type = 'PLAN_REVISION_SAVED'",
+                    (str(task_id),),
+                ).fetchone()[0]
+            )
+            return self._has_fresh_consent_blocker(
+                self._connection,
+                task_id,
+                latest_plan_sequence,
+            )
+
+    def _existing_stage2_review(
+        self,
+        connection: sqlite3.Connection,
+        task_id: UUID,
+        *,
+        review_request_id: UUID,
+        requested_outcome: str,
+        plan_revision: int,
+        plan_hash: str,
+        preview_id: UUID,
+        preview_digest: str,
+    ) -> Stage2ReviewWrite | None:
+        row = connection.execute(
+            "SELECT * FROM approval_records WHERE id = ? AND task_id = ?",
+            (str(review_request_id), str(task_id)),
+        ).fetchone()
+        if row is not None:
+            try:
+                record = ApprovalDecisionRecord(
+                    approval_id=UUID(row["id"]),
+                    task_id=UUID(row["task_id"]),
+                    plan_revision=row["plan_revision"],
+                    plan_hash=row["plan_hash"],
+                    preview_id=UUID(row["preview_id"]),
+                    preview_digest=row["preview_digest"],
+                    decision=ApprovalDecisionValue(row["decision"]),
+                    authority=row["authority"],
+                    decided_at=_parse_timestamp(row["decided_at"]),
+                )
+            except (ValidationError, ValueError) as exc:
+                raise PersistenceIntegrityError("stored approval audit record is invalid") from exc
+            resolution = record.decision.value
+            if (
+                record.plan_revision != plan_revision
+                or record.plan_hash != plan_hash
+                or record.preview_id != preview_id
+                or record.preview_digest != preview_digest
+            ):
+                raise ReviewConflictError("review request identity was replayed with different data")
+            if requested_outcome != resolution:
+                raise ReviewConflictError("review request identity was replayed with a different outcome")
+            return Stage2ReviewWrite(
+                resolution=resolution,
+                requested_outcome=requested_outcome,
+                task_id=task_id,
+                plan_revision=record.plan_revision,
+                plan_hash=record.plan_hash,
+                preview_id=record.preview_id,
+                preview_digest=record.preview_digest,
+                review_request_id=review_request_id,
+                event_id=None,
+                decision_id=record.approval_id,
+                idempotent_replay=True,
+            )
+
+        resolutions = {
+            "APPROVAL_REVIEW_REVISION_REQUESTED": "REVISE",
+            "APPROVAL_REVIEW_CANCELLED": "CANCELLED",
+            "APPROVAL_REVIEW_STALE": "STALE",
+            "APPROVAL_REVIEW_UNAVAILABLE": "UNAVAILABLE",
+        }
+        rows = connection.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY seq",
+            (str(task_id),),
+        ).fetchall()
+        for event in rows:
+            if event["event_type"] not in resolutions:
+                continue
+            metadata = self._stage2_event_metadata(event)
+            if metadata.get("approval_id") != str(review_request_id):
+                continue
+            resolution = resolutions[event["event_type"]]
+            if (
+                metadata.get("authority") != "NON_AUTHORIZING_AUDIT_RECORD"
+                or metadata.get("plan_revision") != plan_revision
+                or metadata.get("plan_hash") != plan_hash
+                or metadata.get("preview_id") != str(preview_id)
+                or metadata.get("preview_digest") != preview_digest
+            ):
+                raise ReviewConflictError("review request identity was replayed with different data")
+            stored_outcome = metadata.get("requested_outcome")
+            if stored_outcome is None:
+                raise PersistenceIntegrityError("stored Stage 2 audit event is missing its requested outcome")
+            if stored_outcome != requested_outcome:
+                raise ReviewConflictError("review request identity was replayed with a different outcome")
+            return Stage2ReviewWrite(
+                resolution=resolution,
+                requested_outcome=requested_outcome,
+                task_id=task_id,
+                plan_revision=plan_revision,
+                plan_hash=plan_hash,
+                preview_id=preview_id,
+                preview_digest=preview_digest,
+                review_request_id=review_request_id,
+                event_id=UUID(event["id"]),
+                decision_id=None,
+                idempotent_replay=True,
+            )
+        return None
+
+    def _find_stage2_revocation(
+        self,
+        connection: sqlite3.Connection,
+        task_id: UUID,
+        *,
+        revocation_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        preview_id: UUID,
+        preview_digest: str,
+    ) -> UUID | None:
+        rows = connection.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND event_type = 'APPROVAL_PREVIEW_REVOKED' ORDER BY seq",
+            (str(task_id),),
+        ).fetchall()
+        for event in rows:
+            metadata = self._stage2_event_metadata(event)
+            if metadata.get("approval_id") != str(revocation_id):
+                continue
+            if (
+                metadata.get("authority") != "NON_AUTHORIZING_AUDIT_RECORD"
+                or metadata.get("plan_revision") != plan_revision
+                or metadata.get("plan_hash") != plan_hash
+                or metadata.get("preview_id") != str(preview_id)
+                or metadata.get("preview_digest") != preview_digest
+                or metadata.get("requires_fresh_plan_and_consent") is not True
+            ):
+                raise ReviewConflictError("revocation identity was replayed with different data")
+            return UUID(event["id"])
+        return None
+
+    @staticmethod
+    def _stage2_event_metadata(row: sqlite3.Row) -> dict[str, object]:
+        try:
+            raw_metadata = json.loads(row["data_json"])
+            metadata = EventMetadata(values=raw_metadata)
+            if _canonical_json(metadata.values) != row["data_json"]:
+                raise ValueError("event metadata is not canonical")
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise PersistenceIntegrityError("stored Stage 2 audit event is invalid") from exc
+        return dict(metadata.values)
+
+    def _has_fresh_consent_blocker(
+        self,
+        connection: sqlite3.Connection,
+        task_id: UUID,
+        after_sequence: int,
+    ) -> bool:
+        rows = connection.execute(
+            "SELECT * FROM task_events WHERE task_id = ? AND seq > ? ORDER BY seq",
+            (str(task_id), after_sequence),
+        ).fetchall()
+        for row in rows:
+            metadata = self._stage2_event_metadata(row)
+            if metadata.get("requires_fresh_plan_and_consent") is True:
+                return True
+        return False
+
+    def _append_stage2_event(
+        self,
+        connection: sqlite3.Connection,
+        task_id: UUID,
+        event_type: str,
+        *,
+        review_request_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        preview_id: UUID,
+        preview_digest: str,
+        now: str,
+        requested_outcome: str | None = None,
+        error_code: str | None = None,
+        requires_fresh_plan_and_consent: bool = False,
+    ) -> UUID:
+        values: dict[str, str | int | float | bool | None] = {
+            "approval_id": str(review_request_id),
+            "authority": "NON_AUTHORIZING_AUDIT_RECORD",
+            "plan_revision": plan_revision,
+            "plan_hash": plan_hash,
+            "preview_digest": preview_digest,
+            "preview_id": str(preview_id),
+        }
+        if requested_outcome is not None:
+            if requested_outcome not in {"APPROVE", "REVISE", "REJECT", "CANCELLED"}:
+                raise ValueError("Stage 2 requested outcome is invalid")
+            values["requested_outcome"] = requested_outcome
+        if requires_fresh_plan_and_consent:
+            values["requires_fresh_plan_and_consent"] = True
+        if error_code is not None:
+            if _ERROR_CODE.fullmatch(error_code) is None:
+                raise ValueError("Stage 2 event error code is invalid")
+            values["error_code"] = error_code
+        return self._append_event(
+            connection,
+            task_id,
+            event_type,
+            EventMetadata(values=values),
+            now=now,
+        )
+
+    def _commit_transition_unlocked(
+        self,
+        connection: sqlite3.Connection,
+        task_id: UUID,
+        current_state: PersistentTaskState,
+        to_state: PersistentTaskState,
+        *,
+        event_type: str,
+        metadata_values: dict[str, str | int | float | bool | None],
+        now: str,
+        error_code: str | None,
+    ) -> None:
+        """Apply a validated task transition inside an open transaction.
+
+        Shared by ``transition_task`` and the Stage 2 review writes so both
+        paths emit the identical ``TASK_<state>`` event shape with merged
+        from/to metadata, identical terminal-state bookkeeping, and identical
+        ``last_error_code`` semantics.
+        """
+
+        finished_at = (
+            now
+            if to_state
+            in {
+                PersistentTaskState.COMPLETED,
+                PersistentTaskState.CANCELLED,
+                PersistentTaskState.DENIED,
+                PersistentTaskState.FAILED,
+            }
+            else None
+        )
+        connection.execute(
+            "UPDATE tasks SET state = ?, updated_at = ?, finished_at = ?, last_error_code = ? "
+            "WHERE id = ?",
+            (to_state.value, now, finished_at, error_code, str(task_id)),
+        )
+        values = dict(metadata_values)
+        values["from_state"] = current_state.value
+        values["to_state"] = to_state.value
+        self._append_event(
+            connection,
+            task_id,
+            event_type,
+            EventMetadata(values=values),
+            now=now,
+        )
+
+    def _stage2_transition_unlocked(
+        self,
+        connection: sqlite3.Connection,
+        task_id: UUID,
+        current_state: PersistentTaskState,
+        to_state: PersistentTaskState,
+        *,
+        now: str,
+        plan_revision: int,
+        plan_hash: str | None,
+    ) -> None:
+        if to_state not in _TRANSITIONS[current_state]:
+            raise IllegalPersistentTransition(
+                f"illegal Stage 2 review transition: {current_state} -> {to_state}"
+            )
+        metadata_values: dict[str, str | int | float | bool | None] = {
+            "plan_revision": plan_revision,
+        }
+        if plan_hash is not None:
+            metadata_values["plan_hash"] = plan_hash
+        self._commit_transition_unlocked(
+            connection,
+            task_id,
+            current_state,
+            to_state,
+            event_type=f"TASK_{to_state.value}",
+            metadata_values=metadata_values,
+            now=now,
+            error_code=None,
+        )
 
     def get_approval_record(self, approval_id: UUID) -> ApprovalDecisionRecord:
         with self._lock:
@@ -955,7 +1591,7 @@ class SQLiteTaskStore:
         *,
         now: str,
         step_id: UUID | None = None,
-    ) -> None:
+    ) -> UUID:
         self._validate_event_name(event_type)
         sequence = int(
             connection.execute(
@@ -963,11 +1599,12 @@ class SQLiteTaskStore:
                 (str(task_id),),
             ).fetchone()[0]
         )
+        event_id = uuid4()
         connection.execute(
             "INSERT INTO task_events(id, task_id, seq, event_type, step_id, data_json, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
-                str(uuid4()),
+                str(event_id),
                 str(task_id),
                 sequence,
                 event_type,
@@ -976,6 +1613,7 @@ class SQLiteTaskStore:
                 now,
             ),
         )
+        return event_id
 
     @staticmethod
     def _validate_event_name(event_type: str) -> None:

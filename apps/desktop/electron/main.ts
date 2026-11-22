@@ -3,12 +3,15 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
+import { createFailClosedReviewProvider } from './review';
+import { parseReviewOutcomeRequest } from '../shared/review';
 
 const APP_ROOT = app.getAppPath();
 const RENDERER_FILE = resolve(join(APP_ROOT, 'dist', 'index.html'));
 const PRELOAD_FILE = resolve(join(APP_ROOT, 'dist-electron', 'electron', 'preload.js'));
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
 const backend = new BackendClient({ launchSpec: resolveBackendLaunchSpec });
+const reviewProvider = createFailClosedReviewProvider();
 let mainWindow: BrowserWindow | undefined;
 let shuttingDown = false;
 
@@ -49,14 +52,23 @@ function registerIpc(): void {
     validateInvoke(event);
     return backend.ping();
   });
+  ipcMain.handle('desktop:review-preview', async (event) => {
+    validateInvoke(event);
+    return reviewProvider.getReview();
+  });
+  ipcMain.handle('desktop:record-review-outcome', async (event, rawRequest: unknown) => {
+    validateInvoke(event);
+    const request = parseReviewOutcomeRequest(rawRequest);
+    return reviewProvider.recordOutcome(request);
+  });
 }
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 960,
-    height: 640,
+    width: 1120,
+    height: 800,
     minWidth: 720,
-    minHeight: 480,
+    minHeight: 600,
     show: false,
     webPreferences: {
       preload: PRELOAD_FILE,
