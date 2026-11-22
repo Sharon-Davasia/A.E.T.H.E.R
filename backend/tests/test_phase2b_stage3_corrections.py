@@ -96,13 +96,24 @@ class ServiceProcess:
             stderr=subprocess.PIPE,
         )
         assert self.process.stdin is not None and self.process.stdout is not None
+        # Set before the handshake, so a failing handshake assertion below can still
+        # reap the child it already spawned rather than leaking it for the session.
+        self._exit_code: int | None = None
         self.key = secrets.token_bytes(32)
         self.session = secrets.token_hex(16)
         challenge = secrets.token_bytes(32)
-        self.process.stdin.write(MAGIC + bytes.fromhex(self.session) + self.key + challenge)
-        self.process.stdin.flush()
-        hello = read_frame(self.process.stdout)
-        assert hello["kind"] == "channel.hello"
+        try:
+            self.process.stdin.write(MAGIC + bytes.fromhex(self.session) + self.key + challenge)
+            self.process.stdin.flush()
+            hello = read_frame(self.process.stdout)
+            assert hello["kind"] == "channel.hello"
+        except BaseException:
+            # Construction is what spawns the child; if the handshake cannot be
+            # completed the caller has no handle to close, so clean up here. The
+            # hello assertion is inside the block for the same reason: a wrong-kind
+            # frame must not leak the child either.
+            self.close()
+            raise
 
     def request(self, seq: int, request_id: str, kind: str, payload: object) -> dict[str, object]:
         envelope = {
@@ -130,9 +141,25 @@ class ServiceProcess:
         return self.request(seq, str(uuid4()), "demo.ping", {"text": "synthetic-only"})
 
     def close(self) -> int:
-        assert self.process.stdin is not None
-        self.process.stdin.close()
-        return self.process.wait(timeout=10)
+        """Close the channel and reap the child; safe to call from ``finally``.
+
+        Closing the pipe twice is tolerated and a child that ignores the closed
+        channel is killed rather than left running, so this can be called on the
+        failure and skip paths without leaking a process or its pipes. Repeated
+        calls return the first exit status.
+        """
+
+        if self._exit_code is not None:
+            return self._exit_code
+        with contextlib.suppress(OSError, ValueError):
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        try:
+            self._exit_code = self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self._exit_code = self.process.wait(timeout=10)
+        return self._exit_code
 
 
 def get_ready_preview(child: ServiceProcess, seq: int) -> dict[str, object]:
@@ -538,11 +565,13 @@ def test_narrative_unreadable_by_permissions_fails_closed(db_path: Path, tmp_pat
         _assert_read_is_denied(narrative)
         _assert_unavailable_but_channel_usable(child)
     finally:
-        # Restore even if an assertion above fails, so the temporary tree is left
-        # in a readable state for the rest of the suite.
+        # Restore and reap unconditionally: a failed assertion here must not leave
+        # the temporary tree unreadable or the child running for the rest of the
+        # suite. Restoring the mode is best-effort (it is the mode this test just
+        # removed), but the child is always closed.
         with contextlib.suppress(OSError):
             narrative.chmod(original_mode)
-    assert child.close() == 0
+        assert child.close() == 0
 
 
 def _icacls(*arguments: str) -> subprocess.CompletedProcess[str]:
@@ -572,8 +601,19 @@ def _deny_read_windows(path: Path) -> None:
 
 
 def _clear_windows_acl(path: Path) -> None:
-    with contextlib.suppress(Exception):
-        _icacls(str(path), "/reset")
+    """Restore the inherited ACL, reporting a failure instead of suppressing it.
+
+    Leaving the deny ACE in place would keep the temporary narrative unreadable
+    for the remainder of the session, so a failed restore is a real error rather
+    than noise to swallow.
+    """
+
+    restored = _icacls(str(path), "/reset")
+    if restored.returncode != 0:
+        raise AssertionError(
+            "could not restore the ACL after the deny ACE "
+            f"(exit {restored.returncode}): {restored.stdout.strip()} {restored.stderr.strip()}"
+        )
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows access-denial semantics required")
@@ -597,8 +637,13 @@ def test_narrative_unreadable_by_windows_acl_fails_closed(db_path: Path, tmp_pat
         _assert_read_is_denied(narrative)
         _assert_unavailable_but_channel_usable(child)
     finally:
-        _clear_windows_acl(narrative)
-    assert child.close() == 0
+        # Restore and reap unconditionally, including when the deny ACE could not
+        # be applied and the test skips. The nested block keeps the child closing
+        # even if the restore itself fails, while still surfacing that failure.
+        try:
+            _clear_windows_acl(narrative)
+        finally:
+            assert child.close() == 0
 
 
 def test_bridge_in_process_narrative_deleted_before_record(db_path: Path, tmp_path: Path) -> None:
