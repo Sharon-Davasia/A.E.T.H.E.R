@@ -91,6 +91,7 @@ CONSUMPTION_TEST_MODULES = frozenset(
         "tests.test_phase2_end_to_end",
         "tests.test_phase2d_edits",
         "tests.test_phase2_authoritative_consumption",
+        "tests.test_phase2_consumption_recovery",
         "fs_support",
         "test_phase2_grant_consumption",
         "test_phase2_mutation_journal",
@@ -99,6 +100,7 @@ CONSUMPTION_TEST_MODULES = frozenset(
         "test_phase2_end_to_end",
         "test_phase2d_edits",
         "test_phase2_authoritative_consumption",
+        "test_phase2_consumption_recovery",
     }
 )
 
@@ -163,6 +165,21 @@ _SCHEMA = (
     """
     CREATE INDEX IF NOT EXISTS capability_grant_consumptions_by_action
         ON capability_grant_consumptions(approval_id, action_digest)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS capability_grant_attempts (
+        consumption_id TEXT PRIMARY KEY,
+        approval_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        plan_revision INTEGER NOT NULL,
+        plan_hash TEXT NOT NULL,
+        step_id TEXT NOT NULL,
+        capability_id TEXT NOT NULL,
+        risk_tier INTEGER NOT NULL,
+        action_digest TEXT NOT NULL,
+        consumed_by TEXT NOT NULL,
+        started_at TEXT NOT NULL
+    )
     """,
 )
 
@@ -275,6 +292,23 @@ class Consumption:
     consumed_at: datetime
     state: ConsumptionState
     replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ConsumptionAttempt:
+    """A spend this process began, durable before the spend happened (S14-12).
+
+    It exists so a crash between the authoritative commit and the local projection
+    leaves something a restart can find. It carries the stable ``consumption_id``
+    and the action identity, which is exactly enough to ask the authoritative
+    ledger whether the use was actually spent. It is *not* an allowance: nothing
+    reads it to decide permission, and holding one authorizes nothing.
+    """
+
+    consumption_id: UUID
+    approval_id: UUID
+    action_digest: str
+    started_at: datetime
 
 
 class IssuanceDisabledConsumptionLedger:
@@ -716,10 +750,27 @@ class ConsumptionLedger:
         two independently created consumption databases share the single global
         count instead of each holding a copy of it.
 
-        The local table is used only to attach the *outcome* of the filesystem
-        effect (SUCCEEDED / FAILED / UNVERIFIED and the detail) to the same
-        identity, which reconciliation reads. It never decides whether the spend
-        was allowed.
+        **The two databases cannot commit together** (S14-12). The authoritative
+        ledger owns its file; this projection owns another. A crash between the
+        authorititative commit and the projection insert is therefore *possible*,
+        and pretending otherwise was the bug: the spend was real, but nothing
+        local named it, so restart reconciliation could not find it.
+
+        The order below is chosen so that crash is always discoverable:
+
+        1. write a durable **attempt** row, committed *before* the spend. It
+           carries the stable ``consumption_id`` and the full action identity, so
+           a restart can ask the authoritative ledger "was this spent?" without
+           having to trust anything local;
+        2. spend, via the authoritative ledger;
+        3. record the projection, which tracks only the *outcome* of the
+           filesystem effect and never decides permission.
+
+        A crash after (1) but before (2) leaves an attempt the ledger has no
+        consumption for, and reconciliation reports it as not-spent. A crash after
+        (2) but before (3) leaves an attempt the ledger *does* have a consumption
+        for, and reconciliation reports it NEEDS_REVIEW. Neither can be mistaken
+        for success.
         """
 
         authority = self._require_authority()
@@ -737,9 +788,53 @@ class ConsumptionLedger:
             raise ConsumptionError(
                 "consumption_consumer_invalid", "consumed_by must be an allow-listed code"
             )
+        identity = action_identity(
+            task_id=task_id,
+            plan_revision=plan_revision,
+            plan_hash=plan_hash,
+            step_id=step_id,
+            capability_id=capability_id,
+            risk_tier=risk_tier,
+            arguments_sha256=arguments_sha256,
+            expected_effect_sha256=expected_effect_sha256,
+            resource_versions=resource_versions,
+            consumed_by=consumed_by,
+        )
 
-        # The authoritative transaction. Everything below mirrors a refusal from
-        # the ledger verbatim so the executor's reason codes stay meaningful.
+        # --- 1. durable attempt, committed before any spend -----------------
+        # Refuse a reused id that means a different action *before* touching the
+        # authoritative ledger: a mismatched identity must never reach a spend.
+        existing_attempt = self._attempt(consumption_id)
+        if existing_attempt is not None and str(existing_attempt["action_digest"]) != identity:
+            raise ConsumptionError(
+                "consumption_attempt_mismatch",
+                "this consumption id was already begun for a different action",
+            )
+        if existing_attempt is None:
+            with self._lock, self._transaction() as connection:
+                connection.execute(
+                    "INSERT INTO capability_grant_attempts"
+                    " (consumption_id, approval_id, task_id, plan_revision, plan_hash,"
+                    " step_id, capability_id, risk_tier, action_digest, consumed_by,"
+                    " started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        str(consumption_id),
+                        str(approval_id),
+                        str(task_id),
+                        plan_revision,
+                        plan_hash.casefold(),
+                        str(step_id),
+                        capability_id,
+                        int(risk_tier),
+                        identity,
+                        consumed_by,
+                        timestamp,
+                    ),
+                )
+
+        # --- 2. the authoritative transaction -------------------------------
+        # Everything below mirrors a refusal from the ledger verbatim so the
+        # executor's reason codes stay meaningful.
         try:
             record = authority.consume(
                 consumption_id=consumption_id,
@@ -766,23 +861,47 @@ class ConsumptionLedger:
 
         replayed = bool(getattr(record, "replayed", False))
         uses_remaining_after = int(getattr(record, "uses_remaining_after", 0))
-        identity = action_identity(
+
+        # --- 3. projection, which must never overwrite a terminal outcome ----
+        return self._record_projection(
+            consumption_id=consumption_id,
+            approval_id=approval_id,
             task_id=task_id,
             plan_revision=plan_revision,
             plan_hash=plan_hash,
             step_id=step_id,
             capability_id=capability_id,
             risk_tier=risk_tier,
-            arguments_sha256=arguments_sha256,
-            expected_effect_sha256=expected_effect_sha256,
-            resource_versions=resource_versions,
+            identity=identity,
             consumed_by=consumed_by,
+            timestamp=timestamp,
+            uses_remaining_after=uses_remaining_after,
+            replayed=replayed,
         )
 
-        # Record the outcome-tracking row against the SAME identity, so resolve()
-        # and reconciliation keep working. It is a projection of the authoritative
-        # spend, never an independent allowance: nothing reads uses from it to
-        # decide permission.
+    def _record_projection(
+        self,
+        *,
+        consumption_id: UUID,
+        approval_id: UUID,
+        task_id: UUID,
+        plan_revision: int,
+        plan_hash: str,
+        step_id: UUID,
+        capability_id: str,
+        risk_tier: RiskTier,
+        identity: str,
+        consumed_by: str,
+        timestamp: str,
+        uses_remaining_after: int,
+        replayed: bool,
+    ) -> Consumption:
+        """Record the outcome-tracking row for a spend that just committed.
+
+        It is a projection of the authoritative spend, never an independent
+        allowance: nothing reads uses from it to decide permission.
+        """
+
         with self._lock, self._transaction() as connection:
             connection.execute(
                 "INSERT OR REPLACE INTO capability_grant_consumptions"
@@ -816,6 +935,65 @@ class ConsumptionLedger:
             state="PENDING",
             replayed=replayed,
         )
+
+    # -- recovery surface (S14-12) ----------------------------------------
+
+    def _attempt(self, consumption_id: UUID) -> sqlite3.Row | None:
+        with self._lock:
+            row: sqlite3.Row | None = self._connection.execute(
+                "SELECT * FROM capability_grant_attempts WHERE consumption_id = ?",
+                (str(consumption_id),),
+            ).fetchone()
+            return row
+
+    def unprojected_attempts(self) -> tuple[ConsumptionAttempt, ...]:
+        """Attempts that reached the spend but have no local projection.
+
+        These are the crash window S14-12 exists for: the authoritative ledger may
+        hold a consumption that no local row and no journal intent names. Returned
+        oldest-first so a restart walks them deterministically.
+        """
+
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT a.* FROM capability_grant_attempts AS a"
+                " LEFT JOIN capability_grant_consumptions AS c"
+                "   ON c.consumption_id = a.consumption_id"
+                " WHERE c.consumption_id IS NULL"
+                " ORDER BY a.started_at, a.consumption_id"
+            ).fetchall()
+            return tuple(_attempt_from_row(row) for row in rows)
+
+    def authoritative_consumption(self, consumption_id: UUID) -> object | None:
+        """The authoritative ledger's record for an id, or ``None`` if unspent.
+
+        This is the question reconciliation must be able to ask. It is answered by
+        the authoritative ledger itself, never by the local projection, so a
+        missing local row cannot hide a real spend.
+        """
+
+        authority = self._require_authority()
+        if authority is None:
+            raise ConsumptionError(
+                "consumption_authority_not_authoritative",
+                "no authoritative grant ledger is configured",
+            )
+        reader = getattr(authority, "get_consumption", None)
+        if reader is None:
+            raise ConsumptionError(
+                "consumption_authority_incomplete",
+                "the authoritative ledger cannot be queried by consumption id, so a "
+                "spend it holds without a local projection is undiscoverable",
+            )
+        try:
+            found: object | None = reader(consumption_id)
+            return found
+        except Exception as exc:
+            # Absent is an answer: it means the attempt never reached the spend,
+            # or the spend was refused. Anything else is a failure to ask.
+            if type(exc).__name__ == "GrantNotFoundError":
+                return None
+            raise
 
     def grant_budget_simulated(
         self,
@@ -917,6 +1095,15 @@ class ConsumptionLedger:
         self._connection.execute("COMMIT")
 
 
+def _attempt_from_row(row: sqlite3.Row) -> ConsumptionAttempt:
+    return ConsumptionAttempt(
+        consumption_id=UUID(str(row["consumption_id"])),
+        approval_id=UUID(str(row["approval_id"])),
+        action_digest=str(row["action_digest"]),
+        started_at=datetime.fromisoformat(str(row["started_at"])),
+    )
+
+
 def _consumption_from_row(row: sqlite3.Row, *, replayed: bool) -> Consumption:
     state = str(row["state"])
     if state not in CONSUMPTION_STATES:
@@ -940,6 +1127,7 @@ __all__ = [
     "CONSUMED_BY_CODES",
     "CONSUMPTION_STATES",
     "Consumption",
+    "ConsumptionAttempt",
     "ConsumptionError",
     "ConsumptionLedger",
     "IssuanceDisabledConsumptionLedger",
