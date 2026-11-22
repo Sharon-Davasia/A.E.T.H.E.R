@@ -28,9 +28,21 @@ from aether.core.edits.receipts import ActionReceiptRecord, ReceiptStore
 
 
 class ConsumptionView(Protocol):
-    """The narrow read surface reconciliation needs from consumption accounting."""
+    """The narrow read surface reconciliation needs from consumption accounting.
+
+    ``pending`` is the local projection. ``unprojected_attempts`` and
+    ``authoritative_consumption`` exist because the projection is *not* the only
+    place a spend can hide: the authoritative ledger commits in its own database,
+    so a crash between that commit and the projection insert leaves a real spend
+    with no local row (S14-12). A reconciler that only read ``pending`` could not
+    see it, and would report a spent grant use as clean.
+    """
 
     def pending(self) -> Sequence[object]: ...
+
+    def unprojected_attempts(self) -> Sequence[object]: ...
+
+    def authoritative_consumption(self, consumption_id: UUID) -> object | None: ...
 
 
 class SnapshotReader(Protocol):
@@ -106,7 +118,99 @@ class MutationReconciler:
 
         results = [self._reconcile_one(intent, pending_consumptions) for intent in open_intents]
         results.extend(self._reconcile_orphans(pending, open_intents))
+        results.extend(self._reconcile_unprojected(open_intents))
         return ReconciliationReport(reconciliations=tuple(results))
+
+    def _reconcile_unprojected(
+        self, open_intents: Sequence[MutationIntent]
+    ) -> list[Reconciliation]:
+        """Report authoritative spends that never got a local projection.
+
+        S14-12. The consumption projection and the authoritative grant ledger are
+        two independent SQLite databases, so they cannot commit together. A
+        process killed after ``GrantLedger.consume`` committed but before the
+        projection insert leaves a use that is really spent, named by no local row
+        and by no journal intent. The previous reconciler walked local pending rows
+        and journal intents only, so it reported that state as clean.
+
+        The durable attempt row closes the window. For each attempt with no
+        projection, the *authoritative* ledger is asked whether that consumption id
+        exists:
+
+        * it exists -> the use was spent and no local record names the outcome.
+          NEEDS_REVIEW, never success. There is no refund: the grant was really
+          consumed.
+        * it does not exist -> the spend never landed (the crash came before the
+          authoritative commit, or the ledger refused it). ``NOT_APPLIED`` is an
+          honest verdict because nothing was spent.
+        * the ledger cannot be asked, or fails to answer -> NEEDS_REVIEW. An
+          unanswered question is not a negative one.
+
+        An attempt whose id a journal intent does name is already covered by
+        ``_reconcile_one``, which compares the file against the intent.
+        """
+
+        known_intents = {
+            str(intent.consumption_id) for intent in open_intents if intent.consumption_id
+        }
+        results: list[Reconciliation] = []
+        reader = getattr(self._consumption, "unprojected_attempts", None)
+        if reader is None:
+            return results
+        for attempt in reader():
+            consumption_id = getattr(attempt, "consumption_id", None)
+            if consumption_id is None:
+                continue
+            if str(consumption_id) in known_intents:
+                continue
+            try:
+                spent = self._consumption.authoritative_consumption(consumption_id)
+            except Exception:
+                results.append(
+                    Reconciliation(
+                        intent_id=None,
+                        consumption_id=consumption_id,
+                        verdict="NEEDS_REVIEW",
+                        reason_code="reconcile_authority_unavailable",
+                        detail=(
+                            "a grant use was attempted but the authoritative ledger could "
+                            "not be queried; whether it was spent is unknown and must be "
+                            "reviewed"
+                        ),
+                    )
+                )
+                continue
+            if spent is None:
+                results.append(
+                    Reconciliation(
+                        intent_id=None,
+                        consumption_id=consumption_id,
+                        verdict="NOT_APPLIED",
+                        reason_code="reconcile_attempt_not_spent",
+                        detail=(
+                            "a grant use was attempted but the authoritative ledger holds "
+                            "no consumption for it; nothing was spent"
+                        ),
+                    )
+                )
+                continue
+            uses_remaining_after = getattr(spent, "uses_remaining_after", None)
+            results.append(
+                Reconciliation(
+                    intent_id=None,
+                    consumption_id=consumption_id,
+                    verdict="NEEDS_REVIEW",
+                    reason_code="reconcile_consumed_without_projection",
+                    detail=(
+                        "the authoritative ledger holds a consumption that no local "
+                        "projection and no journal intent names: the process died between "
+                        f"committing the spend and recording its outcome "
+                        f"(uses_remaining_after={uses_remaining_after}); whether a file "
+                        "changed is unknown and must be reviewed"
+                    ),
+                )
+            )
+        return results
 
     def _reconcile_orphans(
         self, pending: Sequence[object], open_intents: Sequence[MutationIntent]
