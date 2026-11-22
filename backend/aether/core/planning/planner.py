@@ -33,6 +33,7 @@ from uuid import UUID, uuid4, uuid5
 from aether.core.approval_review import PreviewDiff, PreviewNarrative
 from aether.core.contracts.policy import RiskTier
 from aether.core.persistence.models import PlanStep, TaskPlan, TaskPlanResource
+from aether.core.planning.edit_binding import ApprovedEdit, EditBindingError
 from aether.core.policy.capabilities import CapabilityRegistry, CapabilityRegistryError
 from aether.core.resources.registry import ResourceRegistry, ResourceRegistryError
 
@@ -60,12 +61,18 @@ class PlanGoal(StrEnum):
 
 @dataclass(frozen=True, slots=True)
 class PlanIntent:
-    """One already-decided user intent, with its exact typed arguments."""
+    """One already-decided user intent, with its exact typed arguments.
+
+    ``proposed_content`` is required for edit goals and forbidden otherwise. It is
+    the exact bytes the user is being asked to approve, so the planner can render
+    and bind them rather than describing the change in prose (S14-1).
+    """
 
     goal: PlanGoal
     resource_id: str
     arguments: dict[str, Any]
     summary: str
+    proposed_content: bytes | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +89,8 @@ class PlannedRevision:
     narrative: PreviewNarrative
     step_id: UUID
 
+
+_EDIT_GOALS: frozenset[PlanGoal] = frozenset({PlanGoal.APPLY_EDIT, PlanGoal.UNDO_EDIT})
 
 _GOAL_CAPABILITY: dict[PlanGoal, str] = {
     PlanGoal.INSPECT_FILE: "fs.inspect_file",
@@ -111,6 +120,17 @@ class Planner:
         """Build revision ``revision`` of the plan for ``intent``."""
 
         capability_id = _GOAL_CAPABILITY[intent.goal]
+        editing = intent.goal in _EDIT_GOALS
+        if editing and intent.proposed_content is None:
+            raise PlannerError(
+                "PLAN_APPROVED_BYTES_REQUIRED",
+                "an edit plan must carry the exact proposed bytes so they can be bound",
+            )
+        if not editing and intent.proposed_content is not None:
+            raise PlannerError(
+                "PLAN_UNEXPECTED_PROPOSED_CONTENT",
+                "only edit goals may carry proposed content",
+            )
         try:
             definition = self._capabilities.get(capability_id)
             arguments = self._capabilities.validate(capability_id, intent.arguments)
@@ -149,6 +169,13 @@ class Planner:
         expected_effect = _expected_effect(
             intent.goal, resolved.canonical_path.name, arguments_dump
         )
+        approved_edit: ApprovedEdit | None = None
+        if editing:
+            approved_edit = self._bind_approved_edit(intent, resolved)
+            # The plan's expected effect now names the exact bytes. Because the
+            # plan hash covers expected_effect, the approved post-image cannot be
+            # changed by a later revision without a new hash and a new approval.
+            expected_effect = {**expected_effect, **approved_edit.to_step_arguments()}
         step = PlanStep(
             step_id=step_id,
             capability_id=capability_id,
@@ -174,8 +201,34 @@ class Planner:
             created_at=now,
         )
         plan_hash = hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
-        narrative = _narrative_for(intent, resolved.canonical_path.name, expected_effect)
+        narrative = _narrative_for(
+            intent,
+            resolved.canonical_path.name,
+            expected_effect,
+            approved_edit=approved_edit,
+        )
         return PlannedRevision(plan=plan, plan_hash=plan_hash, narrative=narrative, step_id=step_id)
+
+    def _bind_approved_edit(self, intent: PlanIntent, resolved: Any) -> ApprovedEdit:
+        """Render and bind the exact change the user is being asked to approve."""
+
+        assert intent.proposed_content is not None  # guarded by plan()
+        try:
+            pre_image = resolved.canonical_path.read_bytes()
+        except OSError as exc:
+            raise PlannerError(
+                "PLAN_SOURCE_UNREADABLE",
+                "the current content could not be read, so no exact diff can be shown",
+            ) from exc
+        try:
+            return ApprovedEdit.build(
+                resource_id=resolved.ref.resource_id,
+                pre_image=pre_image,
+                post_image=intent.proposed_content,
+                display_name=resolved.canonical_path.name,
+            )
+        except EditBindingError as exc:
+            raise PlannerError(exc.reason_code, str(exc)) from exc
 
     def revision_for_change(
         self,
@@ -210,7 +263,19 @@ class Planner:
             created_at=self._clock(),
         )
         plan_hash = hashlib.sha256(combined.canonical_json().encode("utf-8")).hexdigest()
-        narrative = _narrative_for(intent, planned.plan.steps[0].resources[0].display_name, {})
+        # Re-derive the narrative with the same approved binding the new step
+        # records, so a superseding revision cannot describe different bytes than
+        # its own step binds (S14-1).
+        narrative = _narrative_for(
+            intent,
+            planned.plan.steps[0].resources[0].display_name,
+            dict(new_step.expected_effect),
+            # The newly planned step carries its freshly rendered diff. A
+            # retained approved step's diff text is deliberately not persisted
+            # (no document content in the plan tables), so it is not re-rendered
+            # here; its binding stays in its own immutable expected effect.
+            approved_edit=_freshly_planned_binding(planned),
+        )
         return PlannedRevision(
             plan=combined, plan_hash=plan_hash, narrative=narrative, step_id=new_step.step_id
         )
@@ -236,6 +301,40 @@ def _expected_effect(
             }
         case PlanGoal.UNDO_EDIT:
             return {"effect": "file_restored", "resource": display_name}
+
+
+def _freshly_planned_binding(planned: PlannedRevision) -> ApprovedEdit | None:
+    """Rebuild the binding of the step this revision just planned, with its text."""
+
+    rendered = planned.narrative.full_diff
+    step = planned.plan.steps[0]
+    if not rendered or "approved_result_digest" not in step.expected_effect:
+        return None
+    return ApprovedEdit.from_step_arguments(
+        resource_id=step.resources[0].resource_id,
+        values={**dict(step.expected_effect), "approved_unified_diff": rendered[0].unified_diff},
+    )
+
+
+def _render_preview_diff(approved_edit: ApprovedEdit) -> str:
+    """Return the exact diff text whose digest the binding records.
+
+    The text comes from the binding itself rather than being re-rendered from a
+    second disk read: re-reading could pick up a concurrently changed file and
+    render a diff whose digest differs from the one the plan hashed. Proving the
+    text matches its own digest is the check that matters.
+    """
+
+    if hashlib.sha256(approved_edit.unified_diff.encode("utf-8")).hexdigest() != (
+        approved_edit.diff_sha256
+    ):
+        raise PlannerError(
+            "PLAN_APPROVED_BINDING_UNSTABLE",
+            "the rendered diff does not match the digest the plan records",
+        )
+    if not approved_edit.unified_diff.strip():
+        raise PlannerError("PLAN_APPROVED_BINDING_UNSTABLE", "the approved diff is empty")
+    return approved_edit.unified_diff
 
 
 def _postcondition(goal: PlanGoal) -> dict[str, Any]:
@@ -266,11 +365,16 @@ def _timeout_for(goal: PlanGoal) -> int:
 
 
 def _narrative_for(
-    intent: PlanIntent, display_name: str, expected_effect: dict[str, Any]
+    intent: PlanIntent,
+    display_name: str,
+    expected_effect: dict[str, Any],
+    *,
+    approved_edit: ApprovedEdit | None = None,
 ) -> PreviewNarrative:
     """Derive the human-facing description *from* the typed plan."""
 
-    edits = intent.goal in {PlanGoal.APPLY_EDIT, PlanGoal.UNDO_EDIT}
+    edits = intent.goal in _EDIT_GOALS
+    diffs: tuple[PreviewDiff, ...]
     preconditions: tuple[str, ...]
     if edits:
         intent_text = (
@@ -296,7 +400,20 @@ def _narrative_for(
         proposed = (
             f"{display_name} content will change from the shown pre-image to the shown result."
         )
-        diffs: tuple[PreviewDiff, ...] = ()
+        # S14-1: the preview must show the exact change, not describe it. The
+        # diff is rendered from the same bytes whose digests the plan, preview
+        # and grant all bind, so what the user reads is what will be written.
+        if approved_edit is None:
+            raise PlannerError(
+                "PLAN_APPROVED_BYTES_REQUIRED",
+                "an edit narrative requires the approved post-image binding",
+            )
+        diffs = (
+            PreviewDiff(
+                resource_id=intent.resource_id,
+                unified_diff=_render_preview_diff(approved_edit),
+            ),
+        )
     else:
         verb = {
             PlanGoal.INSPECT_FILE: "Inspect metadata for",
@@ -316,7 +433,7 @@ def _narrative_for(
         verification = ("The operation reports whether it actually succeeded.",)
         preconditions = (f"{display_name} is inside a registered, permitted root.",)
         proposed = f"{intent.goal.value} result for {display_name}"
-        diffs = ()
+        diffs = ()  # read-only capabilities change no bytes, so no diff exists
     return PreviewNarrative(
         action_intent=intent_text[:512],
         explanation=explanation[:4000],

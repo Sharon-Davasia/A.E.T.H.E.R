@@ -131,7 +131,7 @@ def app(tmp_path: Path):
     authority = _AcceptingAuthority()
     vault = UndoVault(tmp_path / "vault").open()
     receipts = ReceiptStore(tmp_path / "receipts.sqlite3")
-    edits = EditExecutor(registry, authority, vault, receipts, clock=lambda: NOW)
+    edits = EditExecutor(registry, authority, vault, receipts, plans=store, clock=lambda: NOW)
     task_id = uuid4()
     store.create_task("Phase 2 acceptance task", task_id=task_id, now=NOW)
     session = CapabilitySession(store=store, broker=broker, executor=fs_executor, clock=lambda: NOW)
@@ -162,7 +162,15 @@ def app(tmp_path: Path):
     store.close()
 
 
-def _plan_and_present(app, goal: PlanGoal, relative: str, arguments: dict, summary: str):
+def _plan_and_present(
+    app,
+    goal: PlanGoal,
+    relative: str,
+    arguments: dict,
+    summary: str,
+    *,
+    proposed: bytes | None = None,
+):
     registry, store, planner = app["registry"], app["store"], app["planner"]
     resource_id = resolve(registry, relative) if relative else resolve(registry, "")
     task_id = app["task_id"]
@@ -174,6 +182,7 @@ def _plan_and_present(app, goal: PlanGoal, relative: str, arguments: dict, summa
             resource_id=resource_id,
             arguments={"resource_id": resource_id, **arguments},
             summary=summary,
+            proposed_content=proposed,
         ),
         revision=_next_revision(store, task_id),
     )
@@ -187,12 +196,15 @@ def _plan_and_present(app, goal: PlanGoal, relative: str, arguments: dict, summa
     preview = app["previews"].preview_for(
         task_id, plan_revision=revision.plan.revision, plan_hash=plan_hash
     )
+    step = revision.plan.steps[0]
     return {
         "resource_id": resource_id,
         "revision": revision,
         "plan_hash": plan_hash,
         "preview": preview,
-        "step_id": revision.plan.steps[0].step_id,
+        "step_id": step.step_id,
+        "approved_digest": step.expected_effect.get("approved_result_digest"),
+        "approved_effect_digest": step.expected_effect.get("approved_effect_digest"),
     }
 
 
@@ -336,6 +348,7 @@ def test_06_show_the_exact_patch_before_an_edit(app) -> None:
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# Synthetic\n\nThe quick brown fox was edited and verified.\n",
     )
     preview = prepared["preview"]
     assert preview.risk_classification == "T2_MUTATE_RECOVERABLE"
@@ -427,6 +440,7 @@ def test_08_apply_approved_edit_and_compare_exact_bytes(app) -> None:
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# Synthetic\n\nThe quick brown fox was edited and verified.\n",
     )
     _approve(app, prepared)
     proposed = b"# Synthetic\n\nThe quick brown fox was edited and verified.\n"
@@ -439,7 +453,7 @@ def test_08_apply_approved_edit_and_compare_exact_bytes(app) -> None:
         resource_id=prepared["resource_id"],
         expected_sha256=hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         proposed_content=proposed,
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
     outcome = app["edits"].apply(request)
     assert outcome.status == "SUCCEEDED"
@@ -461,6 +475,7 @@ def test_09_refuse_stale_authorization_after_a_later_edit(app) -> None:
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# changed after approval\n",
     )
     _approve(app, prepared)
     approved_sha = hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest()
@@ -476,7 +491,7 @@ def test_09_refuse_stale_authorization_after_a_later_edit(app) -> None:
         resource_id=prepared["resource_id"],
         expected_sha256=approved_sha,
         proposed_content=b"# would clobber\n",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
     with pytest.raises(EditDenied) as refused:
         app["edits"].apply(request)
@@ -512,6 +527,7 @@ def test_10_reject_invalid_grants(app, reason_code: str) -> None:
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# blocked\n",
     )
     app["authority"].reason = reason_code
     before = app["tree"].readme.read_bytes()
@@ -524,7 +540,7 @@ def test_10_reject_invalid_grants(app, reason_code: str) -> None:
         resource_id=prepared["resource_id"],
         expected_sha256=hashlib.sha256(before).hexdigest(),
         proposed_content=b"# blocked\n",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
     with pytest.raises(EditDenied) as refused:
         app["edits"].apply(request)
@@ -543,6 +559,7 @@ def test_11_grant_binding_is_checked_against_the_exact_action(app) -> None:
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# exact action\n",
     )
     request = EditRequest(
         task_id=app["task_id"],
@@ -553,7 +570,7 @@ def test_11_grant_binding_is_checked_against_the_exact_action(app) -> None:
         resource_id=prepared["resource_id"],
         expected_sha256=hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         proposed_content=b"# exact action\n",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
     app["edits"].apply(request)
     # The authority was consulted exactly once for exactly this action.
@@ -571,6 +588,7 @@ def test_12_receipts_persist_across_a_restart(app, tmp_path) -> None:
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# persisted receipt\n",
     )
     request = EditRequest(
         task_id=app["task_id"],
@@ -581,7 +599,7 @@ def test_12_receipts_persist_across_a_restart(app, tmp_path) -> None:
         resource_id=prepared["resource_id"],
         expected_sha256=hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         proposed_content=b"# persisted receipt\n",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
     outcome = app["edits"].apply(request)
     app["receipts"].close()
@@ -608,6 +626,7 @@ def _apply_known_edit(app) -> tuple[object, bytes]:
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# edited\n",
     )
     original = app["tree"].readme.read_bytes()
     request = EditRequest(
@@ -619,13 +638,14 @@ def _apply_known_edit(app) -> tuple[object, bytes]:
         resource_id=prepared["resource_id"],
         expected_sha256=hashlib.sha256(original).hexdigest(),
         proposed_content=b"# edited\n",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
-    return app["edits"].apply(request), original
+    outcome = app["edits"].apply(request)
+    return outcome, original, prepared["approved_effect_digest"]
 
 
 def test_13_undo_restores_the_exact_original(app) -> None:
-    outcome, original = _apply_known_edit(app)
+    outcome, original, bound_effect = _apply_known_edit(app)
     assert app["tree"].readme.read_bytes() != original
     undo_request = EditRequest(
         task_id=app["task_id"],
@@ -636,19 +656,24 @@ def test_13_undo_restores_the_exact_original(app) -> None:
         resource_id=outcome.receipt.resource_id,
         expected_sha256=hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         proposed_content=b"ignored",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=bound_effect,
     )
-    restored = app["edits"].undo(
-        undo_request,
-        snapshot_id=UUID(outcome.snapshot_id),
-        receipt_id=outcome.receipt.receipt_id,
-    )
-    assert restored.status == "SUCCEEDED"
-    assert app["tree"].readme.read_bytes() == original
+    # S14-1/S14-3: undo is a distinct action that must not borrow the edit
+    # approval. It is refused outright here until S14-3 registers fs.undo_edit
+    # with its own plan-bound preview; refusing is safer than reusing the edit
+    # binding. See tests/test_phase2d_edits.py for the same assertion.
+    with pytest.raises(EditDenied) as refused:
+        app["edits"].undo(
+            undo_request,
+            snapshot_id=UUID(outcome.snapshot_id),
+            receipt_id=outcome.receipt.receipt_id,
+        )
+    assert refused.value.reason_code == "undo_authorization_not_implemented"
+    assert app["tree"].readme.read_bytes() != original
 
 
 def test_14_refuse_silent_overwrite_of_a_newer_user_edit(app) -> None:
-    outcome, original = _apply_known_edit(app)
+    outcome, original, bound_effect = _apply_known_edit(app)
     app["tree"].readme.write_text("# user wrote more\n", encoding="utf-8")
     newer = app["tree"].readme.read_bytes()
     undo_request = EditRequest(
@@ -660,7 +685,7 @@ def test_14_refuse_silent_overwrite_of_a_newer_user_edit(app) -> None:
         resource_id=outcome.receipt.resource_id,
         expected_sha256=hashlib.sha256(original).hexdigest(),
         proposed_content=b"ignored",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=bound_effect,
     )
     with pytest.raises(EditDenied) as refused:
         app["edits"].undo(
@@ -683,6 +708,7 @@ def test_15_crash_between_replace_and_verification_is_unverified(app, monkeypatc
             "expected_sha256": hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         },
         "Edit the README",
+        proposed=b"# interrupted\n",
     )
     request = EditRequest(
         task_id=app["task_id"],
@@ -693,7 +719,7 @@ def test_15_crash_between_replace_and_verification_is_unverified(app, monkeypatc
         resource_id=prepared["resource_id"],
         expected_sha256=hashlib.sha256(app["tree"].readme.read_bytes()).hexdigest(),
         proposed_content=b"# interrupted\n",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
     original_read = Path.read_bytes
     state = {"calls": 0}
@@ -772,6 +798,7 @@ def test_17_no_unauthorized_mutation_occurred(app) -> None:
             "expected_sha256": baseline["README.md"],
         },
         "Edit the README",
+        proposed=b"# the only authorized change\n",
     )
     request = EditRequest(
         task_id=app["task_id"],
@@ -782,7 +809,7 @@ def test_17_no_unauthorized_mutation_occurred(app) -> None:
         resource_id=prepared["resource_id"],
         expected_sha256=baseline["README.md"],
         proposed_content=b"# the only authorized change\n",
-        expected_effect_sha256="b" * 64,
+        expected_effect_sha256=prepared["approved_effect_digest"],
     )
     app["edits"].apply(request)
     after = {

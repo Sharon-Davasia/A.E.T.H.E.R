@@ -26,6 +26,9 @@ from aether.core.edits.receipts import (
     ReceiptError,
     ReceiptStore,
 )
+from aether.core.persistence.sqlite_store import PersistentTaskState, SQLiteTaskStore
+from aether.core.planning.planner import Planner
+from aether.core.policy.capabilities import CapabilityRegistry
 from aether.core.vault.undo_vault import UndoVault
 from tests.fs_support import build_registry, build_tree, resolve
 
@@ -75,8 +78,11 @@ def world(tmp_path: Path):
     )
     vault_dir = tmp_path / "vault"
     authority = AcceptingAuthority()
+    store = SQLiteTaskStore(tmp_path / "store.sqlite3")
     with UndoVault(vault_dir) as vault, ReceiptStore(tmp_path / "receipts.sqlite3") as receipts:
-        executor = EditExecutor(registry, authority, vault, receipts, clock=lambda: NOW)
+        executor = EditExecutor(
+            registry, authority, vault, receipts, plans=store, clock=lambda: NOW
+        )
         yield {
             "tree": tree,
             "registry": registry,
@@ -84,8 +90,15 @@ def world(tmp_path: Path):
             "receipts": receipts,
             "executor": executor,
             "authority": authority,
+            "store": store,
+            "planner": Planner(
+                capabilities=CapabilityRegistry.phase2_filesystem(),
+                resources=registry,
+                clock=lambda: NOW,
+            ),
             "tmp": tmp_path,
         }
+    store.close()
 
 
 def make_request(
@@ -98,19 +111,57 @@ def make_request(
     task_id: UUID | None = None,
     step_id: UUID | None = None,
     approval_id: UUID | None = None,
+    world: dict | None = None,
 ) -> EditRequest:
+    """Build a request whose approved bytes are recorded in a persisted plan.
+
+    S14-1 makes the persisted plan the authority for the approved post-image, so
+    a request built without one is refused by design. Supplying ``world`` also
+    persists the matching plan revision.
+    """
+
     path = tree.root / relative
     original = path.read_bytes()
+    proposed = content if content is not None else b"# Rewritten\n\nnew body\n"
+    resolved_task = task_id or uuid4()
+    resolved_step = step_id or uuid4()
+    resolved_approval = approval_id or uuid4()
+    effect_digest = "b" * 64
+    if world is not None:
+        from aether.core.planning.planner import PlanGoal, PlanIntent
+
+        resource_id = resolve(registry, relative)
+        revision = world["planner"].plan(
+            resolved_task,
+            PlanIntent(
+                goal=PlanGoal.APPLY_EDIT,
+                resource_id=resource_id,
+                arguments={
+                    "resource_id": resource_id,
+                    "step_id": str(resolved_step),
+                    "approval_id": str(resolved_approval),
+                    "expected_sha256": expected_sha256 or hashlib.sha256(original).hexdigest(),
+                },
+                summary="Edit",
+                proposed_content=proposed,
+            ),
+            revision=1,
+        )
+        effect_digest = str(revision.plan.steps[0].expected_effect["approved_effect_digest"])
+        resolved_step = revision.step_id
+        world["store"].create_task("edit", task_id=resolved_task, now=NOW)
+        world["store"].transition_task(resolved_task, PersistentTaskState.PLANNING, now=NOW)
+        world["store"].save_plan(revision.plan)
     return EditRequest(
-        task_id=task_id or uuid4(),
-        step_id=step_id or uuid4(),
-        approval_id=approval_id or uuid4(),
+        task_id=resolved_task,
+        step_id=resolved_step,
+        approval_id=resolved_approval,
         plan_revision=1,
         plan_hash="a" * 64,
         resource_id=resolve(registry, relative),
         expected_sha256=expected_sha256 or hashlib.sha256(original).hexdigest(),
-        proposed_content=content if content is not None else b"# Rewritten\n\nnew body\n",
-        expected_effect_sha256="b" * 64,
+        proposed_content=proposed,
+        expected_effect_sha256=effect_digest,
     )
 
 
@@ -126,7 +177,7 @@ def test_apply_verifies_exact_bytes_and_records_a_receipt(world) -> None:
         world["executor"],
         world["receipts"],
     )
-    request = make_request(registry, tree)
+    request = make_request(registry, tree, world=world)
     outcome = executor.apply(request)
 
     assert outcome.status == "SUCCEEDED"
@@ -150,7 +201,7 @@ def test_apply_preserves_file_mode(world) -> None:
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
     os.chmod(tree.readme, 0o640)
     before = tree.readme.stat().st_mode & 0o777
-    executor.apply(make_request(registry, tree))
+    executor.apply(make_request(registry, tree, world=world))
     assert tree.readme.stat().st_mode & 0o777 == before
 
 
@@ -161,7 +212,7 @@ def test_apply_consults_the_grant_before_mutating(world) -> None:
         world["executor"],
         world["authority"],
     )
-    executor.apply(make_request(registry, tree))
+    executor.apply(make_request(registry, tree, world=world))
     assert len(authority.calls) == 1
 
 
@@ -172,7 +223,7 @@ def test_apply_consults_the_grant_before_mutating(world) -> None:
 
 def test_stale_target_is_refused_and_nothing_is_written(world) -> None:
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
-    request = make_request(registry, tree)
+    request = make_request(registry, tree, world=world)
     # Simulate a user edit between preview and apply.
     tree.readme.write_text("# Edited by the user meanwhile\n", encoding="utf-8")
     before = tree.readme.read_bytes()
@@ -193,7 +244,7 @@ def test_failed_grant_check_blocks_the_edit(world) -> None:
     authority.reason = "GRANT_EXPIRED"
     before = tree.readme.read_bytes()
     with pytest.raises(EditDenied) as denied:
-        executor.apply(make_request(registry, tree))
+        executor.apply(make_request(registry, tree, world=world))
     assert denied.value.reason_code == "GRANT_EXPIRED"
     assert tree.readme.read_bytes() == before
 
@@ -212,7 +263,7 @@ def test_every_grant_denial_prevents_mutation(world, reason: str) -> None:
     authority.reason = reason
     before = tree.readme.read_bytes()
     with pytest.raises(EditDenied) as denied:
-        executor.apply(make_request(registry, tree))
+        executor.apply(make_request(registry, tree, world=world))
     assert denied.value.reason_code == reason
     assert tree.readme.read_bytes() == before
 
@@ -301,7 +352,7 @@ def test_a_verified_pre_image_is_captured_before_replacement(world) -> None:
         world["vault"],
     )
     original = tree.readme.read_bytes()
-    outcome = executor.apply(make_request(registry, tree))
+    outcome = executor.apply(make_request(registry, tree, world=world))
     stored = vault.get(UUID(outcome.snapshot_id))
     assert stored == original
     assert hashlib.sha256(stored).hexdigest() == outcome.pre_sha256
@@ -322,7 +373,7 @@ def test_edit_is_refused_when_no_snapshot_can_be_taken(world, monkeypatch) -> No
     monkeypatch.setattr(vault, "put", broken_put)
     before = tree.readme.read_bytes()
     with pytest.raises(EditDenied) as denied:
-        executor.apply(make_request(registry, tree))
+        executor.apply(make_request(registry, tree, world=world))
     assert denied.value.reason_code == "snapshot_unavailable"
     assert tree.readme.read_bytes() == before
 
@@ -334,7 +385,7 @@ def test_tampered_snapshot_is_detected(world) -> None:
         world["executor"],
         world["vault"],
     )
-    outcome = executor.apply(make_request(registry, tree))
+    outcome = executor.apply(make_request(registry, tree, world=world))
     object_file = next((Path(vault._directory) / "objects").rglob("*.bin"))
     object_file.write_bytes(b"AETHERV1" + b"\x00" * 12 + b"\xff" * 32)
     from aether.core.vault.undo_vault import VaultIntegrityError
@@ -356,7 +407,7 @@ def test_undo_restores_the_exact_original_bytes(world) -> None:
         world["receipts"],
     )
     original = tree.readme.read_bytes()
-    applied = executor.apply(make_request(registry, tree))
+    applied = executor.apply(make_request(registry, tree, world=world))
     assert tree.readme.read_bytes() != original
 
     undo_request = make_request(
@@ -365,23 +416,25 @@ def test_undo_restores_the_exact_original_bytes(world) -> None:
         content=b"placeholder ignored by undo",
         expected_sha256=hashlib.sha256(tree.readme.read_bytes()).hexdigest(),
     )
-    restored = executor.undo(
-        undo_request,
-        snapshot_id=UUID(applied.snapshot_id),
-        receipt_id=applied.receipt.receipt_id,
-    )
-    assert restored.status == "SUCCEEDED"
-    assert tree.readme.read_bytes() == original
-    assert hashlib.sha256(tree.readme.read_bytes()).hexdigest() == applied.pre_sha256
-    # Undo produced its own receipt, distinct from the forward edit.
-    assert restored.receipt.receipt_id != applied.receipt.receipt_id
-    assert restored.receipt.detail.get("undo_of") == str(applied.receipt.receipt_id)
-    assert receipts.get(restored.receipt.receipt_id).status == "SUCCEEDED"
+    # S14-1/S14-3: undo is NOT authorized through the forward-edit binding. It
+    # requires its own registered fs.undo_edit capability, which lands in S14-3.
+    # Until then the mutation path refuses it outright rather than reusing the
+    # edit approval, so this asserts the refusal rather than a silent restore.
+    with pytest.raises(EditDenied) as refused:
+        executor.undo(
+            undo_request,
+            snapshot_id=UUID(applied.snapshot_id),
+            receipt_id=applied.receipt.receipt_id,
+        )
+    assert refused.value.reason_code == "undo_authorization_not_implemented"
+    # The file is untouched by the refused undo.
+    assert tree.readme.read_bytes() != original
+    assert receipts.get(applied.receipt.receipt_id).status == "SUCCEEDED"
 
 
 def test_undo_refuses_to_overwrite_a_newer_user_edit(world) -> None:
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
-    applied = executor.apply(make_request(registry, tree))
+    applied = executor.apply(make_request(registry, tree, world=world))
     # The user keeps working after our edit.
     tree.readme.write_text("# A newer user edit\n", encoding="utf-8")
     newer = tree.readme.read_bytes()
@@ -405,7 +458,7 @@ def test_undo_refuses_to_overwrite_a_newer_user_edit(world) -> None:
 
 def test_undo_requires_the_matching_receipt(world) -> None:
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
-    applied = executor.apply(make_request(registry, tree))
+    applied = executor.apply(make_request(registry, tree, world=world))
     other = ActionReceiptRecord(
         receipt_id=uuid4(),
         task_id="t",
@@ -443,7 +496,7 @@ def test_undo_requires_its_own_grant(world) -> None:
         world["executor"],
         world["authority"],
     )
-    applied = executor.apply(make_request(registry, tree))
+    applied = executor.apply(make_request(registry, tree, world=world))
     authority.reason = "GRANT_STEP_MISMATCH"
     current = tree.readme.read_bytes()
     undo_request = make_request(
@@ -469,7 +522,7 @@ def test_undo_requires_its_own_grant(world) -> None:
 
 def test_receipts_survive_a_restart(world, tmp_path) -> None:
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
-    outcome = executor.apply(make_request(registry, tree))
+    outcome = executor.apply(make_request(registry, tree, world=world))
     world["receipts"].close()
     with ReceiptStore(tmp_path / "receipts.sqlite3") as reopened:
         stored = reopened.get(outcome.receipt.receipt_id)
@@ -485,7 +538,7 @@ def test_receipts_are_append_only(world) -> None:
         world["executor"],
         world["receipts"],
     )
-    outcome = executor.apply(make_request(registry, tree))
+    outcome = executor.apply(make_request(registry, tree, world=world))
     with pytest.raises(ReceiptError) as refused:
         receipts.record(outcome.receipt)
     assert refused.value.reason_code == "receipt_already_recorded"
@@ -518,7 +571,7 @@ def test_unresolved_receipts_are_reported_for_reconciliation(world) -> None:
         world["executor"],
         world["receipts"],
     )
-    executor.apply(make_request(registry, tree))
+    executor.apply(make_request(registry, tree, world=world))
     assert receipts.unresolved() == ()
 
     unverified = ActionReceiptRecord(
@@ -553,7 +606,7 @@ def test_an_unverifiable_edit_is_never_reported_as_success(world, monkeypatch) -
         return data
 
     monkeypatch.setattr(Path, "read_bytes", lying_read)
-    outcome = executor.apply(make_request(registry, tree))
+    outcome = executor.apply(make_request(registry, tree, world=world))
     monkeypatch.setattr(Path, "read_bytes", original_read)
 
     assert outcome.status == "UNVERIFIED"
@@ -566,7 +619,7 @@ def test_an_unverifiable_edit_is_never_reported_as_success(world, monkeypatch) -
 
 def test_missing_target_never_substitutes_a_similar_file(world) -> None:
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
-    request = make_request(registry, tree)
+    request = make_request(registry, tree, world=world)
     tree.readme.unlink()
     (tree.root / "README.md.bak").write_text("a similar name\n", encoding="utf-8")
     with pytest.raises(EditDenied) as denied:
@@ -593,7 +646,7 @@ def test_replacement_failure_leaves_the_original_intact(world, monkeypatch) -> N
         return original_replace(source, destination, *args, **kwargs)
 
     monkeypatch.setattr("aether.core.edits.executor.os.replace", failing_replace)
-    outcome = executor.apply(make_request(registry, tree))
+    outcome = executor.apply(make_request(registry, tree, world=world))
     assert outcome.status == "FAILED"
     assert outcome.reason_code == "target_locked_by_another_process"
     assert tree.readme.read_bytes() == original
@@ -604,7 +657,7 @@ def test_replacement_failure_leaves_the_original_intact(world, monkeypatch) -> N
 
 def test_a_temporary_file_is_never_left_behind(world) -> None:
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
-    executor.apply(make_request(registry, tree))
+    executor.apply(make_request(registry, tree, world=world))
     leftovers = [p.name for p in tree.root.iterdir() if p.name.endswith(".aether-tmp")]
     assert leftovers == []
 
@@ -619,15 +672,17 @@ def test_crash_between_replace_and_verification_is_unverified(world, monkeypatch
 
     registry, tree, executor = world["registry"], world["tree"], world["executor"]
     original_read = Path.read_bytes
-    request = make_request(registry, tree)  # reads the file to compute the hash
-    state = {"pre_image_read": False}
+    request = make_request(registry, tree, world=world)  # reads the file to hash it
+    state = {"reads_after_arming": 0}
 
     def fail_readback(self):
         if self.name == "README.md":
-            if not state["pre_image_read"]:
-                state["pre_image_read"] = True
-                return original_read(self)
-            raise OSError(5, "I/O error during verification")
+            state["reads_after_arming"] += 1
+            # The executor reads the pre-image first, then re-reads to verify.
+            # Fail the verification read so the replace has already happened.
+            if state["reads_after_arming"] > 1:
+                raise OSError(5, "I/O error during verification")
+            return original_read(self)
         return original_read(self)
 
     monkeypatch.setattr(Path, "read_bytes", fail_readback)
@@ -664,7 +719,7 @@ def test_receipt_is_written_even_when_replacement_fails(world, monkeypatch) -> N
         return original_replace(source, destination, *args, **kwargs)
 
     monkeypatch.setattr("aether.core.edits.executor.os.replace", failing_replace)
-    outcome = executor.apply(make_request(registry, tree))
+    outcome = executor.apply(make_request(registry, tree, world=world))
     assert outcome.status == "FAILED"
     failures = [r for r in receipts.for_task(outcome.receipt.task_id) if r.status == "FAILED"]
     assert len(failures) == 1
