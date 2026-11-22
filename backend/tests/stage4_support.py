@@ -39,11 +39,17 @@ LATER = NOW + timedelta(minutes=5)
 
 BACKEND_ROOT = Path(__file__).parents[1]
 PERSISTENCE_DIR = BACKEND_ROOT / "aether/core/persistence"
-PROPOSED_MIGRATION = PERSISTENCE_DIR / "proposed_migrations/0002_phase2b_stage4_grants.sql"
-PROPOSED_MIGRATION_SHA256 = hashlib.sha256(PROPOSED_MIGRATION.read_bytes()).hexdigest()
+# PR #14: 0002 is now *registered* in the production migration registry but is
+# still refusals-gated (``PENDING_MIGRATION_VERSIONS``). Tests that exercise the
+# migration's mechanics activate it in-memory only, via ``activated_migrations``.
+MIGRATION_0002 = PERSISTENCE_DIR / "migrations/0002_phase2b_stage4_grants.sql"
+# Historical name kept for the existing Stage 4 suite.
+PROPOSED_MIGRATION = MIGRATION_0002
+MIGRATION_0002_SHA256 = hashlib.sha256(MIGRATION_0002.read_bytes()).hexdigest()
+PROPOSED_MIGRATION_SHA256 = MIGRATION_0002_SHA256
 MIGRATION_NAME_V2 = "0002_phase2b_stage4_grants"
 
-# Fingerprint of the full version-2 schema (all 27 tables/indexes/triggers),
+# Fingerprint of the full version-2 schema (30 tables/indexes/triggers),
 # computed exactly like ``SQLiteTaskStore._verify_schema`` does. Pinned in the
 # grant ledger as ``_EXPECTED_SCHEMA_SHA256_V2``.
 V2_SCHEMA_SHA256 = "dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788"
@@ -59,26 +65,38 @@ def sha256_json(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def stage4_store(tmp_path: Path, monkeypatch) -> SQLiteTaskStore:
-    """A store configured for schema v2 in a *test-only* schema registry.
+def activation_state(monkeypatch, *, activated: bool = True) -> None:
+    """Set schema activation for the current test only.
 
-    Registers the proposed migration in the module constants and points the
-    store at a temporary migrations directory holding copies of ``0001`` and
-    the proposed ``0002``. This mirrors the separately approved production
-    migration change without modifying any production constant, migration
-    directory, or pinned fingerprint.
+    ``activated=True`` mirrors the state after explicit user approval (active
+    schema version 2, nothing pending) so the migration's real mechanics are
+    exercised. ``activated=False`` is the shipped state: version 2 registered
+    and verified, but refused.
     """
 
     from aether.core.persistence import sqlite_store
 
-    migrations = copy_migrations(tmp_path / "migrations", include_proposed=True)
-    monkeypatch.setitem(
-        sqlite_store._EXPECTED_MIGRATIONS,
-        2,
-        ("0002_phase2b_stage4_grants.sql", PROPOSED_MIGRATION_SHA256),
-    )
-    monkeypatch.setitem(sqlite_store._EXPECTED_SCHEMA_SHA256, 2, V2_SCHEMA_SHA256)
-    return SQLiteTaskStore(tmp_path / "store.sqlite3", migrations_dir=migrations)
+    if activated:
+        monkeypatch.setattr(sqlite_store, "ACTIVE_SCHEMA_VERSION", 2)
+        monkeypatch.setattr(sqlite_store, "PENDING_MIGRATION_VERSIONS", frozenset())
+    else:
+        monkeypatch.setattr(sqlite_store, "ACTIVE_SCHEMA_VERSION", 1)
+        monkeypatch.setattr(sqlite_store, "PENDING_MIGRATION_VERSIONS", frozenset({2}))
+
+
+def stage4_store(tmp_path: Path, monkeypatch) -> SQLiteTaskStore:
+    """A schema-v2 store, with the migration activated only for this test.
+
+    The production registry is used unchanged (0002 is registered there); only
+    the pending-migration gate is lifted, in memory, so the migration's real
+    mechanics are exercised. No production constant, file or fingerprint is
+    modified.
+    """
+
+    migration_dir = tmp_path / "migrations"
+    copy_migrations(migration_dir, include_proposed=True)
+    activation_state(monkeypatch, activated=True)
+    return SQLiteTaskStore(tmp_path / "store.sqlite3", migrations_dir=migration_dir)
 
 
 class SyntheticT2Plan:
@@ -386,5 +404,5 @@ def copy_migrations(destination: Path, *, include_proposed: bool = False) -> Pat
         destination / "0001_phase2b_core.sql",
     )
     if include_proposed:
-        shutil.copyfile(PROPOSED_MIGRATION, destination / "0002_phase2b_stage4_grants.sql")
+        shutil.copyfile(MIGRATION_0002, destination / "0002_phase2b_stage4_grants.sql")
     return destination

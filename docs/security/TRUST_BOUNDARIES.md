@@ -170,12 +170,15 @@ merged; Stage 4 is a new branch from merged `main`.
   agree across the state row, the consumption table and `CONSUMED` events. The ledger never
   applies or registers a migration; version-1 databases fail closed with
   `GrantUnavailableError`.
-- **Proposed migration requires separate approval.**
-  `backend/aether/core/persistence/proposed_migrations/0002_phase2b_stage4_grants.sql`
-  (SHA-256 `d2a02f54…`; the earlier `a91b431c…` proposal is superseded and unapproved) is inert. Applying it also requires updating the store's
-  `_EXPECTED_MIGRATIONS`, `_EXPECTED_SCHEMA_SHA256` and `_CRITICAL_TRIGGER_NAMES` plus tests,
-  as one separately approved change. Until then `SQLiteTaskStore` stays pinned to version 1 and
-  rejects version-2 databases.
+- **Prepared migration requires separate approval to activate.**
+  `backend/aether/core/persistence/migrations/0002_phase2b_stage4_grants.sql`
+  (SHA-256 `d2a02f54…`; the earlier `a91b431c…` proposal is superseded and unapproved) is
+  registered in the store's `_EXPECTED_MIGRATIONS` / `_EXPECTED_SCHEMA_SHA256` and its bytes
+  and fingerprint are verified on every open, but it is **not applied and not activated**:
+  `ACTIVE_SCHEMA_VERSION = 1` and version 2 is in `PENDING_MIGRATION_VERSIONS`. A build whose
+  active version is 1 creates version-1 databases and refuses version-2 databases as newer
+  than the application. Activation is a separate, explicitly approved change; the evidence
+  and residual risks are in `docs/engineering/PHASE2B_STAGE4_MIGRATION.md`.
 - **One owner, one connection.** `GrantLedger.open(store)` *shares* the store's already-held
   owner lock and its single connection; it never opens a second connection or a second lock.
   Grant writes join the store's `BEGIN IMMEDIATE` transaction, which re-verifies the database
