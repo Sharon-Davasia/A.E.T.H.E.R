@@ -30,9 +30,13 @@
 
 ## 2. Exact test results (Linux, this sandbox)
 
-Command: `uv run pytest` in `backend/`. Full suite: **709 passed, 3 skipped**
-(712 collected). The 3 skips are the two native-Windows ACL tests and one
+Command: `uv run pytest` in `backend/`. Full suite at `a65460c`: **775 passed,
+3 skipped** (778 collected). The 3 skips are two native-Windows ACL tests and one
 environment-gated test; they are **skipped, not passed**.
+
+This count was produced in a **fresh, isolated interpreter** (`python3.11 -m venv`
+with the project installed editable from this checkout), so it is reproducible and
+not dependent on the sandbox's shared editable install.
 
 | Suite | Tests | Result |
 |---|---|---|
@@ -46,6 +50,10 @@ environment-gated test; they are **skipped, not passed**.
 | `test_phase2_mutation_journal.py` | 22 | PASS (S14-4) |
 | `test_phase2_vault_key_protection.py` | 18 (2 skipped) | PASS (S14-5) |
 | `test_phase2_fixture_safety.py` | 21 | PASS (S14-6) |
+| `test_phase2_grant_authority.py` | 20 | PASS (S14-7) |
+| `test_phase2_orphan_consumption.py` | 11 | PASS (S14-8) |
+| `test_phase2_execution_context.py` | 10 | PASS (S14-9) |
+| `test_phase2_windows_acl.py` | 25 | PASS (S14-10) |
 | `test_phase2b_stage4_grants.py` | 114 | PASS |
 | `test_phase2b_stage4_migration.py` | 28 | PASS |
 | `test_phase2b_trusted_approval.py` | 32 | PASS (new) |
@@ -171,10 +179,11 @@ and the Phase 1 deny-all broker default were not modified.
 - The Stage 3 review button was not turned into an execution approval.
 - No acceptance result was fabricated to close a gate.
 
-## 10. Independent-review remediation (S14-1 … S14-6)
+## 10. Independent-review remediation (S14-1 … S14-10)
 
-PR #14's independent review found nine defects. They are corrected here as six
-separately reviewable commits. This section states what changed, what proves it,
+PR #14's independent review found nine defects, and a post-interruption review of
+the correction found four more. All thirteen are corrected here as ten separately
+reviewable commits. This section states what changed, what proves it,
 and — as importantly — what remains **NOT VERIFIED**.
 
 | Commit | Subject | The defect it corrects | Proof |
@@ -184,6 +193,10 @@ and — as importantly — what remains **NOT VERIFIED**.
 | `ac0f39c` | S14-3 | Undo was authorized through the forward-edit capability and could overwrite a newer user edit | `test_phase2_undo_authorization.py` (16): distinct `fs.undo_edit`, edit approval refused for undo (`approved_capability_mismatch`), current bytes compared to the receipt's verified post-image, newer edit refused as `undo_conflict_newer_content` |
 | `e75264b` | S14-4 | A kill between replacing the file and writing the receipt left a changed file with no durable record | `test_phase2_mutation_journal.py` (22): intent durable before the replace, single intent per step, kill-after-replace re-opened from disk, kill-before-replace distinguished, read-only reconciliation, `COMPLETED_UNVERIFIED` never treated as consistent |
 | `fef5592` | S14-5 | The vault key was stored inside the vault directory, and `chmod` was a silent no-op on Windows | `test_phase2_vault_key_protection.py` (16 passed, 2 skipped): key relocated, in-vault key refused, copied vault cannot decrypt, legacy key migrated, real DACL on Windows (skipped here), unprotected key refuses to open |
+| `58e271a` | S14-7 | A consumption budget could be created for any approval id, so consumption was a second approval source, and accepting grant doubles hid it | `test_phase2_grant_authority.py` (20): budget requires an authoritative grant, may not exceed or disagree with it, spends re-checked for EXPIRED/REVOKED/EXHAUSTED, invented approval cannot authorize a real file mutation |
+| `e399099` | S14-8 | A crash between spending a use and journaling left a pending consumption that reconciliation reported as clean | `test_phase2_orphan_consumption.py` (11): orphan reported `reconcile_consumption_without_intent`, never consistent, never completed, file untouched, never attached to another intent |
+| `f5ab233` | S14-9 | `_consumption_id` was shared mutable executor state, and the journal was optional | `test_phase2_execution_context.py` (10): attribute gone, two interleaved operations resolve only their own use, journal-less executor refuses before any state change, journal check precedes consumption |
+| `a65460c` | S14-10 | The Windows ACL check accepted any descriptor containing an owner ACE, so owner-plus-Everyone passed | `test_phase2_windows_acl.py` (25): exact ACE inventory; Everyone, Users, Authenticated Users, unrelated SIDs, SYSTEM, Administrators, inherited and deny ACEs all rejected |
 | `1b2f9c8` | S14-6 | The Windows verifier deleted fixtures outside its own containment and could report unverifiable checks as passing | `test_phase2_fixture_safety.py` (21): `assert_contained`, `assert_no_redirection`, marker-bound `FixtureLease`, source scan forbidding recursive deletes, PASS/FAIL/NOT VERIFIED only |
 
 ### What this remediation does not prove
@@ -191,15 +204,23 @@ and — as importantly — what remains **NOT VERIFIED**.
 Every item below is still **NOT VERIFIED** and no commit above changes that:
 
 - No real mutation path is wired into the running application. The executor and
-  journal are exercised by tests only; `chat_service.py` still wires nothing.
+  journal are exercised by tests only; `chat_service.py` still wires nothing, and
+  `ConsumptionLedger` is never constructed in shipped code — only the
+  `IssuanceDisabledConsumptionLedger` default.
 - The Electron approval surface has not been demonstrated by a human clicking
   approve. The automated tests drive the chain programmatically.
 - No real process kill, power loss or forced unmount has been performed. The
   crash tests simulate the kill in-process and re-open the stores from disk; the
   *simulation* is honest about its own limits, but it is not a real interruption.
-- The native Windows DACL has not been executed on Windows in this session. The
-  two Windows-only tests skip here and the verifier's gate is written to fail if
-  the ACL is not protected — but that failure has not been observed on NTFS.
+- The native Windows DACL has not been executed on Windows in this session. S14-10
+  proves the *verifier* is strict, by parsing SDDL on Linux, but does not prove
+  that Windows produces that SDDL or that `SetFileSecurityW` succeeds. The two
+  Windows-only tests skip here, and the verifier's gate is written to fail on an
+  unprotected or broadly-granted DACL — but that gate has not been observed on NTFS.
+- The consumption authority (S14-7) is wired only in tests. No production
+  configuration constructs a `ConsumptionLedger` with a real `GrantLedger`
+  authority, because issuing those grants requires schema v2 activation and is
+  still disabled.
 - Schema v2 remains inactive (`ACTIVE_SCHEMA_VERSION = 1`,
   `PENDING_MIGRATION_VERSIONS = {2}`) and production grant issuance remains
   disabled (`GRANT_ISSUANCE_DISABLED`).
@@ -210,7 +231,7 @@ Every item below is still **NOT VERIFIED** and no commit above changes that:
 
 | Gate | Result |
 |---|---|
-| Backend suite | 709 passed, 3 skipped |
+| Backend suite | 775 passed, 3 skipped (clean isolated interpreter) |
 | Ruff / format / mypy | clean / clean / clean (95 files) |
 | Desktop typecheck / eslint | pass / pass |
 | Desktop Node tests | 54 pass, 7 skipped (environment-gated) |
