@@ -27,6 +27,140 @@ from typing import Any, Final
 
 _WINDOWS_SDDL: Final = "D:P(A;;FA;;;OW)"
 
+# Access-mask bits that grant the right to read, write or execute. Any of these in
+# an ACE is a disclosure/modification risk, so a protected-but-broad DACL is not
+# accepted merely because it also contains an owner ACE.
+_ACCESS_MASK_READ: Final = 0x0001
+_ACCESS_MASK_WRITE: Final = 0x0002
+_ACCESS_MASK_APPEND: Final = 0x0004
+_ACCESS_MASK_DELETE_CHILD: Final = 0x0040
+_ACCESS_MASK_WRITE_DAC: Final = 0x00040000
+_ACCESS_MASK_WRITE_OWNER: Final = 0x00080000
+_GENERIC_ALL: Final = 0x10000000
+_GENERIC_WRITE: Final = 0x40000000
+_GENERIC_READ: Final = 0x80000000
+_DANGEROUS_ACCESS_BITS: Final = (
+    _ACCESS_MASK_READ
+    | _ACCESS_MASK_WRITE
+    | _ACCESS_MASK_APPEND
+    | _ACCESS_MASK_DELETE_CHILD
+    | _ACCESS_MASK_WRITE_DAC
+    | _ACCESS_MASK_WRITE_OWNER
+    | _GENERIC_ALL
+    | _GENERIC_WRITE
+    | _GENERIC_READ
+)
+
+# The only principals permitted to hold access on a vault object.
+#   OW  = owner rights (this file's owner)
+#   S-1-3-4 = OWNER RIGHTS, the SDDL spelling of the same principal
+_OWNER_PRINCIPALS: Final = frozenset({"OW", "S-1-3-4"})
+_ACE_FLAG_INHERITED: Final = 0x10
+_ACE_TYPE_ALLOW: Final = "A"
+
+# SDDL uses two-letter access-mask abbreviations, not only hexadecimal. Reading
+# them as hex made the parser refuse real descriptors (``FA`` is not hex), so the
+# table is explicit. Values are the standard access bits.
+_SDDL_RIGHTS: Final[dict[str, int]] = {
+    "GR": 0x80000000,  # GENERIC_READ
+    "GW": 0x40000000,  # GENERIC_WRITE
+    "GX": 0x20000000,  # GENERIC_EXECUTE
+    "GA": 0x10000000,  # GENERIC_ALL
+    "FA": 0x001F01FF,  # FILE_ALL_ACCESS
+    "FR": 0x00120089,  # FILE_GENERIC_READ
+    "FW": 0x00120116,  # FILE_GENERIC_WRITE
+    "FX": 0x001200A0,  # FILE_GENERIC_EXECUTE
+    "RD": 0x00010000,  # FILE_READ_DATA / LIST_DIRECTORY
+    "WD": 0x00040000,  # FILE_WRITE_DATA / ADD_FILE
+    "AD": 0x00080000,  # FILE_APPEND_DATA / ADD_SUBDIRECTORY
+    "REA": 0x00040000,  # FILE_READ_EA
+    "WEA": 0x00100000,  # FILE_WRITE_EA
+    "X": 0x00200000,  # FILE_EXECUTE / TRAVERSE
+    "DC": 0x00400000,  # FILE_DELETE_CHILD
+    "RA": 0x00800000,  # FILE_READ_ATTRIBUTES
+    "WA": 0x01000000,  # FILE_WRITE_ATTRIBUTES
+    "D": 0x00010000,  # DELETE (standard right)
+    "RC": 0x00020000,  # READ_CONTROL
+    "SD": 0x00040000,  # DELETE
+    "WDAC": 0x00040000,  # WRITE_DAC token spelling
+    "WO": 0x00080000,  # WRITE_OWNER
+}
+# Multi-letter keys must be tried longest-first so "FA" is not read as "F"+"A".
+_SDDL_RIGHTS_BY_LENGTH = sorted(_SDDL_RIGHTS, key=len, reverse=True)
+
+
+# SDDL inheritance ACE flags.
+_SDDL_ACE_FLAGS: Final[dict[str, int]] = {
+    "AI": 0x10,  # INHERITED_ACE (SDDL spells it ID for inherited-from-parent)
+    "ID": 0x10,
+    "OI": 0x01,  # OBJECT_INHERIT
+    "CI": 0x02,  # CONTAINER_INHERIT
+    "IO": 0x80,  # INHERIT_ONLY
+    "NP": 0x04,  # NO_PROPAGATE
+}
+_SDDL_ACE_FLAGS_BY_LENGTH = sorted(_SDDL_ACE_FLAGS, key=len, reverse=True)
+
+
+def parse_ace_flags(text: str) -> int:
+    """Interpret SDDL ACE flags, which are letter pairs, not hexadecimal."""
+
+    value = text.strip().upper()
+    if not value:
+        return 0
+    if value.isdigit():
+        return int(value, 16)
+    flags = 0
+    remaining = value
+    while remaining:
+        for key in _SDDL_ACE_FLAGS_BY_LENGTH:
+            if remaining.startswith(key):
+                flags |= _SDDL_ACE_FLAGS[key]
+                remaining = remaining[len(key) :]
+                break
+        else:
+            raise PermissionEnforcementError(
+                "permissions_windows_unparseable",
+                f"unrecognised ACE flag abbreviation {remaining!r}",
+            )
+    return flags
+
+
+def parse_access_mask(text: str) -> int:
+    """Interpret an SDDL access mask, abbreviated or hexadecimal, or raise.
+
+    Abbreviations are tried first: ``FA`` means FILE_ALL_ACCESS, not 0xFA, and
+    treating it as hex would silently under-report the granted rights. An explicit
+    ``0x`` prefix, and a value of digits only, are read as hexadecimal.
+    """
+
+    value = text.strip()
+    if not value:
+        return 0
+    if value[:2].lower() == "0x":
+        try:
+            return int(value, 16)
+        except ValueError as exc:
+            raise PermissionEnforcementError(
+                "permissions_windows_unparseable", "an ACE mask is not hexadecimal"
+            ) from exc
+    if value.isdigit():
+        return int(value, 16)
+    mask = 0
+    remaining = value.upper()
+    while remaining:
+        for key in _SDDL_RIGHTS_BY_LENGTH:
+            if remaining.startswith(key):
+                mask |= _SDDL_RIGHTS[key]
+                remaining = remaining[len(key) :]
+                break
+        else:
+            raise PermissionEnforcementError(
+                "permissions_windows_unparseable",
+                f"unrecognised access-mask abbreviation {remaining!r}",
+            )
+    return mask
+
+
 # Windows security APIs, resolved lazily: importing ctypes.wintypes on POSIX is
 # pointless, and the constants below only exist on Windows.
 _ERROR_SUCCESS: Final = 0
@@ -277,16 +411,135 @@ def _verify_windows(target: Path) -> PermissionReport:
     finally:
         kernel32.LocalFree(text)
 
-    # An owner-only protected DACL: exactly one ACE, full access, owner rights.
-    protected = observed.startswith("D:P")
-    owner_only = ";;FA;;;OW)" in observed or ";;FA;;;S-1-3-4)" in observed
-    enforced = protected and owner_only
+    return evaluate_windows_dacl(target, observed)
+
+
+@dataclass(frozen=True, slots=True)
+class AceAnalysis:
+    """One parsed access-control entry."""
+
+    ace_type: str
+    flags: int
+    mask: int
+    principal: str
+
+    @property
+    def inherited(self) -> bool:
+        return bool(self.flags & _ACE_FLAG_INHERITED)
+
+    @property
+    def grants_access(self) -> bool:
+        return self.ace_type == _ACE_TYPE_ALLOW and bool(self.mask & _DANGEROUS_ACCESS_BITS)
+
+
+def parse_sddl_dacl(sddl: str) -> tuple[bool, tuple[AceAnalysis, ...]]:
+    """Parse an SDDL string into (protected, ACEs).
+
+    Only the DACL portion is interpreted: ``D:`` introduces it, ``P`` marks it
+    protected, ``NO_ACCESS_CONTROL`` (``NO_ACCESS_CONTROL``/``N``) or a null DACL
+    (``NO_ACCESS_CONTROL``) are rejected, and each parenthesised ACE is read as
+    ``type;flags;mask;object;inherit;principal``.
+
+    Raises :class:`PermissionEnforcementError` on anything unparseable, because a
+    DACL that cannot be read cannot be trusted.
+    """
+
+    text = sddl.strip()
+    if not text:
+        raise PermissionEnforcementError(
+            "permissions_windows_unparseable", "the security descriptor is empty"
+        )
+    if not text.startswith("D:"):
+        raise PermissionEnforcementError(
+            "permissions_windows_unparseable", "the descriptor has no DACL section"
+        )
+    remainder = text[2:]
+    protected = False
+    if remainder.startswith("P"):
+        protected = True
+        remainder = remainder[1:]
+
+    aces: list[AceAnalysis] = []
+    position = 0
+    while position < len(remainder):
+        character = remainder[position]
+        if character.isspace():
+            position += 1
+            continue
+        if character != "(":
+            if remainder[position:].startswith("NO_ACCESS_CONTROL"):
+                # An unprotected null DACL grants everyone full control.
+                return False, ()
+            raise PermissionEnforcementError(
+                "permissions_windows_unparseable",
+                f"unexpected DACL content at offset {position}",
+            )
+        end = remainder.find(")", position)
+        if end < 0:
+            raise PermissionEnforcementError("permissions_windows_unparseable", "unterminated ACE")
+        fields = remainder[position + 1 : end].split(";")
+        if len(fields) < 6:
+            raise PermissionEnforcementError(
+                "permissions_windows_unparseable", "an ACE has fewer than six fields"
+            )
+        ace_type, flags_text, mask_text, _object, _inherit, principal = fields[:6]
+        flags = parse_ace_flags(flags_text)
+        mask = parse_access_mask(mask_text)
+        aces.append(
+            AceAnalysis(
+                ace_type=ace_type or _ACE_TYPE_ALLOW,
+                flags=flags,
+                mask=mask,
+                principal=principal,
+            )
+        )
+        position = end + 1
+    return protected, tuple(aces)
+
+
+def evaluate_windows_dacl(target: Path, sddl: str) -> PermissionReport:
+    """Decide whether a DACL actually protects ``target`` as owner-only.
+
+    The previous implementation accepted any string containing an owner ACE, so a
+    descriptor that *also* granted Everyone or Users access passed. This evaluates
+    the whole inventory instead:
+
+    * the DACL must be present and protected (no inherited ACEs can widen it);
+    * there must be at least one ACE, and none of them may be inherited;
+    * every ACE must be an allow-ACE for the owner principal;
+    * deny-ACEs, unknown ACE types and any other principal are rejected.
+
+    A deny-ACE is refused rather than reasoned about: on a vault object it means
+    the effective access is not what this check can prove, and "prove" is the
+    only acceptable standard for a key file.
+    """
+
+    protected, aces = parse_sddl_dacl(sddl)
+    reasons: list[str] = []
+    if not protected:
+        reasons.append("DACL is not protected (inherited ACEs may apply)")
+    if not aces:
+        reasons.append("DACL grants no access at all, or is null")
+    for ace in aces:
+        if ace.inherited:
+            reasons.append(f"inherited ACE for {ace.principal}")
+            continue
+        if ace.ace_type != _ACE_TYPE_ALLOW:
+            reasons.append(f"non-allow ACE ({ace.ace_type}) for {ace.principal}")
+            continue
+        if ace.principal not in _OWNER_PRINCIPALS:
+            if ace.grants_access:
+                reasons.append(f"access granted to unauthorized principal {ace.principal}")
+            else:
+                reasons.append(f"unexpected principal {ace.principal} in DACL")
+    enforced = not reasons
+    detail = sddl if enforced else f"{sddl} | " + "; ".join(reasons)
     return PermissionReport(
         path=str(target),
         platform="windows",
         enforced=enforced,
         mechanism="windows-dacl",
-        detail=observed,
+        detail=detail,
     )
 
 

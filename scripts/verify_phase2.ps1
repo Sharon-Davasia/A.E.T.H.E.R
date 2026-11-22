@@ -289,9 +289,18 @@ def acl_owner_only():
             raise AssertionError("vault key is stored inside the vault directory")
         key_report = verify_owner_only(key, directory=False)
         if not key_report.enforced:
+            # S14-10: this is now an exact ACE-inventory check, so the message
+            # names the offending principal or ACE rather than just failing.
             raise AssertionError("vault key ACL is not owner-only: " + key_report.detail)
         if key_report.platform != "windows":
             raise AssertionError("expected the native Windows DACL mechanism")
+        if not key_report.detail.startswith("D:P"):
+            raise AssertionError("vault key DACL is not protected (inherited ACEs apply)")
+        for unexpected in (";;WD)", ";;BU)", ";;AU)", ";;SY)", ";;BA)"):
+            if unexpected in key_report.detail:
+                raise AssertionError(
+                    "vault key DACL grants access to an unauthorized principal: " + unexpected
+                )
         for directory in (fixture / "vault", fixture / "vault" / "objects"):
             report = verify_owner_only(directory, directory=True)
             if not report.enforced:
