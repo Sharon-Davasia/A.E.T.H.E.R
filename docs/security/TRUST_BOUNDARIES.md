@@ -89,11 +89,48 @@ merged; Stage 4 is a new branch from merged `main`.
   `NON_AUTHORIZING_AUDIT_RECORD`, a model proposal, a synthetic dev preview and any
   `AETHER_REVIEW_*` development seam can never produce a grant. Source-scan tests assert no
   module outside `aether/core/grants` constructs an issuer or an attestation.
-- **The trusted authorizing interaction does not exist yet.** The Master-required path —
+- **The trusted authorizing interaction does not exist yet, and neither does a production
+  preview source.** The Master-required path —
   explicit user gesture authenticated at the Electron-main/backend boundary, plus a production
   planner/narrative source — is future work. Until it exists, issuance stays disabled and the
   Stage 3 approve button is untouched (not upgraded into a second, ambiguous approval).
-- **Issuance prerequisites (all enforced).** A proof; the *current persisted* plan loaded
+- **Authorization is established before storage, and storage cannot authorize (S4-6).**
+  `GrantLedger.issue()` no longer exists. The single write primitive is private
+  (`GrantLedger._persist_verified_grant`) and requires a single-use `IssuancePermit` that
+  only `GrantIssuer.issue()` mints, after both trust decisions succeed. A permit is bound to
+  one scope digest and one issuer identity and is consumed on first use; passing `None`, an
+  ordinary object, a namespace or any other stand-in raises `AUTHORIZATION_EVIDENCE_REQUIRED`
+  before the database is touched. Python class identity and inheritance remain irrelevant:
+  there is no capability class, no subclass check, and the permit is valued by its data plus
+  its one-shot state, not by its type. Test-only simulation stays in `backend/tests/`.
+- **Preview identity is verified against authoritative evidence (S4-6).** The
+  `preview_id`/`preview_digest` inside an attestation is a *claim*. `GrantIssuer` resolves the
+  authoritative preview for that exact task/plan revision/hash through an injected
+  `PreviewAuthority` and requires them to match (`PREVIEW_IDENTITY_MISMATCH`,
+  `PREVIEW_SOURCE_MISMATCH`, `PREVIEW_SOURCE_UNAVAILABLE`). No production preview source
+  exists in this phase, so the shipped default is `NullPreviewAuthority`, which always raises:
+  the verification is explicitly *unavailable* and production issuance stays disabled. A
+  preview value carried in the attestation alone never authorizes anything. No authorizing
+  IPC or trusted renderer→backend grant channel was added.
+- **Fresh consent is checked inside the writing transaction (S4-7).** Both the grant insert
+  and the use decrement call `GrantLedger._check_fresh_consent`, which reuses the store's
+  existing Stage 2 predicate (`SQLiteTaskStore.is_stage2_preview_blocked`, i.e. the
+  `APPROVAL_PREVIEW_REVOKED` / `requires_fresh_plan_and_consent` audit semantics) on the
+  transaction's own connection. A revocation that lands after the pre-check, or after
+  issuance but before use, denies with `CONSENT_INVALIDATED` and leaves no grant row, no
+  consumption row and no decrement — even when task state and plan identity are unchanged.
+  A standalone ledger (no owning store) cannot verify consent and fails closed with
+  `CONSENT_AUTHORITY_UNAVAILABLE`.
+- **No success without current-plan authority (S4-8).** `GrantAuthority` fails closed with
+  `GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED` when it has no store, so scope verification can
+  never report success without checking the authoritative current task/plan; historical
+  grants deny after supersession regardless. Grant reads and current task/plan/consent reads
+  happen inside one consistent snapshot under the store's lock, and `GrantLedger.open(store)`
+  adopts that same lock (`ledger._lock is store._lock`), so an unsynchronized read cannot
+  observe uncommitted task or grant state. The one-owner/one-connection design is unchanged:
+  still exactly one connection and one serialization mechanism.
+- **Issuance prerequisites (all enforced).** A verified attestation and an authoritative
+  preview match; the *current persisted* plan loaded
   through the store's integrity-verifying path (never a caller-supplied plan); exact
   step/capability/tier/argument-hash/effect-hash/resource-version/recovery-class binding;
   lifetime ≤ 60 minutes; 1–8 uses; no T3; and an idempotent issuance identity whose replay
@@ -134,7 +171,7 @@ merged; Stage 4 is a new branch from merged `main`.
   detected and fails closed. Expiry comparisons trust the caller-supplied clock; there is no
   attested time source. Consumption is not yet bound to a real action, so "one use = one action"
   is proven transactionally, not end-to-end.
-- Stage 4 is Linux-verified only (333 passed / 1 skipped backend, desktop `npm run check`,
+- Stage 4 is Linux-verified only (390 passed / 1 skipped backend, desktop `npm run check`,
   golden fixture check). No Windows filesystem, ACL, reparse, process or resource-security
   behavior is inferred from those results; the Windows acceptance items remain open. T3 remains
   unavailable until a dedicated authorization design and its prerequisites are separately approved.

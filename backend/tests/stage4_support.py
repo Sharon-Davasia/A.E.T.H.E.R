@@ -169,6 +169,11 @@ class SyntheticT2Plan:
     def resource_versions(self) -> dict[str, str]:
         return {self.resource_id: self.resource_version}
 
+    def publish_preview(self, authority: SimulatedPreviewAuthority) -> str:
+        """Register the authoritative preview for this plan and return its digest."""
+
+        return authority.publish(self.plan)
+
     def decision(self, *, value: str = "APPROVE") -> ApprovalDecisionRecord:
         return ApprovalDecisionRecord(
             approval_id=self.approval_id,
@@ -193,6 +198,67 @@ class SyntheticT2Plan:
             "uses_remaining": 1,
             "approval_id": self.approval_id,
         }
+
+
+class SimulatedPreviewAuthority:
+    """Test-only preview source backed by the *real* Stage 2 preview builder.
+
+    It resolves the canonical ``ExactPreview`` for a persisted plan (exactly as
+    the review surface would), so a test can prove that a claimed preview
+    identity is checked against authoritative evidence rather than trusted.
+    """
+
+    authority_id = "test.preview_source"
+
+    def __init__(self) -> None:
+        self._narratives: dict[tuple[str, int], object] = {}
+
+    def publish(self, plan: TaskPlan, *, revision: int | None = None) -> str:
+        """Build and register the authoritative preview for a plan; return the digest."""
+
+        from aether.core.approval_review import build_preview
+
+        preview = build_preview(plan, default_narrative(plan))
+        self._narratives[(str(plan.task_id), revision or plan.revision)] = preview
+        return preview.preview_digest
+
+    def resolve(self, *, task_id, plan_revision, plan_hash):  # type: ignore[no-untyped-def]
+        from aether.core.grants.attestation import (
+            AuthoritativePreview,
+            PreviewSourceUnavailable,
+        )
+
+        preview = self._narratives.get((str(task_id), plan_revision))
+        if preview is None:
+            raise PreviewSourceUnavailable(
+                "PREVIEW_SOURCE_UNAVAILABLE", "no synthetic preview registered for this plan"
+            )
+        if preview.plan_hash != plan_hash:
+            raise PreviewSourceUnavailable(
+                "PREVIEW_SOURCE_MISMATCH", "registered preview belongs to another plan hash"
+            )
+        return AuthoritativePreview(
+            task_id=preview.task_id,
+            plan_revision=preview.plan_revision,
+            plan_hash=preview.plan_hash,
+            preview_id=preview.preview_id,
+            preview_digest=preview.preview_digest,
+        )
+
+
+def default_narrative(plan: TaskPlan):  # type: ignore[no-untyped-def]
+    from aether.core.approval_review import PreviewNarrative
+
+    return PreviewNarrative(
+        action_intent="Replace one exact token in a synthetic file",
+        explanation="Synthetic preview used by Stage 4 grant-foundation tests.",
+        preconditions=("the file exists",),
+        external_effects=("one synthetic file changes",),
+        risks=("synthetic risk",),
+        verification_strategy=("re-hash after write",),
+        proposed_effect="one token replaced",
+        full_diff=(),
+    )
 
 
 class SimulatedAttestationVerifier:
@@ -253,6 +319,33 @@ def make_attestation(
     }
     fields.update(overrides)
     return AuthorizationAttestation(**fields)
+
+
+def persist_with_permit(
+    ledger,  # type: ignore[no-untyped-def]
+    grant,  # type: ignore[no-untyped-def]
+    *,
+    scope_digest: str,
+    issuance_key,
+    issued_by: str,  # type: ignore[no-untyped-def]
+):
+    """Test-only: store a grant with a freshly minted single-use permit.
+
+    Normal production code reaches storage only through ``GrantIssuer.issue``;
+    ledger-semantics tests need the storage primitive directly, so they mint the
+    permit here instead of pretending to be an authorization decision.
+    """
+
+    from aether.core.grants.ledger import IssuancePermit
+
+    permit = IssuancePermit._mint(scope_digest=scope_digest, issued_by=issued_by)
+    return ledger._persist_verified_grant(
+        grant,
+        permit=permit,
+        scope_digest=scope_digest,
+        issuance_key=issuance_key,
+        issued_by=issued_by,
+    )
 
 
 def apply_proposed_migration_raw(database: Path) -> None:

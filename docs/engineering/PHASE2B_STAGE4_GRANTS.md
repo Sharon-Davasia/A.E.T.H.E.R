@@ -196,7 +196,7 @@ Environment: `/tmp/aether-stage4-venv` (Python 3.11), editable backend install.
 
 | Check | Result |
 |---|---|
-| `pytest tests` | **375 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 89 (88 in `test_phase2b_stage4_grants.py` + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
+| `pytest tests` | **390 passed, 1 skipped** (skip = optional `AETHER_RUN_MODEL_INTEGRATION=1`); Stage 4 adds 104 (103 in `test_phase2b_stage4_grants.py` + 1 recovery-binding test in `test_phase2_approval_binding.py`) |
 | `ruff check .` | passed |
 | `ruff format --check` (Stage 4 files) | passed |
 | `mypy` (strict) | passed, 72 source files |
@@ -256,7 +256,31 @@ branch; none enables issuance, execution or a migration.
 | **S4-4** — validation trusted caller-supplied historical plan identities | Issuance requires the task to exist in a consent-bearing state, be free of fresh-consent blockers, and match the **current** persisted plan; it re-checks the task pointer *inside* the issuing transaction. Consumption re-reads the task state/plan pointer inside the decrement transaction (`GRANT_PLAN_SUPERSEDED` / `TASK_STATE_NOT_AUTHORIZABLE`). `GrantAuthority` accepts an optional store and performs the same current-plan check after scope validation. Recovery class is compared with the persisted plan step's trusted value. | `test_issued_grant_is_denied_after_the_plan_advances`, `test_use_is_denied_once_the_task_leaves_consent_states`, `test_issuance_refuses_tasks_outside_consent_states_and_invalidated_consent`, `test_issuance_rechecks_the_plan_inside_its_transaction`, `test_current_plan_check_and_decrement_are_atomic_under_concurrency`, `test_recovery_class_comes_from_the_trusted_plan_step` |
 | **S4-5** — second connection risked weakening store ownership; audit text was unrestricted | `GrantLedger.open(store)` **shares** the store's owner lock and single connection and reuses the store's `BEGIN IMMEDIATE` transaction (location verified before/after commit), so ownership, atomicity and recovery invariants are untouched; one ledger per store. `read_only()` is an explicit `mode=ro` verification handle and the path-only constructor refuses while a store owns the database. Event `detail` is restricted to allow-listed keys with boolean/integer/bounded-code/digest/timestamp values; revocation and consumer identity are bounded codes (`REVOCATION_CODES`, `CONSUMED_BY_CODES`) with `CHECK … GLOB` constraints, never free text. | `test_ledger_shares_the_store_connection_and_lock`, `test_ledger_write_is_rolled_back_with_the_task_transaction`, `test_store_still_enforces_single_owner_while_ledger_is_open`, `test_standalone_ledger_cannot_take_ownership_from_a_store`, `test_standalone_ledgers_are_mutually_exclusive`, `test_read_only_handle_verifies_and_cannot_write`, `test_free_text_audit_metadata_is_refused`, `test_consumption_consumer_code_is_bounded` |
 
-### Migration-control outcome
+## 6c. Second-round corrections (S4-6 … S4-8)
+
+The second review accepted S4-1…S4-5 and required three further corrections. They are
+implemented on the same branch; still no issuance, execution, IPC or migration.
+
+| Finding | Code-level resolution | Tests |
+|---|---|---|
+| **S4-6** — `GrantLedger.issue()` could persist a grant with no verified authorization evidence | Authorization is now established *before* storage and storage is not an authorization path. `GrantLedger.issue()` is removed; the only write primitive is the private `GrantLedger._persist_verified_grant(...)`, whose first argument is a `permit:` keyword that accepts nothing but a single-use `IssuancePermit`. Permits are mintable only through `IssuancePermit._mint()` inside `GrantIssuer.issue()`, are bound to the exact scope digest and issuer identity, and are consumed on first use (`ISSUANCE_PERMIT_ALREADY_USED` / `ISSUANCE_PERMIT_MISMATCH`). Anything else — `None`, a plain object, a namespace, a subclass-like stand-in — is refused with `AUTHORIZATION_EVIDENCE_REQUIRED` before a database handle is touched. Preview identity is now verified against **authoritative preview evidence**: new `PreviewAuthority` contract plus `AuthoritativePreview`; `GrantIssuer` requires the attestation's `preview_id`/`preview_digest` to equal what the injected source resolves for this task/revision/hash (`PREVIEW_IDENTITY_MISMATCH`, `PREVIEW_SOURCE_MISMATCH`). The shipped default is `NullPreviewAuthority`, which raises `PREVIEW_SOURCE_UNAVAILABLE`: no production preview source exists in this phase, so that verification is explicitly unavailable and production issuance stays disabled rather than silently skipped. Class identity/inheritance is still never an authentication boundary, and the only simulation (`SimulatedAttestationVerifier`, `SimulatedPreviewAuthority`) lives in `backend/tests/stage4_support.py`. No authorizing IPC was added. | `test_no_ledger_entry_point_can_persist_a_grant_without_authorization`, `test_issuance_permit_is_single_use_and_bound_to_its_scope`, `test_production_default_has_no_preview_source_and_stays_disabled`, `test_permit_subclass_cannot_inherit_authorization_and_override_is_ignored`, `test_forged_preview_identity_is_rejected_against_authoritative_evidence`, `test_verified_preview_identity_is_required_for_successful_issuance`, `test_preview_source_failures_fail_closed`, `test_production_verifier_denies_all_issuance`, `test_no_production_module_issues_grants_or_exposes_ipc` (now also scans for `_persist_verified_grant` / `IssuancePermit`) |
+| **S4-7** — revocation/fresh-consent was checked only before the transaction | `GrantLedger._check_fresh_consent()` runs inside the same transaction as the grant insert **and** inside the decrement transaction, delegating to the store's existing Stage 2 predicate `SQLiteTaskStore.is_stage2_preview_blocked()` (the `APPROVAL_PREVIEW_REVOKED` / `requires_fresh_plan_and_consent` event semantics). No second consent system. It additionally refuses if the store's connection is not the transaction's connection (`CONSENT_AUTHORITY_UNAVAILABLE`), so the check cannot silently read outside the write. Denials are `CONSENT_INVALIDATED` with no grant row, no consumption row and no use decrement; a revocation after issuance denies use even when task state and plan identity are unchanged. | `test_revocation_between_issuance_precheck_and_transaction_denies` (asserts the denial came from the in-transaction check), `test_revocation_after_issuance_denies_consumption_without_decrement`, `test_consent_check_is_shared_with_the_store_not_reimplemented`, `test_standalone_ledger_cannot_verify_consent_and_fails_closed` |
+| **S4-8** — `GrantAuthority(store=None)` skipped current-plan checks; shared-connection reads were unsynchronized | `GrantAuthority.check_action` fails closed with `GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED` when no current-plan authority is supplied — no success is reportable without checking the authoritative current task/plan. Grant load and the current task/plan/consent reads now happen inside one consistent snapshot guarded by the store's lock, so historical grants deny after supersession and a reader cannot observe uncommitted task/grant state. `GrantLedger.open(store)` adopts the store's `_lock` as its own (`ledger._lock is store._lock`), keeping the single-owner/one-connection design: there is still exactly one connection and one serialization mechanism. | `test_grant_authority_without_store_fails_closed`, `test_historical_grant_denies_after_supersession_without_store`, `test_shared_connection_reads_take_the_store_lock`, `test_reader_cannot_observe_an_uncommitted_grant_write` |
+
+### Migration-control outcome (second round)
+
+The proposed migration bytes did **not** change in this round: no column or trigger was
+needed, because the authorized-preview binding is derived from existing plan/preview
+evidence and the revocation/consent state is already the Stage 2 `task_events` audit
+stream. Pins therefore remain:
+
+- proposed migration SHA-256: `d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c`
+- complete version-2 schema fingerprint: `dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788`
+  (30 objects, `user_version = 2`)
+- still proposed, inert, unregistered and never applied; production schema pins unchanged
+  (v1 `70907729…` / `02f3cac7…`).
+
+### Migration-control outcome (first round, S4-1 … S4-5)
 
 The proposed migration's **bytes changed** for S4-2/S4-3/S4-5 and the artefacts were
 regenerated, not carried over:
@@ -283,8 +307,12 @@ regenerated, not carried over:
 
 - **No execution.** `GRANT_VALIDATED_EXECUTOR_NOT_ENABLED` is the ceiling; there is no
   adapter, no mutation, no shell, no IPC operation that performs work.
-- **No production issuance.** The authenticated authorizing interaction (and a
-  production planner/narrative source) is still absent.
+- **No production issuance.** The authenticated authorizing interaction is still absent,
+  and so is a production preview source: `PRODUCTION_PREVIEW_AUTHORITY` is
+  `NullPreviewAuthority`, which raises `PREVIEW_SOURCE_UNAVAILABLE`. Preview identity
+  therefore cannot be verified in production, and issuance is explicitly disabled rather
+  than unverified. Wiring a real preview source is a prerequisite for the production
+  verifier, not a substitute for it.
 - **T3 unavailable**, permanently, until a dedicated authorization design and its
   prerequisites are separately approved.
 - **Attestation trust:** `AuthorizationAttestation` is a *claim*. Its trustworthiness is

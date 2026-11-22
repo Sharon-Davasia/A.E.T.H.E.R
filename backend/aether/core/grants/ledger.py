@@ -27,6 +27,13 @@ storage-identity checks are never weakened.
   and for read-only diagnostics against a database no store has open. It is
   not used for production issuance and takes its own lock when available.
 
+Authorization is established **before** storage. :meth:`GrantLedger.issue` is
+private-by-convention (`GrantLedger._persist_verified_grant`) and accepts only
+the single-use :class:`IssuancePermit` that ``GrantIssuer`` obtains *after* the
+attestation verifier and the authoritative preview source both succeed. No
+public ledger entry point can persist a grant, so no production-capable path
+can bypass the trusted authorization decision.
+
 Consumption is a compare-and-decrement inside the store's transaction: a
 grant can never be spent below zero, a revoked/expired/exhausted grant can
 never be spent, and a retried consumption with the same idempotency identity
@@ -58,6 +65,7 @@ from aether.core.grants.errors import (
     GrantConflictError,
     GrantDeniedError,
     GrantIntegrityError,
+    GrantIssuanceDenied,
     GrantNotFoundError,
     GrantUnavailableError,
 )
@@ -240,8 +248,55 @@ def consumption_action_digest(
     )
 
 
+class IssuancePermit:
+    """One-shot proof that the trusted authorization decision already happened.
+
+    Minted only by :meth:`GrantIssuer.issue`, after the injected attestation
+    verifier *and* the authoritative preview source both succeeded for this
+    exact grant and scope. Storage accepts nothing else, so authorization can
+    never be established by the write path itself, by a label, by a subclass or
+    by an ordinary caller-created object.
+
+    The permit is an in-process, same-thread value: it proves that *this*
+    process performed the trusted decision immediately before the write. It is
+    not a durable token and is never persisted.
+    """
+
+    _scope_digest: str
+    _issuer: str
+    _consumed: bool
+
+    def __init__(self, *, scope_digest: str, issued_by: str) -> None:
+        raise TypeError("IssuancePermit is minted only by GrantIssuer.issue")
+
+    @classmethod
+    def _mint(cls, *, scope_digest: str, issued_by: str) -> IssuancePermit:
+        permit = object.__new__(cls)
+        permit._scope_digest = scope_digest
+        permit._issuer = issued_by
+        permit._consumed = False
+        return permit
+
+    def _claim(self, *, scope_digest: str, issued_by: str) -> None:
+        if self._consumed:
+            raise GrantIssuanceDenied(
+                "ISSUANCE_PERMIT_ALREADY_USED", "an issuance permit authorizes exactly one write"
+            )
+        if scope_digest != self._scope_digest or issued_by != self._issuer:
+            raise GrantIssuanceDenied(
+                "ISSUANCE_PERMIT_MISMATCH", "issuance permit does not cover this grant"
+            )
+        self._consumed = True
+
+
 class GrantLedger:
     """Schema-v2 grant store. Fails closed on any verification mismatch."""
+
+    # S4-8: the synchronization mechanism is an attribute of the ledger so a
+    # reader can prove it took the writer's lock. In shared mode it *is* the
+    # owning task store's lock, so ledger reads and store writes/fresh-consent
+    # reads are mutually exclusive on the one shared connection.
+    _lock: threading.RLock
 
     def __init__(
         self,
@@ -348,6 +403,10 @@ class GrantLedger:
             _shared_transaction=store._transaction,
         )
         ledger._store = store
+        # One shared connection means one synchronization mechanism: adopt the
+        # store's lock so grant reads and grant writes serialize with every
+        # task/plan/audit operation on that connection (S4-8).
+        ledger._lock = store._lock
         try:
             store._stage4_grant_ledger = ledger  # type: ignore[attr-defined]
         except AttributeError:  # pragma: no cover - unexpected store shape
@@ -545,14 +604,33 @@ class GrantLedger:
     # Issuance (transactional, idempotent on the full authorization intent)
     # ------------------------------------------------------------------
 
-    def issue(
+    def _persist_verified_grant(
         self,
         grant: ExactApprovalGrant,
         *,
+        permit: IssuancePermit,
         scope_digest: str,
         issuance_key: UUID,
         issued_by: str,
     ) -> GrantIssuanceOutcome:
+        """Store one already-authorized grant.
+
+        Private by design (S4-6): the only caller is :meth:`GrantIssuer.issue`,
+        which obtains the permit from the trusted authorization decision. A
+        direct call without a valid single-use permit is refused before any
+        database interaction.
+        """
+
+        # Exact type, and the base implementation is called explicitly: a
+        # subclass cannot inherit into authorization, and overriding ``_claim``
+        # changes nothing (S4-6).
+        if type(permit) is not IssuancePermit:
+            raise GrantIssuanceDenied(
+                "AUTHORIZATION_EVIDENCE_REQUIRED",
+                "grant storage requires a permit from the trusted authorization decision; "
+                "direct issuance is not an authorization path",
+            )
+        IssuancePermit._claim(permit, scope_digest=scope_digest, issued_by=issued_by)
         # S4-2: the supplied digest is verified independently, never trusted.
         actual_digest = exact_approval_scope_digest(grant)
         if not isinstance(scope_digest, str) or scope_digest != actual_digest:
@@ -619,6 +697,7 @@ class GrantLedger:
                     "TASK_STATE_NOT_AUTHORIZABLE",
                     "the task left a consent-bearing state while issuing this grant",
                 )
+            self._check_fresh_consent(connection, grant.task_id)
             scope_json = _canonical_json(grant.model_dump(mode="json"))
             connection.execute(
                 "INSERT INTO exact_approval_grants ("
@@ -674,14 +753,14 @@ class GrantLedger:
     # ------------------------------------------------------------------
 
     def load(self, approval_id: UUID) -> ExactApprovalGrant:
-        with self._lock:
+        with self._lock, self._read():
             row = self._grant_row(approval_id)
             grant, _state = self._grant_view(approval_id, row)
             return grant
 
     def status(self, approval_id: UUID, *, now: datetime | None = None) -> GrantStatus:
         now = now or datetime.now(UTC)
-        with self._lock:
+        with self._lock, self._read():
             row = self._grant_row(approval_id)
             grant, state = self._grant_view(approval_id, row)
 
@@ -714,7 +793,7 @@ class GrantLedger:
             )
 
     def get_consumption(self, consumption_id: UUID) -> GrantConsumption:
-        with self._lock:
+        with self._lock, self._read():
             row = self._connection.execute(
                 "SELECT * FROM exact_approval_grant_consumptions WHERE consumption_id = ?",
                 (str(consumption_id),),
@@ -724,7 +803,7 @@ class GrantLedger:
             return self._consumption_from_row(row)
 
     def list_consumptions(self, approval_id: UUID) -> tuple[GrantConsumption, ...]:
-        with self._lock:
+        with self._lock, self._read():
             rows = self._connection.execute(
                 "SELECT * FROM exact_approval_grant_consumptions "
                 "WHERE approval_id = ? ORDER BY consumed_at, consumption_id",
@@ -855,6 +934,7 @@ class GrantLedger:
                 plan_revision=plan_revision,
                 plan_hash=plan_hash,
             )
+            self._check_fresh_consent(connection, task_id)
             decremented = connection.execute(
                 "UPDATE exact_approval_grant_state "
                 "SET uses_remaining = uses_remaining - 1, consumed_count = consumed_count + 1 "
@@ -958,6 +1038,43 @@ class GrantLedger:
             raise GrantDeniedError(
                 "TASK_STATE_NOT_AUTHORIZABLE",
                 "the task is no longer in a state that carries live user consent",
+            )
+
+    def _check_fresh_consent(self, connection: sqlite3.Connection, task_id: UUID) -> None:
+        """S4-7: the store's own fresh-consent predicate, inside this transaction.
+
+        Called inside the same transaction as the grant write or the use
+        decrement. It delegates to ``SQLiteTaskStore.is_stage2_preview_blocked``
+        — the existing Stage 2 semantics that read ``task_events`` for an
+        ``APPROVAL_PREVIEW_REVOKED`` (or any event marked
+        ``requires_fresh_plan_and_consent``) after the latest saved plan. That
+        predicate reads through the store's connection, which in shared mode is
+        the transaction's connection, so an uncommitted revocation/REVISE is
+        visible here and a revocation that lands later is caught by the next
+        write. No second consent system is implemented.
+        """
+
+        store = self._store
+        if store is None:
+            raise GrantDeniedError(
+                "CONSENT_AUTHORITY_UNAVAILABLE",
+                "fresh-consent state is only verifiable through the owning task store",
+            )
+        if store._connection is not connection:
+            raise GrantDeniedError(
+                "CONSENT_AUTHORITY_UNAVAILABLE",
+                "fresh-consent state must be read inside the grant transaction",
+            )
+        try:
+            blocked = store.is_stage2_preview_blocked(task_id)
+        except Exception as exc:  # fail closed on unreadable audit state
+            raise GrantDeniedError(
+                "CONSENT_AUTHORITY_UNAVAILABLE", "fresh-consent state could not be verified"
+            ) from exc
+        if blocked:
+            raise GrantDeniedError(
+                "CONSENT_INVALIDATED",
+                "fresh plan and consent are required before this grant can be written or used",
             )
 
     def _grant_view(
@@ -1156,6 +1273,20 @@ class GrantLedger:
         else:
             self._connection.execute("COMMIT")
 
+    @contextmanager
+    def _read(self) -> Iterator[sqlite3.Connection]:
+        """Read guard for every public read path (S4-8).
+
+        Reads refuse a closed ledger, and on the shared connection they must
+        serialize with the store's writes. In shared mode ``self._lock`` *is* the
+        store's lock (adopted in :meth:`open`), so the caller's surrounding
+        ``with self._lock`` already excludes an uncommitted task/grant write
+        performed by another thread inside the store's transaction.
+        """
+
+        self._require_open()
+        yield self._connection
+
     def _require_open(self) -> None:
         if self._closed:
             raise GrantUnavailableError("grant ledger is closed")
@@ -1163,7 +1294,7 @@ class GrantLedger:
     def events(self, approval_id: UUID) -> tuple[tuple[int, str, str | None, dict[str, Any]], ...]:
         """Read-only audit view used by tests and recovery verification."""
 
-        with self._lock:
+        with self._lock, self._read():
             rows = self._connection.execute(
                 "SELECT grant_seq, event, reason_code, detail_json, created_at "
                 "FROM exact_approval_grant_events WHERE approval_id = ? ORDER BY grant_seq",

@@ -10,6 +10,18 @@ task, plan revision/hash, preview identity, approved-scope digest, issuer
 identity and freshness window. Trust is decided by an **injected verifier**,
 never by Python class identity or inheritance.
 
+Two independent conditions are required before anything is persisted:
+
+1. the attestation verifier accepts the claim (who authorized, and for what);
+2. the **authoritative preview source** confirms that the claimed preview
+   identity is the one the backend actually produced for this exact plan
+   revision — a preview carried inside the attestation object is only a claim.
+
+:meth:`GrantIssuer.issue` is the sole authorization path. On success it mints a
+single-use :class:`~aether.core.grants.ledger.IssuancePermit`, which is the only
+argument the ledger's private storage primitive accepts. There is therefore no
+production-capable write entry point that can bypass either decision.
+
 Fail-closed prerequisites enforced here, in order:
 
 1. an attestation exists and its verifier is configured (production ships a
@@ -44,13 +56,16 @@ from aether.core.contracts.approval import (
 )
 from aether.core.contracts.policy import RiskTier
 from aether.core.grants.attestation import (
+    PRODUCTION_PREVIEW_AUTHORITY,
     AttestationRejected,
     AttestationVerifier,
     AuthorizationAttestation,
     IssuanceBinding,
+    PreviewAuthority,
+    PreviewSourceUnavailable,
 )
 from aether.core.grants.errors import GrantIssuanceDenied
-from aether.core.grants.ledger import GrantLedger
+from aether.core.grants.ledger import GrantLedger, IssuancePermit
 from aether.core.grants.models import GrantIssuanceOutcome
 from aether.core.persistence import PersistentTaskState
 from aether.core.persistence.models import PlanStep, TaskPlan, _thaw_json
@@ -98,10 +113,14 @@ class GrantIssuer:
         store: SQLiteTaskStore,
         ledger: GrantLedger,
         attestations: AttestationVerifier,
+        previews: PreviewAuthority | None = None,
     ) -> None:
         self._store = store
         self._ledger = ledger
         self._attestations = attestations
+        # Production default has no preview source, so preview identity cannot
+        # be verified and issuance stays disabled.
+        self._previews: PreviewAuthority = previews or PRODUCTION_PREVIEW_AUTHORITY
 
     def issue(
         self,
@@ -182,12 +201,56 @@ class GrantIssuer:
             issued_at=grant.issued_at,
             expires_at=grant.expires_at,
         )
-        return self._ledger.issue(
+        self._check_authoritative_preview(attestation, grant=grant)
+        permit = IssuancePermit._mint(scope_digest=scope_digest, issued_by=attestation.authority_id)
+        return self._ledger._persist_verified_grant(
             grant,
+            permit=permit,
             scope_digest=scope_digest,
             issuance_key=attestation.authorization_id,
             issued_by=attestation.authority_id,
         )
+
+    def _check_authoritative_preview(
+        self, attestation: AuthorizationAttestation, *, grant: ExactApprovalGrant
+    ) -> None:
+        """S4-6: the claimed preview must equal the authoritative preview.
+
+        The preview identity inside the attestation is a claim; only the
+        injected preview source can confirm it. With the production default
+        there is no preview source, so this raises and issuance stays disabled
+        rather than silently skipping the check.
+        """
+
+        try:
+            authoritative = self._previews.resolve(
+                task_id=grant.task_id,
+                plan_revision=grant.plan_revision,
+                plan_hash=grant.plan_hash,
+            )
+        except PreviewSourceUnavailable as exc:
+            raise GrantIssuanceDenied(exc.reason_code, str(exc)) from exc
+        except Exception as exc:  # fail closed on any preview-source failure
+            raise GrantIssuanceDenied(
+                "PREVIEW_SOURCE_UNAVAILABLE", "authoritative preview resolution failed"
+            ) from exc
+        if (
+            authoritative.task_id != grant.task_id
+            or authoritative.plan_revision != grant.plan_revision
+            or authoritative.plan_hash.casefold() != grant.plan_hash.casefold()
+        ):
+            raise GrantIssuanceDenied(
+                "PREVIEW_SOURCE_MISMATCH",
+                "authoritative preview belongs to a different task or plan revision",
+            )
+        if (
+            authoritative.preview_id != attestation.preview_id
+            or authoritative.preview_digest != attestation.preview_digest
+        ):
+            raise GrantIssuanceDenied(
+                "PREVIEW_IDENTITY_MISMATCH",
+                "attestation does not cover the authoritative preview that was shown",
+            )
 
     # ------------------------------------------------------------------
     # Internal checks

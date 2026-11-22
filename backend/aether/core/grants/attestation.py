@@ -70,6 +70,8 @@ class AuthorizationAttestation(BaseModel):
     plan_revision: int = Field(ge=1)
     plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     # The preview identity the user actually saw, and its canonical digest.
+    # Verified against the authoritative preview source by the issuer; being
+    # present in this object is never itself evidence.
     preview_id: UUID
     preview_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
     # Digest of the exact approved operations scope this attestation covers.
@@ -126,6 +128,64 @@ class IssuanceBinding:
     expires_at: datetime
     uses_remaining: int
     max_tier: int
+
+
+class AuthoritativePreview(BaseModel):
+    """The preview identity the *backend* knows was shown for a plan revision.
+
+    This is resolved from an authoritative preview source, never from an
+    attestation object: an attestation may only *claim* a preview identity, and
+    the issuer requires the claim to equal the authoritative one.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    task_id: UUID
+    plan_revision: int = Field(ge=1)
+    plan_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    preview_id: UUID
+    preview_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class PreviewSourceUnavailable(Exception):
+    """No authoritative preview source is configured; issuance must stay disabled."""
+
+    def __init__(self, reason_code: str, message: str) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+
+
+class PreviewAuthority(Protocol):
+    """Resolves the authoritative preview for one persisted plan revision."""
+
+    @property
+    def authority_id(self) -> str:
+        """Opaque identifier of the preview source."""
+
+    def resolve(self, *, task_id: UUID, plan_revision: int, plan_hash: str) -> AuthoritativePreview:
+        """Return the authoritative preview; raise :class:`PreviewSourceUnavailable`."""
+
+
+class NullPreviewAuthority:
+    """The only preview authority this package ships: it has no preview source.
+
+    The production planner/preview source does not exist yet, so preview
+    identity cannot be verified and production issuance stays disabled. This is
+    stated explicitly rather than skipped.
+    """
+
+    authority_id = "none"
+
+    def resolve(self, *, task_id: UUID, plan_revision: int, plan_hash: str) -> AuthoritativePreview:
+        del task_id, plan_revision, plan_hash
+        raise PreviewSourceUnavailable(
+            "PREVIEW_SOURCE_UNAVAILABLE",
+            "no authoritative preview source is configured; preview identity cannot be "
+            "verified and production issuance is disabled",
+        )
+
+
+PRODUCTION_PREVIEW_AUTHORITY: PreviewAuthority = NullPreviewAuthority()
 
 
 class AttestationVerifier(Protocol):

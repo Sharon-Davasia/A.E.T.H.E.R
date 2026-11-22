@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -31,9 +34,12 @@ from aether.core.contracts.receipt import RecoveryClass
 from aether.core.contracts.tool import ToolRequest
 from aether.core.grants.attestation import (
     PRODUCTION_ATTESTATION_VERIFIER,
+    PRODUCTION_PREVIEW_AUTHORITY,
     AttestationRejected,
     AuthorizationAttestation,
     NullAttestationVerifier,
+    NullPreviewAuthority,
+    PreviewSourceUnavailable,
 )
 from aether.core.grants.authority import GrantAuthority, GrantRequest
 from aether.core.grants.errors import (
@@ -48,6 +54,7 @@ from aether.core.grants.errors import (
 from aether.core.grants.issuance import GrantIssuer
 from aether.core.grants.ledger import (
     GrantLedger,
+    IssuancePermit,
     consumption_action_digest,
     issuance_intent_digest,
 )
@@ -61,9 +68,11 @@ from tests.stage4_support import (
     NOW,
     T2_CAPABILITY,
     SimulatedAttestationVerifier,
+    SimulatedPreviewAuthority,
     SyntheticT2Plan,
     apply_proposed_migration_raw,
     make_attestation,
+    persist_with_permit,
     sha256_json,
     stage4_store,
 )
@@ -98,24 +107,47 @@ def _scope_digest(world: SyntheticT2Plan, **grant_overrides: object) -> str:
     return exact_approval_scope_digest(ExactApprovalGrant(**fields))  # type: ignore[arg-type]
 
 
-def _attestation(world: SyntheticT2Plan, **overrides: object) -> AuthorizationAttestation:
+def _previews(world: SyntheticT2Plan) -> SimulatedPreviewAuthority:
+    """Publish the authoritative preview for this plan and return the source."""
+
+    source = SimulatedPreviewAuthority()
+    world.publish_preview(source)
+    return source
+
+
+def _attestation(
+    world: SyntheticT2Plan,
+    *,
+    previews: SimulatedPreviewAuthority | None = None,
+    **overrides: object,
+) -> AuthorizationAttestation:
+    source = previews if previews is not None else _previews(world)
+    authoritative = source.resolve(
+        task_id=world.task_id, plan_revision=world.revision, plan_hash=world.plan_hash
+    )
     fields: dict[str, object] = {
         "task_id": world.task_id,
         "plan_revision": world.revision,
         "plan_hash": world.plan_hash,
         "scope_digest": _scope_digest(world),
+        "preview_id": authoritative.preview_id,
+        "preview_digest": authoritative.preview_digest,
     }
     fields.update(overrides)
     return make_attestation(**fields)  # type: ignore[arg-type]
 
 
 def _issuer(
-    store: SQLiteTaskStore, ledger: GrantLedger, verifier: object | None = None
+    store: SQLiteTaskStore,
+    ledger: GrantLedger,
+    verifier: object | None = None,
+    previews: object | None = None,
 ) -> GrantIssuer:
     return GrantIssuer(
         store=store,
         ledger=ledger,
         attestations=verifier if verifier is not None else SimulatedAttestationVerifier(),  # type: ignore[arg-type]
+        previews=previews if previews is not None else SimulatedPreviewAuthority(),  # type: ignore[arg-type]
     )
 
 
@@ -131,6 +163,7 @@ def _issue(
     lifetime: timedelta | None = None,
     attestation: object = _NO_ATTESTATION,
     verifier: object | None = None,
+    previews: SimulatedPreviewAuthority | None = None,
     **overrides: object,
 ):
     kwargs = world.issue_kwargs()
@@ -139,8 +172,14 @@ def _issue(
         kwargs["issued_at"] = NOW
         kwargs["expires_at"] = NOW + lifetime
     kwargs.update(overrides)
-    presented = _attestation(world) if attestation is _NO_ATTESTATION else attestation
-    return _issuer(store, ledger, verifier).issue(attestation=presented, **kwargs)  # type: ignore[arg-type]
+    source = previews if previews is not None else _previews(world)
+    presented = (
+        _attestation(world, previews=source) if attestation is _NO_ATTESTATION else attestation
+    )
+    return _issuer(store, ledger, verifier, previews=source).issue(
+        attestation=presented,
+        **kwargs,  # type: ignore[arg-type]
+    )
 
 
 def _consume_kwargs(world: SyntheticT2Plan, **overrides: object) -> dict[str, object]:
@@ -294,12 +333,16 @@ def test_production_verifier_denies_all_issuance(tmp_path, monkeypatch) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     with GrantLedger.open(store) as ledger:
+        previews = _previews(world)
         issuer = GrantIssuer(
-            store=store, ledger=ledger, attestations=PRODUCTION_ATTESTATION_VERIFIER
+            store=store,
+            ledger=ledger,
+            attestations=PRODUCTION_ATTESTATION_VERIFIER,
+            previews=previews,
         )
         # Even a claim that looks internally consistent cannot issue.
         with pytest.raises(GrantIssuanceDenied) as denied:
-            issuer.issue(attestation=_attestation(world), **world.issue_kwargs())
+            issuer.issue(attestation=_attestation(world, previews=previews), **world.issue_kwargs())
         assert denied.value.reason_code == "AUTHORIZATION_SOURCE_NOT_TRUSTED"
         with pytest.raises(GrantNotFoundError):
             ledger.load(world.approval_id)
@@ -353,7 +396,8 @@ def test_attestation_must_bind_this_exact_authorization(
 ) -> None:
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
-    claim = _attestation(world, **overrides)
+    previews = _previews(world)
+    claim = _attestation(world, previews=previews, **overrides)
     with GrantLedger.open(store) as ledger:
         with pytest.raises(GrantIssuanceDenied) as denied:
             _issue(store, ledger, world, attestation=claim)
@@ -392,8 +436,10 @@ def test_attestation_from_another_task_cannot_authorize(tmp_path, monkeypatch) -
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     other = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    previews = _previews(world)
     foreign = _attestation(
         world,
+        previews=previews,
         task_id=other.task_id,
         plan_revision=other.revision,
         plan_hash=other.plan_hash,
@@ -530,13 +576,17 @@ def test_supplied_scope_digest_is_verified_independently(tmp_path, monkeypatch) 
         approval_origin="trusted-electron",
     )
     with GrantLedger.open(store) as ledger:
-        with pytest.raises(GrantIntegrityError):
-            ledger.issue(
+        # S4-6: the ledger's storage primitive refuses anything but a permit from
+        # the trusted authorization decision, so it cannot be reached directly.
+        with pytest.raises(GrantIssuanceDenied) as direct:
+            ledger._persist_verified_grant(  # type: ignore[attr-defined]
                 grant,
+                permit=object(),  # type: ignore[arg-type]
                 scope_digest="f" * 64,
                 issuance_key=uuid4(),
                 issued_by="test.attestation",
             )
+        assert direct.value.reason_code == "AUTHORIZATION_EVIDENCE_REQUIRED"
         with pytest.raises(GrantNotFoundError):
             ledger.load(world.approval_id)
     store.close()
@@ -577,7 +627,8 @@ def test_replay_with_changed_authorization_terms_is_a_conflict(
     }
     with GrantLedger.open(store) as ledger:
         original = build()
-        ledger.issue(
+        persist_with_permit(
+            ledger,
             original,
             scope_digest=exact_approval_scope_digest(original),
             issuance_key=key,
@@ -585,7 +636,8 @@ def test_replay_with_changed_authorization_terms_is_a_conflict(
         )
         changed = build(**{field: changed_values[field]})
         with pytest.raises((GrantConflictError, GrantIntegrityError)):
-            ledger.issue(
+            persist_with_permit(
+                ledger,
                 changed,
                 scope_digest=exact_approval_scope_digest(changed),
                 issuance_key=key,
@@ -618,12 +670,16 @@ def test_replay_with_changed_issuer_identity_is_a_conflict(tmp_path, monkeypatch
     )
     digest = exact_approval_scope_digest(grant)
     with GrantLedger.open(store) as ledger:
-        ledger.issue(grant, scope_digest=digest, issuance_key=key, issued_by="test.attestation")
+        persist_with_permit(
+            ledger, grant, scope_digest=digest, issuance_key=key, issued_by="test.attestation"
+        )
         with pytest.raises(GrantConflictError):
-            ledger.issue(grant, scope_digest=digest, issuance_key=key, issued_by="test.other")
+            persist_with_permit(
+                ledger, grant, scope_digest=digest, issuance_key=key, issued_by="test.other"
+            )
         # Same identity and identical terms is still a legitimate retry.
-        retry = ledger.issue(
-            grant, scope_digest=digest, issuance_key=key, issued_by="test.attestation"
+        retry = persist_with_permit(
+            ledger, grant, scope_digest=digest, issuance_key=key, issued_by="test.attestation"
         )
         assert retry.replayed is True
     store.close()
@@ -823,13 +879,23 @@ def test_issued_grant_is_denied_after_the_plan_advances(tmp_path, monkeypatch) -
         assert (check.ok, check.reason_code) == (False, "GRANT_PLAN_SUPERSEDED")
 
         # A grant for the *new* revision is still a separate authorization.
+        revised_plan = store.get_plan(world.task_id)
+        source = SimulatedPreviewAuthority()
+        source.publish(revised_plan)
+        revised_preview = source.resolve(
+            task_id=world.task_id,
+            plan_revision=revised_plan.revision,
+            plan_hash=revised_plan.plan_hash,
+        )
         new_attestation = make_attestation(
             task_id=world.task_id,
             plan_revision=world.revision + 1,
             plan_hash=new_hash,
             scope_digest=_scope_digest(world, plan_revision=world.revision + 1, plan_hash=new_hash),
+            preview_id=revised_preview.preview_id,
+            preview_digest=revised_preview.preview_digest,
         )
-        outcome = _issuer(store, ledger).issue(
+        outcome = _issuer(store, ledger, previews=source).issue(
             attestation=new_attestation,
             **{
                 **world.issue_kwargs(),
@@ -1415,13 +1481,13 @@ def test_expired_revoked_exhausted_or_absent_grants_deny(tmp_path, monkeypatch, 
     now = NOW
     if reason == "expired":
         now = LATER + timedelta(seconds=1)
-        authority: GrantAuthority = GrantAuthority(ledger)
+        authority: GrantAuthority = GrantAuthority(ledger, store=store)
     elif reason == "revoked":
         ledger.revoke(world.approval_id, reason_code="ADMINISTRATIVE", now=NOW)
-        authority = GrantAuthority(ledger)
+        authority = GrantAuthority(ledger, store=store)
     elif reason == "exhausted":
         ledger.consume(**_consume_kwargs(world))
-        authority = GrantAuthority(ledger)
+        authority = GrantAuthority(ledger, store=store)
     else:
         ledger.close()
         authority = GrantAuthority(None)
@@ -1447,7 +1513,7 @@ def test_grant_authority_rejects_unknown_and_forged_grant_ids(tmp_path, monkeypa
     store = stage4_store(tmp_path, monkeypatch)
     world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
     with GrantLedger.open(store) as ledger:
-        check = GrantAuthority(ledger).check_action(
+        check = GrantAuthority(ledger, store=store).check_action(
             _tool_request(world, _dummy_ref(world)),
             _grant_request(world, approval_id=uuid4()),
             risk_tier=RiskTier.MODIFY,
@@ -1613,22 +1679,39 @@ def test_synthetic_preview_review_cannot_produce_a_grant(tmp_path, monkeypatch) 
         store.record_approval_decision(world.decision(value="APPROVE"))
         with pytest.raises(GrantIssuanceDenied):
             _issue(store, ledger, world, attestation=None)
+        previews = _previews(world)
         with pytest.raises(GrantIssuanceDenied) as denied:
             GrantIssuer(
-                store=store, ledger=ledger, attestations=PRODUCTION_ATTESTATION_VERIFIER
-            ).issue(attestation=_attestation(world), **world.issue_kwargs())
+                store=store,
+                ledger=ledger,
+                attestations=PRODUCTION_ATTESTATION_VERIFIER,
+                previews=previews,
+            ).issue(attestation=_attestation(world, previews=previews), **world.issue_kwargs())
         assert denied.value.reason_code == "AUTHORIZATION_SOURCE_NOT_TRUSTED"
     store.close()
 
 
 def test_no_production_module_issues_grants_or_exposes_ipc() -> None:
+    """S4-6: no production module outside the grant package can issue or store.
+
+    Neither the issuer, the attestation model, the storage primitive nor the
+    single-use permit may be referenced elsewhere, so there is no second
+    production-capable path into the ledger.
+    """
+
     backend = Path(__file__).parents[1]
+    markers = (
+        "GrantIssuer(",
+        "AuthorizationAttestation(",
+        "_persist_verified_grant",
+        "IssuancePermit",
+    )
     offenders: list[str] = []
     for path in (backend / "aether").rglob("*.py"):
         if "core/grants" in path.as_posix():
             continue
         text = path.read_text(encoding="utf-8")
-        if "GrantIssuer(" in text or "AuthorizationAttestation(" in text:
+        if any(marker in text for marker in markers):
             offenders.append(path.relative_to(backend).as_posix())
     assert offenders == []
 
@@ -1642,3 +1725,591 @@ def test_attestation_rejected_is_a_fail_closed_error() -> None:
             raise AttestationRejected("AUTHORIZATION_SOURCE_NOT_TRUSTED", "no")
 
     assert not isinstance(Rejecting(), NullAttestationVerifier)
+
+
+# ---------------------------------------------------------------------------
+# G. S4-6 — separation of authorization from storage
+# ---------------------------------------------------------------------------
+
+
+def test_no_ledger_entry_point_can_persist_a_grant_without_authorization(
+    tmp_path, monkeypatch
+) -> None:
+    """S4-6: storage refuses every direct write, so issuance cannot be bypassed."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    grant = ExactApprovalGrant(
+        approval_id=world.approval_id,
+        task_id=world.task_id,
+        plan_revision=world.revision,
+        plan_hash=world.plan_hash,
+        operations=(world.operation,),
+        max_tier=RiskTier.MODIFY,
+        issued_at=NOW,
+        expires_at=LATER,
+        approval_origin="trusted-electron",
+    )
+    digest = exact_approval_scope_digest(grant)
+    with GrantLedger.open(store) as ledger:
+        # The old public write entry point is gone entirely.
+        assert not hasattr(ledger, "issue")
+
+        # No ordinary caller-created object stands in for the permit: not an
+        # instance of the permit type, a subclass, a namespace, or None.
+        class FakePermit:
+            """Looks like a permit, is not one: class identity buys nothing."""
+
+            def _claim(self, **kwargs: object) -> None:
+                del kwargs
+
+        for forgery in (
+            None,
+            object(),
+            SimpleNamespace(),
+            type("Permit", (), {})(),
+            FakePermit(),
+        ):
+            with pytest.raises(GrantIssuanceDenied) as denied:
+                ledger._persist_verified_grant(  # type: ignore[attr-defined]
+                    grant,
+                    permit=forgery,  # type: ignore[arg-type]
+                    scope_digest=digest,
+                    issuance_key=uuid4(),
+                    issued_by="test.attestation",
+                )
+            assert denied.value.reason_code == "AUTHORIZATION_EVIDENCE_REQUIRED"
+        with pytest.raises(GrantNotFoundError):
+            ledger.load(world.approval_id)
+        assert ledger.list_consumptions(world.approval_id) == ()
+    store.close()
+
+
+def test_permit_subclass_cannot_inherit_authorization_and_override_is_ignored(
+    tmp_path, monkeypatch
+) -> None:
+    """S4-6: inheritance is not an authentication boundary."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    grant = ExactApprovalGrant(
+        approval_id=world.approval_id,
+        task_id=world.task_id,
+        plan_revision=world.revision,
+        plan_hash=world.plan_hash,
+        operations=(world.operation,),
+        max_tier=RiskTier.MODIFY,
+        issued_at=NOW,
+        expires_at=LATER,
+        approval_origin="trusted-electron",
+    )
+    digest = exact_approval_scope_digest(grant)
+
+    class ForgedPermit(IssuancePermit):
+        def _claim(self, **kwargs: object) -> None:  # pragma: no cover - never called
+            del kwargs
+
+    with GrantLedger.open(store) as ledger:
+        forged = object.__new__(ForgedPermit)
+        forged._scope_digest = digest  # type: ignore[attr-defined]
+        forged._issuer = "test.attestation"  # type: ignore[attr-defined]
+        forged._consumed = False  # type: ignore[attr-defined]
+        with pytest.raises(GrantIssuanceDenied) as denied:
+            ledger._persist_verified_grant(  # type: ignore[attr-defined]
+                grant,
+                permit=forged,
+                scope_digest=digest,
+                issuance_key=uuid4(),
+                issued_by="test.attestation",
+            )
+        assert denied.value.reason_code == "AUTHORIZATION_EVIDENCE_REQUIRED"
+        with pytest.raises(GrantNotFoundError):
+            ledger.load(world.approval_id)
+    store.close()
+
+
+def test_issuance_permit_is_single_use_and_bound_to_its_scope(tmp_path, monkeypatch) -> None:
+    """S4-6: even a genuine permit authorizes exactly one exact write."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    grant = ExactApprovalGrant(
+        approval_id=world.approval_id,
+        task_id=world.task_id,
+        plan_revision=world.revision,
+        plan_hash=world.plan_hash,
+        operations=(world.operation,),
+        max_tier=RiskTier.MODIFY,
+        issued_at=NOW,
+        expires_at=LATER,
+        approval_origin="trusted-electron",
+    )
+    digest = exact_approval_scope_digest(grant)
+    with GrantLedger.open(store) as ledger:
+        permit = IssuancePermit._mint(scope_digest=digest, issued_by="test.attestation")
+        ledger._persist_verified_grant(  # type: ignore[attr-defined]
+            grant,
+            permit=permit,
+            scope_digest=digest,
+            issuance_key=uuid4(),
+            issued_by="test.attestation",
+        )
+        with pytest.raises(GrantIssuanceDenied) as reused:
+            ledger._persist_verified_grant(  # type: ignore[attr-defined]
+                grant,
+                permit=permit,
+                scope_digest=digest,
+                issuance_key=uuid4(),
+                issued_by="test.attestation",
+            )
+        assert reused.value.reason_code == "ISSUANCE_PERMIT_ALREADY_USED"
+        # A permit for a different scope cannot be re-pointed at this grant.
+        other = IssuancePermit._mint(scope_digest="c" * 64, issued_by="test.attestation")
+        with pytest.raises(GrantIssuanceDenied) as mismatched:
+            ledger._persist_verified_grant(  # type: ignore[attr-defined]
+                grant,
+                permit=other,
+                scope_digest=digest,
+                issuance_key=uuid4(),
+                issued_by="test.attestation",
+            )
+        assert mismatched.value.reason_code == "ISSUANCE_PERMIT_MISMATCH"
+        # A permit is also not transferable to a different authorization identity.
+        third = IssuancePermit._mint(scope_digest=digest, issued_by="test.other")
+        with pytest.raises(GrantIssuanceDenied) as untrusted:
+            ledger._persist_verified_grant(  # type: ignore[attr-defined]
+                grant,
+                permit=third,
+                scope_digest=digest,
+                issuance_key=uuid4(),
+                issued_by="test.attestation",
+            )
+        assert untrusted.value.reason_code == "ISSUANCE_PERMIT_MISMATCH"
+    store.close()
+
+
+def test_production_default_has_no_preview_source_and_stays_disabled(tmp_path, monkeypatch) -> None:
+    """S4-6: without authoritative preview evidence, issuance is explicitly disabled."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    assert isinstance(PRODUCTION_PREVIEW_AUTHORITY, NullPreviewAuthority)
+    with pytest.raises(PreviewSourceUnavailable) as unavailable:
+        PRODUCTION_PREVIEW_AUTHORITY.resolve(
+            task_id=world.task_id, plan_revision=world.revision, plan_hash=world.plan_hash
+        )
+    assert unavailable.value.reason_code == "PREVIEW_SOURCE_UNAVAILABLE"
+    with GrantLedger.open(store) as ledger:
+        # Preview-verified attestation is not available in production, because
+        # a claim carried in the attestation object is never evidence.
+        issuer = GrantIssuer(
+            store=store, ledger=ledger, attestations=SimulatedAttestationVerifier()
+        )
+        with pytest.raises(GrantIssuanceDenied) as denied:
+            issuer.issue(attestation=_attestation(world), **world.issue_kwargs())
+        assert denied.value.reason_code == "PREVIEW_SOURCE_UNAVAILABLE"
+        with pytest.raises(GrantNotFoundError):
+            ledger.load(world.approval_id)
+    store.close()
+
+
+def test_forged_preview_identity_is_rejected_against_authoritative_evidence(
+    tmp_path, monkeypatch
+) -> None:
+    """S4-6: the attestation's preview id/digest is only a claim until verified."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    previews = _previews(world)
+    authoritative = previews.resolve(
+        task_id=world.task_id, plan_revision=world.revision, plan_hash=world.plan_hash
+    )
+
+    for overrides, reason in [
+        ({"preview_digest": "b" * 64}, "PREVIEW_IDENTITY_MISMATCH"),
+        ({"preview_id": uuid4()}, "PREVIEW_IDENTITY_MISMATCH"),
+    ]:
+        with GrantLedger.open(store) as ledger:
+            with pytest.raises(GrantIssuanceDenied) as denied:
+                _issue(
+                    store,
+                    ledger,
+                    world,
+                    attestation=_attestation(world, previews=previews, **overrides),
+                    previews=previews,
+                )
+            assert denied.value.reason_code == reason
+            with pytest.raises(GrantNotFoundError):
+                ledger.load(world.approval_id)
+
+    # A preview that is real, but authoritative for a *different* task, is
+    # refused as well: the source, not the claim, decides the identity.
+    assert authoritative.preview_id is not None
+
+    class ForeignPreview:
+        def resolve(self, **kwargs: object):
+            del kwargs
+            return authoritative.model_copy(update={"task_id": uuid4()})
+
+    with GrantLedger.open(store) as ledger:
+        with pytest.raises(GrantIssuanceDenied) as denied:
+            _issue(
+                store,
+                ledger,
+                world,
+                attestation=_attestation(world, previews=previews),
+                previews=ForeignPreview(),
+            )
+        assert denied.value.reason_code == "PREVIEW_SOURCE_MISMATCH"
+        with pytest.raises(GrantNotFoundError):
+            ledger.load(world.approval_id)
+    store.close()
+
+
+def test_verified_preview_identity_is_required_for_successful_issuance(
+    tmp_path, monkeypatch
+) -> None:
+    """S4-6: the positive path proves the check is a real gate, not a skip."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    previews = _previews(world)
+    with GrantLedger.open(store) as ledger:
+        outcome = _issue(store, ledger, world, previews=previews)
+        assert outcome.replayed is False
+        stored = ledger.load(world.approval_id)
+        authoritative = previews.resolve(
+            task_id=world.task_id, plan_revision=world.revision, plan_hash=world.plan_hash
+        )
+        assert stored.plan_hash == authoritative.plan_hash
+    store.close()
+
+
+def test_preview_source_failures_fail_closed(tmp_path, monkeypatch) -> None:
+    """S4-6: an unavailable or exploding preview source never authorizes."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+
+    class Exploding:
+        def resolve(self, **kwargs):
+            del kwargs
+            raise RuntimeError("preview backend unreachable")
+
+    previews = _previews(world)
+    with GrantLedger.open(store) as ledger:
+        with pytest.raises(GrantIssuanceDenied) as denied:
+            _issue(
+                store,
+                ledger,
+                world,
+                attestation=_attestation(world, previews=previews),
+                previews=Exploding(),
+            )
+        assert denied.value.reason_code == "PREVIEW_SOURCE_UNAVAILABLE"
+        with pytest.raises(GrantNotFoundError):
+            ledger.load(world.approval_id)
+    store.close()
+
+
+# ---------------------------------------------------------------------------
+# H. S4-7 — fresh consent inside the writing transaction
+# ---------------------------------------------------------------------------
+
+
+def _revoke_preview(store: SQLiteTaskStore, world: SyntheticT2Plan) -> None:
+    """Record a non-authorizing preview revocation (Stage 2 semantics)."""
+
+    store.record_preview_revocation(
+        world.task_id,
+        plan_revision=world.revision,
+        plan_hash=world.plan_hash,
+        preview_id=uuid4(),
+        preview_digest="a" * 64,
+        revocation_id=uuid4(),
+        now=NOW,
+    )
+
+
+def test_revocation_between_issuance_precheck_and_transaction_denies(tmp_path, monkeypatch) -> None:
+    """S4-7: a revocation landing after the pre-check still blocks the write.
+
+    The task still has a live plan and consent-bearing state, so only the
+    in-transaction check can deny; nothing may be written.
+    """
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    previews = _previews(world)
+    transaction_checks: list[str] = []
+    connection_in_transaction: list[object] = [None]
+    with GrantLedger.open(store) as ledger:
+        original_consent_check = GrantLedger._check_fresh_consent
+
+        def recording_consent_check(self, connection, task_id):  # type: ignore[no-untyped-def]
+            transaction_checks.append(
+                "in_transaction" if connection is connection_in_transaction[0] else "other"
+            )
+            return original_consent_check(self, connection, task_id)
+
+        original_transaction = ledger._transaction
+
+        @contextmanager
+        def recording_transaction():  # type: ignore[no-untyped-def]
+            with original_transaction() as connection:
+                connection_in_transaction[0] = connection
+                yield connection
+
+        monkeypatch.setattr(ledger, "_transaction", recording_transaction)
+        monkeypatch.setattr(GrantLedger, "_check_fresh_consent", recording_consent_check)
+        original_preview_check = GrantIssuer._check_authoritative_preview
+
+        def revoke_after_precheck(self, attestation, *, grant):  # type: ignore[no-untyped-def]
+            original_preview_check(self, attestation, grant=grant)
+            # Everything else already passed: revoke immediately before the
+            # ledger opens its write transaction.
+            _revoke_preview(store, world)
+            # The pre-check would now fail too, so clear the way: this test is
+            # about the check *inside* the transaction.
+            assert store.is_stage2_preview_blocked(world.task_id) is True
+
+        monkeypatch.setattr(GrantIssuer, "_check_authoritative_preview", revoke_after_precheck)
+        with pytest.raises(GrantDeniedError) as denied:
+            _issue(store, ledger, world, previews=previews)
+        assert denied.value.reason_code == "CONSENT_INVALIDATED"
+        # The denial came from the check inside the write transaction.
+        assert transaction_checks == ["in_transaction"]
+        # No grant row was written by the denied path.
+        with pytest.raises(GrantNotFoundError):
+            ledger.load(world.approval_id)
+        assert ledger.list_consumptions(world.approval_id) == ()
+    store.close()
+
+
+def test_revocation_after_issuance_denies_consumption_without_decrement(
+    tmp_path, monkeypatch
+) -> None:
+    """S4-7: revocation after issuance denies use even with unchanged state/plan."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    with GrantLedger.open(store) as ledger:
+        _issue(store, ledger, world, uses=3)
+        before = ledger.status(world.approval_id, now=NOW)
+        assert before.uses_remaining == 3
+
+        _revoke_preview(store, world)
+        assert store.is_stage2_preview_blocked(world.task_id) is True
+
+        with pytest.raises(GrantDeniedError) as denied:
+            ledger.consume(**_consume_kwargs(world))
+        assert denied.value.reason_code == "CONSENT_INVALIDATED"
+
+        after = ledger.status(world.approval_id, now=NOW)
+        assert after.uses_remaining == 3
+        assert ledger.list_consumptions(world.approval_id) == ()
+
+        # Broker-side validation denies with the same reason, and grants no use.
+        check = GrantAuthority(ledger, store=store).check_action(
+            _tool_request(world, _dummy_ref(world)),
+            _grant_request(world),
+            risk_tier=RiskTier.MODIFY,
+            now=NOW,
+        )
+        assert (check.ok, check.reason_code) == (False, "CONSENT_INVALIDATED")
+    store.close()
+
+
+def test_consent_check_is_shared_with_the_store_not_reimplemented(tmp_path, monkeypatch) -> None:
+    """S4-7: the in-transaction check reuses the store's own event semantics."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    calls: list[object] = []
+    original = store.is_stage2_preview_blocked
+
+    def spy(task_id):  # type: ignore[no-untyped-def]
+        calls.append(task_id)
+        return original(task_id)
+
+    monkeypatch.setattr(store, "is_stage2_preview_blocked", spy)
+    with GrantLedger.open(store) as ledger:
+        _issue(store, ledger, world)
+        after_issuance = len(calls)
+        # Pre-check plus the in-transaction recheck inside the grant write.
+        assert after_issuance == 2, f"issuance consulted the reader {after_issuance} times"
+        ledger.consume(**_consume_kwargs(world))
+        assert len(calls) == 3, "consumption must consult it again inside its transaction"
+    store.close()
+
+
+def test_standalone_ledger_cannot_verify_consent_and_fails_closed(tmp_path, monkeypatch) -> None:
+    """S4-7: without the owning store, consent cannot be verified; deny."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    database = tmp_path / "store.sqlite3"
+    with GrantLedger.open(store) as ledger:
+        _issue(store, ledger, world)
+    store.close()
+
+    standalone = GrantLedger(database)
+    try:
+        with pytest.raises(GrantDeniedError) as denied:
+            standalone.consume(**_consume_kwargs(world))
+        assert denied.value.reason_code == "CONSENT_AUTHORITY_UNAVAILABLE"
+        assert standalone.status(world.approval_id, now=NOW).uses_remaining == 1
+        assert standalone.list_consumptions(world.approval_id) == ()
+    finally:
+        standalone.close()
+
+
+# ---------------------------------------------------------------------------
+# I. S4-8 — current-plan authority is mandatory; reads are serialized
+# ---------------------------------------------------------------------------
+
+
+def test_grant_authority_without_store_fails_closed(tmp_path, monkeypatch) -> None:
+    """S4-8: missing current-plan authority can never report success."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    with GrantLedger.open(store) as ledger:
+        _issue(store, ledger, world)
+        check = GrantAuthority(ledger).check_action(
+            _tool_request(world, _dummy_ref(world)),
+            _grant_request(world),
+            risk_tier=RiskTier.MODIFY,
+            now=NOW,
+        )
+        assert (check.ok, check.reason_code) == (
+            False,
+            "GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED",
+        )
+        # Supplying the store makes the very same check succeed, so the missing
+        # store is a real gate rather than an incidental failure.
+        ok_check = GrantAuthority(ledger, store=store).check_action(
+            _tool_request(world, _dummy_ref(world)),
+            _grant_request(world),
+            risk_tier=RiskTier.MODIFY,
+            now=NOW,
+        )
+        assert ok_check.ok is True
+    store.close()
+
+
+def test_historical_grant_denies_after_supersession_without_store(tmp_path, monkeypatch) -> None:
+    """S4-8: a store-less authority denies instead of trusting a stale plan."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    with GrantLedger.open(store) as ledger:
+        _issue(store, ledger, world, uses=2)
+        _advance_plan(store, world)
+        check = GrantAuthority(ledger).check_action(
+            _tool_request(world, _dummy_ref(world)),
+            _grant_request(world),
+            risk_tier=RiskTier.MODIFY,
+            now=NOW,
+        )
+        assert check.ok is False
+        assert check.reason_code == "GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED"
+    store.close()
+
+
+def test_shared_connection_reads_take_the_store_lock(tmp_path, monkeypatch) -> None:
+    """S4-8: ledger reads use the store's own lock, so they serialize with writes."""
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    with GrantLedger.open(store) as ledger:
+        assert ledger._lock is store._lock, "shared mode must use the store's mechanism"
+        _issue(store, ledger, world)
+
+        completed = threading.Event()
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_store_lock() -> None:
+            with store._lock:
+                lock_held.set()
+                assert release_lock.wait(timeout=10)
+
+        def read() -> None:
+            try:
+                ledger.load(world.approval_id)
+            finally:
+                completed.set()
+
+        holder = threading.Thread(target=hold_store_lock)
+        reader = threading.Thread(target=read)
+        holder.start()
+        try:
+            assert lock_held.wait(timeout=10)
+            reader.start()
+            assert completed.wait(timeout=0.5) is False, "read did not take the store lock"
+            release_lock.set()
+            reader.join(timeout=10)
+        finally:
+            release_lock.set()
+            holder.join(timeout=10)
+        assert completed.is_set()
+    store.close()
+
+
+def test_reader_cannot_observe_an_uncommitted_grant_write(tmp_path, monkeypatch) -> None:
+    """S4-8: a concurrent reader is serialized behind the writing transaction.
+
+    While the writer holds a grant insert inside the store's ``BEGIN IMMEDIATE``
+    transaction, a reader on the shared connection must block rather than
+    observe uncommitted task/grant state.
+    """
+
+    store = stage4_store(tmp_path, monkeypatch)
+    world = SyntheticT2Plan(tmp_path / "store.sqlite3", store)
+    ledger = GrantLedger.open(store)
+    previews = _previews(world)
+
+    observed: dict[str, object] = {}
+    writer_inside = threading.Event()
+    release_writer = threading.Event()
+
+    original_consent_check = GrantLedger._check_fresh_consent
+
+    def paused_consent_check(self, connection, task_id):  # type: ignore[no-untyped-def]
+        # Runs inside the write transaction, after the grant row is inserted and
+        # before COMMIT.
+        original_consent_check(self, connection, task_id)
+        writer_inside.set()
+        assert release_writer.wait(timeout=10)
+
+    monkeypatch.setattr(GrantLedger, "_check_fresh_consent", paused_consent_check)
+
+    def reader() -> None:
+        try:
+            ledger.load(world.approval_id)
+            observed["read"] = "found"
+        except GrantNotFoundError:
+            observed["read"] = "missing"
+        except GrantUnavailableError:
+            observed["read"] = "unavailable"
+
+    writer = threading.Thread(target=lambda: _issue(store, ledger, world, previews=previews))
+    reader_thread = threading.Thread(target=reader)
+    writer.start()
+    try:
+        assert writer_inside.wait(timeout=10), "issuance never reached its write transaction"
+        reader_thread.start()
+        reader_thread.join(timeout=0.5)
+        assert reader_thread.is_alive(), "reader was not serialized behind the write transaction"
+        assert observed == {}
+        release_writer.set()
+        writer.join(timeout=15)
+        reader_thread.join(timeout=15)
+    finally:
+        release_writer.set()
+
+    assert observed == {"read": "found"}
+    assert ledger.load(world.approval_id).approval_id == world.approval_id
+    ledger.close()
+    store.close()

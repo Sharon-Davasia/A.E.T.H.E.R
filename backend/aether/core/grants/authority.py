@@ -5,10 +5,12 @@ happens at execution time, which does not exist yet) and never converts review
 evidence into authorization. This module only *validates* a persisted grant
 against one exact proposed action and reports a verdict.
 
-Independent review S4-4: a persisted grant is not evaluated in isolation.
-Validation also requires the task's *current* persisted plan, when a task
-store is supplied, so caller-supplied historical plan identities cannot
-re-authorize an action after the plan moved on.
+Independent review S4-4/S4-8: a persisted grant is never evaluated in
+isolation. Current-plan authority is **mandatory**: without the owning task
+store this authority cannot verify freshness, so it fails closed with
+``GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED`` instead of silently skipping the
+check. Caller-supplied historical plan identities can therefore never
+re-authorize an action after the plan moved on, even by accident.
 """
 
 from __future__ import annotations
@@ -16,8 +18,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import cast
 from uuid import UUID
 
 from aether.core.contracts.policy import RiskTier
@@ -75,9 +79,9 @@ class GrantAuthority:
         # A missing ledger is the production configuration in this phase:
         # grant validation fails closed with GRANT_AUTHORITY_UNAVAILABLE.
         self._ledger = ledger
-        # Optional current-plan authority. When supplied, the task's live state
-        # and current plan pointer are consulted; a grant for a superseded
-        # plan or a task that left consent-bearing states denies.
+        # Current-plan authority is mandatory. Without it, scope verification
+        # could report success for a grant whose plan has been superseded, so
+        # the check below fails closed instead.
         self._store = store
 
     def check_action(
@@ -91,6 +95,13 @@ class GrantAuthority:
         now = now or datetime.now(UTC)
         if self._ledger is None:
             return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", grant_request.approval_id)
+        if self._store is None:
+            # S4-8: no current-plan authority means no success is possible.
+            return GrantCheck(
+                False,
+                "GRANT_CURRENT_PLAN_AUTHORITY_REQUIRED",
+                grant_request.approval_id,
+            )
         try:
             task_id = UUID(str(request.task_id))
         except (ValueError, TypeError, AttributeError):
@@ -100,8 +111,42 @@ class GrantAuthority:
             if not ref.observed_version:
                 return GrantCheck(False, "GRANT_RESOURCE_MISMATCH", grant_request.approval_id)
             resource_versions[ref.resource_id] = ref.observed_version
+        # S4-8: the grant read and the current task/plan/consent read must come
+        # from ONE consistent snapshot. The task store's lock is the same
+        # mechanism that serializes its writes, so holding it here prevents this
+        # authority from seeing uncommitted task or grant state written by
+        # another thread inside the store's transaction.
+        with self._consistent_snapshot():
+            return self._check_with_current_plan(
+                request,
+                grant_request,
+                ledger=self._ledger,
+                task_id=task_id,
+                resource_versions=resource_versions,
+                risk_tier=risk_tier,
+                now=now,
+            )
+
+    def _consistent_snapshot(self) -> AbstractContextManager[None]:
+        store = self._store
+        lock = getattr(store, "_lock", None) if store is not None else None
+        if lock is None:
+            return nullcontext()
+        return cast("AbstractContextManager[None]", lock)
+
+    def _check_with_current_plan(
+        self,
+        request: ToolRequest,
+        grant_request: GrantRequest,
+        *,
+        ledger: GrantLedger,
+        task_id: UUID,
+        resource_versions: dict[str, str],
+        risk_tier: RiskTier,
+        now: datetime,
+    ) -> GrantCheck:
         try:
-            grant = self._ledger.load(grant_request.approval_id)
+            grant = ledger.load(grant_request.approval_id)
         except GrantNotFoundError:
             return GrantCheck(False, "GRANT_NOT_FOUND", grant_request.approval_id)
         except GrantIntegrityError:
@@ -148,11 +193,8 @@ class GrantAuthority:
     ) -> GrantCheck | None:
         """Validate against the task's current persisted plan, when available."""
 
-        store = self._store
-        if store is None:
-            return None
         try:
-            task = store.get_task(task_id)  # type: ignore[attr-defined]
+            task = self._store.get_task(task_id)  # type: ignore[union-attr]
         except KeyError:
             return GrantCheck(False, "TASK_NOT_AVAILABLE", approval_id)
         except Exception:
@@ -164,7 +206,7 @@ class GrantAuthority:
         ):
             return GrantCheck(False, "GRANT_PLAN_SUPERSEDED", approval_id)
         try:
-            if store.is_stage2_preview_blocked(task_id):  # type: ignore[attr-defined]
+            if self._store.is_stage2_preview_blocked(task_id):  # type: ignore[union-attr]
                 return GrantCheck(False, "CONSENT_INVALIDATED", approval_id)
         except Exception:
             return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", approval_id)
