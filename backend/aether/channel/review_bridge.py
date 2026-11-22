@@ -6,6 +6,13 @@ database (Stage 2 keeps full-diff content out of the database entirely), so a
 preview narrative must be supplied by a trusted backend-side source. Two
 sources are supported, checked in this order:
 
+The narrow operation surface is ``review.get_preview`` (present one exact
+persisted preview), ``review.record_outcome`` (record one bounded Stage 2
+outcome) and ``review.get_outcome`` (read-only audit reconciliation of a
+previously submitted exact request, added so a lost acknowledgement can be
+confirmed without creating a new decision). All three are server-hosted,
+typed and digest-bound; there is no generic privileged operation.
+
 1. ``AETHER_REVIEW_NARRATIVE`` — absolute path to a JSON seed file of the form
    ``{"task_id": "<uuid>", "narrative": {...}}``. The narrative is validated as
    ``PreviewNarrative`` (all Stage 2 bounds and content screening apply) and
@@ -42,7 +49,9 @@ from aether.core.approval_review import (
     PreviewReviewService,
     ReviewOutcome,
     ReviewOutcomeRequest,
+    ReviewResult,
     ReviewUnavailableError,
+    review_result_from_write,
 )
 from aether.core.persistence.sqlite_store import (
     PersistenceError,
@@ -158,7 +167,13 @@ class ReviewBridge:
     # ------------------------------------------------------------------
     def _load_narrative(self, task_id: UUID) -> PreviewNarrative:
         if self._narrative_seed_path:
-            raw = _read_bounded(self._narrative_seed_path, _NARRATIVE_MAX_BYTES)
+            try:
+                raw = _read_bounded(self._narrative_seed_path, _NARRATIVE_MAX_BYTES)
+            except (OSError, ValueError) as exc:
+                # Deleted, unreadable, replaced-by-directory, or oversized since
+                # startup: the trusted preview source is unusable. Fail closed
+                # into the bounded unavailable contract; never raise.
+                raise ReviewUnavailableError("the trusted preview source is unreadable") from exc
             try:
                 seed = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -242,6 +257,19 @@ class ReviewBridge:
             full_diff_acknowledged=full_diff_acknowledged,
         )
 
+    @staticmethod
+    def _acknowledgement(result: ReviewResult) -> dict[str, object]:
+        return {
+            "resolution": result.resolution.value,
+            "requestedOutcome": result.requested_outcome.value,
+            "authority": NON_AUTHORIZING_AUDIT_RECORD,
+            "auditPersisted": True,
+            "granted": False,
+            "executionAvailable": False,
+            "idempotentReplay": result.idempotent_replay,
+            "message": result.message,
+        }
+
     def record_outcome(self, value: object) -> tuple[dict[str, object] | None, str | None]:
         """Record one exact bounded outcome; returns (ack, None) or (None, reason)."""
 
@@ -265,17 +293,49 @@ class ReviewBridge:
             return None, "invalid_review_request"
         except (KeyError, PersistenceError, PersistenceIntegrityError):
             return None, "review_unavailable"
-        acknowledgement: dict[str, object] = {
-            "resolution": result.resolution.value,
-            "requestedOutcome": result.requested_outcome.value,
-            "authority": NON_AUTHORIZING_AUDIT_RECORD,
-            "auditPersisted": True,
-            "granted": False,
-            "executionAvailable": False,
-            "idempotentReplay": result.idempotent_replay,
-            "message": result.message,
-        }
-        return acknowledgement, None
+        return self._acknowledgement(result), None
+
+    def get_outcome(self, value: object) -> tuple[dict[str, object] | None, str | None]:
+        """Reconcile one previously submitted exact request; read-only.
+
+        Returns the persisted audit acknowledgement (``idempotentReplay`` is
+        True) for the exact immutable request identity, or a bounded machine
+        reason. Never writes an audit event, never transitions state, never
+        presents or re-verifies a preview, and requires no narrative source —
+        only the persisted records are consulted. This exists so a lost
+        acknowledgement can be confirmed after a terminal transition, after a
+        narrative-source failure, or after a process restart, without creating
+        a new stale decision and without inferring any authorization.
+        """
+
+        try:
+            request = self._parse_outcome_request(value)
+        except ValueError:
+            return None, "invalid_review_request"
+        try:
+            write = self._store.find_stage2_review_outcome(
+                request.task_id,
+                review_request_id=request.review_request_id,
+                requested_outcome=request.outcome.value,
+                plan_revision=request.plan_revision,
+                plan_hash=request.plan_hash,
+                preview_id=request.preview_id,
+                preview_digest=request.preview_digest,
+            )
+        except ReviewConflictError:
+            return None, "review_conflict"
+        except PersistenceIntegrityError:
+            return None, "review_unavailable"
+        except (KeyError, PersistenceError):
+            return None, "review_unavailable"
+        except Exception:
+            # An unexpected store failure must never break the channel or
+            # fabricate an acknowledgement.
+            return None, "review_unavailable"
+        if write is None:
+            return None, "not_recorded"
+        result = review_result_from_write(write, request=request)
+        return self._acknowledgement(result), None
 
 
 def from_env() -> ReviewBridge | None:

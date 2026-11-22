@@ -1,16 +1,27 @@
 """Trusted backend-hosted authenticated channel service.
 
-Run as ``python -m aether.channel.service``. This process is the single
+Run as ``python -P -I -B -u -m aether.channel.service`` with an interpreter that
+has the ``aether`` package installed (the backend project venv in development,
+a bundled build in the future). ``-I`` implies ``-E`` (ignore ``PYTHON*``
+environment variables, including ``PYTHONPATH`` and ``PYTHONHOME``) and ``-s``
+(suppress user site-packages); ``-P`` (Python >= 3.11) removes the current
+directory/script directory from ``sys.path``. The service therefore imports
+only from the interpreter's own site-packages — dependencies must be
+installed, not source-path-injected. This process is the single
 trusted backend peer for the Electron desktop's authenticated channel at this
 build stage. It performs the Stage 1 bootstrap (MAGIC, session id, per-launch
 HMAC key, challenge) and speaks the same canonical-JSON envelope protocol; on
-top of the Stage 1 ``demo.ping`` it additionally serves two narrow, typed
+top of the Stage 1 ``demo.ping`` it additionally serves three narrow, typed
 review operations backed by the real persisted task/plan store:
 
 * ``review.get_preview``    — present the exact preview for one reviewable
   persisted PREVIEW_READY/AWAITING_APPROVAL task;
 * ``review.record_outcome`` — record one exact bounded, non-authorizing audit
-  outcome through ``PreviewReviewService``.
+  outcome through ``PreviewReviewService``;
+* ``review.get_outcome``    — read-only audit reconciliation of a previously
+  submitted exact request (added so a lost acknowledgement can be confirmed).
+  It never writes, never transitions state and never re-verifies a preview;
+  it only reports what the persisted audit records already prove.
 
 There is no generic privileged operation: unknown kinds terminate the session.
 The service holds an exclusive owner lock on the development database named by
@@ -37,6 +48,7 @@ from aether.channel.review_bridge import ReviewBridge
 _PING_KIND = "demo.ping"
 _GET_PREVIEW_KIND = "review.get_preview"
 _RECORD_OUTCOME_KIND = "review.record_outcome"
+_GET_OUTCOME_KIND = "review.get_outcome"
 
 
 def _hello(session: str, challenge: str, key: bytes) -> dict[str, object]:
@@ -150,6 +162,18 @@ def main() -> int:
                     response_payload = _error_payload("review_unavailable")
                 else:
                     acknowledgement, reason = bridge.record_outcome(payload)
+                    if acknowledgement is not None:
+                        response_kind = "review.outcome"
+                        response_payload = acknowledgement
+                    else:
+                        response_kind = "review.error"
+                        response_payload = _error_payload(reason or "review_unavailable")
+            elif kind == _GET_OUTCOME_KIND:
+                if bridge is None:
+                    response_kind = "review.error"
+                    response_payload = _error_payload("review_unavailable")
+                else:
+                    acknowledgement, reason = bridge.get_outcome(payload)
                     if acknowledgement is not None:
                         response_kind = "review.outcome"
                         response_payload = acknowledgement

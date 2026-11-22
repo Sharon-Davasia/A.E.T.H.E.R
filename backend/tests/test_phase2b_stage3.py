@@ -1,7 +1,10 @@
 """Stage 3 authenticated review-transport tests.
 
-Subprocess coverage of ``python -m aether.channel.service`` over the real
-wire protocol, plus in-process bridge tests for revocation/tamper handling.
+Subprocess coverage of the hardened ``python -P -I -B -u -m
+aether.channel.service`` launch over the real wire protocol, plus in-process
+bridge tests for revocation/tamper handling. The hardened flags mean the
+interpreter must have ``aether`` installed (it does in the development
+environment); cwd/PYTHONPATH injection is not available to the child.
 All fixtures are synthetic; nothing here issues, stores or consumes an
 ExactApprovalGrant and no filesystem/network effect exists beyond the
 temporary SQLite development database.
@@ -67,7 +70,7 @@ class ServiceProcess:
         if narrative is not None:
             env["AETHER_REVIEW_NARRATIVE"] = str(narrative)
         self.process = subprocess.Popen(
-            [sys.executable, "-B", "-u", "-m", "aether.channel.service"],
+            [sys.executable, "-P", "-I", "-B", "-u", "-m", "aether.channel.service"],
             cwd=BACKEND_ROOT,
             env=env,
             stdin=subprocess.PIPE,
@@ -165,7 +168,7 @@ def test_review_unavailable_without_configuration(tmp_path: Path) -> None:
         "LC_ALL": "C.UTF-8",
     }
     process = subprocess.Popen(
-        [sys.executable, "-B", "-u", "-m", "aether.channel.service"],
+        [sys.executable, "-P", "-I", "-B", "-u", "-m", "aether.channel.service"],
         cwd=BACKEND_ROOT,
         env=env,
         stdin=subprocess.PIPE,
