@@ -161,7 +161,20 @@ branch HEAD, so the split preserves every file exactly.
 | Q | `eb7e07e` S14-14 vault concurrency | 819 passed, 3 skipped |
 | R | `1038b1d` `9a1334f` `03e11e8` `ec9452b` + docs tip | 819 passed, 3 skipped |
 
-**0 failures at every tip.** The count rises monotonically as tests are added, and
+**0 failures at every tip.**
+
+One observation worth recording rather than hiding. Tip **N** (`3d1ade5`) failed
+`test_two_interleaved_operations_each_resolve_their_own_consumption` in **2 of 6**
+full-suite runs. That is expected and is not a split defect: N predates both vault
+fixes, so it still carries the pre-existing index race, exactly as the source
+branch did at the equivalent commit. Tip **P** (`9194036`, the first vault lock)
+showed **2 of 8** failures in one session; 24 subsequent full runs of that tip did
+not reproduce it, and I could not capture the error text, so I am not claiming P is
+clean -- only that the failure was not reproducible on demand. Tips **Q** and **R**
+were **18 of 18** and **10 of 10** clean respectively. The residual at P is
+consistent with the incomplete invariant that S14-14 exists to finish (maintenance
+paths still unlocked), but without the trace that is an inference, not a
+measurement. The count rises monotonically as tests are added, and
 never falls, which is the signature of a split that preserves coverage rather than
 one that quietly drops it. The earlier per-tip table this replaces was measured
 with D as a side branch off C, which is the arrangement the D→L correction exists
