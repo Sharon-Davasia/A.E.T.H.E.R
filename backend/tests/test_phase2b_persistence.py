@@ -122,10 +122,17 @@ def test_versioned_migration_and_private_file_permissions(tmp_path) -> None:
     reopened.close()
 
 
-def _copy_migration_directory(destination: Path) -> Path:
+def _copy_migration_directory(destination: Path, *names: str) -> Path:
+    """Copy the packaged migrations the test needs into a scratch directory.
+
+    The production registry now lists both versions (PR #14), so the packaged
+    set must be copied in full — a partial set is itself an integrity error.
+    """
+
     destination.mkdir()
-    source = Path(__file__).parents[1] / "aether/core/persistence/migrations/0001_phase2b_core.sql"
-    shutil.copyfile(source, destination / source.name)
+    migrations = Path(__file__).parents[1] / "aether/core/persistence/migrations"
+    for name in names or ("0001_phase2b_core.sql", "0002_phase2b_stage4_grants.sql"):
+        shutil.copyfile(migrations / name, destination / name)
     return destination
 
 
