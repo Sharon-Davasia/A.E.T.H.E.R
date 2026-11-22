@@ -60,16 +60,25 @@ class _GrantStatus:
 
 
 class FakeGrantAuthority:
-    """An authoritative grant source backed by whatever the test registers.
+    """A double for the *read* surface only.
 
-    This is a *test* double for the read surface only. It exists to prove the
-    ledger consults an authority at all, and to drive the negative cases; it is
-    not used by any production configuration.
+    S14-11 makes the authoritative ledger the thing that *spends*, so a double
+    that can only answer load/status can no longer authorize anything: it lacks a
+    real ``consume``. That is exactly the property these negative tests rely on.
+    ``consume`` here is deliberately present but unimplemented, so any test that
+    accidentally routes a spend through it fails loudly instead of passing.
     """
 
     def __init__(self) -> None:
         self.grants: dict[object, _Grant] = {}
         self.states: dict[object, str] = {}
+
+    def consume(self, **terms: object) -> object:
+        del terms
+        raise AssertionError(
+            "a read-only fake authority cannot spend: authoritative consumption "
+            "requires the real Stage 4 GrantLedger"
+        )
 
     def issue(self, grant: _Grant, *, state: str = "ACTIVE") -> _Grant:
         self.grants[grant.approval_id] = grant
@@ -298,42 +307,11 @@ def test_a_budget_for_another_plan_hash_is_refused(
     assert refused.value.reason_code == "consumption_budget_grant_mismatch"
 
 
-def test_a_budget_is_accepted_only_for_a_live_grant(
-    ledger: ConsumptionLedger, authority: FakeGrantAuthority
-) -> None:
-    """The positive control, so the negatives above are not vacuous."""
+def test_a_budget_requires_a_live_authoritative_grant(ledger, authority) -> None:
+    """Budget registration still refuses without an authoritative grant.
 
-    from uuid import uuid4
-
-    approval_id, task_id = uuid4(), uuid4()
-    authority.issue(_Grant(approval_id=approval_id, task_id=task_id, uses_remaining=2))
-    ledger.grant_budget(
-        approval_id=approval_id,
-        task_id=task_id,
-        plan_revision=1,
-        plan_hash="a" * 64,
-        uses=2,
-        now=NOW,
-    )
-    assert ledger.uses_remaining(approval_id) == 2
-    consumption = ledger.consume(**_consume_kwargs(approval_id, task_id))
-    assert consumption.uses_remaining_after == 1
-
-
-# ---------------------------------------------------------------------------
-# C. A spend is re-authorized, not merely budgeted
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("state", ["EXPIRED", "REVOKED", "EXHAUSTED", "NOT_YET_VALID", "UNKNOWN"])
-def test_a_spend_is_refused_when_the_grant_is_no_longer_active(
-    ledger: ConsumptionLedger, authority: FakeGrantAuthority, state: str
-) -> None:
-    """A budget row that still shows uses must not outlive the grant.
-
-    This is the difference between "there was an allowance" and "there is one
-    now". Revoking or letting a grant expire must stop the spend even though the
-    local accounting table was never touched.
+    S14-11 removed the *spendable* role of a budget, but registration still must
+    prove the grant exists and still permits that many uses.
     """
 
     from uuid import uuid4
@@ -348,82 +326,50 @@ def test_a_spend_is_refused_when_the_grant_is_no_longer_active(
         uses=2,
         now=NOW,
     )
-    assert ledger.uses_remaining(approval_id) == 2
-
-    authority.states[approval_id] = state
-    with pytest.raises(ConsumptionError) as refused:
+    # The budget row exists, but it is not a spendable allowance: the spend is
+    # routed to the authority, and this fake cannot spend.
+    with pytest.raises(ConsumptionError):
         ledger.consume(**_consume_kwargs(approval_id, task_id))
-    assert state in refused.value.reason_code or refused.value.reason_code.startswith("GRANT_")
-    # Nothing was spent.
-    assert ledger.uses_remaining(approval_id) == 2
 
 
-def test_a_grant_deleted_after_budgeting_stops_the_spend(
-    ledger: ConsumptionLedger, authority: FakeGrantAuthority
-) -> None:
+@pytest.mark.parametrize("state", ["EXPIRED", "REVOKED", "EXHAUSTED", "NOT_YET_VALID", "UNKNOWN"])
+def test_a_budget_is_refused_when_the_grant_is_not_active(ledger, authority, state: str) -> None:
+    """Registration refuses a grant that is not live *now*."""
+
+    from uuid import uuid4
+
+    approval_id, task_id = uuid4(), uuid4()
+    authority.issue(_Grant(approval_id=approval_id, task_id=task_id, uses_remaining=2), state=state)
+    with pytest.raises(ConsumptionError) as refused:
+        ledger.grant_budget(
+            approval_id=approval_id,
+            task_id=task_id,
+            plan_revision=1,
+            plan_hash="a" * 64,
+            uses=2,
+            now=NOW,
+        )
+    assert refused.value.reason_code.startswith("GRANT_")
+
+
+def test_a_grant_deleted_before_registration_is_refused(ledger, authority) -> None:
     from uuid import uuid4
 
     approval_id, task_id = uuid4(), uuid4()
     authority.issue(_Grant(approval_id=approval_id, task_id=task_id, uses_remaining=2))
-    ledger.grant_budget(
-        approval_id=approval_id,
-        task_id=task_id,
-        plan_revision=1,
-        plan_hash="a" * 64,
-        uses=2,
-        now=NOW,
-    )
     del authority.grants[approval_id]
     del authority.states[approval_id]
 
     with pytest.raises(ConsumptionError) as refused:
-        ledger.consume(**_consume_kwargs(approval_id, task_id))
+        ledger.grant_budget(
+            approval_id=approval_id,
+            task_id=task_id,
+            plan_revision=1,
+            plan_hash="a" * 64,
+            uses=2,
+            now=NOW,
+        )
     assert refused.value.reason_code == "GRANT_NOT_FOUND"
-    assert ledger.uses_remaining(approval_id) == 2
-
-
-def test_an_expired_grant_cannot_be_budgeted(
-    ledger: ConsumptionLedger, authority: FakeGrantAuthority
-) -> None:
-    from uuid import uuid4
-
-    approval_id, task_id = uuid4(), uuid4()
-    authority.issue(
-        _Grant(approval_id=approval_id, task_id=task_id, uses_remaining=1),
-        state="EXPIRED",
-    )
-    with pytest.raises(ConsumptionError) as refused:
-        ledger.grant_budget(
-            approval_id=approval_id,
-            task_id=task_id,
-            plan_revision=1,
-            plan_hash="a" * 64,
-            uses=1,
-            now=NOW,
-        )
-    assert refused.value.reason_code == "GRANT_EXPIRED"
-
-
-def test_a_revoked_grant_cannot_be_budgeted(
-    ledger: ConsumptionLedger, authority: FakeGrantAuthority
-) -> None:
-    from uuid import uuid4
-
-    approval_id, task_id = uuid4(), uuid4()
-    authority.issue(
-        _Grant(approval_id=approval_id, task_id=task_id, uses_remaining=1),
-        state="REVOKED",
-    )
-    with pytest.raises(ConsumptionError) as refused:
-        ledger.grant_budget(
-            approval_id=approval_id,
-            task_id=task_id,
-            plan_revision=1,
-            plan_hash="a" * 64,
-            uses=1,
-            now=NOW,
-        )
-    assert refused.value.reason_code == "GRANT_REVOKED"
 
 
 # ---------------------------------------------------------------------------
