@@ -587,12 +587,20 @@ def _icacls(*arguments: str) -> subprocess.CompletedProcess[str]:
 
 
 def _deny_read_windows(path: Path) -> None:
-    """Deny the current user read access to *path* with an explicit deny ACE."""
+    """Deny the current user file content reads with an explicit deny ACE.
+
+    ``(RD)`` is ``FILE_READ_DATA`` only, which is exactly what makes the narrative
+    inaccessible. It deliberately does *not* include ``READ_CONTROL`` the way the
+    broader ``(R)`` does: denying that removes the right needed to rewrite the
+    security descriptor, so restoring the ACL afterwards would itself be refused
+    with exit 5 ("Access is denied") and could not be done unelevated. Denying the
+    narrow right keeps the denial real while leaving restoration possible.
+    """
 
     user = os.environ.get("USERNAME")
     if not user:
         pytest.skip("USERNAME is unset; cannot target a deny ACE at the current user")
-    applied = _icacls(str(path), "/deny", f"{user}:(R)")
+    applied = _icacls(str(path), "/deny", f"{user}:(RD)")
     if applied.returncode != 0:
         pytest.skip(
             "a deny ACE could not be applied in this environment "
@@ -601,19 +609,41 @@ def _deny_read_windows(path: Path) -> None:
 
 
 def _clear_windows_acl(path: Path) -> None:
-    """Restore the inherited ACL, reporting a failure instead of suppressing it.
+    """Restore the file's permissions, then prove the content is readable again.
 
-    Leaving the deny ACE in place would keep the temporary narrative unreadable
-    for the remainder of the session, so a failed restore is a real error rather
-    than noise to swallow.
+    ``/reset`` strips the explicit ACEs and restores inheritance, which is the state
+    ``seed_narrative`` creates. It needs only WRITE_DAC on the file, so the owner can
+    do it without administrator rights -- provided the deny left READ_CONTROL alone.
+
+    A failure still raises rather than being swallowed: leaving the deny in place
+    would keep the temporary narrative unreadable for the remainder of the session.
+    The readability check afterwards is what actually proves the intended
+    permissions are back, instead of trusting the tool's exit code.
     """
 
     restored = _icacls(str(path), "/reset")
     if restored.returncode != 0:
+        # One retry in a form that only touches this user's deny ACE, for hosts
+        # where a full reset is refused but a targeted removal is not.
+        user = os.environ.get("USERNAME")
+        retry = _icacls(str(path), "/remove:d", user) if user else None
+        if retry is None or retry.returncode != 0:
+            detail = (
+                f"reset exit {restored.returncode}: "
+                f"{restored.stdout.strip()} {restored.stderr.strip()}"
+            )
+            if retry is not None:
+                detail += (
+                    f"; remove:d exit {retry.returncode}: "
+                    f"{retry.stdout.strip()} {retry.stderr.strip()}"
+                )
+            raise AssertionError(f"could not restore the ACL after the deny ACE ({detail})")
+    try:
+        path.read_bytes()
+    except OSError as exc:
         raise AssertionError(
-            "could not restore the ACL after the deny ACE "
-            f"(exit {restored.returncode}): {restored.stdout.strip()} {restored.stderr.strip()}"
-        )
+            f"permissions were not restored: the file is still unreadable ({exc})"
+        ) from exc
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows access-denial semantics required")
@@ -637,13 +667,28 @@ def test_narrative_unreadable_by_windows_acl_fails_closed(db_path: Path, tmp_pat
         _assert_read_is_denied(narrative)
         _assert_unavailable_but_channel_usable(child)
     finally:
-        # Restore and reap unconditionally, including when the deny ACE could not
-        # be applied and the test skips. The nested block keeps the child closing
-        # even if the restore itself fails, while still surfacing that failure.
+        # Reap the child and restore the ACL unconditionally -- including when the
+        # deny ACE could not be applied and the test skips -- with each step running
+        # even if the other fails. An exception raised here would replace an earlier
+        # test failure as the primary report, so when one is already propagating the
+        # cleanup problem is folded into the message instead of raised over the top.
+        primary = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
+        try:
+            assert child.close() == 0
+        except BaseException as error:  # collected, then re-raised below
+            cleanup_errors.append(error)
         try:
             _clear_windows_acl(narrative)
-        finally:
-            assert child.close() == 0
+        except BaseException as error:  # collected, then re-raised below
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            detail = "; ".join(str(error) for error in cleanup_errors)
+            if primary is None:
+                raise cleanup_errors[0]
+            raise AssertionError(
+                f"cleanup failed as well as the test body: {detail} (earlier failure: {primary})"
+            ) from primary
 
 
 def test_bridge_in_process_narrative_deleted_before_record(db_path: Path, tmp_path: Path) -> None:
