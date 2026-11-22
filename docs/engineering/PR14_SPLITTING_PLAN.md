@@ -41,7 +41,11 @@ Ordered. Each row is one PR. "Depends on" must merge first.
 | J | **S14-8 — orphan consumption** | `e399099` | `edits/journal.py`, `edits/reconcile.py`, `test_phase2_orphan_consumption.py` | I |
 | K | **S14-9 — operation state + mandatory journal** | `f5ab233` | `edits/executor.py`, `edits/journal.py`, `test_phase2_execution_context.py`, 6 adapted suites | J |
 | L | **S14-10 — exact Windows ACL** | `a65460c` | `core/security/file_permissions.py`, `test_phase2_windows_acl.py`, `verify_phase2.ps1` | K **and** D — `file_permissions.py` is *created by D*, so L cannot apply to `main` alone |
-| M | **Acceptance report** | `9a1334f`, *pending* | `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | L |
+| M | **S14-11 — one authoritative spend** | `d1bdd2c` | `grants/consumption.py`, `test_phase2_authoritative_consumption.py`, `test_phase2_grant_authority.py` | L |
+| N | **S14-12 — unprojected spend discoverable** | `3d1ade5` | `grants/consumption.py`, `edits/reconcile.py`, `test_phase2_consumption_recovery.py` | M |
+| O | **S14-13 — replay preserves terminal state** | `3149b6c` | `grants/consumption.py`, `test_phase2_consumption_recovery.py` | N |
+| P | **Vault index race (found during S14-12)** | `9194036` | `vault/undo_vault.py`, `test_phase2_vault_key_protection.py` | L (independent of M–O) |
+| Q | **Documentation set, as one reviewed commit** | `1038b1d`, `9a1334f`, `03e11e8`, `ec9452b`, *final* | `PR14_SPLITTING_PLAN.md`, `PHASE2_ACCEPTANCE_REPORT.md`, `.gitignore` | O, P |
 
 ---
 
@@ -130,34 +134,40 @@ interpreter**: a new `python3.11 -m venv` with the project installed editable *f
 that checkout*, so `aether` resolves to the code under test rather than to the
 sandbox's main checkout.
 
-| PR tip | Result |
-|---|---|
-| C (`1b2f9c8`) alone | 609 passed, 1 skipped |
-| D (C + S14-5) | 627 passed, 3 skipped |
-| E (C + S14-1) | 635 passed, 1 skipped |
-| F (E + S14-2) | 654 passed, 1 skipped |
-| G (F + S14-3) | 670 passed, 1 skipped |
-| H (G + S14-4) | 693 passed, 1 skipped |
-| I (H + S14-7) | **729 passed, 3 skipped, 0 failed** |
-| J (I + S14-8) | **740 passed, 3 skipped, 0 failed** |
-| K (J + S14-9) | **750 passed, 3 skipped, 0 failed** |
-| L (K + S14-10) | **775 passed, 3 skipped, 0 failed** |
-| M (L + S14-11) | **794 passed, 3 skipped, 0 failed** |
+**Every one of the 17 tips was rebuilt and re-tested** after the D→L and
+documentation-chain corrections, as one linear A→Q sequence from a clean `02dff4b`
+base. All 20 cherry-picks applied clean, and the A–Q tip is byte-identical to the
+branch HEAD, so the split preserves every file exactly.
 
-**Dependency-correct chain, re-verified (S14-11).** The individual tips above were
-measured before the D→L defect was found, and D was measured as a side branch off
-C. Rebuilt as one linear sequence carrying D inline, each pick clean:
+| PR | Contains | Result (isolated venv) |
+|---|---|---|
+| A | `2b60708` schema v2 prepared, inert | 429 passed, 1 skipped |
+| B | `470fea9` workstreams B–E | 589 passed, 1 skipped |
+| C | `1b2f9c8` S14-6 verifier | 612 passed, 1 skipped |
+| D | `fef5592` S14-5 vault key | 628 passed, 3 skipped |
+| E | `36a4063` S14-1 approved bytes | 652 passed, 3 skipped |
+| F | `fb58b49` S14-2 grant consumption | 671 passed, 3 skipped |
+| G | `ac0f39c` S14-3 undo authorization | 687 passed, 3 skipped |
+| H | `e75264b` S14-4 mutation journal | 709 passed, 3 skipped |
+| I | `58e271a` S14-7 grant authority | 729 passed, 3 skipped |
+| J | `e399099` S14-8 orphan consumption | 740 passed, 3 skipped |
+| K | `f5ab233` S14-9 operation state | 750 passed, 3 skipped |
+| L | `a65460c` S14-10 Windows ACL | 775 passed, 3 skipped |
+| M | `d1bdd2c` S14-11 authoritative spend | 794 passed, 3 skipped |
+| N | `3d1ade5` S14-12 unprojected spend | 802 passed, 3 skipped |
+| O | `3149b6c` S14-13 replay terminal state | 809 passed, 3 skipped |
+| P | `9194036` vault index race | 810 passed, 3 skipped |
+| Q | `1038b1d` `9a1334f` `03e11e8` `ec9452b` docs + final | 810 passed, 3 skipped |
 
-```
-1b2f9c8 -> fef5592 -> 36a4063 -> fb58b49 -> ac0f39c -> e75264b
-        -> 58e271a -> e399099 -> f5ab233 -> a65460c -> d1bdd2c
-```
+**0 failures at every tip.** The count rises monotonically as tests are added, and
+never falls, which is the signature of a split that preserves coverage rather than
+one that quietly drops it. The earlier per-tip table this replaces was measured
+with D as a side branch off C, which is the arrangement the D→L correction exists
+to remove; those numbers are superseded, not silently reused.
 
-Tip of that chain, in a fresh `python3.11 -m venv` installed editable from the
-worktree: **794 passed, 3 skipped, 0 failed**, ruff `All checks passed!`,
-`ruff format --check` 144 files, `mypy aether` 95 files clean. This is the number
-that matters for the split: it proves the linear dependency applies, not just that
-each commit is individually plausible.
+The 3 skips throughout are the two native-Windows ACL tests and the
+environment-gated model-integration test. A, B and C show 1 skip because the
+Windows-only tests are added by D.
 
 **No exclusions.** An earlier revision of this plan deselected
 `test_hardened_launch_import_origin_comes_from_selected_interpreter` because it
@@ -289,9 +299,36 @@ git cherry-pick -x a65460c && git push -u origin split/pr14-s14-10-windows-acl
 git switch -c split/pr14-s14-11-authoritative-consumption split/pr14-s14-10-windows-acl
 git cherry-pick -x d1bdd2c && git push -u origin split/pr14-s14-11-authoritative-consumption
 
-# N -- acceptance report
-git switch -c split/pr14-acceptance-report split/pr14-s14-11-authoritative-consumption
-git cherry-pick -x 03e11e8 && git push -u origin split/pr14-acceptance-report
+# N -- S14-12
+git switch -c split/pr14-s14-12-unprojected-spend split/pr14-s14-11-authoritative-consumption
+git cherry-pick -x 3d1ade5 && git push -u origin split/pr14-s14-12-unprojected-spend
+
+# O -- S14-13
+git switch -c split/pr14-s14-13-replay-terminal-state split/pr14-s14-12-unprojected-spend
+git cherry-pick -x 3149b6c && git push -u origin split/pr14-s14-13-replay-terminal-state
+
+# P -- the vault index race, independent of M-O but stacked on L so the chain stays linear
+git switch -c split/pr14-vault-index-race split/pr14-s14-13-replay-terminal-state
+git cherry-pick -x 9194036 && git push -u origin split/pr14-vault-index-race
+
+# Q -- the documentation set, in creation order (see 5.8)
+git switch -c split/pr14-docs split/pr14-vault-index-race
+git cherry-pick -x 1038b1d   # CREATES PR14_SPLITTING_PLAN.md
+git cherry-pick -x 9a1334f   # CREATES the acceptance report, .gitignore
+git cherry-pick -x 03e11e8   # modifies both
+git cherry-pick -x ec9452b   # modifies both
+git cherry-pick -x <final-docs-SHA>
+git push -u origin split/pr14-docs
+```
+
+Before opening **Q**, confirm it is a complete documentation set and not a partial
+one:
+
+```bash
+git log --oneline -- split/../docs/engineering/PR14_SPLITTING_PLAN.md | wc -l   # >= 4
+test -f docs/engineering/PHASE2_ACCEPTANCE_REPORT.md && echo "report present"
+test -f docs/engineering/PR14_SPLITTING_PLAN.md && echo "plan present"
+git diff --stat main...split/pr14-docs -- docs .gitignore
 ```
 
 Before opening **L**, confirm its base really carries D:
@@ -302,6 +339,43 @@ test -f backend/aether/core/security/file_permissions.py && echo "file present"
 ```
 
 Open each with `gh pr create --fill` and a base of the previous PR's branch.
+
+#### The documentation commits are a chain too (corrected)
+
+An earlier revision of this plan put a single documentation PR at the end that
+cherry-picked `03e11e8` alone. That cannot work either, and for the same reason
+the D→L defect could not: a commit that *modifies* a file needs the commit that
+*created* it.
+
+```
+1038b1d  CREATES docs/engineering/PR14_SPLITTING_PLAN.md
+9a1334f  CREATES docs/engineering/PHASE2_ACCEPTANCE_REPORT.md, .gitignore
+03e11e8  modifies both
+ec9452b  modifies both
+```
+
+Cherry-picking `03e11e8` onto a tree with neither file fails outright; onto a tree
+with only one of them it half-applies. So the documentation PR carries all four in
+creation order, plus the final docs commit. This is why "PR N: acceptance report"
+in the previous revision was wrong: it named one commit for a four-commit set.
+
+**Why one PR and not four.** These are review *aids*, not security boundaries.
+The security boundary is the code, and the code is already split. Four separate
+documentation PRs would add review overhead for edits to prose that is being
+corrected as the code under it lands. If a reviewer prefers them separate, the
+sequence above is already ordered so each can be its own branch; say so and it
+can be split without touching a line of code.
+
+Verify the documentation set as a set, not commit by commit:
+
+```bash
+# On the tip of split/pr14-docs:
+git log --oneline origin/main..HEAD -- docs/engineering/PR14_SPLITTING_PLAN.md
+git log --oneline origin/main..HEAD -- docs/engineering/PHASE2_ACCEPTANCE_REPORT.md
+# Both must show every documentation commit, and both files must exist.
+test -s docs/engineering/PR14_SPLITTING_PLAN.md
+test -s docs/engineering/PHASE2_ACCEPTANCE_REPORT.md
+```
 
 ### 5.8 Verify before each push
 
