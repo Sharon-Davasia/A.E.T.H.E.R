@@ -47,6 +47,12 @@ from uuid import UUID, uuid4
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from aether.core.security.file_permissions import (
+    PermissionEnforcementError,
+    restrict_to_owner,
+    verify_owner_only,
+)
+
 _VAULT_VERSION: Final = 1
 _KEY_BYTES: Final = 32
 _NONCE_BYTES: Final = 12
@@ -112,6 +118,7 @@ class UndoVault:
         self,
         directory: Path,
         *,
+        key_path: Path | None = None,
         quota_bytes: int = 256 * 1024 * 1024,
         retention_seconds: int = 30 * 24 * 60 * 60,
         clock: Callable[[], float] | None = None,
@@ -124,11 +131,69 @@ class UndoVault:
         self._directory = Path(directory)
         self._objects = self._directory / "objects"
         self._index = self._directory / "index.json"
-        self._key_path = self._directory / "vault.key"
+        # S14-5: the key must not live inside the vault directory. The whole
+        # point of encrypting snapshots is that copying the vault directory is
+        # not enough to read them; a key stored alongside the ciphertext defeats
+        # that completely. The default is a sibling directory with a distinct
+        # owner-only restriction, and any key inside the vault is refused.
+        self._key_path = self._resolve_key_path(key_path)
         self._quota_bytes = quota_bytes
         self._retention_seconds = retention_seconds
         self._clock = clock or time.time
         self._cipher: AESGCM | None = None
+        self._legacy_key_migrated = False
+
+    def _resolve_key_path(self, key_path: Path | None) -> Path:
+        candidate = (
+            Path(key_path)
+            if key_path is not None
+            else self._directory.parent / f"{self._directory.name}-key" / "vault.key"
+        )
+        resolved_candidate = candidate.expanduser()
+        resolved_directory = self._directory.expanduser().resolve()
+        try:
+            inside = resolved_candidate.resolve().is_relative_to(resolved_directory)
+        except (OSError, RuntimeError):
+            inside = False
+        if inside:
+            raise VaultError(
+                "vault_key_inside_vault",
+                "the vault key must be stored outside the vault directory, so that a "
+                "copy of the vault does not disclose the key",
+            )
+        if resolved_candidate.name == "":
+            raise VaultError("vault_key_path_invalid", "the key path must name a file")
+        return resolved_candidate
+
+    @property
+    def key_path(self) -> Path:
+        """Where the key lives. Exposed so an audit can check it, never the key."""
+
+        return self._key_path
+
+    def _migrate_legacy_key(self) -> None:
+        """Move a key that a previous build wrote inside the vault directory.
+
+        Done before the key is used, and reported through the returned warning so
+        an operator can see that a weaker layout was actually in use.
+        """
+
+        legacy = self._directory / "vault.key"
+        if not legacy.exists():
+            return
+        if self._key_path.exists():
+            # Two keys means the vault may already have been half-migrated; do
+            # not guess which one decrypts the snapshots.
+            raise VaultError(
+                "vault_key_migration_ambiguous",
+                "both a legacy in-vault key and the external key exist; resolve manually",
+            )
+        self._key_path.parent.mkdir(parents=True, exist_ok=True)
+        _restrict_permissions(self._key_path.parent)
+        self._key_path.write_bytes(legacy.read_bytes())
+        _restrict_permissions(self._key_path)
+        legacy.unlink()
+        self._legacy_key_migrated = True
 
     # -- lifecycle -------------------------------------------------------
 
@@ -138,6 +203,8 @@ class UndoVault:
         self._objects.mkdir(parents=True, exist_ok=True)
         _restrict_permissions(self._directory)
         _restrict_permissions(self._objects)
+        self._legacy_key_migrated = False
+        self._migrate_legacy_key()
         self._cipher = AESGCM(self._load_or_create_key())
         self._harden_existing_objects()
         return self
@@ -332,15 +399,38 @@ class UndoVault:
         raise VaultError("vault_snapshot_unknown", "no such snapshot in this vault")
 
     def _load_or_create_key(self) -> bytes:
+        self._key_path.parent.mkdir(parents=True, exist_ok=True)
+        _restrict_permissions(self._key_path.parent)
         if self._key_path.exists():
             key = self._key_path.read_bytes()
             if len(key) != _KEY_BYTES:
                 raise VaultError("vault_key_invalid", "the vault key file is malformed")
+            self._assert_key_protected()
             return key
         key = os.urandom(_KEY_BYTES)
         _atomic_write(self._key_path, key)
         _restrict_permissions(self._key_path)
+        self._assert_key_protected()
         return key
+
+    def _assert_key_protected(self) -> None:
+        """Refuse to run with a key another account could read (S14-5).
+
+        The key protects every snapshot, so an unprotected key is a broken vault
+        rather than a degraded one. This fails closed with an explicit code so it
+        cannot be mistaken for a warning.
+        """
+
+        try:
+            report = verify_owner_only(self._key_path, directory=False)
+        except PermissionEnforcementError as exc:
+            raise VaultError(exc.reason_code, str(exc)) from exc
+        if not report.enforced:
+            raise VaultError(
+                "vault_key_not_protected",
+                f"the vault key is not owner-only ({report.mechanism}: {report.detail}); "
+                "refusing to use it, because snapshots would not be protected",
+            )
 
     def _harden_existing_objects(self) -> None:
         for path in self._objects.rglob("*.bin"):
@@ -434,14 +524,15 @@ def _entry(raw: Any) -> _IndexEntry:
 
 
 def _restrict_permissions(path: Path) -> None:
-    """Owner-only permissions where the platform supports them."""
+    """Owner-only permissions, for real on both platforms (S14-5).
 
-    if os.name == "nt":
-        # Windows ACL hardening is verified on the target machine; the POSIX
-        # mode below is a no-op there by design rather than a silent claim.
-        return
-    with contextlib.suppress(OSError):
-        path.chmod(0o600 if path.is_file() else 0o700)
+    Previously this was a silent no-op on Windows, which meant the vault
+    directory, its objects and the key were only as protected as the user's
+    profile happened to be. It now applies a real ACL there and raises if it
+    cannot, rather than reporting protection that does not exist.
+    """
+
+    restrict_to_owner(path, directory=path.is_dir() and not path.is_file())
 
 
 def _atomic_write(target: Path, payload: bytes) -> None:
