@@ -1,0 +1,80 @@
+﻿# TEMPORARY Linux verification for PR #34.
+# Remove before integration into the Phase 2 stack.
+name: Phase 2 PR34 Linux verification
+
+on:
+  push:
+    branches:
+      - verification/phase2-merge-ready-windows
+    paths:
+      - .github/workflows/phase2-pr34-linux-temporary.yml
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Linux backend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bf08ca9274ed02576ec791ff20781e47a92725a4
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install Python and locked dependencies
+        working-directory: backend
+        run: |
+          uv python install 3.12.10
+          uv sync --python 3.12.10 --all-extras --locked
+
+      - name: Backend quality gates
+        working-directory: backend
+        run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+          uv run --no-sync mypy
+          uv run --no-sync pytest -q
+
+  desktop:
+    name: Linux desktop
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bf08ca9274ed02576ec791ff20781e47a92725a4
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.22.3'
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Pin npm
+        run: |
+          npm install --global npm@10.9.8
+          test "$(npm --version)" = "10.9.8"
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install backend for desktop channel tests
+        working-directory: backend
+        run: |
+          uv python install 3.12.10
+          uv sync --python 3.12.10 --all-extras --locked
+          echo "$GITHUB_WORKSPACE/backend/.venv/bin" >> "$GITHUB_PATH"
+
+      - name: Install desktop dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      - name: Desktop quality gates
+        working-directory: apps/desktop
+        env:
+          AETHER_DEV_PYTHON: ${{ github.workspace }}/backend/.venv/bin/python
+        run: npm run check
