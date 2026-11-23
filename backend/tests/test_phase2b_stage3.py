@@ -58,7 +58,9 @@ def read_frame(stream) -> dict[str, object]:  # type: ignore[no-untyped-def]
 
 
 class ServiceProcess:
-    def __init__(self, db_path: Path, *, dev_seed: bool = True, narrative: Path | None = None) -> None:
+    def __init__(
+        self, db_path: Path, *, dev_seed: bool = True, narrative: Path | None = None
+    ) -> None:
         env = {
             "PATH": os.path.dirname(sys.executable),
             "LANG": "C.UTF-8",
@@ -115,16 +117,16 @@ class ServiceProcess:
 
 
 def get_ready_preview(child: ServiceProcess, seq: int) -> dict[str, object]:
-    response = child.request(
-        seq, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID}
-    )
+    response = child.request(seq, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
     assert response["kind"] == "review.preview"
     payload = response["payload"]
     assert payload["status"] == "ready", payload
     return payload["preview"]
 
 
-def outcome_request(preview: dict[str, object], outcome: str, acknowledged: bool) -> dict[str, object]:
+def outcome_request(
+    preview: dict[str, object], outcome: str, acknowledged: bool
+) -> dict[str, object]:
     return {
         "reviewRequestId": preview["reviewRequestId"],
         "taskId": preview["taskId"],
@@ -148,9 +150,7 @@ def decision_count(db: Path) -> int:
     import sqlite3
 
     with sqlite3.connect(db) as connection:
-        return int(
-            connection.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0]
-        )
+        return int(connection.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0])
 
 
 def test_ping_roundtrip_with_review_transport(db_path: Path) -> None:
@@ -228,9 +228,7 @@ def test_review_unavailable_without_configuration(tmp_path: Path) -> None:
 
 def test_get_preview_returns_verifiable_exact_preview(db_path: Path) -> None:
     child = ServiceProcess(db_path)
-    response = child.request(
-        1, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID}
-    )
+    response = child.request(1, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
     assert response["kind"] == "review.preview"
     payload = response["payload"]
     assert payload["status"] == "ready"
@@ -251,9 +249,7 @@ def test_get_preview_rejects_malformed_and_unknown_tasks(db_path: Path) -> None:
     child = ServiceProcess(db_path)
     malformed = child.request(1, str(uuid4()), "review.get_preview", {"task_id": "not-a-uuid"})
     assert malformed["payload"] == {"status": "unavailable", "reason": "invalid_task"}
-    unknown = child.request(
-        2, str(uuid4()), "review.get_preview", {"task_id": str(uuid4())}
-    )
+    unknown = child.request(2, str(uuid4()), "review.get_preview", {"task_id": str(uuid4())})
     assert unknown["payload"]["status"] == "unavailable"
     assert child.close() == 0
 
@@ -357,13 +353,17 @@ def test_unknown_kind_terminates_session(db_path: Path) -> None:
     assert child.process.wait(timeout=10) != 0
 
 
-def test_oversized_preview_fails_closed_without_frame_overflow(db_path: Path, tmp_path: Path) -> None:
+def test_oversized_preview_fails_closed_without_frame_overflow(
+    db_path: Path, tmp_path: Path
+) -> None:
     narrative_path = tmp_path / "oversized-narrative.json"
     # Inside the 64,000-character narrative bound, but the canonical JSON
     # escaping of the newlines pushes the outbound frame past the channel
     # bound, exercising the fail-closed preview_too_large path.
-    large_diff = "--- a/synthetic-example.py\n+++ b/synthetic-example.py\n" + (
-        "-line-of-synthetic-content\n" * 2360
+    large_diff = (
+        "--- a/synthetic-example.py\n+++ b/synthetic-example.py\n"
+        + ("-line-of-synthetic-content\n" * 2360)
+        + "\\ aether-diff-v2 eof: original=newline replacement=newline"
     )
     assert len(large_diff) <= 64_000
     assert len(json.dumps(large_diff)) > 65_000
@@ -375,16 +375,16 @@ def test_oversized_preview_fails_closed_without_frame_overflow(db_path: Path, tm
             "preconditions": ["The synthetic example file remains at the previewed version"],
             "external_effects": ["No external service or operating-system action"],
             "risks": ["The displayed diff could fail deterministic post-check verification"],
-            "verification_strategy": ["Recompute the synthetic content hash and compare it to the expected hash"],
+            "verification_strategy": [
+                "Recompute the synthetic content hash and compare it to the expected hash"
+            ],
             "proposed_effect": "Replace the displayed synthetic example line with the displayed replacement.",
             "full_diff": [{"resource_id": "file:synthetic-1", "unified_diff": large_diff}],
         },
     }
     narrative_path.write_text(json.dumps(seed), encoding="utf-8")
     child = ServiceProcess(db_path, dev_seed=True, narrative=narrative_path)
-    response = child.request(
-        1, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID}
-    )
+    response = child.request(1, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
     assert response["kind"] == "review.preview"
     assert response["payload"] == {"status": "unavailable", "reason": "preview_too_large"}
     assert child.close() == 0
@@ -406,9 +406,7 @@ def test_bridge_revocation_blocks_presentation(tmp_path: Path) -> None:
     assert isinstance(preview, dict)
     narrative = bridge._dev_narrative  # trusted in-process access for this unit test
     assert narrative is not None
-    bridge._service.revoke(
-        DEV_SEED_TASK_ID, narrative, reason_code="review_revoked"
-    )
+    bridge._service.revoke(DEV_SEED_TASK_ID, narrative, reason_code="review_revoked")
     blocked = bridge.get_preview(FIXED_TASK_ID)
     assert blocked == {"status": "unavailable", "reason": "review_unavailable"}
     bridge.close()
@@ -479,10 +477,7 @@ def test_bridge_rejects_secret_bearing_narrative(tmp_path: Path) -> None:
 def test_bridge_from_env_fails_closed(tmp_path: Path) -> None:
     assert ReviewBridge.from_env({}) is None
     assert ReviewBridge.from_env({"AETHER_REVIEW_DB": "relative/path.sqlite3"}) is None
-    assert (
-        ReviewBridge.from_env({"AETHER_REVIEW_DB": str(tmp_path / "missing.sqlite3")})
-        is None
-    )
+    assert ReviewBridge.from_env({"AETHER_REVIEW_DB": str(tmp_path / "missing.sqlite3")}) is None
     db_dir = tmp_path / "existing"
     db_dir.mkdir(mode=0o700)
     db = db_dir / "review.sqlite3"

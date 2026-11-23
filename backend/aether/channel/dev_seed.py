@@ -75,9 +75,7 @@ def build_synthetic_plan(task_id: UUID, revision: int) -> TaskPlan:
                 risk_tier=RiskTier.MODIFY,
                 approval_status=PlanStepApprovalStatus.REQUIRED,
                 idempotency_key=_FIXED_IDEMPOTENCY_KEY,
-                postconditions=(
-                    {"condition": "synthetic content hash matches expected value"},
-                ),
+                postconditions=({"condition": "synthetic content hash matches expected value"},),
                 recovery_class="REVERSIBLE",
             ),
         ),
@@ -104,6 +102,7 @@ def build_synthetic_narrative() -> PreviewNarrative:
                     "+++ b/synthetic-example.py\n"
                     "-synthetic-original\n"
                     f"+{CANARY}\n"
+                    "\\ aether-diff-v2 eof: original=newline replacement=newline"
                 ),
             ),
         ),
@@ -162,4 +161,3 @@ def ensure_synthetic_scenario(store: SQLiteTaskStore) -> tuple[UUID, PreviewNarr
 
 def dev_seed_requested(value: str | None) -> bool:
     return value == DEV_SEED_VALUE
-

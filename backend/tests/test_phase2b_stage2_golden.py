@@ -28,7 +28,9 @@ from aether.core.contracts.policy import RiskTier
 from aether.core.persistence.models import PlanStep, TaskPlan, TaskPlanResource
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-FIXTURE_PATH = REPO_ROOT / "apps" / "desktop" / "tests" / "fixtures" / "stage2-exact-preview.golden.json"
+FIXTURE_PATH = (
+    REPO_ROOT / "apps" / "desktop" / "tests" / "fixtures" / "stage2-exact-preview.golden.json"
+)
 GOLDEN_CANARY = "SYNTHETIC-CANONICAL-CANARY-2b9e31"
 
 
@@ -85,6 +87,7 @@ def _golden_narrative() -> PreviewNarrative:
                     "+++ b/golden-example.py\n"
                     "-synthetic-original\n"
                     f"+{GOLDEN_CANARY}\n"
+                    "\\ aether-diff-v2 eof: original=newline replacement=newline"
                 ),
             ),
         ),

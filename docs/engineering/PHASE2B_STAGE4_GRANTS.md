@@ -22,7 +22,7 @@ Adds:
 | Validation | `aether/core/grants/validation.py` — pure, fail-closed `check_grant_scope` with reason codes |
 | Durable persistence | `aether/core/grants/ledger.py` — `GrantLedger` (schema v2 only, verifies fingerprints, never migrates) |
 | Policy integration | `PolicyBroker(..., grant_authority=...)` — deny-by-default, execution still disabled |
-| Proposed schema | `aether/core/persistence/proposed_migrations/0002_phase2b_stage4_grants.sql` (**not applied, not registered**) |
+| Prepared schema | `aether/core/persistence/migrations/0002_phase2b_stage4_grants.sql` — registered and byte-verified, but **not applied and not activated** (PR #14; see `PHASE2B_STAGE4_MIGRATION.md`) |
 | Tests | `backend/tests/test_phase2b_stage4_grants.py` (46 tests) + `tests/stage4_support.py` |
 
 Does **not** add: any execution adapter, any filesystem mutation, any shell/command
@@ -146,7 +146,7 @@ consumption table and `CONSUMED` events.
 
 ## 4. Proposed migration — separate approval required
 
-`backend/aether/core/persistence/proposed_migrations/0002_phase2b_stage4_grants.sql`
+`backend/aether/core/persistence/migrations/0002_phase2b_stage4_grants.sql`
 
 - SHA-256: `d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c`
   (supersedes the earlier proposed `a91b431c…`, which is **not** approved and must be
@@ -168,10 +168,16 @@ consumption table and `CONSUMED` events.
   `exact_approval_grant_state.revocation_code` replace free-text revocation reasons with
   bounded machine-readable codes (`CHECK … GLOB '[A-Z]*'`), plus
   `CHECK ((revoked_at IS NULL) = (revocation_code IS NULL))` (S4-5).
-- It lives in `proposed_migrations/`, is **not** in `migrations/`, is **not** in
-  `_EXPECTED_MIGRATIONS`, and no production fingerprint references it.
+- **PR #14 update:** the file now lives in `migrations/`, is registered in
+  `_EXPECTED_MIGRATIONS` and `_EXPECTED_SCHEMA_SHA256`, and its bytes and fingerprint are
+  verified on every open — but it is **still not applied and not activated**:
+  `ACTIVE_SCHEMA_VERSION = 1` and version 2 is in `PENDING_MIGRATION_VERSIONS`. The
+  registration/activation split, the recomputed pins and the full verification record are in
+  `docs/engineering/PHASE2B_STAGE4_MIGRATION.md`.
 
-Applying or merging it is a separate change that must also:
+*Historical (pre-PR #14) text, superseded by the paragraph above:* the file lived in
+`proposed_migrations/` and was neither registered nor fingerprinted. The steps that change
+listed at the time were:
 
 1. move the file to `aether/core/persistence/migrations/0002_phase2b_stage4_grants.sql`;
 2. add `2: ("0002_phase2b_stage4_grants.sql", "<sha256>")` to `_EXPECTED_MIGRATIONS`;
@@ -392,8 +398,9 @@ stream. Pins therefore remain:
 - proposed migration SHA-256: `d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c`
 - complete version-2 schema fingerprint: `dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788`
   (30 objects, `user_version = 2`)
-- still proposed, inert, unregistered and never applied; production schema pins unchanged
-  (v1 `70907729…` / `02f3cac7…`).
+- inert and never applied; at the time of that round it was also unregistered. Production
+  schema pins were unchanged (v1 `70907729…` / `02f3cac7…`); PR #14 registers the version-2
+  pins without activating them.
 
 ### Migration-control outcome (first round, S4-1 … S4-5)
 
@@ -404,9 +411,11 @@ regenerated, not carried over:
   (previous, now **unapproved and superseded**: `a91b431c…`)
 - complete version-2 schema fingerprint: `dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788`
   (previous: `f68447f6…`), still 30 objects
-- the file remains in `proposed_migrations/`, unregistered, unfingerprinted by
-  `SQLiteTaskStore`, and every test applies it only through a `monkeypatch`-scoped
-  temporary migrations directory.
+- at the time, the file remained in `proposed_migrations/`, unregistered and unfingerprinted
+  by `SQLiteTaskStore`, and every test applied it only through a `monkeypatch`-scoped
+  temporary migrations directory. **Superseded by PR #14:** the bytes and fingerprint above
+  are now the registered production pins, while application stays gated behind
+  `ACTIVE_SCHEMA_VERSION`.
 
 ### Windows-specific acceptance items for this design (not Linux-inferred)
 

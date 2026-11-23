@@ -237,16 +237,64 @@ _ACTIVE_RESTART_STATES = frozenset(
 _EVENT_NAME = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
 _ERROR_CODE = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
 _LOWER_PREVIEW_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Migration registry: version -> (filename, SHA-256 of the packaged bytes).
+#
+# PR #14 (Phase 2B Stage 4) prepares version 2 here. Every entry is verified
+# against the packaged bytes before any SQL runs, and the recorded ledger row
+# is re-verified on every reopen, so a prepared-but-unauthorized migration
+# cannot be applied by accident.
 _EXPECTED_MIGRATIONS: dict[int, tuple[str, str]] = {
     1: (
         "0001_phase2b_core.sql",
         "709077298230c7065c6778b3149f93b679b6e678220e2d1a34d3540a348d741e",
-    )
+    ),
+    2: (
+        "0002_phase2b_stage4_grants.sql",
+        # Independently recomputed from the packaged bytes, not copied from
+        # documentation (see docs/engineering/PHASE2B_STAGE4_MIGRATION.md).
+        "d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c",
+    ),
 }
 _EXPECTED_SCHEMA_SHA256: dict[int, str] = {
-    1: "02f3cac7e905dfb4d1f161621c789bd5c437530002dec36202e9b2dfaa5d2e30"
+    1: "02f3cac7e905dfb4d1f161621c789bd5c437530002dec36202e9b2dfaa5d2e30",
+    2: "dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788",
 }
-_CRITICAL_TRIGGER_NAMES = frozenset(
+
+# ---------------------------------------------------------------------------
+# Migration activation (Phase 2B Stage 4, PR #14)
+# ---------------------------------------------------------------------------
+#
+# Registering a migration is *preparation*; making it the schema this build
+# creates and accepts is *activation*. They are deliberately separate:
+#
+# * ``_EXPECTED_MIGRATIONS`` / ``_EXPECTED_SCHEMA_SHA256`` list every known
+#   version, so their packaged bytes and fingerprints are verified on every
+#   single open — even while a version is inactive.
+# * ``ACTIVE_SCHEMA_VERSION`` is the version this build creates and accepts.
+#   It is one, so a prepared-but-unapproved version changes nothing about user
+#   databases.
+# * ``PENDING_MIGRATION_VERSIONS`` records versions that are prepared but must
+#   never run until explicitly authorized. Activation refuses to target a
+#   pending version, so bumping the active version alone cannot apply one.
+#
+# Activating version 2 requires separate explicit user approval after
+# independent review; that change sets ``ACTIVE_SCHEMA_VERSION = 2`` and clears
+# version 2 from ``PENDING_MIGRATION_VERSIONS`` in the same reviewed commit.
+ACTIVE_SCHEMA_VERSION = 1
+PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset({2})
+
+
+def _activation_error(version: int) -> str:
+    return (
+        f"migration {version} is registered but not authorized to apply; activating it "
+        "requires explicit approval, and this build refuses to apply it"
+    )
+
+
+# Objects each schema version must contain. Version 2 is a strict superset of
+# version 1: 0002 only adds the grant ledger, so an upgraded v1 database and a
+# clean v2 install must be indistinguishable in what they guarantee.
+_CRITICAL_TRIGGER_NAMES_V1 = frozenset(
     {
         "task_plans_no_update",
         "task_plans_no_delete",
@@ -258,6 +306,39 @@ _CRITICAL_TRIGGER_NAMES = frozenset(
         "approval_records_no_delete",
     }
 )
+_CRITICAL_TRIGGER_NAMES_V2 = _CRITICAL_TRIGGER_NAMES_V1 | {
+    "exact_approval_grants_scope_no_update",
+    "exact_approval_grant_events_no_update",
+    "exact_approval_grant_events_no_delete",
+    "exact_approval_grant_consumptions_no_update",
+    "exact_approval_grant_consumptions_no_delete",
+    "exact_approval_grant_state_guarded_update",
+    "exact_approval_grant_state_no_delete",
+}
+_CRITICAL_TABLES_V1 = frozenset(
+    {
+        "schema_migrations",
+        "tasks",
+        "task_plans",
+        "task_steps",
+        "task_events",
+        "approval_records",
+    }
+)
+_CRITICAL_TABLES_V2 = _CRITICAL_TABLES_V1 | {
+    "exact_approval_grants",
+    "exact_approval_grant_state",
+    "exact_approval_grant_events",
+    "exact_approval_grant_consumptions",
+}
+
+_SCHEMA_REQUIREMENTS: dict[int, tuple[frozenset[str], frozenset[str]]] = {
+    1: (_CRITICAL_TABLES_V1, _CRITICAL_TRIGGER_NAMES_V1),
+    2: (_CRITICAL_TABLES_V2, _CRITICAL_TRIGGER_NAMES_V2),
+}
+
+# Backwards-compatible alias: the highest version's trigger inventory.
+_CRITICAL_TRIGGER_NAMES = _CRITICAL_TRIGGER_NAMES_V2
 
 
 def persistent_state_from_phase1(state: TaskState) -> PersistentTaskState:
@@ -1012,9 +1093,13 @@ class SQLiteTaskStore:
                 or record.preview_id != preview_id
                 or record.preview_digest != preview_digest
             ):
-                raise ReviewConflictError("review request identity was replayed with different data")
+                raise ReviewConflictError(
+                    "review request identity was replayed with different data"
+                )
             if requested_outcome != resolution:
-                raise ReviewConflictError("review request identity was replayed with a different outcome")
+                raise ReviewConflictError(
+                    "review request identity was replayed with a different outcome"
+                )
             return Stage2ReviewWrite(
                 resolution=resolution,
                 requested_outcome=requested_outcome,
@@ -1053,12 +1138,18 @@ class SQLiteTaskStore:
                 or metadata.get("preview_id") != str(preview_id)
                 or metadata.get("preview_digest") != preview_digest
             ):
-                raise ReviewConflictError("review request identity was replayed with different data")
+                raise ReviewConflictError(
+                    "review request identity was replayed with different data"
+                )
             stored_outcome = metadata.get("requested_outcome")
             if stored_outcome is None:
-                raise PersistenceIntegrityError("stored Stage 2 audit event is missing its requested outcome")
+                raise PersistenceIntegrityError(
+                    "stored Stage 2 audit event is missing its requested outcome"
+                )
             if stored_outcome != requested_outcome:
-                raise ReviewConflictError("review request identity was replayed with a different outcome")
+                raise ReviewConflictError(
+                    "review request identity was replayed with a different outcome"
+                )
             return Stage2ReviewWrite(
                 resolution=resolution,
                 requested_outcome=requested_outcome,
@@ -1275,6 +1366,36 @@ class SQLiteTaskStore:
         except (ValidationError, ValueError) as exc:
             raise PersistenceIntegrityError("stored approval audit record is invalid") from exc
         return record
+
+    def record_observation_event(
+        self,
+        task_id: UUID,
+        event_type: str,
+        *,
+        values: dict[str, str | int | float | bool | None] | None = None,
+        step_id: UUID | None = None,
+        now: datetime | None = None,
+    ) -> UUID:
+        """Append one non-state-changing audit event for a capability action.
+
+        Read-tier capabilities (inspect/read/search/open) do not transition the
+        task, but they must still be auditable. This is the narrow, validated
+        entry point for that: it never changes task state, it rejects unknown
+        event names through the same ``_EVENT_NAME`` rule as every other event,
+        and it runs inside the store's transaction and lock.
+        """
+
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            event_id = self._append_event(
+                connection,
+                task_id,
+                event_type,
+                EventMetadata(values=dict(values or {})),
+                now=timestamp,
+                step_id=step_id,
+            )
+        return event_id
 
     def list_events(self, task_id: UUID, *, after_sequence: int = 0) -> tuple[StoredTaskEvent, ...]:
         with self._lock:
@@ -1526,8 +1647,17 @@ class SQLiteTaskStore:
 
     def _apply_migrations(self) -> None:
         current = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        latest_version = max(_EXPECTED_MIGRATIONS, default=0)
-        if current > latest_version:
+        target_version = ACTIVE_SCHEMA_VERSION
+        if target_version not in _EXPECTED_MIGRATIONS:
+            raise PersistenceIntegrityError("active schema version is not registered")
+        # Activation gate (PR #14): a prepared migration must never run before it
+        # is explicitly authorized, even if the active version was bumped.
+        if target_version in PENDING_MIGRATION_VERSIONS:
+            raise PersistenceIntegrityError(_activation_error(target_version))
+        # Compare against the *active* version, not the registry maximum: a build
+        # that has only activated version 1 must refuse a version-2 database
+        # rather than open schema it does not implement.
+        if current > target_version:
             raise PersistenceIntegrityError("database schema is newer than this application")
         if current > 0:
             try:
@@ -1548,7 +1678,7 @@ class SQLiteTaskStore:
                     or row["sha256"] != expected_sha256
                 ):
                     raise PersistenceIntegrityError("applied migration checksum mismatch")
-        for version in range(current + 1, latest_version + 1):
+        for version in range(current + 1, target_version + 1):
             migration_name, checksum, script = self._verified_migrations[version]
             try:
                 self._connection.executescript(f"BEGIN IMMEDIATE;\n{script}")
@@ -1562,24 +1692,32 @@ class SQLiteTaskStore:
                         _timestamp(None),
                     ),
                 )
+                # Verify the version bump *before* committing. A migration whose
+                # script completes but does not advance ``user_version`` (for
+                # example a truncated or interrupted file) would otherwise leave
+                # a committed partial schema behind while the database still
+                # reports the old version.
+                applied = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+                if applied != version:
+                    raise PersistenceIntegrityError(
+                        f"migration {migration_name} did not advance schema version"
+                    )
                 self._connection.execute("COMMIT")
             except sqlite3.Error as exc:
                 if self._connection.in_transaction:
                     self._connection.execute("ROLLBACK")
                 raise PersistenceIntegrityError(f"migration {migration_name} failed") from exc
-            applied = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-            if applied != version:
-                raise PersistenceIntegrityError("migration did not advance schema version")
+            except PersistenceIntegrityError:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
 
     def _verify_schema(self) -> None:
-        required_tables = {
-            "schema_migrations",
-            "tasks",
-            "task_plans",
-            "task_steps",
-            "task_events",
-            "approval_records",
-        }
+        user_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
+        requirements = _SCHEMA_REQUIREMENTS.get(user_version)
+        if requirements is None:
+            raise PersistenceIntegrityError("database schema version is not supported")
+        required_tables, required_triggers = requirements
         rows = self._connection.execute(
             "SELECT type, name, sql FROM sqlite_master "
             "WHERE type IN ('table', 'index', 'trigger') "
@@ -1588,7 +1726,7 @@ class SQLiteTaskStore:
         ).fetchall()
         present_tables = {row["name"] for row in rows if row["type"] == "table"}
         present_triggers = {row["name"] for row in rows if row["type"] == "trigger"}
-        if not required_tables.issubset(present_tables) or not _CRITICAL_TRIGGER_NAMES.issubset(
+        if not required_tables.issubset(present_tables) or not required_triggers.issubset(
             present_triggers
         ):
             raise PersistenceIntegrityError("database schema objects are missing")
@@ -1596,7 +1734,6 @@ class SQLiteTaskStore:
             (row["type"], row["name"], _normalize_schema_sql(row["sql"])) for row in rows
         ]
         schema_hash = hashlib.sha256(_canonical_json(schema_descriptor).encode("utf-8")).hexdigest()
-        user_version = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
         if schema_hash != _EXPECTED_SCHEMA_SHA256.get(user_version):
             raise PersistenceIntegrityError("database schema integrity fingerprint mismatch")
         expected_name, expected_sha256 = _EXPECTED_MIGRATIONS[user_version]

@@ -61,7 +61,7 @@ function validPreview(): Record<string, unknown> {
     }],
     fullDiff: [{
       resourceId: 'file:00000000-0000-0000-0000-000000000005',
-      unifiedDiff: '--- a/example.txt\n+++ b/example.txt\n-old\n+new\n',
+      unifiedDiff: '--- a/example.txt\n+++ b/example.txt\n-old\n+new\n\\ aether-diff-v2 eof: original=newline replacement=newline',
     }],
     fullDiffAvailable: true,
     previewId: PREVIEW_ID,

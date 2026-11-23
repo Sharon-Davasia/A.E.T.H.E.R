@@ -15,12 +15,14 @@ hardened launch with the real wire protocol.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import secrets
 import sqlite3
+import stat
 import struct
 import subprocess
 import sys
@@ -94,13 +96,24 @@ class ServiceProcess:
             stderr=subprocess.PIPE,
         )
         assert self.process.stdin is not None and self.process.stdout is not None
+        # Set before the handshake, so a failing handshake assertion below can still
+        # reap the child it already spawned rather than leaking it for the session.
+        self._exit_code: int | None = None
         self.key = secrets.token_bytes(32)
         self.session = secrets.token_hex(16)
         challenge = secrets.token_bytes(32)
-        self.process.stdin.write(MAGIC + bytes.fromhex(self.session) + self.key + challenge)
-        self.process.stdin.flush()
-        hello = read_frame(self.process.stdout)
-        assert hello["kind"] == "channel.hello"
+        try:
+            self.process.stdin.write(MAGIC + bytes.fromhex(self.session) + self.key + challenge)
+            self.process.stdin.flush()
+            hello = read_frame(self.process.stdout)
+            assert hello["kind"] == "channel.hello"
+        except BaseException:
+            # Construction is what spawns the child; if the handshake cannot be
+            # completed the caller has no handle to close, so clean up here. The
+            # hello assertion is inside the block for the same reason: a wrong-kind
+            # frame must not leak the child either.
+            self.close()
+            raise
 
     def request(self, seq: int, request_id: str, kind: str, payload: object) -> dict[str, object]:
         envelope = {
@@ -128,22 +141,38 @@ class ServiceProcess:
         return self.request(seq, str(uuid4()), "demo.ping", {"text": "synthetic-only"})
 
     def close(self) -> int:
-        assert self.process.stdin is not None
-        self.process.stdin.close()
-        return self.process.wait(timeout=10)
+        """Close the channel and reap the child; safe to call from ``finally``.
+
+        Closing the pipe twice is tolerated and a child that ignores the closed
+        channel is killed rather than left running, so this can be called on the
+        failure and skip paths without leaking a process or its pipes. Repeated
+        calls return the first exit status.
+        """
+
+        if self._exit_code is not None:
+            return self._exit_code
+        with contextlib.suppress(OSError, ValueError):
+            if self.process.stdin is not None:
+                self.process.stdin.close()
+        try:
+            self._exit_code = self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self._exit_code = self.process.wait(timeout=10)
+        return self._exit_code
 
 
 def get_ready_preview(child: ServiceProcess, seq: int) -> dict[str, object]:
-    response = child.request(
-        seq, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID}
-    )
+    response = child.request(seq, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
     assert response["kind"] == "review.preview"
     payload = response["payload"]
     assert payload["status"] == "ready", payload
     return payload["preview"]
 
 
-def outcome_request(preview: dict[str, object], outcome: str, acknowledged: bool) -> dict[str, object]:
+def outcome_request(
+    preview: dict[str, object], outcome: str, acknowledged: bool
+) -> dict[str, object]:
     return {
         "reviewRequestId": preview["reviewRequestId"],
         "taskId": preview["taskId"],
@@ -176,9 +205,7 @@ def seed_narrative(tmp_path: Path) -> Path:
 
 def counts(db: Path) -> tuple[int, int]:
     with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as connection:
-        decisions = int(
-            connection.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0]
-        )
+        decisions = int(connection.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0])
         events = int(connection.execute("SELECT COUNT(*) FROM task_events").fetchone()[0])
     return decisions, events
 
@@ -296,7 +323,9 @@ def test_reconcile_with_drifted_plan_hash_is_denied(db_path: Path) -> None:
 def test_reconcile_repeats_without_creating_new_stale_decisions(db_path: Path) -> None:
     child = ServiceProcess(db_path)
     preview = get_ready_preview(child, 1)
-    stale_request = outcome_request(dict(preview, planRevision=int(preview["planRevision"]) + 1), "APPROVE", True)
+    stale_request = outcome_request(
+        dict(preview, planRevision=int(preview["planRevision"]) + 1), "APPROVE", True
+    )
     recorded = child.request(2, str(uuid4()), "review.record_outcome", stale_request)
     assert recorded["payload"]["resolution"] == "STALE"
     before = counts(db_path)
@@ -401,7 +430,12 @@ def test_narrative_deleted_mid_session_fails_closed_and_recovers(
     assert child.ping(4)["kind"] == "demo.pong"
     # Restore the source; the permitted request succeeds again.
     narrative.write_text(
-        json.dumps({"task_id": FIXED_TASK_ID, "narrative": build_synthetic_narrative().model_dump(mode="json")}),
+        json.dumps(
+            {
+                "task_id": FIXED_TASK_ID,
+                "narrative": build_synthetic_narrative().model_dump(mode="json"),
+            }
+        ),
         encoding="utf-8",
     )
     preview = child.request(5, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
@@ -475,14 +509,9 @@ def test_narrative_replaced_by_other_task_fails_closed(db_path: Path, tmp_path: 
     assert child.close() == 0
 
 
-def test_narrative_unreadable_by_permissions_fails_closed(
-    db_path: Path, tmp_path: Path
-) -> None:
-    if os.geteuid() == 0:
-        pytest.skip("permission checks are meaningless as root")
-    narrative = seed_narrative(tmp_path)
-    child = ServiceProcess(db_path, narrative=narrative)
-    narrative.chmod(0)
+def _assert_unavailable_but_channel_usable(child: ServiceProcess) -> None:
+    """Both review operations must fail closed while the channel stays usable."""
+
     preview = child.request(1, str(uuid4()), "review.get_preview", {"task_id": FIXED_TASK_ID})
     assert preview["payload"] == {"status": "unavailable", "reason": "review_unavailable"}
     request = outcome_request(
@@ -501,8 +530,170 @@ def test_narrative_unreadable_by_permissions_fails_closed(
     assert ack["kind"] == "review.error"
     assert ack["payload"] == {"reason": "review_unavailable"}
     assert child.ping(3)["kind"] == "demo.pong"
-    narrative.chmod(0o600)
-    assert child.close() == 0
+
+
+def _assert_read_is_denied(narrative: Path) -> None:
+    """Prove the denial is in force, so the assertions below cannot pass vacuously."""
+
+    try:
+        with open(narrative, "rb"):
+            pass
+    except PermissionError:
+        return
+    pytest.fail(
+        "read access was not denied; a passing fail-closed assertion below would "
+        "prove nothing about unreadable narratives"
+    )
+
+
+def test_narrative_unreadable_by_permissions_fails_closed(db_path: Path, tmp_path: Path) -> None:
+    """An unreadable trusted narrative fails closed on POSIX mode-bit denial.
+
+    ``chmod(0)`` establishes denial only where the mode bits govern access: on
+    POSIX a non-root process is refused with ``EACCES`` and the assertions below
+    are meaningful. On Windows the stored mode carries nothing but the read-only
+    attribute, so ``chmod(0)`` leaves the file fully readable and the service
+    would correctly serve a preview -- which is why this test could not pass
+    there. The Windows case is covered separately by
+    ``test_narrative_unreadable_by_windows_acl_fails_closed``.
+    """
+
+    if os.name != "posix":
+        pytest.skip("POSIX mode-bit denial does not exist on this platform")
+    if os.geteuid() == 0:
+        pytest.skip("permission checks are meaningless as root")
+    narrative = seed_narrative(tmp_path)
+    child = ServiceProcess(db_path, narrative=narrative)
+    original_mode = stat.S_IMODE(narrative.stat().st_mode)
+    try:
+        narrative.chmod(0)
+        _assert_read_is_denied(narrative)
+        _assert_unavailable_but_channel_usable(child)
+    finally:
+        # Restore and reap unconditionally: a failed assertion here must not leave
+        # the temporary tree unreadable or the child running for the rest of the
+        # suite. Restoring the mode is best-effort (it is the mode this test just
+        # removed), but the child is always closed.
+        with contextlib.suppress(OSError):
+            narrative.chmod(original_mode)
+        assert child.close() == 0
+
+
+def _icacls(*arguments: str) -> subprocess.CompletedProcess[str]:
+    """Run the platform ``icacls`` tool, skipping if it is genuinely unavailable."""
+
+    # Windows environment variable lookup is case-insensitive; SYSTEMROOT is the
+    # canonical spelling and is what the platform always sets.
+    system_root = os.environ.get("SYSTEMROOT", r"C:\Windows")
+    tool = Path(system_root) / "System32" / "icacls.exe"
+    if not tool.is_file():
+        pytest.skip(f"{tool} is unavailable; cannot set a real Windows ACL")
+    return subprocess.run([str(tool), *arguments], capture_output=True, text=True, timeout=30)
+
+
+def _deny_read_windows(path: Path) -> None:
+    """Deny the current user file content reads with an explicit deny ACE.
+
+    ``(RD)`` is ``FILE_READ_DATA`` only, which is exactly what makes the narrative
+    inaccessible. It deliberately does *not* include ``READ_CONTROL`` the way the
+    broader ``(R)`` does: denying that removes the right needed to rewrite the
+    security descriptor, so restoring the ACL afterwards would itself be refused
+    with exit 5 ("Access is denied") and could not be done unelevated. Denying the
+    narrow right keeps the denial real while leaving restoration possible.
+    """
+
+    user = os.environ.get("USERNAME")
+    if not user:
+        pytest.skip("USERNAME is unset; cannot target a deny ACE at the current user")
+    applied = _icacls(str(path), "/deny", f"{user}:(RD)")
+    if applied.returncode != 0:
+        pytest.skip(
+            "a deny ACE could not be applied in this environment "
+            f"(exit {applied.returncode}): {applied.stdout.strip()} {applied.stderr.strip()}"
+        )
+
+
+def _clear_windows_acl(path: Path) -> None:
+    """Restore the file's permissions, then prove the content is readable again.
+
+    ``/reset`` strips the explicit ACEs and restores inheritance, which is the state
+    ``seed_narrative`` creates. It needs only WRITE_DAC on the file, so the owner can
+    do it without administrator rights -- provided the deny left READ_CONTROL alone.
+
+    A failure still raises rather than being swallowed: leaving the deny in place
+    would keep the temporary narrative unreadable for the remainder of the session.
+    The readability check afterwards is what actually proves the intended
+    permissions are back, instead of trusting the tool's exit code.
+    """
+
+    restored = _icacls(str(path), "/reset")
+    if restored.returncode != 0:
+        # One retry in a form that only touches this user's deny ACE, for hosts
+        # where a full reset is refused but a targeted removal is not.
+        user = os.environ.get("USERNAME")
+        retry = _icacls(str(path), "/remove:d", user) if user else None
+        if retry is None or retry.returncode != 0:
+            detail = (
+                f"reset exit {restored.returncode}: "
+                f"{restored.stdout.strip()} {restored.stderr.strip()}"
+            )
+            if retry is not None:
+                detail += (
+                    f"; remove:d exit {retry.returncode}: "
+                    f"{retry.stdout.strip()} {retry.stderr.strip()}"
+                )
+            raise AssertionError(f"could not restore the ACL after the deny ACE ({detail})")
+    try:
+        path.read_bytes()
+    except OSError as exc:
+        raise AssertionError(
+            f"permissions were not restored: the file is still unreadable ({exc})"
+        ) from exc
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows access-denial semantics required")
+def test_narrative_unreadable_by_windows_acl_fails_closed(db_path: Path, tmp_path: Path) -> None:
+    """Windows: a real deny ACE removes read access, so the service fails closed.
+
+    This is the Windows counterpart of the POSIX test above. ``icacls`` applies an
+    explicit deny ACE for the current user because ``chmod`` cannot express Windows
+    access denial: the process is then refused at ``open`` by the ACL, which is the
+    real condition the fail-closed path exists to survive.
+
+    If the environment cannot apply or observe that denial -- SYSTEM, an
+    unexpected privilege, or a filesystem without ACLs -- the test skips with the
+    reason rather than passing vacuously.
+    """
+
+    narrative = seed_narrative(tmp_path)
+    child = ServiceProcess(db_path, narrative=narrative)
+    try:
+        _deny_read_windows(narrative)
+        _assert_read_is_denied(narrative)
+        _assert_unavailable_but_channel_usable(child)
+    finally:
+        # Reap the child and restore the ACL unconditionally -- including when the
+        # deny ACE could not be applied and the test skips -- with each step running
+        # even if the other fails. An exception raised here would replace an earlier
+        # test failure as the primary report, so when one is already propagating the
+        # cleanup problem is folded into the message instead of raised over the top.
+        primary = sys.exc_info()[1]
+        cleanup_errors: list[BaseException] = []
+        try:
+            assert child.close() == 0
+        except BaseException as error:  # collected, then re-raised below
+            cleanup_errors.append(error)
+        try:
+            _clear_windows_acl(narrative)
+        except BaseException as error:  # collected, then re-raised below
+            cleanup_errors.append(error)
+        if cleanup_errors:
+            detail = "; ".join(str(error) for error in cleanup_errors)
+            if primary is None:
+                raise cleanup_errors[0]
+            raise AssertionError(
+                f"cleanup failed as well as the test body: {detail} (earlier failure: {primary})"
+            ) from primary
 
 
 def test_bridge_in_process_narrative_deleted_before_record(db_path: Path, tmp_path: Path) -> None:
@@ -576,7 +767,12 @@ def test_hardened_launch_ignores_pythonhome_and_pythonusersite(tmp_path: Path) -
         "PYTHONUSERBASE": str(tmp_path / "does-not-exist"),
     }
     result = subprocess.run(
-        [sys.executable, *HARDENED_FLAGS, "-c", "import aether.channel.service; print('IMPORT_OK')"],
+        [
+            sys.executable,
+            *HARDENED_FLAGS,
+            "-c",
+            "import aether.channel.service; print('IMPORT_OK')",
+        ],
         cwd=BACKEND_ROOT,
         env=env,
         capture_output=True,

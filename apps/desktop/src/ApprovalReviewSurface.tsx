@@ -1,6 +1,10 @@
 import React from 'react';
 import {
   canRecordOutcome,
+  diffDisplayLines,
+  diffEofState,
+  previewHasCompleteEofEvidence,
+  type DiffEofState,
   type ExactPreview,
   type ReviewAcknowledgement,
   type ReviewOutcome,
@@ -13,6 +17,14 @@ interface ApprovalReviewSurfaceProps {
   readonly acknowledgement: ReviewAcknowledgement | undefined;
   readonly error: string | undefined;
   readonly onOutcome: (outcome: ReviewOutcome, fullDiffAcknowledged: boolean) => void;
+}
+
+function eofStateLabel(state: DiffEofState): string {
+  switch (state) {
+    case 'newline': return 'ends with a newline';
+    case 'no-newline': return 'ends without a final newline';
+    case 'empty': return 'is empty';
+  }
 }
 
 function riskLabel(tier: ExactPreview['highestRiskTier']): string {
@@ -72,8 +84,10 @@ export function ApprovalReviewSurface({
   }
 
   const diffRequired = preview.fullDiffAvailable;
+  const eofIncomplete = preview.fullDiffAvailable && !previewHasCompleteEofEvidence(preview);
   const outcomeAvailable = (outcome: ReviewOutcome): boolean =>
-    canRecordOutcome(outcome, { pending, diffRequired, diffAcknowledged });
+    canRecordOutcome(outcome, { pending, diffRequired, diffAcknowledged })
+    && !(outcome === 'APPROVE' && eofIncomplete);
 
   return <section className="review-panel" aria-labelledby="review-preview-title">
     <p className="eyebrow">STAGE 2 · REVIEW EVIDENCE ONLY</p>
@@ -149,7 +163,16 @@ export function ApprovalReviewSurface({
       <button type="button" className="secondary" aria-expanded={diffExpanded} aria-controls="full-diff-panel" onClick={() => setDiffExpanded((expanded) => !expanded)}>
         {diffExpanded ? 'Hide full diff' : 'Inspect full diff'}
       </button>
-      {diffExpanded && <pre id="full-diff-panel" tabIndex={0} aria-label="Full proposed diff">{preview.fullDiff.map((diff) => `${diff.resourceId}\n${diff.unifiedDiff}`).join('\n\n')}</pre>}
+      {diffExpanded && <div id="full-diff-panel">
+        {preview.fullDiff.map((diff) => {
+          const eof = diffEofState(diff.unifiedDiff);
+          return <div key={diff.resourceId}>
+            <pre tabIndex={0} aria-label="Full proposed diff">{diffDisplayLines(diff.unifiedDiff).map((line, index) => <span key={index} className="diff-line">{line.text}{line.crlf && <span className="crlf-badge" role="img" aria-label="CRLF line ending">CRLF</span>}{'\n'}</span>)}</pre>
+            {eof && <p className="notice">End of file — original {eofStateLabel(eof.original)}; replacement {eofStateLabel(eof.replacement)}.</p>}
+          </div>;
+        })}
+      </div>}
+      {eofIncomplete && <p className="review-error" role="alert">This preview does not carry complete end-of-file evidence, so it cannot be approved. Revise, reject, or cancel instead.</p>}
       <label className="diff-acknowledgement">
         <input type="checkbox" checked={diffAcknowledged} onChange={(event) => setDiffAcknowledged(event.target.checked)} aria-describedby="diff-acknowledgement-help" />
         <span>I inspected this exact full diff.<span id="diff-acknowledgement-help" className="diff-acknowledgement-help"> Required only to approve; revising, rejecting, or cancelling does not require it.</span></span>

@@ -256,6 +256,11 @@ class ApprovalDecisionRecord(BaseModel):
         return value
 
 
+_UUID_PATTERN = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
 class EventMetadata(BaseModel):
     """Small redacted metadata only; no document/preview bodies or credentials."""
 
@@ -287,6 +292,18 @@ class EventMetadata(BaseModel):
             "preview_id",
             "requested_outcome",
             "error_code",
+            # Capability audit (Phase 2C/2D). Deliberately excludes any path,
+            # content, query text or free-form detail: an audit event records
+            # that a capability ran, against which resource identity, and with
+            # what outcome code -- never the data itself.
+            "capability",
+            "outcome",
+            "reason_code",
+            "resource_id",
+            "receipt_id",
+            "snapshot_id",
+            "pre_sha256",
+            "post_sha256",
         }
         if any(key not in allowed for key in value):
             raise ValueError("event metadata key is not allow-listed")
@@ -312,7 +329,12 @@ class EventMetadata(BaseModel):
                 )
             ):
                 raise ValueError("event approval ID must be a UUID")
-            if key == "requested_outcome" and item not in {"APPROVE", "REVISE", "REJECT", "CANCELLED"}:
+            if key == "requested_outcome" and item not in {
+                "APPROVE",
+                "REVISE",
+                "REJECT",
+                "CANCELLED",
+            }:
                 raise ValueError("event requested outcome is invalid")
             if key == "decision" and item not in {"APPROVE", "REJECT"}:
                 raise ValueError("event decision is invalid")
@@ -337,6 +359,34 @@ class EventMetadata(BaseModel):
                 not isinstance(item, str) or not re.fullmatch(r"[a-z][a-z0-9_.-]{0,127}", item)
             ):
                 raise ValueError("event error code is invalid")
+            if key == "capability" and (
+                not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", item)
+            ):
+                raise ValueError("event capability id is invalid")
+            if key == "outcome" and item not in {
+                "SUCCEEDED",
+                "FAILED",
+                "PARTIAL",
+                "UNVERIFIED",
+            }:
+                raise ValueError("event outcome is invalid")
+            if key == "reason_code" and (
+                not isinstance(item, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", item)
+            ):
+                raise ValueError("event reason code is invalid")
+            if key == "resource_id" and (
+                not isinstance(item, str)
+                or not re.fullmatch(r"(?:file|directory):[0-9a-fA-F-]{36}", item)
+            ):
+                raise ValueError("event resource id must be a registry resource id")
+            if key in {"receipt_id", "snapshot_id"} and (
+                not isinstance(item, str) or not _UUID_PATTERN.fullmatch(item)
+            ):
+                raise ValueError("event identifier must be a UUID")
+            if key in {"pre_sha256", "post_sha256"} and (
+                not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
+            ):
+                raise ValueError("event content digest must be a lowercase SHA-256 digest")
         return value
 
 

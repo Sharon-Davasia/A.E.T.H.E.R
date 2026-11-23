@@ -31,6 +31,7 @@ from aether.core.persistence.sqlite_store import (
 
 _NOW = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
 _CANARY = "SYNTHETIC-DIFF-CANARY-7f91c4"
+TRAILER = "\\ aether-diff-v2 eof: original=newline replacement=newline"
 
 
 def _plan(task_id, *, revision: int = 1) -> TaskPlan:
@@ -72,16 +73,16 @@ def _narrative(*, action: str = "Preview one synthetic code edit") -> PreviewNar
         preconditions=("The synthetic example file remains at the previewed version",),
         external_effects=("No external service or operating-system action",),
         risks=("The displayed diff could fail deterministic post-check verification",),
-        verification_strategy=("Recompute the synthetic content hash and compare it to the expected hash",),
+        verification_strategy=(
+            "Recompute the synthetic content hash and compare it to the expected hash",
+        ),
         proposed_effect="Replace the displayed synthetic example line with the displayed replacement.",
         full_diff=(
             PreviewDiff(
                 resource_id="file:synthetic-1",
                 unified_diff=(
-                    "--- a/example.py\n"
-                    "+++ b/example.py\n"
-                    "-synthetic-original\n"
-                    f"+{_CANARY}\n"
+                    f"--- a/example.py\n+++ b/example.py\n-synthetic-original\n+{_CANARY}\n"
+                    + TRAILER
                 ),
             ),
         ),
@@ -153,8 +154,12 @@ def _store_with_plan(tmp_path, *, revision: int = 1):
 
 def _ready_store(tmp_path, *, revision: int = 1):
     store, task_id = _store_with_plan(tmp_path, revision=revision)
-    store.transition_task(task_id, PersistentTaskState.PREVIEW_READY, now=_NOW + timedelta(seconds=10))
-    store.transition_task(task_id, PersistentTaskState.AWAITING_APPROVAL, now=_NOW + timedelta(seconds=11))
+    store.transition_task(
+        task_id, PersistentTaskState.PREVIEW_READY, now=_NOW + timedelta(seconds=10)
+    )
+    store.transition_task(
+        task_id, PersistentTaskState.AWAITING_APPROVAL, now=_NOW + timedelta(seconds=11)
+    )
     return store, task_id
 
 
@@ -193,12 +198,18 @@ def test_preview_is_deterministic_canonical_and_diff_bound(tmp_path) -> None:
     assert changed.preview_digest != first.preview_digest
     changed_diff = service.present(
         task_id,
-        PreviewNarrative(**{**_narrative().model_dump(), "full_diff": (
-            PreviewDiff(
-                resource_id="file:synthetic-1",
-                unified_diff="--- a/example.py\n+++ b/example.py\n-synthetic-original\n+synthetic-replacement-2\n",
-            ),
-        )}),
+        PreviewNarrative(
+            **{
+                **_narrative().model_dump(),
+                "full_diff": (
+                    PreviewDiff(
+                        resource_id="file:synthetic-1",
+                        unified_diff="--- a/example.py\n+++ b/example.py\n-synthetic-original\n+synthetic-replacement-2\n"
+                        + TRAILER,
+                    ),
+                ),
+            }
+        ),
     )
     assert changed_diff.preview_digest != first.preview_digest
     store.close()
@@ -226,7 +237,7 @@ def test_exact_preview_rejects_cross_resource_diff_reference(tmp_path) -> None:
                     "full_diff": (
                         PreviewDiff(
                             resource_id="file:not-in-plan",
-                            unified_diff="--- a/other\n+++ b/other\n-old\n+new\n",
+                            unified_diff="--- a/other\n+++ b/other\n-old\n+new\n" + TRAILER,
                         ),
                     ),
                 }
@@ -295,7 +306,9 @@ def test_revise_reject_and_cancel_do_not_require_full_diff_acknowledgement(tmp_p
         service = PreviewReviewService(store)
         preview = service.present(task_id, _narrative())
         request = _request(preview, outcome, acknowledged=False)
-        result = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=20))
+        result = service.record_outcome(
+            task_id, _narrative(), request, now=_NOW + timedelta(seconds=20)
+        )
         assert result.resolution is ReviewResolution(outcome.value)
         assert result.granted is False
         assert result.execution_available is False
@@ -335,7 +348,9 @@ def test_approve_is_audit_only_and_survives_request_replay(tmp_path) -> None:
     assert result.granted is False
     assert result.execution_available is False
     assert store.get_task(task_id).state is PersistentTaskState.AWAITING_APPROVAL
-    replayed = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=30))
+    replayed = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=30)
+    )
     assert replayed.idempotent_replay is True
     assert replayed.resolution is ReviewResolution.APPROVE
     assert _decision_count(store) == 1
@@ -351,14 +366,18 @@ def test_reject_is_idempotent_after_terminal_state_and_restart(tmp_path) -> None
     service = PreviewReviewService(store)
     preview = service.present(task_id, _narrative())
     request = _request(preview, ReviewOutcome.REJECT)
-    result = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=20))
+    result = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=20)
+    )
     assert result.resolution is ReviewResolution.REJECT
     assert store.get_task(task_id).state is PersistentTaskState.DENIED
     store.close()
 
     reopened = SQLiteTaskStore(tmp_path / "stage2.sqlite3")
     service = PreviewReviewService(reopened)
-    replayed = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=30))
+    replayed = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=30)
+    )
     assert replayed.resolution is ReviewResolution.REJECT
     assert replayed.idempotent_replay is True
     assert _decision_count(reopened) == 1
@@ -374,8 +393,7 @@ def test_identical_concurrent_clicks_create_one_audit_outcome(tmp_path) -> None:
 
     with ThreadPoolExecutor(max_workers=8) as workers:
         futures = [
-            workers.submit(service.record_outcome, task_id, _narrative(), request)
-            for _ in range(8)
+            workers.submit(service.record_outcome, task_id, _narrative(), request) for _ in range(8)
         ]
         results = [future.result() for future in futures]
 
@@ -392,9 +410,7 @@ def test_replayed_request_with_conflicting_outcome_fails_closed(tmp_path) -> Non
     preview = service.present(task_id, _narrative())
     request = _request(preview, ReviewOutcome.APPROVE)
     service.record_outcome(task_id, _narrative(), request)
-    conflicting = ReviewOutcomeRequest(
-        **{**request.model_dump(), "outcome": ReviewOutcome.REJECT}
-    )
+    conflicting = ReviewOutcomeRequest(**{**request.model_dump(), "outcome": ReviewOutcome.REJECT})
     with pytest.raises(ReviewConflictError, match="different outcome"):
         service.record_outcome(task_id, _narrative(), conflicting)
     assert _decision_count(store) == 1
@@ -411,7 +427,9 @@ def test_resource_plan_revision_diff_and_preview_drift_are_stale_not_decisions(t
     store.transition_task(task_id, PersistentTaskState.PLANNING, now=_NOW + timedelta(seconds=20))
     plan_two = _plan(task_id, revision=2)
     store.save_plan(plan_two)
-    result = service.record_outcome(task_id, _narrative(), original_request, now=_NOW + timedelta(seconds=30))
+    result = service.record_outcome(
+        task_id, _narrative(), original_request, now=_NOW + timedelta(seconds=30)
+    )
     assert result.resolution is ReviewResolution.STALE
     assert _decision_count(store) == 0
 
@@ -423,7 +441,7 @@ def test_resource_plan_revision_diff_and_preview_drift_are_stale_not_decisions(t
             "full_diff": (
                 PreviewDiff(
                     resource_id="file:synthetic-1",
-                    unified_diff="--- a/example.py\n+++ b/example.py\n-old\n+different\n",
+                    unified_diff="--- a/example.py\n+++ b/example.py\n-old\n+different\n" + TRAILER,
                 ),
             ),
         }
@@ -438,11 +456,15 @@ def test_revise_is_audit_only_returns_to_planning_and_requires_fresh_consent(tmp
     service = PreviewReviewService(store)
     preview = service.present(task_id, _narrative())
     request = _request(preview, ReviewOutcome.REVISE)
-    result = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=20))
+    result = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=20)
+    )
     assert result.resolution is ReviewResolution.REVISE
     assert result.granted is False
     assert store.get_task(task_id).state is PersistentTaskState.PLANNING
-    replay = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=30))
+    replay = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=30)
+    )
     assert replay.idempotent_replay is True
     revision_events = [
         event
@@ -452,8 +474,12 @@ def test_revise_is_audit_only_returns_to_planning_and_requires_fresh_consent(tmp
     assert len(revision_events) == 1
 
     store.save_plan(_plan(task_id, revision=2))
-    store.transition_task(task_id, PersistentTaskState.PREVIEW_READY, now=_NOW + timedelta(seconds=40))
-    store.transition_task(task_id, PersistentTaskState.AWAITING_APPROVAL, now=_NOW + timedelta(seconds=41))
+    store.transition_task(
+        task_id, PersistentTaskState.PREVIEW_READY, now=_NOW + timedelta(seconds=40)
+    )
+    store.transition_task(
+        task_id, PersistentTaskState.AWAITING_APPROVAL, now=_NOW + timedelta(seconds=41)
+    )
     fresh = service.present(task_id, _narrative())
     assert fresh.plan_revision == 2
     store.close()
@@ -482,17 +508,26 @@ def test_revocation_invalidates_before_outcome_and_is_idempotent(tmp_path) -> No
 
     revocation = service.revoke(task_id, _narrative(), now=_NOW + timedelta(seconds=20))
     assert revocation.already_revoked is False
-    assert service.revoke(task_id, _narrative(), now=_NOW + timedelta(seconds=21)).already_revoked is True
+    assert (
+        service.revoke(task_id, _narrative(), now=_NOW + timedelta(seconds=21)).already_revoked
+        is True
+    )
     with pytest.raises(ReviewUnavailableError, match="fresh consent"):
         service.present(task_id, _narrative())
-    result = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=22))
+    result = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=22)
+    )
     assert result.resolution is ReviewResolution.UNAVAILABLE
     assert _decision_count(store) == 0
-    replay = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=23))
+    replay = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=23)
+    )
     assert replay.resolution is ReviewResolution.UNAVAILABLE
     assert replay.idempotent_replay is True
     event_types = [event.event_type for event in store.list_events(task_id)]
-    assert event_types.index("APPROVAL_PREVIEW_REVOKED") < event_types.index("APPROVAL_REVIEW_UNAVAILABLE")
+    assert event_types.index("APPROVAL_PREVIEW_REVOKED") < event_types.index(
+        "APPROVAL_REVIEW_UNAVAILABLE"
+    )
     store.close()
 
 
@@ -503,12 +538,16 @@ def test_outcome_before_revocation_remains_audit_only(tmp_path) -> None:
     request = _request(preview, ReviewOutcome.APPROVE)
     service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=20))
     service.revoke(task_id, _narrative(), now=_NOW + timedelta(seconds=30))
-    replay = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=31))
+    replay = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=31)
+    )
     assert replay.idempotent_replay is True
     decision = store.get_approval_record(request.review_request_id)
     assert decision.authority == "NON_AUTHORIZING_AUDIT_RECORD"
     event_types = [event.event_type for event in store.list_events(task_id)]
-    assert event_types.index("APPROVAL_DECISION_RECORDED") < event_types.index("APPROVAL_PREVIEW_REVOKED")
+    assert event_types.index("APPROVAL_DECISION_RECORDED") < event_types.index(
+        "APPROVAL_PREVIEW_REVOKED"
+    )
     store.close()
 
 
@@ -523,11 +562,15 @@ def test_restart_after_approval_fails_closed_and_replays_audit_only(tmp_path) ->
 
     reopened = SQLiteTaskStore(database_path)
     assert reopened.get_task(task_id).state is PersistentTaskState.PAUSED
-    assert any(event.event_type == "RESTART_RECOVERY_PAUSED" for event in reopened.list_events(task_id))
+    assert any(
+        event.event_type == "RESTART_RECOVERY_PAUSED" for event in reopened.list_events(task_id)
+    )
     service = PreviewReviewService(reopened)
     with pytest.raises(ReviewUnavailableError, match="fresh consent"):
         service.present(task_id, _narrative())
-    replay = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=40))
+    replay = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=40)
+    )
     assert replay.resolution is ReviewResolution.APPROVE
     assert replay.idempotent_replay is True
     assert replay.granted is False
@@ -552,7 +595,9 @@ def test_injected_failure_after_decision_write_rolls_back_rejection(tmp_path) ->
     assert _decision_count(store) == 0
     with store._lock:
         store._connection.execute("DROP TRIGGER injected_stage2_event_failure")
-    result = service.record_outcome(task_id, _narrative(), request, now=_NOW + timedelta(seconds=21))
+    result = service.record_outcome(
+        task_id, _narrative(), request, now=_NOW + timedelta(seconds=21)
+    )
     assert result.resolution is ReviewResolution.REJECT
     assert store.get_task(task_id).state is PersistentTaskState.DENIED
     assert _decision_count(store) == 1
@@ -573,7 +618,9 @@ def test_unavailable_review_records_audit_event_without_execution(tmp_path) -> N
     assert result.resolution is ReviewResolution.UNAVAILABLE
     assert result.granted is False
     assert _decision_count(store) == 0
-    assert any(event.event_type == "APPROVAL_REVIEW_UNAVAILABLE" for event in store.list_events(task_id))
+    assert any(
+        event.event_type == "APPROVAL_REVIEW_UNAVAILABLE" for event in store.list_events(task_id)
+    )
     store.close()
 
 
@@ -585,7 +632,9 @@ def test_full_diff_is_not_persisted_in_audit_records_or_events(tmp_path) -> None
     assert _CANARY in preview.full_diff[0].unified_diff
     assert _CANARY not in preview.canonical_json()
     service.record_outcome(task_id, _narrative(), _request(preview, ReviewOutcome.APPROVE))
-    event_payload = "\n".join(event.metadata.model_dump_json() for event in store.list_events(task_id))
+    event_payload = "\n".join(
+        event.metadata.model_dump_json() for event in store.list_events(task_id)
+    )
     audit_texts = event_payload + str(store.get_approval_record(preview.review_request_id))
     assert _CANARY not in audit_texts
     store.close()
@@ -617,7 +666,9 @@ def test_stale_replay_with_changed_outcome_or_preview_fails_closed(tmp_path) -> 
     original_request = _request(original, ReviewOutcome.APPROVE)
     store.transition_task(task_id, PersistentTaskState.PLANNING, now=_NOW + timedelta(seconds=20))
     store.save_plan(_plan(task_id, revision=2))
-    stale = service.record_outcome(task_id, _narrative(), original_request, now=_NOW + timedelta(seconds=30))
+    stale = service.record_outcome(
+        task_id, _narrative(), original_request, now=_NOW + timedelta(seconds=30)
+    )
     assert stale.resolution is ReviewResolution.STALE
     database_path = tmp_path / "stage2.sqlite3"
     store.close()
@@ -693,9 +744,7 @@ def test_decision_event_replay_rejects_outcome_tampering_after_reopen(tmp_path) 
     replayed = reopened_service.record_outcome(task_id, _narrative(), request)
     assert replayed.resolution is ReviewResolution.REVISE
     assert replayed.idempotent_replay is True
-    conflicting = ReviewOutcomeRequest(
-        **{**request.model_dump(), "outcome": ReviewOutcome.APPROVE}
-    )
+    conflicting = ReviewOutcomeRequest(**{**request.model_dump(), "outcome": ReviewOutcome.APPROVE})
     with pytest.raises(ReviewConflictError, match="different outcome"):
         reopened_service.record_outcome(task_id, _narrative(), conflicting)
     reopened.close()
@@ -744,7 +793,10 @@ def test_stage2_preview_model_rejects_noncanonical_and_drift_inputs(tmp_path) ->
     plan = store.get_plan(task_id)
     narrative = _narrative()
     preview = build_preview(plan, narrative)
-    assert ExactPreview.model_validate_json(preview.model_dump_json()).preview_digest == preview.preview_digest
+    assert (
+        ExactPreview.model_validate_json(preview.model_dump_json()).preview_digest
+        == preview.preview_digest
+    )
     with pytest.raises(ValueError, match="canonical"):
         PreviewStep(
             step_id=uuid4(),
