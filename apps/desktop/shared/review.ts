@@ -212,6 +212,58 @@ function recoveryClass(value: unknown): RecoveryClass {
   throw new Error('review recovery class is invalid');
 }
 
+export type DiffEofState = 'empty' | 'newline' | 'no-newline';
+
+export interface DiffEofEvidence {
+  original: DiffEofState;
+  replacement: DiffEofState;
+}
+
+const EOF_TRAILER =
+  /^\\ aether-diff-v2 eof: original=(empty|newline|no-newline) replacement=(empty|newline|no-newline)$/;
+
+/**
+ * The EOF evidence carried by a canonical aether-diff-v2 diff, or undefined
+ * when the trailer is missing or malformed. Derived only from the final
+ * line; the canonical string itself is never modified.
+ */
+export function diffEofState(unifiedDiff: string): DiffEofEvidence | undefined {
+  const lines = unifiedDiff.split('\n');
+  const lastLine = lines[lines.length - 1] ?? '';
+  const match = EOF_TRAILER.exec(lastLine);
+  if (!match) return undefined;
+  return {
+    original: match[1] as DiffEofState,
+    replacement: match[2] as DiffEofState,
+  };
+}
+
+/** True when every diff in the preview carries complete EOF evidence. */
+export function previewHasCompleteEofEvidence(preview: ExactPreview): boolean {
+  return preview.fullDiff.every((diff) => diffEofState(diff.unifiedDiff) !== undefined);
+}
+
+export interface DiffDisplayLine {
+  text: string;
+  crlf: boolean;
+}
+
+/**
+ * Display-only structured lines: the EOF trailer is stripped and a CRLF
+ * line ending becomes data (`crlf: true`) instead of a literal glyph in
+ * the text, so indicators can never collide with file content. The
+ * canonical diff string is untouched.
+ */
+export function diffDisplayLines(unifiedDiff: string): DiffDisplayLine[] {
+  const lines = unifiedDiff.split('\n');
+  const body = diffEofState(unifiedDiff) ? lines.slice(0, -1) : lines;
+  return body.map((line) =>
+    line.endsWith('\r')
+      ? { text: line.slice(0, -1), crlf: true }
+      : { text: line, crlf: false },
+  );
+}
+
 function parseDiff(value: unknown): PreviewDiff {
   const item = record(value);
   keys(item, ['resourceId', 'unifiedDiff']);
@@ -227,8 +279,23 @@ function parseDiff(value: unknown): PreviewDiff {
   if (SAFE_TEXT.test(unifiedDiff) || SECRET_LIKE.test(unifiedDiff)) {
     throw new Error('review field unifiedDiff contains unsafe text');
   }
-  if (unifiedDiff.includes('\r')) {
-    throw new Error('full diff must use normalized line endings');
+  // CRLF is exact content: a carriage return is accepted only as part of
+  // a CRLF pair, and the canonical string is returned untouched (every
+  // approval digest hashes it). A bare CR is ambiguous and rejected.
+  for (let index = 0; index < unifiedDiff.length; index += 1) {
+    if (unifiedDiff[index] === '\r' && unifiedDiff[index + 1] !== '\n') {
+      throw new Error('full diff must not contain a bare carriage return');
+    }
+  }
+  // aether-diff-v2: exactly one EOF trailer, in final position, with no
+  // trailing newline and no other backslash-leading line. Legacy
+  // (pre-trailer) diff text is refused rather than reinterpreted.
+  const diffLines = unifiedDiff.split('\n');
+  if (!diffEofState(unifiedDiff)) {
+    throw new Error('full diff must end with the aether-diff-v2 EOF trailer');
+  }
+  if (diffLines.slice(0, -1).some((line) => line.startsWith('\\'))) {
+    throw new Error('full diff must not contain a backslash line before the EOF trailer');
   }
   return { resourceId, unifiedDiff };
 }

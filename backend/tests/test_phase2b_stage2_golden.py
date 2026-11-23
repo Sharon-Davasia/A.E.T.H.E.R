@@ -87,6 +87,7 @@ def _golden_narrative() -> PreviewNarrative:
                     "+++ b/golden-example.py\n"
                     "-synthetic-original\n"
                     f"+{GOLDEN_CANARY}\n"
+                    "\\ aether-diff-v2 eof: original=newline replacement=newline"
                 ),
             ),
         ),

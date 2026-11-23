@@ -70,6 +70,14 @@ class ExactDiff:
         return hashlib.sha256(material).hexdigest()
 
 
+def _eof_state(raw: bytes) -> str:
+    """The final-newline state of one image, derived only from its raw bytes."""
+
+    if raw == b"":
+        return "empty"
+    return "newline" if raw.endswith(b"\n") else "no-newline"
+
+
 def _decode(raw: bytes) -> list[str]:
     """Decode to text for diffing, refusing what cannot be shown faithfully.
 
@@ -101,6 +109,15 @@ def render_exact_diff(
 ) -> ExactDiff:
     """Render the exact change from ``pre_image`` to ``post_image``."""
 
+    # A lone final carriage return cannot be represented faithfully: its
+    # fragment would look exactly like a CRLF-terminated line once joined, and
+    # appending the EOF trailer after it would form a spurious CRLF pair.
+    # Refuse explicitly rather than render misleading evidence.
+    if pre_image.endswith(b"\r") or post_image.endswith(b"\r"):
+        raise DiffError(
+            "diff_final_cr_unsupported",
+            "content ending in a lone carriage return cannot be previewed exactly",
+        )
     pre_lines = _decode(pre_image)
     post_lines = _decode(post_image)
     if pre_image == post_image:
@@ -120,6 +137,17 @@ def render_exact_diff(
     )
     if not unified:
         raise DiffError("diff_empty", "the change produced no diff")
+    # The canonical EOF trailer (aether-diff-v2) records both images' final-
+    # newline states, derived exclusively from the raw bytes above. Splitting
+    # on "\n" turns a trailing newline into an empty sentinel element, which
+    # renders as a bare +/- line indistinguishable from a trailing blank
+    # line; the trailer is what makes that evidence unambiguous. It is part
+    # of the canonical text, so every digest computed over the diff binds it.
+    trailer = (
+        f"\\ aether-diff-v2 eof: original={_eof_state(pre_image)} "
+        f"replacement={_eof_state(post_image)}"
+    )
+    unified = [*unified, trailer]
     if len(unified) > MAX_DIFF_LINES:
         raise DiffError(
             "diff_too_large",

@@ -16,7 +16,9 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
+from pydantic import ValidationError
 
+from aether.core.approval_review import PreviewDiff
 from aether.core.edits.executor import EditDenied, EditExecutor, EditRequest
 from aether.core.edits.journal import MutationJournal
 from aether.core.edits.receipts import ReceiptStore
@@ -420,3 +422,265 @@ def test_planner_never_writes_the_file_it_plans_against(world) -> None:
     before = world["tree"].readme.read_bytes()
     _plan(world, PATCH_A)
     assert world["tree"].readme.read_bytes() == before
+
+
+# ---------------------------------------------------------------------------
+# E. aether-diff-v2 EOF trailer: byte-derived truth and strict grammar
+# ---------------------------------------------------------------------------
+
+
+def _expected_eof_state(raw: bytes) -> str:
+    """Independent re-derivation used only by these tests."""
+
+    if raw == b"":
+        return "empty"
+    return "newline" if raw.endswith(b"\n") else "no-newline"
+
+
+@pytest.mark.parametrize(
+    ("pre_image", "post_image"),
+    [
+        (b"a\nb\n", b"a\nc\n"),  # LF, newline -> newline
+        (b"a\nb", b"a\nc"),  # LF, no-newline -> no-newline
+        (b"a\nb", b"a\nb\n"),  # missing final newline added
+        (b"a\nb\n", b"a\nb"),  # missing final newline removed
+        (b"a\r\nb\r\n", b"a\r\nc\r\n"),  # CRLF
+        (b"a\r\nb", b"a\r\nb\r\n"),  # CRLF, missing final newline added
+        (b"a\nb\r\n", b"a\nc\r\n"),  # mixed endings
+        (b"", b"new\n"),  # empty original
+        (b"old\n", b""),  # empty replacement
+        (b"x\ny\nz\n", b"x\ny\nw"),  # change remote from EOF + newline removed
+        (b"a\nb\n", b"a\r\nb\r\n"),  # line-ending-only change
+    ],
+)
+def test_eof_trailer_states_match_the_raw_bytes(pre_image: bytes, post_image: bytes) -> None:
+    """The trailer states are verified against the raw bytes themselves,
+    re-derived independently here -- never by digest agreement alone."""
+
+    rendered = render_exact_diff(pre_image=pre_image, post_image=post_image, display_name="f.txt")
+    trailer = rendered.unified_diff.split("\n")[-1]
+    assert trailer == (
+        f"\\ aether-diff-v2 eof: original={_expected_eof_state(pre_image)} "
+        f"replacement={_expected_eof_state(post_image)}"
+    )
+    # The trailer is inside the canonical text, so digests bind it.
+    assert hashlib.sha256(rendered.unified_diff.encode("utf-8")).hexdigest() == (
+        rendered.diff_sha256
+    )
+
+
+def test_eof_state_alone_changes_the_rendering_and_effect_digests() -> None:
+    with_newline = render_exact_diff(
+        pre_image=b"a\nb\n", post_image=b"a\nc\n", display_name="f.txt"
+    )
+    without_newline = render_exact_diff(pre_image=b"a\nb", post_image=b"a\nc", display_name="f.txt")
+    assert with_newline.pre_sha256 != without_newline.pre_sha256
+    assert with_newline.diff_sha256 != without_newline.diff_sha256
+    assert with_newline.effect_sha256 != without_newline.effect_sha256
+
+
+def test_lone_final_cr_is_refused_at_the_renderer() -> None:
+    for pre_image, post_image in [(b"a\r", b"a\n"), (b"a\n", b"a\r")]:
+        with pytest.raises(DiffError) as refused:
+            render_exact_diff(pre_image=pre_image, post_image=post_image, display_name="f.txt")
+        assert refused.value.reason_code == "diff_final_cr_unsupported"
+
+
+@pytest.mark.parametrize(
+    "bad_diff",
+    [
+        # legacy v1: no trailer at all
+        "--- a/f.txt\n+++ b/f.txt\n-old\n+new",
+        # git-style marker instead of the trailer
+        "--- a/f.txt\n+++ b/f.txt\n-old\n+new\n\\ No newline at end of file",
+        # malformed trailer token
+        "--- a/f.txt\n+++ b/f.txt\n-old\n+new\n\\ aether-diff-v2 eof: original=yes replacement=newline",
+        # misplaced trailer (not final)
+        "--- a/f.txt\n\\ aether-diff-v2 eof: original=newline replacement=newline\n-old\n+new",
+        # duplicated trailer
+        "--- a/f.txt\n+++ b/f.txt\n-old\n+new\n\\ aether-diff-v2 eof: original=newline replacement=newline\n\\ aether-diff-v2 eof: original=newline replacement=newline",
+        # trailing newline after the trailer
+        "--- a/f.txt\n+++ b/f.txt\n-old\n+new\n\\ aether-diff-v2 eof: original=newline replacement=newline\n",
+    ],
+)
+def test_preview_diff_rejects_legacy_and_malformed_eof_trailers(bad_diff: str) -> None:
+    with pytest.raises(ValidationError):
+        PreviewDiff(resource_id="file:f", unified_diff=bad_diff)
+
+
+def test_trailerless_text_cannot_satisfy_a_v2_binding() -> None:
+    binding = ApprovedEdit.build(
+        resource_id="file:abc", pre_image=b"old\n", post_image=b"new\n", display_name="f.txt"
+    )
+    legacy_text = binding.unified_diff.rsplit("\n", 1)[0]
+    assert hashlib.sha256(legacy_text.encode("utf-8")).hexdigest() != binding.diff_sha256
+
+
+def test_crlf_pair_is_accepted_byte_identically_and_bare_cr_refused() -> None:
+    crlf_diff = (
+        "--- a/f.txt\r\n+++ b/f.txt\r\n-old\r\n+new\r\n"
+        "\\ aether-diff-v2 eof: original=newline replacement=newline"
+    )
+    parsed = PreviewDiff(resource_id="file:f", unified_diff=crlf_diff)
+    assert parsed.unified_diff == crlf_diff
+    with pytest.raises(ValidationError):
+        PreviewDiff(
+            resource_id="file:f",
+            unified_diff=(
+                "--- a/f.txt\n+++ b/f.txt\n-old\r+new\n"
+                "\\ aether-diff-v2 eof: original=newline replacement=newline"
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# F. Legacy EOF binding at the executor: refused before spend or mutation
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_v1_persisted_binding_is_refused_before_mutation_and_spend(world) -> None:
+    """A pre-trailer (v1) persisted plan fails closed at the executor.
+
+    The executor recomputes the canonical aether-diff-v2 rendering from the
+    actual pre/post bytes and compares its digests to the persisted binding.
+    A v1 binding's byte digests still match, but its rendering/effect
+    digests cannot, so it is refused BEFORE any grant consumption, journal
+    intent, snapshot or file mutation.
+    """
+
+    from dataclasses import replace
+
+    planned = _plan(world, PATCH_A, save=False)
+    step = planned.plan.steps[0]
+    effect = dict(step.expected_effect)
+    v1_text = planned.narrative.full_diff[0].unified_diff.rsplit("\n", 1)[0]
+    v1_diff = hashlib.sha256(v1_text.encode("utf-8")).hexdigest()
+    v1_effect = hashlib.sha256(
+        (
+            f"aether-effect-v1\n{effect['approved_source_digest']}\n"
+            f"{effect['approved_result_digest']}\n{v1_diff}\n"
+        ).encode()
+    ).hexdigest()
+    legacy_step = step.model_copy(
+        update={
+            "expected_effect": {
+                **effect,
+                "approved_rendering_digest": v1_diff,
+                "approved_effect_digest": v1_effect,
+            }
+        }
+    )
+    legacy_plan = planned.plan.model_copy(update={"steps": (legacy_step,)})
+    approval_id = UUID(str(step.arguments["approval_id"]))
+    world["grants"].bind(
+        approval_id=approval_id,
+        task_id=planned.plan.task_id,
+        now=NOW,
+    )
+    world["store"].create_task("approved bytes", task_id=planned.plan.task_id, now=NOW)
+    world["store"].transition_task(planned.plan.task_id, PersistentTaskState.PLANNING, now=NOW)
+    world["store"].save_plan(legacy_plan)
+
+    before = world["tree"].readme.read_bytes()
+    uses_before = world["grants"].ledger.uses_remaining(approval_id)
+    request = replace(_request(world, planned, PATCH_A), expected_effect_sha256=v1_effect)
+    with pytest.raises(EditDenied) as refused:
+        world["executor"].apply(request)
+    assert refused.value.reason_code == "approved_rendering_mismatch"
+    # Zero unauthorized mutation and zero grant accounting side effects.
+    assert world["tree"].readme.read_bytes() == before
+    assert world["grants"].ledger.uses_remaining(approval_id) == uses_before
+    assert world["grants"].ledger.pending() == ()
+    assert world["journal"].open_intents() == ()
+
+
+def test_stale_target_is_refused_and_external_bytes_preserved(world) -> None:
+    """A file changed after preview is refused; the external bytes survive.
+
+    (Only the legacy-binding refusal is required to precede grant
+    consumption; the freshness accounting ordering is unchanged.)
+    """
+
+    planned = _plan(world, PATCH_A)
+    request = _request(world, planned, PATCH_A)
+    world["tree"].readme.write_bytes(b"# Changed externally\n")
+    with pytest.raises(EditDenied) as refused:
+        world["executor"].apply(request)
+    assert refused.value.reason_code == "STALE_TARGET"
+    assert world["tree"].readme.read_bytes() == b"# Changed externally\n"
+
+
+def test_rendering_unverifiable_content_is_refused_before_spend(world) -> None:
+    """Bytes that cannot be rendered as a v2 diff (lone final CR) fail closed."""
+
+    from dataclasses import replace
+
+    planned = _plan(world, PATCH_A, save=False)
+    step = planned.plan.steps[0]
+    effect = dict(step.expected_effect)
+    cr_content = b"# Project\n\nEnds with a lone carriage return\r"
+    bound_effect = "f" * 64
+    legacy_step = step.model_copy(
+        update={
+            "expected_effect": {
+                **effect,
+                "approved_result_digest": hashlib.sha256(cr_content).hexdigest(),
+                "approved_result_bytes": len(cr_content),
+                "approved_rendering_digest": "0" * 64,
+                "approved_effect_digest": bound_effect,
+            }
+        }
+    )
+    legacy_plan = planned.plan.model_copy(update={"steps": (legacy_step,)})
+    approval_id = UUID(str(step.arguments["approval_id"]))
+    world["grants"].bind(approval_id=approval_id, task_id=planned.plan.task_id, now=NOW)
+    world["store"].create_task("approved bytes", task_id=planned.plan.task_id, now=NOW)
+    world["store"].transition_task(planned.plan.task_id, PersistentTaskState.PLANNING, now=NOW)
+    world["store"].save_plan(legacy_plan)
+
+    before = world["tree"].readme.read_bytes()
+    uses_before = world["grants"].ledger.uses_remaining(approval_id)
+    request = replace(_request(world, planned, cr_content), expected_effect_sha256=bound_effect)
+    with pytest.raises(EditDenied) as refused:
+        world["executor"].apply(request)
+    assert refused.value.reason_code == "approved_rendering_unverifiable"
+    assert world["tree"].readme.read_bytes() == before
+    assert world["grants"].ledger.uses_remaining(approval_id) == uses_before
+    assert world["grants"].ledger.pending() == ()
+    assert world["journal"].open_intents() == ()
+
+
+def test_valid_v2_edit_without_final_newline_applies(world) -> None:
+    """The positive EOF control: a v2-bound no-final-newline edit succeeds."""
+
+    patch = b"# Project\n\nFixed the typo in the introduction."
+    planned = _plan(world, patch)
+    outcome = world["executor"].apply(_request(world, planned, patch))
+    assert outcome.status == "SUCCEEDED"
+    assert world["tree"].readme.read_bytes() == patch
+    assert world["grants"].ledger.pending() == ()
+
+
+def test_concurrent_change_before_replace_is_not_overwritten(world, monkeypatch) -> None:
+    """A change landing after verification but before replace is preserved.
+
+    The executor re-reads the target immediately before ``os.replace``; the
+    interloper's bytes survive, the outcome is a FAILED STALE_TARGET, and
+    the spent consumption is resolved FAILED rather than left PENDING.
+    """
+
+    planned = _plan(world, PATCH_A)
+    original_verify = EditExecutor._verify_approved_result
+
+    def verify_then_tamper(self, *args, **kwargs):
+        result = original_verify(self, *args, **kwargs)
+        world["tree"].readme.write_bytes(b"# Concurrent user edit\n")
+        return result
+
+    monkeypatch.setattr(EditExecutor, "_verify_approved_result", verify_then_tamper)
+    outcome = world["executor"].apply(_request(world, planned, PATCH_A))
+    assert outcome.status == "FAILED"
+    assert outcome.reason_code == "STALE_TARGET"
+    assert world["tree"].readme.read_bytes() == b"# Concurrent user edit\n"
+    assert world["grants"].ledger.pending() == ()
+    assert world["journal"].open_intents() == ()

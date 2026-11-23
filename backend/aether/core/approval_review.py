@@ -45,6 +45,10 @@ _REVIEW_NAMESPACE = UUID("364d9991-2687-4cc4-afc3-c0f5ab78379d")
 _REVOKE_NAMESPACE = UUID("24a20e7e-caa1-4af7-98be-8b09d709ac19")
 _LOWER_SHA256 = re.compile(r"[0-9a-f]{64}")
 _ABSOLUTE_PATH = re.compile(r"(?:^|[\s(])(?:[A-Za-z]:[\\/]|\\\\|/)")
+_EOF_TRAILER = re.compile(
+    r"^\\ aether-diff-v2 eof: original=(empty|newline|no-newline) "
+    r"replacement=(empty|newline|no-newline)$"
+)
 _RECOVERY_SEVERITY = {
     "REVERSIBLE": 0,
     "SNAPSHOT_RESTORABLE": 1,
@@ -74,9 +78,18 @@ def _validate_diff_text(value: str) -> str:
         raise ValueError("full diff contains secret-like material")
     if any(character == "\x7f" for character in value):
         raise ValueError("full diff must not contain control characters")
+    # CRLF is exact content, not a control character: a carriage return is
+    # accepted only as part of a CRLF pair, and the value is returned
+    # byte-identically (validators never transform diff text, because every
+    # approval digest hashes the exact string). A bare CR is ambiguous and
+    # is rejected.
+    for index, character in enumerate(value):
+        if character == "\r" and (index + 1 >= len(value) or value[index + 1] != "\n"):
+            raise ValueError("full diff must not contain a bare carriage return")
     if any(
         not (
             character == "\n"
+            or character == "\r"
             or character == "\t"
             or " " <= character <= "~"
             or ord(character) >= 160
@@ -84,6 +97,14 @@ def _validate_diff_text(value: str) -> str:
         for character in value
     ):
         raise ValueError("full diff must not contain control characters")
+    # aether-diff-v2: exactly one EOF trailer, in final position, with no
+    # trailing newline and no other backslash-leading line. Legacy
+    # (pre-trailer) diff text is refused rather than reinterpreted.
+    lines = value.split("\n")
+    if not _EOF_TRAILER.match(lines[-1]):
+        raise ValueError("full diff must end with the aether-diff-v2 EOF trailer")
+    if any(line.startswith("\\") for line in lines[:-1]):
+        raise ValueError("full diff must not contain a backslash line before the EOF trailer")
     return value
 
 

@@ -6,12 +6,15 @@ or :meth:`EditExecutor.undo`, so a single review can reason about every write.
 
 The order of operations is the security property:
 
-1. **Grant first.** No mutation is attempted before the exact grant has been
-   scope-verified against the persisted ledger, the current plan and the live
-   resource version. Verification is not consumption; consumption happens after
-   the pre-image is captured, so a failed write does not burn a use.
+1. **Binding first.** No mutation is attempted before the exact grant has
+   been scope-verified against the persisted ledger, the current plan and the
+   live resource version, and before the persisted approval binding —
+   including a recomputed canonical aether-diff-v2 rendering of the actual
+   bytes — has been verified against the pre-image. Verification is not
+   consumption: a refused legacy binding spends no grant use.
 2. **Freshness second.** The target is re-inspected and compared with the
-   version the user approved. A file that changed since preview stops here with
+   version the user approved, and re-read immediately before the replace.
+   A file that changed since preview stops here with
    ``STALE_TARGET`` and *no write* — the caller must produce a new preview and a
    new approval.
 3. **Snapshot third.** The pre-image is captured, stored in the encrypted vault,
@@ -56,6 +59,7 @@ from aether.core.fs import errors as fs_errors
 from aether.core.grants.authority import GrantAuthority, GrantRequest
 from aether.core.grants.consumption import IssuanceDisabledConsumptionLedger
 from aether.core.planning.edit_binding import ApprovedEdit, EditBindingError
+from aether.core.planning.exact_diff import DiffError, render_exact_diff
 from aether.core.resources.path_safety import (
     PathSafetyError,
     is_protected_path,
@@ -494,6 +498,28 @@ class EditExecutor:
                 "a durable mutation journal is mandatory for every mutation-capable "
                 "executor; refusing to mutate without one",
             )
+        try:
+            pre_image = target.read_bytes()
+        except OSError as exc:
+            raise EditDenied(fs_errors.RESOURCE_NOT_FOUND, "target is unreadable") from exc
+        pre_sha256 = hashlib.sha256(pre_image).hexdigest()
+
+        # Legacy EOF binding: if the actual byte pair already matches the
+        # persisted binding, the persisted rendering/effect digests must
+        # also be the canonical aether-diff-v2 rendering of those bytes --
+        # and that is checked BEFORE the grant is spent, so a legacy (v1)
+        # binding spends nothing, creates no PENDING consumption and
+        # mutates nothing. If the byte pair does not match, this defers to
+        # the post-consumption verification below, preserving the existing
+        # grant-accounting ordering for every other refusal.
+        self._refuse_unrenderable_binding_before_spend(
+            request,
+            content=content,
+            pre_image=pre_image,
+            display_name=target.name,
+            capability_id=capability_id,
+        )
+
         # S14-2: spend the use before touching the file at all, so a crash leaves
         # a PENDING consumption (findable) rather than an unaccounted side effect.
         consumption_id = self._consume_grant(
@@ -503,11 +529,6 @@ class EditExecutor:
             capability_id=capability_id,
         )
         context = _OperationContext(consumption_id=consumption_id, capability_id=capability_id)
-        try:
-            pre_image = target.read_bytes()
-        except OSError as exc:
-            raise EditDenied(fs_errors.RESOURCE_NOT_FOUND, "target is unreadable") from exc
-        pre_sha256 = hashlib.sha256(pre_image).hexdigest()
 
         # Freshness: the bytes the user approved must still be the bytes on disk.
         if pre_sha256 != request.expected_sha256:
@@ -523,8 +544,17 @@ class EditExecutor:
         # S14-1: the bytes about to be written must be the bytes the persisted
         # plan bound and the user approved. Checked here, immediately before any
         # mutation, so a caller cannot pair the approved pre-image with a
-        # different post-image.
-        self._verify_approved_result(request, intended_sha256, pre_image)
+        # different post-image. ``content`` is the intended write for apply
+        # and the verified vault bytes for undo -- never a caller-supplied
+        # description of them.
+        self._verify_approved_result(
+            request,
+            intended_sha256,
+            pre_image,
+            content=content,
+            display_name=target.name,
+            capability_id=capability_id,
+        )
 
         # Snapshot first, and verify the snapshot before touching the original.
         try:
@@ -751,8 +781,80 @@ class EditExecutor:
             # the recovery work item.
             return
 
+    def _verify_rendering_binding(
+        self, binding: ApprovedEdit, *, pre_image: bytes, content: bytes, display_name: str
+    ) -> None:
+        """Refuse unless the binding is the canonical v2 rendering of the bytes.
+
+        Recomputed from the actual pre/post bytes every time; the display
+        name comes from the executor-resolved target -- the same source
+        the planner used -- never from the request or the persisted step,
+        so it cannot be spoofed.
+        """
+
+        try:
+            rendered = render_exact_diff(
+                pre_image=pre_image, post_image=content, display_name=display_name
+            )
+        except DiffError as exc:
+            raise EditDenied(
+                "approved_rendering_unverifiable",
+                "the approved bytes cannot be rendered as a canonical "
+                f"aether-diff-v2 diff ({exc.reason_code}); a fresh preview "
+                "and approval are required",
+            ) from exc
+        if (
+            rendered.diff_sha256 != binding.diff_sha256
+            or rendered.effect_sha256 != binding.effect_sha256
+        ):
+            raise EditDenied(
+                "approved_rendering_mismatch",
+                "the persisted approval does not correspond to the canonical "
+                "aether-diff-v2 rendering of the approved bytes; a fresh "
+                "preview and approval are required",
+            )
+
+    def _refuse_unrenderable_binding_before_spend(
+        self,
+        request: EditRequest,
+        *,
+        content: bytes,
+        pre_image: bytes,
+        display_name: str,
+        capability_id: str,
+    ) -> None:
+        """Reject a legacy/unrenderable binding before any grant consumption.
+
+        Only fires when the actual byte pair already matches the persisted
+        binding -- precisely the legacy case, where byte digests pass but
+        the rendering was never EOF-exact. Any other mismatch defers to
+        the post-consumption verification, preserving the existing
+        grant-accounting ordering for those refusals.
+        """
+
+        if self._plans is None:
+            return
+        try:
+            binding = self._plan_binding(request, capability_id=capability_id)
+        except EditDenied:
+            return
+        try:
+            binding.verify_proposed(proposed_content=content, current_pre_image=pre_image)
+        except EditBindingError:
+            return
+        self._verify_rendering_binding(
+            binding, pre_image=pre_image, content=content, display_name=display_name
+        )
+
     def _verify_approved_result(
-        self, request: EditRequest, intended_sha256: str, pre_image: bytes
+        self,
+        request: EditRequest,
+        intended_sha256: str,
+        pre_image: bytes,
+        *,
+        content: bytes,
+        display_name: str,
+        capability_id: str = _FORWARD_EDIT_CAPABILITY,
     ) -> None:
         """Refuse unless the content matches the binding in the persisted plan.
 
@@ -760,6 +862,19 @@ class EditExecutor:
         persisted plan means the only way to change which bytes are authorized is
         to produce a new plan revision with a new hash — which invalidates the
         existing approval instead of silently reusing it.
+
+        ``content`` is the actual byte string about to be written: the
+        approved proposed content for a forward edit, and the vault-restored
+        bytes for an undo. ``request.proposed_content`` is deliberately not
+        consulted here, so an undo can never be verified against
+        caller-supplied bytes that differ from the snapshot being restored.
+
+        Finally, the canonical aether-diff-v2 rendering is recomputed from
+        the actual pre/post bytes and its digests must equal the persisted
+        binding. A legacy (pre-trailer, v1) binding therefore fails closed
+        here — before any grant consumption or mutation — because its
+        rendering/effect digests cannot match the v2 rendering, even though
+        its byte digests still do.
         """
 
         if self._plans is None:
@@ -768,32 +883,10 @@ class EditExecutor:
                 "no persisted plan source is configured, so approval cannot be "
                 "bound to the bytes about to be written",
             )
+        step = self._plan_step(request, capability_id=capability_id)
+        binding = self._plan_binding(request, capability_id=capability_id)
         try:
-            plan = self._plans.get_plan(request.task_id, request.plan_revision)
-        except Exception as exc:
-            raise EditDenied(
-                "approved_plan_unavailable",
-                "the approved plan revision could not be read",
-            ) from exc
-        step = next((item for item in plan.steps if item.step_id == request.step_id), None)
-        if step is None:
-            raise EditDenied(
-                "approved_step_missing",
-                "the persisted plan has no such step, so nothing was approved here",
-            )
-        try:
-            binding = ApprovedEdit.from_step_arguments(
-                resource_id=request.resource_id, values=dict(step.expected_effect)
-            )
-        except EditBindingError as exc:
-            raise EditDenied(
-                "approved_binding_malformed",
-                "the persisted plan does not carry a usable approval binding",
-            ) from exc
-        try:
-            binding.verify_proposed(
-                proposed_content=request.proposed_content, current_pre_image=pre_image
-            )
+            binding.verify_proposed(proposed_content=content, current_pre_image=pre_image)
         except EditBindingError as exc:
             raise EditDenied(exc.reason_code, str(exc)) from exc
         if intended_sha256 != binding.post_sha256:
@@ -809,10 +902,34 @@ class EditExecutor:
                 "approved_effect_digest_mismatch",
                 "the grant does not cover the effect the approved plan records",
             )
+        # Legacy EOF binding: recompute the canonical v2 rendering from the
+        # actual bytes and compare (see _verify_rendering_binding).
+        self._verify_rendering_binding(
+            binding, pre_image=pre_image, content=content, display_name=display_name
+        )
 
     def _atomic_replace(self, target: Path, content: bytes, pre_image: bytes) -> None:
-        """Same-volume atomic replacement, preserving the original file mode."""
+        """Same-volume atomic replacement, preserving the original file mode.
 
+        The target is re-read immediately before the replace and must still
+        be the verified pre-image: a concurrent change since verification
+        is refused as ``STALE_TARGET`` rather than silently overwritten.
+        (A change in the remaining instant between this read and
+        ``os.replace`` cannot be closed portably without a conditional
+        rename primitive; that residual window is reported separately
+        rather than papered over here.)
+        """
+
+        try:
+            with open(target, "rb") as stream:
+                current = stream.read()
+        except OSError as exc:
+            raise EditDenied(fs_errors.RESOURCE_NOT_FOUND, "target is unreadable") from exc
+        if hashlib.sha256(current).hexdigest() != hashlib.sha256(pre_image).hexdigest():
+            raise EditDenied(
+                "STALE_TARGET",
+                "the file changed after verification; a new preview and approval are required",
+            )
         try:
             mode = stat.S_IMODE(target.stat().st_mode)
         except OSError as exc:
@@ -845,7 +962,6 @@ class EditExecutor:
             if temporary_path is not None:
                 with contextlib.suppress(OSError):
                     os.unlink(temporary_path)
-        del pre_image
 
     def _unverified(
         self,

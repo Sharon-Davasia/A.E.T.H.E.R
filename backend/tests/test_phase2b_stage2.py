@@ -31,6 +31,7 @@ from aether.core.persistence.sqlite_store import (
 
 _NOW = datetime(2026, 11, 21, 12, 0, tzinfo=UTC)
 _CANARY = "SYNTHETIC-DIFF-CANARY-7f91c4"
+TRAILER = "\\ aether-diff-v2 eof: original=newline replacement=newline"
 
 
 def _plan(task_id, *, revision: int = 1) -> TaskPlan:
@@ -81,6 +82,7 @@ def _narrative(*, action: str = "Preview one synthetic code edit") -> PreviewNar
                 resource_id="file:synthetic-1",
                 unified_diff=(
                     f"--- a/example.py\n+++ b/example.py\n-synthetic-original\n+{_CANARY}\n"
+                    + TRAILER
                 ),
             ),
         ),
@@ -202,7 +204,8 @@ def test_preview_is_deterministic_canonical_and_diff_bound(tmp_path) -> None:
                 "full_diff": (
                     PreviewDiff(
                         resource_id="file:synthetic-1",
-                        unified_diff="--- a/example.py\n+++ b/example.py\n-synthetic-original\n+synthetic-replacement-2\n",
+                        unified_diff="--- a/example.py\n+++ b/example.py\n-synthetic-original\n+synthetic-replacement-2\n"
+                        + TRAILER,
                     ),
                 ),
             }
@@ -234,7 +237,7 @@ def test_exact_preview_rejects_cross_resource_diff_reference(tmp_path) -> None:
                     "full_diff": (
                         PreviewDiff(
                             resource_id="file:not-in-plan",
-                            unified_diff="--- a/other\n+++ b/other\n-old\n+new\n",
+                            unified_diff="--- a/other\n+++ b/other\n-old\n+new\n" + TRAILER,
                         ),
                     ),
                 }
@@ -438,7 +441,7 @@ def test_resource_plan_revision_diff_and_preview_drift_are_stale_not_decisions(t
             "full_diff": (
                 PreviewDiff(
                     resource_id="file:synthetic-1",
-                    unified_diff="--- a/example.py\n+++ b/example.py\n-old\n+different\n",
+                    unified_diff="--- a/example.py\n+++ b/example.py\n-old\n+different\n" + TRAILER,
                 ),
             ),
         }

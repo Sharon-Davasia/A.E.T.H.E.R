@@ -302,6 +302,131 @@ def test_undo_restores_the_exact_original_bytes(world) -> None:
     assert hashlib.sha256(original).hexdigest() == restored.post_sha256
 
 
+def test_undo_restores_exact_bytes_after_no_final_newline_edit(world) -> None:
+    """Valid v2 undo across an EOF-state change succeeds.
+
+    The forward edit removes the final newline; undoing it must restore the
+    original bytes exactly, with the v2 rendering recomputed from the
+    vault-restored bytes (pre: edited/no-newline, post: original/newline).
+    """
+
+    no_newline_edit = b"# Edited\n\nThe quick brown fox was edited exactly once."
+    prepared = _plan(world, goal=PlanGoal.APPLY_EDIT, proposed=no_newline_edit)
+    applied = world["executor"].apply(_request(world, prepared, content=no_newline_edit))
+    assert applied.status == "SUCCEEDED"
+    assert world["tree"].readme.read_bytes() == no_newline_edit
+
+    undo_plan = _undo_plan(world, restored=ORIGINAL)
+    restored = world["executor"].undo(
+        _request(world, undo_plan, content=ORIGINAL),
+        snapshot_id=UUID(applied.snapshot_id),
+        receipt_id=applied.receipt.receipt_id,
+    )
+    assert restored.status == "SUCCEEDED"
+    assert world["tree"].readme.read_bytes() == ORIGINAL
+
+
+def test_legacy_v1_undo_binding_is_refused_without_spending(world) -> None:
+    """An undo step bound under v1 (pre-trailer) digests fails closed.
+
+    The vault bytes, receipt and current file are all genuine; only the
+    persisted rendering/effect digests are legacy. The executor recomputes
+    the v2 rendering from the actual (current, vault-restored) byte pair,
+    so the legacy binding is refused before any grant consumption, journal
+    intent or mutation.
+    """
+
+    _, applied = _apply_an_edit(world)
+    registry, tree, store, grants = (
+        world["registry"],
+        world["tree"],
+        world["store"],
+        world["grants"],
+    )
+    task_id = uuid4()
+    approval_id = uuid4()
+    resource_id = resolve(registry, "README.md")
+    planned = world["planner"].plan(
+        task_id,
+        PlanIntent(
+            goal=PlanGoal.UNDO_EDIT,
+            resource_id=resource_id,
+            arguments={
+                "resource_id": resource_id,
+                "step_id": str(uuid4()),
+                "approval_id": str(approval_id),
+                "expected_sha256": hashlib.sha256(tree.readme.read_bytes()).hexdigest(),
+                "receipt_id": str(applied.receipt.receipt_id),
+                "snapshot_id": str(applied.snapshot_id),
+            },
+            summary="undo legacy",
+            proposed_content=ORIGINAL,
+        ),
+        revision=1,
+    )
+    step = planned.plan.steps[0]
+    effect = dict(step.expected_effect)
+    v1_text = planned.narrative.full_diff[0].unified_diff.rsplit("\n", 1)[0]
+    v1_diff = hashlib.sha256(v1_text.encode("utf-8")).hexdigest()
+    v1_effect = hashlib.sha256(
+        (
+            f"aether-effect-v1\n{effect['approved_source_digest']}\n"
+            f"{effect['approved_result_digest']}\n{v1_diff}\n"
+        ).encode()
+    ).hexdigest()
+    legacy_step = step.model_copy(
+        update={
+            "expected_effect": {
+                **effect,
+                "approved_rendering_digest": v1_diff,
+                "approved_effect_digest": v1_effect,
+            }
+        }
+    )
+    legacy_plan = planned.plan.model_copy(update={"steps": (legacy_step,)})
+    store.create_task("undo", task_id=task_id, now=NOW)
+    store.transition_task(task_id, PersistentTaskState.PLANNING, now=NOW)
+    plan_hash = store.save_plan(legacy_plan)
+    grants.bind(approval_id=approval_id, task_id=task_id, now=NOW, plan_hash=plan_hash)
+    prepared = {
+        "task_id": task_id,
+        "approval_id": approval_id,
+        "step_id": planned.step_id,
+        "plan_hash": plan_hash,
+        "effect": v1_effect,
+    }
+    uses_before = grants.ledger.uses_remaining(approval_id)
+    with pytest.raises(EditDenied) as refused:
+        world["executor"].undo(
+            _request(world, prepared, content=ORIGINAL),
+            snapshot_id=UUID(applied.snapshot_id),
+            receipt_id=applied.receipt.receipt_id,
+        )
+    assert refused.value.reason_code == "approved_rendering_mismatch"
+    assert world["tree"].readme.read_bytes() == EDIT
+    assert grants.ledger.uses_remaining(approval_id) == uses_before
+    assert grants.ledger.pending() == ()
+
+
+def test_undo_ignores_caller_supplied_proposed_content(world) -> None:
+    """Undo verifies the vault bytes, not ``request.proposed_content``.
+
+    A request whose caller-supplied content is unrelated garbage must not
+    affect verification: the snapshot plaintext is the only content the
+    undo binding is checked against.
+    """
+
+    _, applied = _apply_an_edit(world)
+    undo_plan = _undo_plan(world)
+    restored = world["executor"].undo(
+        _request(world, undo_plan, content=b"# Caller garbage, never written\n"),
+        snapshot_id=UUID(applied.snapshot_id),
+        receipt_id=applied.receipt.receipt_id,
+    )
+    assert restored.status == "SUCCEEDED"
+    assert world["tree"].readme.read_bytes() == ORIGINAL
+
+
 def test_undo_produces_its_own_receipt_linked_to_the_original(world) -> None:
     _, applied = _apply_an_edit(world)
     undo_plan = _undo_plan(world)

@@ -360,8 +360,10 @@ def test_oversized_preview_fails_closed_without_frame_overflow(
     # Inside the 64,000-character narrative bound, but the canonical JSON
     # escaping of the newlines pushes the outbound frame past the channel
     # bound, exercising the fail-closed preview_too_large path.
-    large_diff = "--- a/synthetic-example.py\n+++ b/synthetic-example.py\n" + (
-        "-line-of-synthetic-content\n" * 2360
+    large_diff = (
+        "--- a/synthetic-example.py\n+++ b/synthetic-example.py\n"
+        + ("-line-of-synthetic-content\n" * 2360)
+        + "\\ aether-diff-v2 eof: original=newline replacement=newline"
     )
     assert len(large_diff) <= 64_000
     assert len(json.dumps(large_diff)) > 65_000

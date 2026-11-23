@@ -102,6 +102,7 @@ def build_synthetic_narrative() -> PreviewNarrative:
                     "+++ b/synthetic-example.py\n"
                     "-synthetic-original\n"
                     f"+{CANARY}\n"
+                    "\\ aether-diff-v2 eof: original=newline replacement=newline"
                 ),
             ),
         ),

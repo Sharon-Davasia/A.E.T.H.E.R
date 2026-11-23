@@ -354,3 +354,21 @@ button:disabled {
   font-size: 0.75rem;
   font-weight: 400;
 }
+
+.crlf-badge {
+  display: inline-block;
+  margin-left: 0.375rem;
+  padding: 0 0.25rem;
+  border: 1px solid currentColor;
+  border-radius: 0.25rem;
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  vertical-align: baseline;
+  opacity: 0.75;
+}
+
+.diff-line {
+  display: block;
+  white-space: pre;
+}
