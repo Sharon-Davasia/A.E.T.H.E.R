@@ -64,7 +64,7 @@ def build_tree(base: Path) -> FixtureTree:
     source_dir = root / "src"
     source_dir.mkdir(parents=True)
     readme = root / "README.md"
-    readme.write_text("# Synthetic\n\nThe quick brown fox needs a needle.\n", encoding="utf-8")
+    readme.write_bytes(b"# Synthetic\n\nThe quick brown fox needs a needle.\n")
     module = source_dir / "module.py"
     module.write_text(
         "def needle(value: int) -> int:\n"

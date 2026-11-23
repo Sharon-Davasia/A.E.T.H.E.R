@@ -261,7 +261,7 @@ def test_a_second_edit_with_the_same_approval_is_refused(world) -> None:
     # The same approval, reused for a second mutation of a *different* target
     # state, so the freshness check cannot mask the accounting refusal.
     second_tree = world["tree"].readme
-    second_tree.write_text("# changed again\n", encoding="utf-8")
+    second_tree.write_bytes(b"# changed again\n")
     with pytest.raises(EditDenied) as refused:
         world["executor"].apply(_request(world, prepared))
     assert refused.value.reason_code == "GRANT_EXHAUSTED"

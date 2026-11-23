@@ -280,7 +280,7 @@ def _windows_apis() -> tuple[Any, Any, Any, Any]:
     import ctypes
     from ctypes import wintypes
 
-    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)  # type: ignore[attr-defined]
+    advapi32 = getattr(ctypes, "WinDLL")("advapi32", use_last_error=True)  # noqa: B009
     advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
         wintypes.LPCWSTR,
         wintypes.DWORD,
@@ -310,7 +310,7 @@ def _windows_apis() -> tuple[Any, Any, Any, Any]:
         ctypes.POINTER(wintypes.ULONG),
     ]
     advapi32.ConvertSecurityDescriptorToStringSecurityDescriptorW.restype = wintypes.BOOL
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)  # noqa: B009
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
     return ctypes, wintypes, advapi32, kernel32
