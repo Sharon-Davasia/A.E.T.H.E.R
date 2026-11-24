@@ -313,10 +313,10 @@ Corrected head (FI-01…FI-08) results, this sandbox:
 
 | Gate | Result |
 |---|---|
-| Backend full suite | **918 passed / 5 skipped** (`pytest backend/tests`) |
-| Backend ruff / format / mypy (strict) | PASS (97 files) |
-| Desktop suite (`npm test`, no Python env) | **83 passed / 0 failed / 7 skipped** (90 tests) |
-| Desktop suite with `AETHER_DEV_PYTHON` set | **90 passed / 0 failed / 0 skipped** (real Python child, production-shaped channel) |
+| Backend full suite | **933 passed / 5 skipped** (`pytest backend/tests`) |
+| Backend ruff / format / mypy (strict) | PASS (99 files) |
+| Desktop suite (`npm test`, no Python env) | 7 Python-child integration tests skip (environment-gated) |
+| Desktop suite with `AETHER_DEV_PYTHON` set | **99 passed / 0 failed / 0 skipped** (real Python child, production-shaped channel; includes FI-01/FI-02B/workflow and native-confirmation tests) |
 | Desktop full gate (`npm run check`: lint, typecheck, tests, Python tests, electron build) | PASS |
 | Gesture golden interop (Python ↔ TS) | PASS (vectors pinned both sides) |
 
