@@ -277,7 +277,7 @@ def test_undo_refuses_substituted_receipt(live) -> None:
 
 
 def test_undo_refuses_resource_substitution(live) -> None:
-    resource_id, executed = _completed_edit(live)
+    _resource_id, executed = _completed_edit(live)
     other_id = _resolve(live, "other.txt")
     planned = _plan(
         live,

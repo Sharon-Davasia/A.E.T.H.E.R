@@ -8,7 +8,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from aether.core.contracts.resource import DataClass, Provenance, ResourceKind, ResourceRef
 from aether.core.resources.path_safety import (
