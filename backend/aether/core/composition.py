@@ -262,6 +262,10 @@ class TrustedComposition:
                 )
                 vault = UndoVault(sibling / f"{stem}.vault").open()
                 receipts = ReceiptStore(sibling / f"{stem}.receipts.sqlite3")
+                # FI-03: the task store must independently verify durable
+                # receipts before recording COMPLETED; register the real
+                # loader now that the receipts database exists.
+                store.set_receipt_evidence_source(receipts.receipt_facts)
                 journal = MutationJournal(sibling / f"{stem}.journal.sqlite3", clock=clock)
                 executor = EditExecutor(
                     registry,
@@ -302,12 +306,11 @@ class TrustedComposition:
             # Fail closed: release whatever this build acquired. The caller's
             # store stays open (the review surface keeps working); only the
             # trusted-execution tier reports unavailable.
-            if consumption is not None:
-                with contextlib.suppress(Exception):
-                    consumption.close()
-            if ledger is not None:
-                with contextlib.suppress(Exception):
-                    ledger.close()
+            store.set_receipt_evidence_source(None)
+            for sibling_store in (consumption, receipts, journal, vault, ledger):
+                if sibling_store is not None:
+                    with contextlib.suppress(Exception):
+                        sibling_store.close()
             raise CompositionUnavailable(
                 "composition_unavailable",
                 "the trusted composition could not be built; no capability is available",
@@ -511,6 +514,8 @@ class TrustedComposition:
         if self._closed:
             return
         self._closed = True
+        # Receipt-gated transitions fail closed once the source is gone.
+        self.store.set_receipt_evidence_source(None)
         # Outstanding gesture nonces die with the session (Decision A).
         with self._gesture_lock:
             self._pending_gesture = None

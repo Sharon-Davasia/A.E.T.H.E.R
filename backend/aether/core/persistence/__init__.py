@@ -3,6 +3,7 @@
 from aether.core.persistence.models import (
     ApprovalDecisionRecord,
     ApprovalDecisionValue,
+    DurableReceiptFacts,
     EventMetadata,
     ExecutionEvidence,
     PersistentTaskState,
@@ -26,6 +27,7 @@ from aether.core.persistence.sqlite_store import (
 __all__ = [
     "ApprovalDecisionRecord",
     "ApprovalDecisionValue",
+    "DurableReceiptFacts",
     "EventMetadata",
     "ExecutionEvidence",
     "IllegalPersistentTransition",

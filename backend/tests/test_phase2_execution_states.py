@@ -35,6 +35,7 @@ from stage4_support import (
 from aether.core.contracts.approval import ExactApprovalGrant, exact_approval_scope_digest
 from aether.core.grants.issuance import GrantIssuer
 from aether.core.persistence import (
+    DurableReceiptFacts,
     ExecutionEvidence,
     IllegalPersistentTransition,
     PersistentTaskState,
@@ -156,10 +157,31 @@ def test_happy_path_walks_the_narrow_execution_chain(world) -> None:
     )
     assert task.state == PersistentTaskState.POSTCHECK.value
 
+    # FI-03: COMPLETED requires the durable receipt behind the identity to
+    # be independently loaded and validated, not merely named.
+    receipt_id = uuid4()
+    resource_id = next(iter(world["plan"].resource_versions()))
+    store.set_receipt_evidence_source(
+        lambda rid: (
+            DurableReceiptFacts(
+                receipt_id=receipt_id,
+                task_id=str(task_id),
+                step_id=str(world["step_id"]),
+                approval_id=str(world["approval_id"]),
+                capability_id="fs.apply_approved_edit",
+                status="SUCCEEDED",
+                resource_id=resource_id,
+                post_sha256="0" * 64,
+                verified=True,
+            )
+            if rid == receipt_id
+            else None
+        )
+    )
     task = store.advance_execution_state(
         task_id,
         PersistentTaskState.COMPLETED,
-        evidence=_evidence(world, receipt_id=uuid4()),
+        evidence=_evidence(world, receipt_id=receipt_id),
         now=NOW,
     )
     assert task.state == PersistentTaskState.COMPLETED.value

@@ -14,7 +14,7 @@ import re
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,6 +31,7 @@ from aether.core.persistence.models import (
     DISABLED_EXECUTION_STATES,
     ApprovalDecisionRecord,
     ApprovalDecisionValue,
+    DurableReceiptFacts,
     EventMetadata,
     ExecutionEvidence,
     PersistentTaskState,
@@ -424,6 +425,10 @@ class SQLiteTaskStore:
         self._lock = threading.RLock()
         self._owner_lock_file: BinaryIO | None = None
         self._closed = False
+        # FI-03: loader for durable receipt facts (separate receipts
+        # database), registered by the composition. Without it, no
+        # receipt-gated transition (COMPLETED) can ever be satisfied.
+        self._receipt_evidence_source: Callable[[UUID], DurableReceiptFacts | None] | None = None
         self._storage_volume_id = ""
         self._parent_identity: tuple[int, int] | None = None
         self._database_identity: tuple[int, int] | None = None
@@ -569,6 +574,20 @@ class SQLiteTaskStore:
             )
         return self.get_task(task_id)
 
+    def set_receipt_evidence_source(
+        self, source: Callable[[UUID], DurableReceiptFacts | None] | None
+    ) -> None:
+        """Register the durable-receipt loader used for FI-03 verification.
+
+        The composition registers the real ``ReceiptStore`` loader once the
+        sibling receipts database exists. Registration is deliberately not
+        a constructor concern: the store is opened by the review surface
+        before the trusted tier is composed, and receipt-gated transitions
+        must fail closed until a real source is registered.
+        """
+
+        self._receipt_evidence_source = source
+
     def advance_execution_state(
         self,
         task_id: UUID,
@@ -647,9 +666,12 @@ class SQLiteTaskStore:
                     raise IllegalPersistentTransition(
                         "execution evidence names no recorded grant consumption for this task"
                     )
-            if required == "receipt" and evidence.receipt_id is None:
-                raise IllegalPersistentTransition(
-                    "a verified receipt is required before this state may be recorded"
+            if required == "receipt":
+                self._verify_receipt_evidence(
+                    connection,
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    evidence=evidence,
                 )
             values: dict[str, str | int | float | bool | None] = {
                 "approval_id": str(evidence.approval_id),
@@ -670,6 +692,95 @@ class SQLiteTaskStore:
                 error_code=None,
             )
         return self.get_task(task_id)
+
+    def _verify_receipt_evidence(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: UUID,
+        plan_revision: int,
+        evidence: ExecutionEvidence,
+    ) -> None:
+        """Independently verify the durable receipt behind a COMPLETED claim.
+
+        FI-03: a caller-supplied receipt UUID is an identity, never proof.
+        The durable record is loaded through the registered evidence source
+        (the real receipts database, a separate persistence boundary — this
+        re-read is point-in-time under the store lock, not cross-database
+        atomicity) and must belong to this exact task, plan step, grant and
+        consumption, name the step's resource, and record a successfully
+        verified outcome whose resulting hash matches the approved effect.
+        """
+
+        if evidence.receipt_id is None:
+            raise IllegalPersistentTransition(
+                "a verified receipt is required before this state may be recorded"
+            )
+        source = self._receipt_evidence_source
+        if source is None:
+            raise IllegalPersistentTransition(
+                "no durable receipt evidence source is registered; completion cannot be verified"
+            )
+        try:
+            facts = source(evidence.receipt_id)
+        except Exception as exc:
+            raise IllegalPersistentTransition(
+                "the durable receipt could not be loaded; completion cannot be verified"
+            ) from exc
+        if facts is None:
+            raise IllegalPersistentTransition("execution evidence names no durable receipt")
+        if facts.task_id != str(task_id):
+            raise IllegalPersistentTransition("the durable receipt belongs to a different task")
+        if facts.approval_id != str(evidence.approval_id):
+            raise IllegalPersistentTransition("the durable receipt belongs to a different grant")
+        if facts.status != "SUCCEEDED" or not facts.verified or not facts.post_sha256:
+            raise IllegalPersistentTransition(
+                "the durable receipt does not record a successfully verified outcome"
+            )
+        step = connection.execute(
+            "SELECT capability_id, resources_json, effect_json FROM task_steps "
+            "WHERE task_id = ? AND plan_revision = ? AND id = ?",
+            (str(task_id), plan_revision, facts.step_id),
+        ).fetchone()
+        if step is None:
+            raise IllegalPersistentTransition(
+                "the durable receipt names no step of the task's current plan"
+            )
+        if step["capability_id"] != facts.capability_id:
+            raise IllegalPersistentTransition(
+                "the durable receipt records a different operation than the plan step"
+            )
+        resource_ids = {
+            str(resource.get("resource_id"))
+            for resource in json.loads(step["resources_json"])
+            if isinstance(resource, dict)
+        }
+        if facts.resource_id not in resource_ids:
+            raise IllegalPersistentTransition(
+                "the durable receipt names a different resource than the plan step"
+            )
+        consumed_step = connection.execute(
+            "SELECT 1 FROM exact_approval_grant_consumptions "
+            "WHERE approval_id = ? AND task_id = ? AND plan_revision = ? AND step_id = ? "
+            "LIMIT 1",
+            (str(evidence.approval_id), str(task_id), plan_revision, facts.step_id),
+        ).fetchone()
+        if consumed_step is None:
+            raise IllegalPersistentTransition(
+                "no recorded grant consumption binds this receipt's step"
+            )
+        effect = json.loads(step["effect_json"])
+        # The approved *resulting content* hash (the post-image the user
+        # approved), distinct from the effect descriptor digest.
+        result_digest = effect.get("approved_result_digest") if isinstance(effect, dict) else None
+        if (
+            isinstance(result_digest, str)
+            and result_digest
+            and facts.post_sha256.casefold() != result_digest.casefold()
+        ):
+            raise IllegalPersistentTransition(
+                "the durable receipt's resulting content does not match the approved effect"
+            )
 
     def save_plan(self, plan: TaskPlan) -> str:
         """Append the next immutable plan revision and update the task pointer."""
