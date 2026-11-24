@@ -64,6 +64,7 @@ from aether.channel.live_bridge import LiveBridge
 from aether.channel.protocol import canonical
 from aether.channel.review_bridge import ReviewBridge
 from aether.core.composition import CompositionUnavailable, TrustedComposition
+from aether.core.persistence.sqlite_store import SQLiteTaskStore
 
 _PING_KIND = "demo.ping"
 _GET_PREVIEW_KIND = "review.get_preview"
@@ -166,6 +167,7 @@ def main() -> int:
     # (no hello is emitted, the backend never becomes ready) instead of
     # falling back to the real application database, and a development
     # review seed cannot redirect the launch.
+    app_store: SQLiteTaskStore | None
     if env.get(ACCEPTANCE_MODE_ENV) == "fixture":
         try:
             app_store = open_fixture_store(env)

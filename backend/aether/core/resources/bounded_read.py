@@ -7,9 +7,11 @@ registered resource in planning/preview paths:
   re-checked for reparse components before opening;
 * the file is opened once (``O_NOFOLLOW`` where available) and read
   from that descriptor only — no check-then-open on the path;
-* the descriptor's ``fstat`` identity must match the resolved path's
-  ``lstat`` identity, the file must be a regular file with no hard
-  links, and its size must fit the bound *before* any allocation;
+* the descriptor's ``fstat`` identity must match both the resolved
+  path's ``lstat`` identity and the registry-issued device/file
+  identity captured at resolution, the file must be a regular file
+  with no hard links, and its size must fit the bound *before* any
+  allocation;
 * bytes are streamed in bounded chunks and the descriptor identity
   (device, inode, size, mtime) must be unchanged after the read, so
   the returned pre-image is one consistent snapshot.
@@ -43,6 +45,12 @@ class _Resolved(Protocol):
     @property
     def canonical_path(self) -> Path: ...
 
+    @property
+    def device_id(self) -> int: ...
+
+    @property
+    def file_id(self) -> int: ...
+
 
 def read_bounded_bytes(resolved: _Resolved, *, max_bytes: int = MAX_BOUNDED_READ_BYTES) -> bytes:
     """Return the complete bytes of one resolved regular file, bounded."""
@@ -72,6 +80,17 @@ def read_bounded_bytes(resolved: _Resolved, *, max_bytes: int = MAX_BOUNDED_READ
         if (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino):
             raise BoundedReadError(
                 "resource_identity_mismatch", "the opened file is not the resolved resource"
+            )
+        # The opened descriptor must be the very file the registry
+        # issued for this resource (device/file identity captured at
+        # resolution) — not merely whatever the path happens to name
+        # now. A rename/symlink substitution after resolution fails
+        # here even if every path-based check would pass.
+        issued = (getattr(resolved, "device_id", None), getattr(resolved, "file_id", None))
+        if issued != (None, None) and (info.st_dev, info.st_ino) != issued:
+            raise BoundedReadError(
+                "resource_identity_mismatch",
+                "the opened file is not the registry-issued resource identity",
             )
         if not stat.S_ISREG(info.st_mode):
             raise BoundedReadError("target_not_a_regular_file", "the target is not a regular file")

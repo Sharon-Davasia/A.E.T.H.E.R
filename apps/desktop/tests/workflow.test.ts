@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -15,9 +16,26 @@ const ROOT_ID = '11111111-1111-4111-8111-111111111111';
 const TASK_ID = '22222222-2222-4222-8222-222222222222';
 const FILE_ID = '33333333-3333-4333-8333-333333333333';
 const TEXT = 'hello world\n';
+const TEXT_SHA256 = createHash('sha256').update(Buffer.from(TEXT, 'utf8')).digest('hex');
+
+function readPayload(data: Record<string, unknown>): Record<string, unknown> {
+  return {
+    resource_id: FILE_ID,
+    display_name: 'sample.txt',
+    text: TEXT,
+    encoding: 'utf-8',
+    total_bytes: 12,
+    returned_bytes: 12,
+    truncated: false,
+    sha256: TEXT_SHA256,
+    version_token: 'v1',
+    ...data,
+  };
+}
 
 interface StubOverrides {
   readData?: Record<string, unknown>;
+  readSequence?: Record<string, unknown>[];
 }
 
 function stub(overrides: StubOverrides = {}) {
@@ -52,20 +70,11 @@ function stub(overrides: StubOverrides = {}) {
     },
     async liveExecuteRead(): Promise<unknown> {
       calls.push('execute-read');
-      return {
-        succeeded: true,
-        data: overrides.readData ?? {
-          resource_id: FILE_ID,
-          display_name: 'sample.txt',
-          text: TEXT,
-          encoding: 'utf-8',
-          total_bytes: 12,
-          returned_bytes: 12,
-          truncated: false,
-          sha256: 'a'.repeat(64),
-          version_token: 'v1',
-        },
-      };
+      const sequence = overrides.readSequence;
+      const data = sequence && sequence.length > 0
+        ? sequence.shift()!
+        : readPayload(overrides.readData ?? {});
+      return { succeeded: true, data };
     },
     async livePlanSearch(): Promise<unknown> {
       calls.push('plan-search');
@@ -134,7 +143,7 @@ test('FI-06A: a truncated source read refuses edit preparation', async () => {
     readData: {
       resource_id: FILE_ID, display_name: 'sample.txt', text: TEXT, encoding: 'utf-8',
       total_bytes: 100, returned_bytes: 12, truncated: true,
-      sha256: 'a'.repeat(64), version_token: 'v1',
+      sha256: TEXT_SHA256, version_token: 'v1',
     },
   });
   const workflow = new LiveWorkflow(backend);
@@ -150,7 +159,7 @@ test('FI-06A: an incomplete or stale source read refuses edit preparation', asyn
     readData: {
       resource_id: FILE_ID, display_name: 'sample.txt', text: TEXT, encoding: 'utf-8',
       total_bytes: 100, returned_bytes: 12, truncated: false,
-      sha256: 'a'.repeat(64), version_token: 'v1',
+      sha256: TEXT_SHA256, version_token: 'v1',
     },
   });
   const workflowA = new LiveWorkflow(incomplete.backend);
@@ -164,7 +173,7 @@ test('FI-06A: an incomplete or stale source read refuses edit preparation', asyn
     readData: {
       resource_id: FILE_ID, display_name: 'sample.txt', text: TEXT, encoding: 'utf-8',
       total_bytes: 12, returned_bytes: 12, truncated: false,
-      sha256: 'a'.repeat(64), version_token: 'v2-changed',
+      sha256: TEXT_SHA256, version_token: 'v2-changed',
     },
   });
   const workflowB = new LiveWorkflow(stale.backend);
@@ -180,7 +189,7 @@ test('FI-06A: a non-UTF-8 source cannot be losslessly re-encoded and refuses', a
     readData: {
       resource_id: FILE_ID, display_name: 'sample.txt', text: TEXT, encoding: 'utf-16',
       total_bytes: 12, returned_bytes: 12, truncated: false,
-      sha256: 'a'.repeat(64), version_token: 'v1',
+      sha256: TEXT_SHA256, version_token: 'v1',
     },
   });
   const workflow = new LiveWorkflow(backend);
@@ -200,4 +209,35 @@ test('FI-02: a complete, current, lossless read prepares the exact edit', async 
   assert.equal(prepared.status, 'ready');
   assert.equal(workflow.plannedPreview()?.previewId, preview.previewId);
   assert.ok(calls.includes('plan-edit'));
+});
+
+test('FI-06A qualification: a changed source between read and planning refuses', async () => {
+  const changedText = 'hello changed\n';
+  const { backend } = stub({
+    readSequence: [
+      readPayload({}),
+      readPayload({
+        text: changedText,
+        total_bytes: Buffer.byteLength(changedText),
+        returned_bytes: Buffer.byteLength(changedText),
+        sha256: createHash('sha256').update(Buffer.from(changedText, 'utf8')).digest('hex'),
+        version_token: 'v2',
+      }),
+    ],
+  });
+  const workflow = new LiveWorkflow(backend);
+  await workflow.registerProject('/fixture/project');
+  assert.equal((await workflow.openFile('sample.txt')).status, 'ready');
+  assert.deepEqual(await workflow.prepareEdit('hello', 'goodbye'), {
+    status: 'unavailable', reason: 'source_changed_since_read',
+  });
+  assert.equal(workflow.plannedPreview(), null);
+});
+
+test('FI-06A qualification: a read whose reported hash does not match its bytes refuses at open', async () => {
+  const { backend } = stub({ readData: { sha256: 'b'.repeat(64) } });
+  const workflow = new LiveWorkflow(backend);
+  await workflow.registerProject('/fixture/project');
+  const opened = await workflow.openFile('sample.txt');
+  assert.deepEqual(opened, { status: 'unavailable', reason: 'source_hash_mismatch' });
 });

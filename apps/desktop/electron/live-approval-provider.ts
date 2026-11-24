@@ -92,10 +92,17 @@ export interface ConfirmationOutcome {
  * Conservative upper bound for a preview the native message dialog can
  * present reviewably. Longer previews refuse authorization
  * (`preview_not_displayable_completely`) rather than risking an
- * unreviewable confirmation. Validated/tightened by the native
- * Windows display check in the acceptance procedure.
+ * unreviewable confirmation.
+ *
+ * STATUS: UNVERIFIED DISPLAY ASSUMPTION. This number has never been
+ * validated against the real Windows UI; it is a conservative guess,
+ * not evidence. Until the native Windows display check (acceptance
+ * procedure scenario 6) is executed and recorded, any approval whose
+ * preview approaches this bound must be treated as not demonstrably
+ * reviewable, and the check may tighten (never loosen without
+ * evidence) this value.
  */
-export const MAX_NATIVE_PREVIEW_DISPLAY_CHARS = 16_000;
+export const UNVERIFIED_NATIVE_PREVIEW_DISPLAY_CHARS = 16_000;
 
 export interface ApprovalContext {
   /** Snapshot of the signed-for task and its verified preview. */

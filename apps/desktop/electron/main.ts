@@ -6,7 +6,7 @@ import { isTrustedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
 import {
   createLiveApprovalProvider,
-  MAX_NATIVE_PREVIEW_DISPLAY_CHARS,
+  UNVERIFIED_NATIVE_PREVIEW_DISPLAY_CHARS,
   type ApprovalSummary,
   type ConfirmationOutcome,
 } from './live-approval-provider';
@@ -43,7 +43,7 @@ async function confirmLiveApproval(summary: ApprovalSummary): Promise<Confirmati
   // (PHASE2_LIVE_WORKFLOW.md section 6, scenario 6).
   const pathsBlock = summary.affectedPaths.map((entry) => `Affected path: ${entry}`).join('\n');
   const message = `Approve this exact action?\n\n${pathsBlock}\n\n${summary.renderedPreview}`;
-  const displayedCompletely = message.length <= MAX_NATIVE_PREVIEW_DISPLAY_CHARS;
+  const displayedCompletely = message.length <= UNVERIFIED_NATIVE_PREVIEW_DISPLAY_CHARS;
   if (!displayedCompletely) return { affirmed: false, displayedCompletely: false };
   const result = await dialog.showMessageBox(mainWindow, {
     type: 'warning',

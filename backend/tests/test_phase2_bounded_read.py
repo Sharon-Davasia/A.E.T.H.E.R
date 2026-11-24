@@ -21,7 +21,8 @@ from aether.core.resources.bounded_read import BoundedReadError, read_bounded_by
 
 
 def _resolved(path):
-    return SimpleNamespace(canonical_path=path)
+    info = path.lstat()
+    return SimpleNamespace(canonical_path=path, device_id=info.st_dev, file_id=info.st_ino)
 
 
 def test_reads_exact_bytes(tmp_path) -> None:
@@ -142,3 +143,17 @@ def test_planner_binds_pre_image_through_bounded_read(tmp_path) -> None:
         planner.plan(uuid4(), intent, revision=1)
     assert caught.value.reason_code == "target_too_large"
     assert big.stat().st_size == 4 * 1024 * 1024 + 1  # never truncated
+
+
+def test_rename_substitution_after_resolution_refused(tmp_path) -> None:
+    """A different file renamed onto the resolved path is not the
+    registry-issued identity, even though the path is unchanged."""
+    target = tmp_path / "sample.txt"
+    target.write_bytes(b"original\n")
+    resolved = _resolved(target)
+    substitute = tmp_path / "substitute.txt"
+    substitute.write_bytes(b"substituted\n")
+    substitute.replace(target)  # same path, different inode
+    with pytest.raises(BoundedReadError) as caught:
+        read_bounded_bytes(resolved)
+    assert caught.value.reason_code == "resource_identity_mismatch"

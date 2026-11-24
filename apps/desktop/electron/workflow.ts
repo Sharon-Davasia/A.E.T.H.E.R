@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   buildProposedContents,
   parseCreatedTask,
@@ -84,19 +85,37 @@ export class LiveWorkflow {
     return registered;
   }
 
+  /** One bounded read of a file resource through the trusted channel. */
+  private async readCurrent(
+    resourceId: string,
+  ): Promise<WorkflowStep<FileContents>> {
+    const readTaskId = parseCreatedTask(await this.backend.liveCreateTask('Read a project file'));
+    const plannedRead = parsePlannedPreview(
+      await this.backend.livePlanRead(readTaskId, resourceId),
+    );
+    if (plannedRead.status !== 'ready') return plannedRead;
+    const read = parseFileContents(await this.backend.liveExecuteRead(readTaskId));
+    if (read.status !== 'ready') return read;
+    // Bind the read to its actual content hash: for UTF-8 the locally
+    // recomputed hash must equal the backend-reported one, so the
+    // bytes main holds are provably the bytes that were read.
+    if (
+      read.value.encoding === 'utf-8'
+      && createHash('sha256').update(Buffer.from(read.value.text, 'utf8')).digest('hex')
+        !== read.value.sha256
+    ) {
+      return { status: 'unavailable', reason: 'source_hash_mismatch' };
+    }
+    return read;
+  }
+
   public async openFile(relativePath: string): Promise<WorkflowStep<ResolvedFile>> {
     if (!this.project) throw new Error('register a project before opening a file');
     const resolved = parseResolvedFile(
       await this.backend.liveResolveResource(this.project.rootId, relativePath),
     );
     if (resolved.status !== 'ready') return resolved;
-    // A bounded read is itself a planned task over the trusted channel.
-    const readTaskId = parseCreatedTask(await this.backend.liveCreateTask('Read a project file'));
-    const plannedRead = parsePlannedPreview(
-      await this.backend.livePlanRead(readTaskId, resolved.value.resourceId),
-    );
-    if (plannedRead.status !== 'ready') return plannedRead;
-    const read = parseFileContents(await this.backend.liveExecuteRead(readTaskId));
+    const read = await this.readCurrent(resolved.value.resourceId);
     if (read.status !== 'ready') return read;
     this.file = resolved.value;
     this.contents = read.value;
@@ -154,6 +173,18 @@ export class LiveWorkflow {
       || Buffer.from(this.contents.text, 'utf8').byteLength !== this.contents.returnedBytes
     ) {
       return { status: 'unavailable', reason: 'source_not_losslessly_representable' };
+    }
+    // Bind preparation to the actual source-content hash: re-read the
+    // file and refuse if anything changed since the opened read, so a
+    // silent external change cannot become the new baseline.
+    const current = await this.readCurrent(this.file.resourceId);
+    if (current.status !== 'ready') return current;
+    if (
+      current.value.sha256 !== this.contents.sha256
+      || current.value.versionToken !== this.contents.versionToken
+      || current.value.text !== this.contents.text
+    ) {
+      return { status: 'unavailable', reason: 'source_changed_since_read' };
     }
     const proposed = buildProposedContents(this.contents.text, find, replace);
     const taskId = parseCreatedTask(await this.backend.liveCreateTask('Apply an approved edit'));
