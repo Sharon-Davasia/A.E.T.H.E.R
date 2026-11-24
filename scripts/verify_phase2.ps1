@@ -3,8 +3,11 @@
 # *** DO NOT RUN THIS ON A MACHINE HOLDING REAL DATA UNTIL ITS SAFETY HAS BEEN
 # *** INDEPENDENTLY REVIEWED. See docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md
 #
-# Run from the repository root on the target Windows 11 machine:
-#     powershell -ExecutionPolicy Bypass -File .\scripts\verify_phase2.ps1
+# Run from the repository root on the target Windows 11 machine
+# (PowerShell 5.1, normal user; NO execution-policy bypass — if the
+# machine policy blocks scripts, the machine owner sets an approved
+# policy; do not work around it):
+#     powershell.exe -NoProfile -File .\scripts\verify_phase2.ps1
 #
 # Safety contract enforced by construction (not by convention):
 #   * Never elevated. Refuses to run as Administrator.
@@ -134,7 +137,7 @@ function Assert-Environment {
     foreach ($tool in @(
             @{ Name = 'Python'; Cmd = 'python' },
             @{ Name = 'Node'; Cmd = 'node' },
-            @{ Name = 'npm'; Cmd = 'npm' },
+            @{ Name = 'npm'; Cmd = 'npm.cmd' },
             @{ Name = 'uv'; Cmd = 'uv' })) {
         $version = (& $tool.Cmd --version) 2>$null
         Add-Result -Requirement "$($tool.Name) available" `
@@ -210,11 +213,11 @@ function Assert-Desktop {
     }
     Write-Section 'Desktop application gates'
     $desktop = Join-Path $root 'apps\desktop'
-    Invoke-Mandatory -Requirement 'Desktop lint' -WorkingDirectory $desktop -Command { npm run lint }
-    Invoke-Mandatory -Requirement 'Desktop typecheck' -WorkingDirectory $desktop -Command { npm run typecheck }
-    Invoke-Mandatory -Requirement 'Desktop Node tests' -WorkingDirectory $desktop -Command { npm test }
-    Invoke-Mandatory -Requirement 'Desktop Python security tests' -WorkingDirectory $desktop -Command { npm run test:python }
-    Invoke-Mandatory -Requirement 'Electron build' -WorkingDirectory $desktop -Command { npm run build:electron }
+    Invoke-Mandatory -Requirement 'Desktop lint' -WorkingDirectory $desktop -Command { npm.cmd run lint }
+    Invoke-Mandatory -Requirement 'Desktop typecheck' -WorkingDirectory $desktop -Command { npm.cmd run typecheck }
+    Invoke-Mandatory -Requirement 'Desktop Node tests' -WorkingDirectory $desktop -Command { npm.cmd test }
+    Invoke-Mandatory -Requirement 'Desktop Python security tests' -WorkingDirectory $desktop -Command { npm.cmd run test:python }
+    Invoke-Mandatory -Requirement 'Electron build' -WorkingDirectory $desktop -Command { npm.cmd run build:electron }
 }
 
 function Assert-NativeProbes {
