@@ -110,7 +110,7 @@ def test_planner_binds_pre_image_through_bounded_read(tmp_path) -> None:
 
     from fs_support import build_registry, build_tree, resolve
 
-    from aether.core.planning.planner import Planner, PlannerError, PlanGoal, PlanIntent
+    from aether.core.planning.planner import PlanGoal, PlanIntent, Planner, PlannerError
     from aether.core.policy.capabilities import CapabilityRegistry
 
     tree = build_tree(tmp_path)
