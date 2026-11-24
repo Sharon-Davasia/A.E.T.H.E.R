@@ -133,17 +133,16 @@ def test_full_live_edit_receipt_and_undo(live) -> None:
     assert receipt["verifiedAt"] is not None
 
     # Undo is a separate plan + gesture + grant bound to the receipt.
+    # FI-07: only the receipt identity crosses the wire; the restoration
+    # bytes and snapshot binding are derived from the durable receipt and
+    # the protected vault, never from caller-supplied content.
     undo_task = bridge.create_task({"goal": "undo the token replacement"})
     undo_planned = bridge.plan_task(
         {
             "taskId": undo_task["taskId"],
             "goal": "undo_edit",
             "resourceId": resource_id,
-            "arguments": {
-                "receipt_id": executed["receiptId"],
-                "snapshot_id": executed["snapshotId"],
-            },
-            "proposedContentBase64": base64.b64encode(ORIGINAL).decode(),
+            "receiptId": executed["receiptId"],
         }
     )
     assert "preview" in undo_planned, undo_planned

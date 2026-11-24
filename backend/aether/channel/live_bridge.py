@@ -30,13 +30,16 @@ import base64
 import binascii
 import hashlib
 import json
+import os
 import re
+import stat
 from collections.abc import Callable
 from datetime import datetime
 from uuid import UUID, uuid4
 
 from aether.core.composition import CompositionUnavailable, TrustedComposition
 from aether.core.edits.executor import EditDenied, EditOutcome, EditRequest
+from aether.core.edits.receipts import ReceiptError
 from aether.core.fs.session import CapabilityOutcome
 from aether.core.grants.errors import GrantDeniedError, GrantIssuanceDenied
 from aether.core.persistence import (
@@ -51,8 +54,10 @@ from aether.core.planning.authorizing_gesture import (
     SignedGesture,
 )
 from aether.core.planning.planner import PlanGoal, PlanIntent, PlannerError
+from aether.core.resources.path_safety import PathSafetyError, reject_reparse_components
 from aether.core.resources.registry import ResourceRegistryError
 from aether.core.review_contract import electron_preview_payload
+from aether.core.vault.undo_vault import VaultError
 
 _UUID_TEXT = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -60,6 +65,15 @@ _UUID_TEXT = re.compile(
 _SHA256_TEXT = re.compile(r"^[0-9a-fA-F]{64}$")
 _MAX_PROPOSED_BYTES = 1_000_000
 _MAX_READ_WIRE_BYTES = 16 * 1024
+# Aligned with the edit executor's own bound: a target larger than this can
+# never be edited, so hashing/planning it is refused before allocation.
+_MAX_TARGET_BYTES = 4 * 1024 * 1024
+_HASH_CHUNK_BYTES = 64 * 1024
+# Plan-argument keys the bridge alone may set (FI-06): caller-supplied
+# values for these are discarded, never merged.
+_RESERVED_ARGUMENT_KEYS = frozenset(
+    {"resource_id", "step_id", "approval_id", "expected_sha256", "receipt_id", "snapshot_id"}
+)
 _EDIT_CAPABILITIES = frozenset({"fs.apply_approved_edit", "fs.undo_edit"})
 
 _READ_GOALS = {
@@ -174,6 +188,7 @@ class LiveBridge:
                     "resourceId",
                     "arguments",
                     "proposedContentBase64",
+                    "receiptId",
                 }
             ):
                 raise _Refused("invalid_request")
@@ -188,8 +203,19 @@ class LiveBridge:
             arguments_in = payload.get("arguments") or {}
             if not isinstance(arguments_in, dict):
                 raise _Refused("invalid_request")
+            # FI-06: security-critical argument keys are bridge-generated.
+            # Caller values for them are discarded, never merged, so a
+            # planning request cannot override the authoritative resource
+            # identity, approval identity, expected hash or (FI-07) the
+            # receipt/snapshot an undo is bound to.
+            arguments: dict[str, object] = {
+                key: value
+                for key, value in arguments_in.items()
+                if key not in _RESERVED_ARGUMENT_KEYS
+            }
+            arguments["resource_id"] = resource_id
             proposed: bytes | None = None
-            if goal in (PlanGoal.APPLY_EDIT, PlanGoal.UNDO_EDIT):
+            if goal is PlanGoal.APPLY_EDIT:
                 raw = payload.get("proposedContentBase64")
                 if not isinstance(raw, str):
                     raise _Refused("proposed_content_required")
@@ -199,15 +225,25 @@ class LiveBridge:
                     raise _Refused("invalid_request") from exc
                 if len(proposed) > _MAX_PROPOSED_BYTES:
                     raise _Refused("proposed_content_too_large")
-            arguments: dict[str, object] = {"resource_id": resource_id, **arguments_in}
+            elif goal is PlanGoal.UNDO_EDIT:
+                # FI-07: the restoration bytes, receipt and snapshot are
+                # derived from the durable receipt + protected vault —
+                # caller-supplied restoration content is refused outright.
+                if "proposedContentBase64" in payload:
+                    raise _Refused("undo_content_must_be_derived")
+                receipt_id = _uuid_field(payload.get("receiptId"))
+                proposed, undo_arguments = self._derive_undo(receipt_id, resource_id)
+                arguments.update(undo_arguments)
+                resource_id = str(arguments["resource_id"])
             if goal in (PlanGoal.APPLY_EDIT, PlanGoal.UNDO_EDIT):
-                arguments.setdefault("approval_id", str(uuid4()))
-                arguments.setdefault("expected_sha256", self._current_file_sha256(resource_id))
+                arguments["approval_id"] = str(uuid4())
+                if goal is PlanGoal.APPLY_EDIT:
+                    arguments["expected_sha256"] = self._current_file_sha256(resource_id)
                 # Placeholder, corrected after the first in-memory build below:
                 # the persisted step arguments must name the plan step's real
                 # (planner-derived) id, because the executor's grant scope
                 # check hashes those arguments verbatim.
-                arguments.setdefault("step_id", str(uuid4()))
+                arguments["step_id"] = str(uuid4())
 
             store = self._composition.store
             task = store.get_task(task_id)
@@ -490,6 +526,8 @@ class LiveBridge:
             return {"status": "unavailable", "reason": unavailable.reason_code}
         except ResourceRegistryError as exc:
             return {"status": "unavailable", "reason": str(exc)}
+        except PathSafetyError as exc:
+            return {"status": "unavailable", "reason": str(exc)}
         except PlannerError as exc:
             return {"status": "unavailable", "reason": exc.reason_code.lower()}
         except (GrantIssuanceDenied, GrantDeniedError) as exc:
@@ -506,9 +544,99 @@ class LiveBridge:
         except Exception:
             return {"status": "unavailable", "reason": "live_unavailable"}
 
+    def _derive_undo(
+        self, receipt_id: UUID, requested_resource_id: str
+    ) -> tuple[bytes, dict[str, object]]:
+        """Derive an undo plan's bytes and bindings authoritatively (FI-07).
+
+        The only caller input is the receipt identity. The durable receipt
+        must record a verified success with a snapshot; the restoration
+        bytes come from the protected vault and must hash to the receipt's
+        pre-image; the resource must be the receipt's resource; and the
+        current file (bounded, revalidating hash) must still be the
+        receipt's verified post-image — a conflicting newer change refuses
+        the plan outright. The separately approved undo grant then binds
+        exactly this receipt, snapshot, resource and restoration.
+        """
+
+        composition = self._composition
+        if composition.receipts is None or composition.vault is None:
+            raise _Refused("schema_activation_pending")
+        try:
+            record = composition.receipts.get(receipt_id)
+        except ReceiptError as exc:
+            raise _Refused(exc.reason_code) from exc
+        if str(record.status) != "SUCCEEDED" or record.verified_at is None:
+            raise _Refused("receipt_not_undoable")
+        if not record.snapshot_id or record.pre_sha256 is None or record.post_sha256 is None:
+            raise _Refused("receipt_has_no_snapshot")
+        if requested_resource_id != record.resource_id:
+            raise _Refused("undo_resource_mismatch")
+        try:
+            restored = composition.vault.get(UUID(record.snapshot_id))
+        except VaultError as exc:
+            raise _Refused(exc.reason_code) from exc
+        if hashlib.sha256(restored).hexdigest() != record.pre_sha256:
+            raise _Refused("undo_snapshot_hash_mismatch")
+        current_sha256 = self._current_file_sha256(record.resource_id)
+        if current_sha256 != record.post_sha256:
+            raise _Refused("undo_conflict_newer_change")
+        return restored, {
+            "resource_id": record.resource_id,
+            "receipt_id": str(record.receipt_id),
+            "snapshot_id": record.snapshot_id,
+            "expected_sha256": current_sha256,
+        }
+
     def _current_file_sha256(self, resource_id: str) -> str:
-        resolved = self._composition.registry.resource_by_id(resource_id)
-        return hashlib.sha256(resolved.canonical_path.read_bytes()).hexdigest()
+        """Bounded, revalidating SHA-256 of a registered file (FI-06).
+
+        The stored resolution is never trusted at face value: the resource
+        is re-resolved through the registry (containment + reparse-point
+        rejection), the re-resolved identity must match the issued one,
+        and the file is then hashed by streaming bounded chunks from an
+        opened descriptor whose fstat identity must match the resolved
+        path (regular file, single hard link, size-capped). No unbounded
+        allocation, and the descriptor — not a second path lookup — is
+        what gets read.
+        """
+
+        registry = self._composition.registry
+        stored = registry.resource_by_id(resource_id)
+        resolved = registry.resolve(stored.root_id, stored.relative_path)
+        if resolved.ref.resource_id != stored.ref.resource_id:
+            raise _Refused("resource_identity_mismatch")
+        path = resolved.canonical_path
+        reject_reparse_components(path)
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise _Refused("target_unavailable") from exc
+        try:
+            info = os.fstat(descriptor)
+            path_info = path.lstat()
+            if (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino):
+                raise _Refused("resource_identity_mismatch")
+            if not stat.S_ISREG(info.st_mode):
+                raise _Refused("target_not_a_regular_file")
+            if info.st_nlink > 1:
+                raise _Refused("target_hard_linked")
+            if info.st_size > _MAX_TARGET_BYTES:
+                raise _Refused("target_too_large")
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                chunk = os.read(descriptor, _HASH_CHUNK_BYTES)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_TARGET_BYTES:
+                    raise _Refused("target_too_large")
+                digest.update(chunk)
+            return digest.hexdigest()
+        finally:
+            os.close(descriptor)
 
     def _parse_gesture(self, payload: object) -> SignedGesture:
         if not isinstance(payload, dict) or set(payload) != {
