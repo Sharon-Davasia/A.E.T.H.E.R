@@ -4,27 +4,45 @@
 
 ## Current phase
 
-**Phase 2B Stage 4 migration preparation (PR #14, branch `arena/9ff5f05b-a-e-t-h-e-r`, opened from merged `main` at `02dff4b`; open, not merged).**
+**Phase 2 implementation is merged to `main`** (PR #34, merge commit
+`a58bd68843091eb339e3c102b8a2cfa204d355c6`; integrated source head
+`3cd5c06`, tree-identical to independently verified commit `bf08ca9`,
+tree `811c9b75b4a42d81a582beb7f37499eb13a55b2a`). The complete stack
+formerly split across PRs #15–#32, plus the CRLF/EOF-trailer and
+legacy-binding corrections and the Windows merge-gate, entered `main`
+exactly once through that PR. PR #14 (closed, superseded — its content is
+integrated) and PR #33 (closed, superseded — corrections incorporated via
+`bf08ca9`) were not merged independently. At the moment of integration there were zero open PRs (historical, as of 2026-11-23; documentation PR #35 was opened afterwards).
 
-Stage 4's trusted exact-approval-grant foundation is **merged** (PR #13, merge commit `02dff4b`; independent-review corrections S4-1…S4-9 included). It **still authorizes nothing**: production issuance stays `GRANT_ISSUANCE_DISABLED`.
+**Phase 2 code integration: COMPLETE. Formal Phase 2 acceptance: NOT
+COMPLETE.** What remains is of two distinct kinds: (a)
+implementation/wiring prerequisites — a separately authorized supported
+live workflow able to issue a real production grant and perform a working
+approved edit and a verified Undo, which the Master Specification's
+acceptance requires demonstrating and which the shipped product
+deliberately cannot do yet; and (b) acceptance evidence: archived native
+Windows evidence, the mandatory human demonstrations in
+`docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §8 (several live
+demonstrations are blocked until a separately authorized live workflow
+exists), a genuine interruption test, and Linux/hosted re-confirmation on
+Python 3.12.10 (Linux verification at `bf08ca9` ran on Python 3.11.2:
+847 passed, 5 skipped). Native Windows results with Python 3.12.10 have
+been user-reported (full suite, desktop 70/70, 6 Python channel tests,
+ruff/mypy/Electron build, ACL unreadable-narrative test 1 passed) but their
+logs are not archived in this repository.
 
-PR #14 prepares schema-version-2 migration `0002_phase2b_stage4_grants.sql` for production integration **without activating it**:
+Security boundaries are unchanged by the integration and verified on
+`main`: `ACTIVE_SCHEMA_VERSION = 1` with `PENDING_MIGRATION_VERSIONS =
+{2}` (schema v2 prepared, **not activated**); production grant issuance
+remains default-deny (`GRANT_ISSUANCE_DISABLED`,
+`NullAttestationVerifier`, `IssuanceDisabledConsumptionLedger`); no live
+mutation path is wired into the running service; Phase 3 has not started.
+Activation of schema v2 or of any live grant/mutation path requires
+separate explicit user approval. The detailed post-merge record is in
+`docs/engineering/PHASE2_ACCEPTANCE_REPORT.md`.
 
-- the file moved from `proposed_migrations/` to `aether/core/persistence/migrations/` byte-identically (`git mv`; SHA-256 `d2a02f54…` unchanged) and is now registered in `_EXPECTED_MIGRATIONS` / `_EXPECTED_SCHEMA_SHA256`;
-- **both** documented values were independently recomputed (migration SHA-256 `d2a02f54…`; version-2 fingerprint `dec68c2c…`, 30 objects) with the method validated by first reproducing the released version-1 pin;
-- registration and activation are separate: `ACTIVE_SCHEMA_VERSION = 1` and `PENDING_MIGRATION_VERSIONS = {2}`, so this build creates and accepts only version 1 while verifying version 2's bytes and fingerprint on every open;
-- a version-2 database is now refused as "newer than this application" (previously compared against the registry maximum — a defect the new tests caught), and a migration that does not bump `user_version` now rolls back inside the transaction instead of committing a partial schema.
-
-It does **not** apply or activate version 2, rewrite migration `0001`, issue a production grant, execute anything, mutate a user file, expose renderer IPC or an HTTP route, upgrade the Stage 3 approve button, promote review evidence to authority, or start Phase 2C/2D/Phase 3. Migration readiness evidence, recomputed pins, the requirements→tests matrix, risks, the dependency-ordered plan and the Windows acceptance checklist are in `docs/engineering/PHASE2B_STAGE4_MIGRATION.md`; Stage 4's own matrix stays in `docs/engineering/PHASE2B_STAGE4_GRANTS.md`. **Activation requires separate explicit user approval.**
-
-Merge state of the preceding phase work (actual, verified against `git log origin/main`):
-
-- Phase 2B-1 — **merged**: PR #7, #8, #9 (Windows stat-result test correction), #10 (Stage 1 desktop foundation).
-- Phase 2B-2 Stage 2 — **merged**: PR #11 (including the independent-review corrections S2-1…S2-4).
-- Phase 2B-2 Stage 3 — **merged**: PR #12 (including the independent-review corrections S3-1…S3-3). Earlier text in this file that describes Stage 2/Stage 3 as "pending review" is historical and superseded by this line.
-- Phase 2B Stage 4 — **merged**: PR #13 (S4-1…S4-9), merge commit `02dff4b`.
-
-Phase 1 model-asset/build gates and target-hardware checks remain unresolved in this sandbox; user-reported Windows checks are recorded separately and are not independently verified here.
+Everything below this section that describes PR #14 or earlier stage
+branches as open/pending is **historical** and superseded by this section.
 
 ## Phase 0 baseline
 

@@ -1,5 +1,14 @@
 # PR #14 — Splitting Plan
 
+> **Historical record (updated 2026-11-23).** This plan was executed:
+> the stack was split into PRs #15–#32 and integrated, with all later
+> corrections, through PR #34 into `main` (merge commit `a58bd68`).
+> PR #14 itself was closed as superseded and was never merged. The text
+> below is preserved unchanged as the historical planning record; its
+> present-tense statements about open PRs and branches no longer describe
+> the repository.
+
+
 **Branch:** `arena/9ff5f05b-a-e-t-h-e-r` (base `main` @ `02dff4b`)
 **PR:** #14, open, **not merged**, no auto-merge requested
 **Scope constraint honoured:** nothing was reverted, reset, force-pushed, deleted or

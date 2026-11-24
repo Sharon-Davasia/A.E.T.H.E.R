@@ -37,14 +37,14 @@ A pre-existing directory is never adopted, reused or deleted.
 
 ```powershell
 cd <repo>
-powershell -ExecutionPolicy Bypass -File .\scripts\verify_phase2.ps1
+powershell -File .\scripts\verify_phase2.ps1
 ```
 
 Useful switches:
 
 | Switch | Effect |
 |---|---|
-| `-FixtureRoot <path>` | Override the fixture root (must remain under `D:\Projects\AETHER-Phase2-Fixture`) |
+| `-Base <path>` | Override the fixture base directory (default `D:\Projects`); the fixture itself is created as `AETHER-Phase2-Fixture-<token>` under it by the fixture module |
 | `-EvidenceRoot <path>` | Where sanitized evidence is written (default `.cache\phase2-evidence`) |
 | `-SkipDesktop` | Skip desktop gates — records them as `NOT VERIFIED`, never as `PASS` |
 | `-SkipBackend` | Skip backend gates — likewise `NOT VERIFIED` |
@@ -153,3 +153,54 @@ substitute for the human evidence.
 The person performing acceptance signs the result with: date, machine identity,
 git SHA, and their own statement of what they observed with their own eyes
 (as distinct from what the script asserted).
+
+---
+
+## 8. Evidence matrix (post-merge reconciliation, 2026-11-23)
+
+Reconciled against merged `main` (`a58bd68`, via PR #34), the automated
+results at verified commit `bf08ca9`, and the user-reported native Windows
+run. Statuses distinguish four evidence classes: **automated** (test-suite
+results), **native Windows** (executed on the target OS), **human
+demonstration** (a person operating the shipped application), and the
+**final verdict**, which is `PASS` only when every required class is
+present. User-reported Windows results have no archived logs in this
+repository; they are marked "reported" and do not by themselves satisfy a
+verdict.
+
+**Production-wiring fact that bounds several scenarios:** production grant
+issuance remains disabled (`GRANT_ISSUANCE_DISABLED`,
+`NullAttestationVerifier`, `IssuanceDisabledConsumptionLedger` default) and
+no live mutation path is wired into the running service. Scenarios whose
+*live* form requires issuing a real grant or mutating a real file are
+therefore **blocked as acceptance demonstrations** until a separately
+authorized, supported live workflow exists. They must not be "demonstrated"
+by bypassing those controls.
+
+| # | Scenario (expected behaviour) | Implementation / test files | Automated | Native Windows evidence | Human demonstration | Final verdict |
+|---|---|---|---|---|---|---|
+| 1 | Open a registered project; bounded access only | `core/fs/session.py`; `test_phase2_end_to_end.py::test_01_*`, `test_phase2c_session.py` | PASS (Linux 847-suite) | Reported PASS (full suite, Win 3.12.10; logs not archived) | Required — open the shipped app on a registered project | **NOT VERIFIED** |
+| 2 | Search + read an allowed file | `core/fs/search.py`, `content.py`; `test_02_*` | PASS | Reported PASS (as above) | Required — live search/read in the app | **NOT VERIFIED** |
+| 3 | Refuse reads outside authorized roots | `core/resources/registry.py`; `test_03_*` | PASS | Reported PASS | Required — attempt an outside-root read live | **NOT VERIFIED** |
+| 4 | Refuse `.env`/sensitive files without authorization | `registry.py`, `fs/content.py`; `test_04_*` | PASS | Reported PASS | Required — live refusal observation | **NOT VERIFIED** |
+| 5 | Deny junction/symlink (reparse-point) escape | `core/resources/path_safety.py`; `test_05_*` (symlink on Linux); native junction probe in verifier step 5 | PASS (symlink); junction NTFS-only | Junction probe is part of `verify_phase2.ps1`; execution/archived output not in repo | Required — create a junction on NTFS and observe refusal | **NOT VERIFIED** |
+| 6 | Human-visible exact patch preview before approval | `core/planning/preview_authority.py`, `planning/exact_diff.py` (aether-diff-v2 EOF trailer), `apps/desktop/src/ApprovalReviewSurface.tsx`; `test_06_*`, desktop CRLF/EOF tests | PASS | Desktop suite reported PASS on Windows | Required — a human reads the exact diff (incl. CRLF/EOF summary) in the real UI | **NOT VERIFIED** |
+| 7 | Refuse mutation before approval | `core/grants/attestation.py`; `test_07_*` | PASS | Reported PASS | Required live — but **blocked**: production grant issuance disabled, no live mutation path; refusal is the only live-observable half | **NOT VERIFIED** (live demo blocked) |
+| 8 | Apply the exact approved edit; hash matches | `core/edits/executor.py`; `test_08_*`, `test_phase2_approved_bytes.py`, `test_phase2d_edits.py` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
+| 9 | Refuse stale approval after post-preview modification | `edits/executor.py`; `test_09_*` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
+| 10 | Reject forged/expired/revoked/exhausted/replayed grants | `core/grants/*`, `planning/authorizing_gesture.py`; `test_10_*` (7 cases), `test_phase2b_stage4_grants.py`, `test_phase2_authoritative_consumption.py` | PASS | Reported PASS | Required against the real ledger — **blocked** for live issuance as #7 | **NOT VERIFIED** (live demo blocked) |
+| 11 | Consumption binds the exact action | `grants/authority.py`, `grants/consumption.py`; `test_11_*` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
+| 12 | Receipts durable across restart | `core/edits/receipts.py`; `test_12_*` | PASS | Reported PASS | Required — real application restart with receipts re-read | **NOT VERIFIED** |
+| 13 | Undo restores the exact original bytes | `core/vault/undo_vault.py`, `edits/executor.py` undo; `test_13_*`, `test_phase2_undo_authorization.py` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
+| 14 | Undo refuses silent overwrite of a newer edit | `edits/executor.py` undo; `test_14_*` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
+| 15 | Truthful crash/cancel recovery (UNVERIFIED, never false success) | `edits/executor.py`, `edits/journal.py`; `test_15_*` (simulated kill, re-opened from disk) | PASS (simulated) | No real interruption performed | Required — a genuine interruption (kill/power) on Windows; simulation does not satisfy this | **NOT VERIFIED** |
+| 16 | T3/shell/unsupported capabilities denied | `core/policy/broker.py`, `fs/executor.py`; `test_16_*` | PASS | Reported PASS | Required — live denial observation in the app | **NOT VERIFIED** |
+| 17 | Zero unauthorized mutation across the run | whole stack; `test_17_*` | PASS | Not observed on a live machine | Required — observed across the acceptance run (fixture hashes before/after) | **NOT VERIFIED** |
+| 18 | Offline; zero unauthorized outbound disclosure | no network client in Phase 2 packages; `test_18_*` | PASS (code-level) | Not observed on a live machine | Required — observed offline behaviour on the machine, not inferred from tests | **NOT VERIFIED** |
+
+**Summary:** 18/18 implemented; 18/18 automated PASS on Linux at `bf08ca9`
+(user-reported PASS on native Windows, unarchived); 0/18 formally accepted.
+Every scenario still lacks at least one required evidence class — archived
+native Windows evidence, a human demonstration, a genuine interruption, or
+a supported live workflow for the presently disabled mutation path.
+**Formal Phase 2 acceptance remains NOT COMPLETE.**

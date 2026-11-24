@@ -1,34 +1,100 @@
 # Phase 2 Acceptance Report
 
-**Date:** 2026-11-15 (report authored) · acceptance run pending
-**Branch:** `arena/9ff5f05b-a-e-t-h-e-r` (open PR #14 at `2b60708`, **not merged**)
+**Date:** 2026-11-15 (report authored) · **post-merge update 2026-11-23**
+**Repository state:** Phase 2 implementation **merged to `main`** via PR #34
+(merge commit `a58bd68843091eb339e3c102b8a2cfa204d355c6`; integrated source
+head `3cd5c06281cb1e749ecb9099d0770975ea249009`). At the moment of that integration there were zero open PRs (historical statement as of 2026-11-23; this report's own documentation PR #35 was opened afterwards).
 **Binding specification:** `docs/architecture/MASTER_SPEC.md`
 **Acceptance procedure:** `docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md`
 **Verifier:** `scripts/verify_phase2.ps1`
 
-> ## Verdict: **NOT COMPLETE**
+> ## Verdicts (kept deliberately separate)
 >
-> Every mandatory item that can be proven on Linux is **PASS**. Every mandatory
-> item that requires the target Windows machine, a human operating the trusted
-> UI, or a real power-loss/interruption event is **NOT VERIFIED**.
+> - **Phase 2 code integration: COMPLETE.** The entire implementation
+>   (formerly PRs #15–#32, plus the CRLF/EOF and Windows merge-gate
+>   corrections) is on `main` through PR #34.
+> - **Automated verification: PASS with qualifications** (see §2 — Linux
+>   results are Python 3.11.2, not 3.12.10; native Windows results are
+>   user-reported and their logs are not archived in this repository).
+> - **Formal Phase 2 acceptance: NOT COMPLETE.** Every mandatory scenario
+>   that requires the target Windows machine, a human operating the trusted
+>   UI, or a real power-loss/interruption event remains **NOT VERIFIED**
+>   (see the evidence matrix in `PHASE2_WINDOWS_ACCEPTANCE.md` §8).
 >
-> Under the directive, Phase 2 must not be declared complete while any mandatory
-> item is `NOT VERIFIED`. **Phase 2 is therefore not complete.** This report does
-> not claim otherwise, and no partial result here may be quoted as acceptance.
+> Merging the implementation is not acceptance. No partial result here may
+> be quoted as acceptance.
+
+## 0. Integration record (verified against GitHub, 2026-11-23)
+
+| Fact | Value |
+|---|---|
+| Integration PR | #34 — **MERGED** 2026-11-23 |
+| Merge commit on `main` | `a58bd68843091eb339e3c102b8a2cfa204d355c6` |
+| Integrated source head | `3cd5c06281cb1e749ecb9099d0770975ea249009` |
+| Independently verified source commit | `bf08ca9274ed02576ec791ff20781e47a92725a4` |
+| Verified source tree | `811c9b75b4a42d81a582beb7f37499eb13a55b2a` |
+| Tree equivalence | `3cd5c06^{tree}` == `bf08ca9^{tree}`; GitHub comparison showed zero file differences between the integration head and merged `main` |
+| Stack integration | PRs #15–#32 entered through PR #34 exactly once (all split tips A–R are ancestors of the integrated head). GitHub recorded PR #15 as merged; the remaining stacked PRs were closed following integration |
+| Superseded PRs | #14 (closed; tree-identical content integrated) and #33 (closed; corrections incorporated via `bf08ca9`). Neither was merged independently, and neither must be reopened for merging |
+| Temporary CI | `.github/workflows/phase2-pr34-linux-temporary.yml` (commit `aa91dcb`) was removed in `3cd5c06` before merge; the manual-only `.github/workflows/ci.yml` is unchanged. The temporary workflow never executed — GitHub Actions reported an **account billing restriction**, which is not a source-code test failure |
 
 ---
 
 ## 1. What is implemented
 
-| Workstream | Deliverable | State |
+| Workstream | Deliverable | State (post-merge, verified on `main`) |
 |---|---|---|
-| A (PR #14) | Schema-v2 migration prepared, **not activated**; `ACTIVE_SCHEMA_VERSION=1`, `PENDING_MIGRATION_VERSIONS={2}` | Implemented, tested, awaiting your review; **not merged** |
-| B (2C) | Bounded typed read/inspect/search/open + task-level session with durable audit | Implemented, tested |
-| C (2B) | Planner, persisted preview authority, signed authorizing gesture, production attestation verifier | Implemented, tested; **production verifier still rejecting by default** |
-| D (2D) | Exact edit executor, encrypted Undo Vault, append-only receipts | Implemented, tested; **no live mutation path enabled** |
-| E | `scripts/verify_phase2.ps1`, `PHASE2_WINDOWS_ACCEPTANCE.md` | Written; **not yet executed on Windows** |
+| A (ex-PR #14) | Schema-v2 migration prepared, **not activated**; `ACTIVE_SCHEMA_VERSION=1`, `PENDING_MIGRATION_VERSIONS={2}` (`backend/aether/core/persistence/sqlite_store.py`) | **Merged via PR #34**; activation still requires separate authorization |
+| B (2C) | Bounded typed read/inspect/search/open + task-level session with durable audit | **Merged via PR #34** |
+| C (2B) | Planner, persisted preview authority, signed authorizing gesture, production attestation verifier | **Merged via PR #34**; production verifier still `NullAttestationVerifier` (rejects everything) |
+| D (2D) | Exact edit executor, encrypted Undo Vault, append-only receipts | **Merged via PR #34**; **no live mutation path enabled** |
+| E | `scripts/verify_phase2.ps1`, `PHASE2_WINDOWS_ACCEPTANCE.md` | Merged; see procedure §8 matrix for per-scenario evidence |
+| F (post-review correction) | CRLF exact previews, `aether-diff-v2` EOF trailer, legacy-binding fail-closed executor (`aece44c`), Windows merge-gate (`bf08ca9`) | **Merged via PR #34**; renderer/validator traceability: `backend/aether/core/planning/exact_diff.py`, `backend/aether/core/approval_review.py`, `backend/aether/core/edits/executor.py`, `apps/desktop/shared/review.ts` |
 
-## 2. Exact test results (Linux, this sandbox)
+## 2. Exact test results
+
+### 2.1 Latest verification (post-integration source, 2026-11-23)
+
+**Linux / Arena — against exact commit `bf08ca9` (isolated worktree):**
+
+| Item | Result |
+|---|---|
+| Python | **3.11.2** (3.12.10 unavailable in the Arena sandbox — see limitation below) |
+| Node.js / npm | v22.22.3 / 10.9.8 (exact) |
+| Backend pytest | **847 passed, 5 skipped**, exit 0 |
+| Ruff lint / format | PASS / PASS (145 files) |
+| mypy (strict) | PASS (95 source files) |
+| Desktop `npm run check` (`AETHER_DEV_PYTHON` = backend venv) | ESLint, both typechecks, renderer + Electron builds PASS; **70 Node tests passed, 0 failed, 0 skipped**; 6 Python channel tests passed |
+
+The 5 Linux skips are **skipped, not passed**: environment-gated model
+integration (`AETHER_RUN_MODEL_INTEGRATION=1` unset), two native-Windows ACL
+vault tests, one Windows access-denial semantics test, and one wheel-packaging
+check (hatchling not installed).
+
+> **Limitation:** these Linux results are **Python 3.11.2** results. They must
+> not be presented as Linux Python 3.12.10 verification; re-confirmation on
+> 3.12.10 remains outstanding.
+
+**Native Windows — user-reported (reported 2026-11-23):** the user reports
+native Windows verification with **Python 3.12.10**: full backend suite passed;
+desktop 70 Node tests passed; 6 Python channel tests passed; Ruff lint/format
+and strict mypy passed; Electron build passed; the native Windows ACL
+unreadable-narrative test passed (1 passed, 0 skipped); Windows worktree
+validation completed. **These results are user-reported: no execution logs,
+exit codes or timestamps are archived in this repository, and they were not
+independently re-executed by the report author.** They are recorded as
+reported evidence, not as independently verified evidence.
+
+**GitHub Actions:** the temporary Linux workflow added for PR #34 could not
+execute — GitHub Actions reported an **account billing restriction**. That is
+an account/infrastructure limitation, **not a source-code test failure**. The
+temporary workflow was removed before merge (`3cd5c06`); the original
+manual-only CI configuration remains intact and unchanged versus `main`.
+
+### 2.2 Historical Linux results (pre-merge, PR #14 era — superseded)
+
+The remainder of this section records the earlier sandbox run. These counts
+are **historical evidence**, not the latest results.
 
 Command: `uv run pytest` in `backend/`. Full suite at `eb7e07e`: **819 passed,
 3 skipped** (822 collected). At `a65460c` it was 775; S14-11 added 21
@@ -109,8 +175,15 @@ packaged Electron binary). They are **skipped, not passed**, and they appear as
 | 17 | Zero unauthorized mutation | whole stack | `test_17_*` PASS | **NOT VERIFIED** |
 | 18 | Offline, no unauthorized cloud traffic | no network client in Phase 2 packages | `test_18_*` PASS | **NOT VERIFIED** (must be observed) |
 
-**Scenario summary: 18 of 18 implemented and covered by a passing Linux test;
-0 of 18 carry Windows evidence.**
+**Scenario summary (updated 2026-11-23): 18 of 18 implemented and covered by
+passing automated tests (Linux, `bf08ca9`; the suite is also user-reported
+passing on native Windows, logs not archived). 0 of 18 are formally accepted:
+the auditable per-scenario evidence matrix — with automated status, native
+Windows evidence status, human-demonstration requirement and final verdict
+per scenario — is maintained in `PHASE2_WINDOWS_ACCEPTANCE.md` §8. Several
+scenarios' *live* demonstrations are currently blocked because production
+grant issuance and any live mutation path remain deliberately disabled; that
+is recorded as an acceptance blocker there, not worked around.**
 
 ## 4. Security boundaries — current, verified state
 
@@ -154,18 +227,30 @@ under an actual process kill. Those are in the Windows verifier.
 - T3 and any generic shell/exec capability — refused.
 - A capability with a registered contract but no adapter — `CAPABILITY_EXECUTOR_NOT_AVAILABLE`.
 
-## 7. Release blockers
+## 7. Release / acceptance blockers
 
-1. **PR #14 is unmerged** and must be reviewed by you independently before merge.
-2. **No Windows evidence exists yet.** Run `scripts/verify_phase2.ps1` on the
-   target machine; any exit code other than `0` blocks the phase.
-3. **No human-in-the-loop approval has been demonstrated.** The gesture chain is
-   tested programmatically; nobody has yet clicked Approve in the real UI.
-4. **No real crash has been exercised.** The `UNVERIFIED` path is proven by
+*Resolved since the pre-merge edition of this report: PR #14's merge review
+(integrated via PR #34 and closed as superseded), and the absence of any
+native Windows test run (now user-reported — see §2.1).*
+
+1. **No human-in-the-loop approval has been demonstrated.** The gesture chain
+   is tested programmatically; nobody has yet clicked Approve in the real UI.
+2. **No real crash has been exercised.** The `UNVERIFIED` path is proven by
    simulation only.
-5. **Schema v2 activation is still a separately-approvable change** and has not
+3. **Live mutation demonstrations are blocked by design.** Production grant
+   issuance remains disabled and no live mutation path is wired, so
+   scenarios requiring a real approved edit cannot be demonstrated live
+   until a separately authorized, supported workflow exists. This must not
+   be bypassed.
+4. **Windows evidence is reported, not archived.** Native Windows results
+   (§2.1) have no execution logs in this repository; formal acceptance
+   requires recorded evidence (see `PHASE2_WINDOWS_ACCEPTANCE.md` §7).
+5. **Linux Python 3.12.10 re-confirmation outstanding** (§2.1 limitation).
+6. **GitHub Actions could not run** (account billing restriction) — no
+   hosted-CI evidence exists; this is not a code failure.
+7. **Schema v2 activation is still a separately-approvable change** and has not
    been requested or granted.
-6. **`cryptography` is a new runtime dependency** (Apache-2.0/BSD-3-Clause) —
+8. **`cryptography` is a runtime dependency** (Apache-2.0/BSD-3-Clause) —
    recorded in `DEPENDENCY_INVENTORY.md`; distribution licence review still open.
 
 ## 8. Phase 1 status
@@ -258,3 +343,60 @@ Every item below is still **NOT VERIFIED** and no commit above changes that:
 | Production grant issuance | **still disabled** |
 | Live mutation path | **still absent** |
 | Phase 3 | **not started** |
+
+
+---
+
+## 11. Acceptance-readiness checklist (post-merge, 2026-11-23)
+
+This checklist lets a future reviewer complete acceptance without relying on
+any prior conversation.
+
+**Implemented and merged** (all on `main` via PR #34, merge commit
+`a58bd68`): schema-v2 migration *prepared but inactive*; bounded typed
+filesystem session with durable audit; planner + persisted preview authority;
+exact-byte approval binding with the `aether-diff-v2` EOF trailer and CRLF
+support; exact edit executor with legacy-binding fail-closed verification;
+encrypted Undo Vault; append-only receipts; mutation journal and consumption
+reconciliation; the Windows acceptance procedure and fixture-safety verifier.
+
+**What automated verification establishes:** the implementation behaves as
+specified in-process on Linux (847 passed / 5 skipped at `bf08ca9`, Python
+3.11.2) and is user-reported passing on native Windows (Python 3.12.10) —
+exact-byte binding, grant accounting, undo authorization, crash-state
+reporting, ACL strictness and fail-closed defaults are all covered by named
+tests (traceability in §3, §10 and `PHASE2_WINDOWS_ACCEPTANCE.md` §8).
+
+**What remains missing — implementation/wiring prerequisites *and* acceptance evidence (kept distinct):** the merged code is complete, but several mandatory demonstrations cannot run against the shipped product until separately authorized implementation/wiring work exists — a supported live workflow that can issue a real production grant and perform a working approved edit and a verified Undo (production grant issuance and any live mutation path remain deliberately disabled, and schema v2 remains inactive). Those are prerequisites to obtain, not evidence to collect. On top of them, the following evidence is missing:
+
+- [ ] Archived native Windows evidence (logs, exit codes, git SHA, machine
+      identity) for the full automated gates, per §7 of the procedure.
+- [ ] Machine-identity, OS/build and NTFS details recorded with the Windows run.
+- [ ] Evidence matrix in `PHASE2_WINDOWS_ACCEPTANCE.md` §8 filled per scenario.
+- [ ] Linux (or hosted-CI) re-confirmation on Python 3.12.10.
+- [ ] The mandatory human demonstrations listed in the procedure §4 —
+      several are **blocked** until a separately authorized live workflow
+      exists (production grant issuance/mutation remain disabled); they must
+      not be simulated by bypassing security controls.
+
+**Safe prerequisites for future acceptance testing:** Windows 11, normal
+(non-elevated) account, fixture root only under the reviewed containment
+rules, clean tree at a recorded commit. **Do not run
+`scripts/verify_phase2.ps1` on a machine containing real data until its
+fixture safety has been independently reviewed** (see the warning in
+`PHASE2_WINDOWS_ACCEPTANCE.md`).
+
+**Actions requiring explicit user authorization:** schema-v2 activation;
+enabling production grant issuance or any live mutation path; merging or
+reopening superseded PRs; running the Windows verifier on a real machine;
+declaring formal acceptance.
+
+**Formal Phase 2 PASS, per the specification and procedure:** every one of
+the 18 mandatory scenarios in the evidence matrix is `PASS` with its
+required evidence class present (automated result *and*, where required,
+archived native Windows evidence *and* a recorded human demonstration),
+with the acceptance signed per the procedure §7. Until then:
+
+- Phase 2 code integration: **COMPLETE**
+- Automated verification: **PASS with qualifications** (§2.1)
+- Formal Phase 2 acceptance: **NOT COMPLETE**
