@@ -97,3 +97,47 @@ def test_fixture_storage_configuration_is_isolated(tmp_path) -> None:
         assert (fixture / "storage").is_dir()
     finally:
         store.close()
+
+
+# ----------------------------------------------------------------------
+# Controlled-activation fixture isolation
+# ----------------------------------------------------------------------
+
+from aether.channel.app_storage import AcceptanceStorageError, open_fixture_store  # noqa: E402
+
+
+def _fixture_env(tmp_path, **overrides):
+    db = tmp_path / "AETHER-Phase2-Fixture-token" / "storage" / "tasks.sqlite3"
+    env = {"AETHER_FIXTURE_DB": str(db)}
+    env.update(overrides)
+    return env
+
+
+def test_fixture_store_opens_only_inside_the_fixture_directory(tmp_path) -> None:
+    store = open_fixture_store(_fixture_env(tmp_path))
+    try:
+        version = int(store._connection.execute("PRAGMA user_version").fetchone()[0])
+        assert version == ACTIVE_SCHEMA_VERSION == 2  # Proposal A candidate
+    finally:
+        store.close()
+
+
+def test_fixture_store_missing_configuration_refuses(tmp_path) -> None:
+    with pytest.raises(AcceptanceStorageError):
+        open_fixture_store({})
+    with pytest.raises(AcceptanceStorageError):
+        open_fixture_store({"AETHER_APP_DB": str(tmp_path / "real" / "tasks.sqlite3")})
+
+
+def test_fixture_store_rejects_paths_outside_the_fixture_directory(tmp_path) -> None:
+    real = tmp_path / "real-app-data" / "tasks.sqlite3"
+    with pytest.raises(AcceptanceStorageError):
+        open_fixture_store({"AETHER_FIXTURE_DB": str(real)})
+    with pytest.raises(AcceptanceStorageError):
+        open_fixture_store({"AETHER_FIXTURE_DB": "relative/tasks.sqlite3"})
+
+
+def test_fixture_store_review_seed_cannot_redirect_acceptance(tmp_path) -> None:
+    env = _fixture_env(tmp_path, AETHER_REVIEW_DB=str(tmp_path / "seed.sqlite3"))
+    with pytest.raises(AcceptanceStorageError):
+        open_fixture_store(env)

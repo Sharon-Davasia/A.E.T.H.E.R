@@ -128,16 +128,31 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
     : { PATH: `${runtimeDir}:/usr/bin:/bin`, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
   // FI-02A: supported application storage for EVERY build. The database
   // lives in the OS per-user application-data directory; the renderer
-  // can neither see nor influence the path. Windows acceptance uses an
-  // isolated fixture database via AETHER_FIXTURE_DB (development /
-  // fixture launches only, absolute path inside the fixture root) so no
-  // real user data is ever touched.
+  // can neither see nor influence the path.
+  //
+  // Controlled-activation acceptance launches set
+  // AETHER_ACCEPTANCE_MODE=fixture: storage MUST be the explicitly
+  // configured fixture database under an AETHER-Phase2-Fixture-*
+  // directory. An invalid or missing fixture configuration throws here
+  // — the backend refuses to start rather than fall back to the real
+  // application database — and development review-seed settings are
+  // never passed through, so they cannot redirect the launch.
+  const acceptanceFixture = process.env.AETHER_ACCEPTANCE_MODE === 'fixture';
   const fixtureDb = process.env.AETHER_FIXTURE_DB;
-  const appDatabasePath = (!packaged && fixtureDb && isAbsolute(fixtureDb))
-    ? resolve(fixtureDb)
-    : join(app.getPath('userData'), 'aether', 'tasks.sqlite3');
-  env.AETHER_APP_DB = appDatabasePath;
-  if (!packaged) {
+  if (acceptanceFixture) {
+    if (!fixtureDb || !isAbsolute(fixtureDb) || !fixtureDb.includes('AETHER-Phase2-Fixture-')) {
+      throw new Error('acceptance fixture storage is not explicitly configured');
+    }
+    env.AETHER_ACCEPTANCE_MODE = 'fixture';
+    env.AETHER_FIXTURE_DB = resolve(fixtureDb);
+    env.AETHER_APP_DB = resolve(fixtureDb);
+  } else {
+    const appDatabasePath = (!packaged && fixtureDb && isAbsolute(fixtureDb))
+      ? resolve(fixtureDb)
+      : join(app.getPath('userData'), 'aether', 'tasks.sqlite3');
+    env.AETHER_APP_DB = appDatabasePath;
+  }
+  if (!packaged && !acceptanceFixture) {
     // Development-only, absolute-path passthroughs for the trusted review
     // source. The renderer can neither see nor influence them. Without them
     // the review surface reports unavailable by design.

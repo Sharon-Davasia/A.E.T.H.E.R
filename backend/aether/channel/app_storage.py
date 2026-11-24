@@ -32,6 +32,52 @@ from pathlib import Path
 from aether.core.persistence.sqlite_store import SQLiteTaskStore
 
 APP_DB_ENV = "AETHER_APP_DB"
+ACCEPTANCE_MODE_ENV = "AETHER_ACCEPTANCE_MODE"
+FIXTURE_DB_ENV = "AETHER_FIXTURE_DB"
+FIXTURE_MARKER = "AETHER-Phase2-Fixture-"
+
+
+class AcceptanceStorageError(RuntimeError):
+    """Acceptance-launch fixture storage is invalid: refuse startup.
+
+    Raised instead of falling back to the real application database.
+    The channel service turns this into a startup refusal (the backend
+    never becomes ready), so an acceptance launch can never silently
+    run against user storage.
+    """
+
+
+def _is_fixture_path(candidate: Path) -> bool:
+    return any(part.startswith(FIXTURE_MARKER) for part in candidate.parts)
+
+
+def open_fixture_store(env: dict[str, str]) -> SQLiteTaskStore:
+    """Open the explicitly configured acceptance fixture store.
+
+    Dedicated fixture storage only: the path must be absolute and live
+    under an ``AETHER-Phase2-Fixture-*`` directory. A development
+    review seed must not redirect an acceptance launch, so its
+    presence is itself a refusal.
+    """
+
+    if env.get("AETHER_REVIEW_DB"):
+        raise AcceptanceStorageError(
+            "development review-seed configuration must not redirect an acceptance launch"
+        )
+    raw = env.get(FIXTURE_DB_ENV)
+    if not raw:
+        raise AcceptanceStorageError("acceptance launch requires explicit fixture storage")
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        raise AcceptanceStorageError("fixture storage path must be absolute")
+    if not _is_fixture_path(candidate):
+        raise AcceptanceStorageError(
+            "fixture storage must live under an AETHER-Phase2-Fixture-* directory"
+        )
+    try:
+        return SQLiteTaskStore(candidate)
+    except Exception as exc:
+        raise AcceptanceStorageError("fixture storage could not be opened") from exc
 
 
 def open_application_store(env: dict[str, str]) -> SQLiteTaskStore | None:
@@ -49,4 +95,11 @@ def open_application_store(env: dict[str, str]) -> SQLiteTaskStore | None:
         return None
 
 
-__all__ = ["APP_DB_ENV", "open_application_store"]
+__all__ = [
+    "ACCEPTANCE_MODE_ENV",
+    "APP_DB_ENV",
+    "FIXTURE_DB_ENV",
+    "AcceptanceStorageError",
+    "open_application_store",
+    "open_fixture_store",
+]

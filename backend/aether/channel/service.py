@@ -54,7 +54,12 @@ import time
 from typing import Any
 
 from aether.channel import protocol
-from aether.channel.app_storage import open_application_store
+from aether.channel.app_storage import (
+    ACCEPTANCE_MODE_ENV,
+    AcceptanceStorageError,
+    open_application_store,
+    open_fixture_store,
+)
 from aether.channel.live_bridge import LiveBridge
 from aether.channel.protocol import canonical
 from aether.channel.review_bridge import ReviewBridge
@@ -153,19 +158,35 @@ def main() -> int:
     key = bootstrap[offset + 16 : offset + 48]
     challenge = bootstrap[offset + 48 : offset + 80].hex()
     gesture_key = bootstrap[offset + 80 : offset + 112]
-    _emit_bounded(_hello(session, challenge, key))
 
     env = dict(os.environ)
-    bridge = ReviewBridge.from_env(env)
-    # FI-02A: the supported application store (AETHER_APP_DB, passed by
-    # Electron main for every build) initializes the trusted composition
-    # independently of the development review seed. The review seed —
-    # when explicitly configured — keeps precedence for the store the
-    # composition shares, exactly as before; otherwise the application
-    # store is used. Misconfiguration fails closed to no composition.
-    app_store = None if bridge is not None else open_application_store(env)
+    # Controlled-activation acceptance launches (AETHER_ACCEPTANCE_MODE
+    # =fixture) run ONLY against explicitly configured fixture storage:
+    # an invalid or missing fixture configuration refuses startup here
+    # (no hello is emitted, the backend never becomes ready) instead of
+    # falling back to the real application database, and a development
+    # review seed cannot redirect the launch.
+    if env.get(ACCEPTANCE_MODE_ENV) == "fixture":
+        try:
+            app_store = open_fixture_store(env)
+        except AcceptanceStorageError:
+            return 3
+        bridge = None
+    else:
+        bridge = ReviewBridge.from_env(env)
+        # FI-02A: the supported application store (AETHER_APP_DB, passed by
+        # Electron main for every build) initializes the trusted composition
+        # independently of the development review seed. The review seed —
+        # when explicitly configured — keeps precedence for the store the
+        # composition shares, exactly as before; otherwise the application
+        # store is used. Misconfiguration fails closed to no composition.
+        app_store = None if bridge is not None else open_application_store(env)
     composition = None
     live_bridge = None
+    # Hello is emitted only after storage resolution: an acceptance
+    # launch with invalid fixture storage exits above without ever
+    # becoming ready.
+    _emit_bounded(_hello(session, challenge, key))
     composition_store = bridge.store if bridge is not None else app_store
     if composition_store is not None:
         try:
