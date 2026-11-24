@@ -3,7 +3,7 @@
 **Date:** 2026-11-15 (report authored) · **post-merge update 2026-11-23**
 **Repository state:** Phase 2 implementation **merged to `main`** via PR #34
 (merge commit `a58bd68843091eb339e3c102b8a2cfa204d355c6`; integrated source
-head `3cd5c06281cb1e749ecb9099d0770975ea249009`). Zero PRs are currently open.
+head `3cd5c06281cb1e749ecb9099d0770975ea249009`). At the moment of that integration there were zero open PRs (historical statement as of 2026-11-23; this report's own documentation PR #35 was opened afterwards).
 **Binding specification:** `docs/architecture/MASTER_SPEC.md`
 **Acceptance procedure:** `docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md`
 **Verifier:** `scripts/verify_phase2.ps1`
@@ -367,7 +367,7 @@ exact-byte binding, grant accounting, undo authorization, crash-state
 reporting, ACL strictness and fail-closed defaults are all covered by named
 tests (traceability in §3, §10 and `PHASE2_WINDOWS_ACCEPTANCE.md` §8).
 
-**What remains missing (evidence, not code):**
+**What remains missing — implementation/wiring prerequisites *and* acceptance evidence (kept distinct):** the merged code is complete, but several mandatory demonstrations cannot run against the shipped product until separately authorized implementation/wiring work exists — a supported live workflow that can issue a real production grant and perform a working approved edit and a verified Undo (production grant issuance and any live mutation path remain deliberately disabled, and schema v2 remains inactive). Those are prerequisites to obtain, not evidence to collect. On top of them, the following evidence is missing:
 
 - [ ] Archived native Windows evidence (logs, exit codes, git SHA, machine
       identity) for the full automated gates, per §7 of the procedure.

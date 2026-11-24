@@ -12,10 +12,15 @@ formerly split across PRs #15–#32, plus the CRLF/EOF-trailer and
 legacy-binding corrections and the Windows merge-gate, entered `main`
 exactly once through that PR. PR #14 (closed, superseded — its content is
 integrated) and PR #33 (closed, superseded — corrections incorporated via
-`bf08ca9`) were not merged independently. There are currently zero open PRs.
+`bf08ca9`) were not merged independently. At the moment of integration there were zero open PRs (historical, as of 2026-11-23; documentation PR #35 was opened afterwards).
 
 **Phase 2 code integration: COMPLETE. Formal Phase 2 acceptance: NOT
-COMPLETE.** What remains is evidence, not implementation: archived native
+COMPLETE.** What remains is of two distinct kinds: (a)
+implementation/wiring prerequisites — a separately authorized supported
+live workflow able to issue a real production grant and perform a working
+approved edit and a verified Undo, which the Master Specification's
+acceptance requires demonstrating and which the shipped product
+deliberately cannot do yet; and (b) acceptance evidence: archived native
 Windows evidence, the mandatory human demonstrations in
 `docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §8 (several live
 demonstrations are blocked until a separately authorized live workflow

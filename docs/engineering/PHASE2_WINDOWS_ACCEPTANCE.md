@@ -37,14 +37,14 @@ A pre-existing directory is never adopted, reused or deleted.
 
 ```powershell
 cd <repo>
-powershell -ExecutionPolicy Bypass -File .\scripts\verify_phase2.ps1
+powershell -File .\scripts\verify_phase2.ps1
 ```
 
 Useful switches:
 
 | Switch | Effect |
 |---|---|
-| `-FixtureRoot <path>` | Override the fixture root (must remain under `D:\Projects\AETHER-Phase2-Fixture`) |
+| `-Base <path>` | Override the fixture base directory (default `D:\Projects`); the fixture itself is created as `AETHER-Phase2-Fixture-<token>` under it by the fixture module |
 | `-EvidenceRoot <path>` | Where sanitized evidence is written (default `.cache\phase2-evidence`) |
 | `-SkipDesktop` | Skip desktop gates — records them as `NOT VERIFIED`, never as `PASS` |
 | `-SkipBackend` | Skip backend gates — likewise `NOT VERIFIED` |
