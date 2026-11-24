@@ -31,7 +31,7 @@ def test_app_store_opens_without_any_review_seed(tmp_path) -> None:
         version = int(store._connection.execute("PRAGMA user_version").fetchone()[0])
         # Only the shipped active schema is applied — opening the
         # supported store never implicitly activates pending migrations.
-        assert version == ACTIVE_SCHEMA_VERSION == 1
+        assert version == ACTIVE_SCHEMA_VERSION == 2
     finally:
         store.close()
 

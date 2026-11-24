@@ -105,20 +105,26 @@ def test_versioned_migration_and_private_file_permissions(tmp_path) -> None:
         applied = store._connection.execute(
             "SELECT version, name, sha256 FROM schema_migrations"
         ).fetchall()
-    assert version == 1
+    # Proposal A: a fresh store is created at the activated schema v2.
+    assert version == 2
     assert [(row["version"], row["name"], row["sha256"]) for row in applied] == [
         (
             1,
             "0001_phase2b_core",
             persistence_store._EXPECTED_MIGRATIONS[1][1],
-        )
+        ),
+        (
+            2,
+            "0002_phase2b_stage4_grants",
+            persistence_store._EXPECTED_MIGRATIONS[2][1],
+        ),
     ]
     if os.name != "nt":
         assert database.stat().st_mode & 0o777 == 0o600
     store.close()
     reopened = SQLiteTaskStore(database)
     with reopened._lock:
-        assert reopened._connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert reopened._connection.execute("PRAGMA user_version").fetchone()[0] == 2
     reopened.close()
 
 

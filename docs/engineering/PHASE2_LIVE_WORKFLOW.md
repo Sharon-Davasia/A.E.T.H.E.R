@@ -106,16 +106,23 @@ storage.
 
 | Configuration | Reads/planning/preview | Authorization | Execution |
 |---|---|---|---|
-| Schema v1 (shipped) | work | mutation tier absent → `schema_activation_pending` | `schema_activation_pending` |
+| Schema v1 (pre-activation DB) | work | mutation tier absent → `schema_activation_pending` | `schema_activation_pending` |
 | Schema v2, production ledger | work | valid signed gesture refused → `grant_issuance_disabled` | refused; file untouched |
 | Schema v2, test-scoped ledger (tests only) | work | works | works — reachable only via test-scoped construction. These tests are **not** production-enablement evidence: the construction discipline they exercise is not an authorization boundary (see Proposal B correction). |
 
 ## 5. Separately reviewable activation proposals (NOT in this PR)
 
-### Proposal A — schema v2 activation
+### Proposal A — schema v2 activation — IMPLEMENTED (this PR, controlled candidate)
 
-Single reviewed change in `sqlite_store.py`: `ACTIVE_SCHEMA_VERSION = 2`,
-remove `2` from `PENDING_MIGRATION_VERSIONS`. Prerequisites: WS1 evidence
+Implemented exactly as proposed: single reviewed change in
+`sqlite_store.py`: `ACTIVE_SCHEMA_VERSION = 2`, `2` removed from
+`PENDING_MIGRATION_VERSIONS`, with the activation record in the
+accompanying comment. Applied only to disposable fixture storage in
+the acceptance configuration; no pre-existing real user database is
+migrated by this candidate (that remains a separate operator action
+with separate authorization and a verified backup). Production grant
+issuance remains disabled — Proposal B below is unchanged and
+unapproved. Prerequisites: WS1 evidence
 (disposable-copy backup → migrate → restore verified; corrupted migration
 fails atomically; originals byte-identical), a recorded backup/rollback
 procedure for real databases, and the full backend suite green. User data

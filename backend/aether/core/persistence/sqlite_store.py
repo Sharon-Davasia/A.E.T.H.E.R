@@ -323,11 +323,20 @@ _EXPECTED_SCHEMA_SHA256: dict[int, str] = {
 #   never run until explicitly authorized. Activation refuses to target a
 #   pending version, so bumping the active version alone cannot apply one.
 #
-# Activating version 2 requires separate explicit user approval after
-# independent review; that change sets ``ACTIVE_SCHEMA_VERSION = 2`` and clears
-# version 2 from ``PENDING_MIGRATION_VERSIONS`` in the same reviewed commit.
-ACTIVE_SCHEMA_VERSION = 1
-PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset({2})
+# Activation record (Proposal A, PR #36): version 2 was activated by
+# explicit user authorization for a controlled Windows acceptance
+# candidate, after independent review of the FI-01..FI-08 corrections.
+# This build therefore creates and accepts schema version 2 and applies
+# migration 0002 through the verified migration path. Production grant
+# issuance remains disabled (Proposal B is a separate, unapproved
+# change); activation of the schema does not enable issuance.
+# Existing real user databases are NOT migrated by this code change in
+# the acceptance candidate: the acceptance configuration uses only
+# disposable fixture storage (AETHER_FIXTURE_DB / AETHER_APP_DB inside
+# an isolated fixture directory), and migrating any pre-existing real
+# database still requires separate authorization and a verified backup.
+ACTIVE_SCHEMA_VERSION = 2
+PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset()
 
 
 def _activation_error(version: int) -> str:

@@ -1043,8 +1043,12 @@ def test_recovery_class_comes_from_the_trusted_plan_step(tmp_path, monkeypatch) 
 # ---------------------------------------------------------------------------
 
 
-def test_ledger_refuses_v1_database_without_the_approved_migration(tmp_path) -> None:
+def test_ledger_refuses_v1_database_without_the_approved_migration(tmp_path, monkeypatch) -> None:
     database = tmp_path / "store.sqlite3"
+    # A genuine v1 database (pre-activation configuration, test-scoped).
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     store = SQLiteTaskStore(database)
     store.create_task("synthetic", task_id=uuid4(), now=NOW)
     try:
@@ -1072,9 +1076,15 @@ def test_ledger_rejects_tampered_migration_ledger_and_schema(tmp_path, monkeypat
         GrantLedger.read_only(database2)
 
 
-def test_raw_applied_migration_without_ledger_row_is_untrusted(tmp_path) -> None:
+def test_raw_applied_migration_without_ledger_row_is_untrusted(tmp_path, monkeypatch) -> None:
     database = tmp_path / "store.sqlite3"
+    # Start from a genuine v1 database so the raw migration is the only
+    # thing that creates the v2 objects (pre-activation framing).
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     SQLiteTaskStore(database).close()
+    monkeypatch.undo()
     apply_proposed_migration_raw(database)
     with sqlite3.connect(database) as connection:
         connection.execute("DELETE FROM schema_migrations WHERE version = 2")
@@ -1391,9 +1401,13 @@ def test_unsafe_database_paths_fail_closed(tmp_path, monkeypatch) -> None:
         GrantLedger(tmp_path / "store.sqlite3\x00")
 
 
-def test_ledger_never_applies_migrations(tmp_path) -> None:
+def test_ledger_never_applies_migrations(tmp_path, monkeypatch) -> None:
     database = tmp_path / "store.sqlite3"
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     SQLiteTaskStore(database).close()
+    monkeypatch.undo()
     before = database.read_bytes()
     with pytest.raises((GrantUnavailableError, GrantIntegrityError, GrantLedgerError)):
         GrantLedger(database)

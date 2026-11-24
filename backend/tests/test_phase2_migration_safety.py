@@ -12,8 +12,12 @@ validate the migration only against *disposable copies* of a v1 database:
   silently resetting it;
 * concurrent ownership is refused while a store holds the database.
 
-Shipped activation is unchanged: ``ACTIVE_SCHEMA_VERSION == 1`` and
-``PENDING_MIGRATION_VERSIONS == {2}`` are asserted directly.
+Proposal A has since activated version 2 in the shipped build
+(controlled Windows acceptance candidate, PR #36). The migration-safety
+properties above are still validated against disposable copies, with
+genuine v1 databases produced under the test-scoped deactivated state;
+``ACTIVE_SCHEMA_VERSION == 2`` and ``PENDING_MIGRATION_VERSIONS == {}``
+are asserted directly.
 """
 
 from __future__ import annotations
@@ -44,9 +48,13 @@ def _fingerprint(path: Path) -> str:
 
 
 def _v1_populated(tmp_path: Path) -> tuple[Path, str]:
-    """Create a genuine v1 database (shipped config) with representative data."""
+    """Create a genuine v1 database (pre-activation config) with data."""
+    from stage4_support import activation_state
+
     database = tmp_path / "store.sqlite3"
-    store = SQLiteTaskStore(database)
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        activation_state(monkeypatch, activated=False)
+        store = SQLiteTaskStore(database)
     task = store.create_task("pre-migration safety task", now=NOW)
     store.transition_task(task.task_id, PersistentTaskState.PLANNING, now=NOW)
     plan = TaskPlan(
@@ -102,12 +110,12 @@ def v1(tmp_path: Path):
     return database, fingerprint
 
 
-def test_shipped_activation_configuration_is_unchanged() -> None:
-    assert sqlite_store.ACTIVE_SCHEMA_VERSION == 1
-    assert frozenset({2}) == sqlite_store.PENDING_MIGRATION_VERSIONS
+def test_shipped_activation_configuration_reflects_proposal_a() -> None:
+    assert sqlite_store.ACTIVE_SCHEMA_VERSION == 2
+    assert frozenset() == sqlite_store.PENDING_MIGRATION_VERSIONS
 
 
-def test_backup_of_v1_database_restores_and_opens_as_v1(tmp_path: Path, v1) -> None:
+def test_backup_of_v1_database_restores_and_opens_as_v1(tmp_path: Path, v1, monkeypatch) -> None:
     database, _ = v1
     backup = tmp_path / "backup.sqlite3"
     shutil.copyfile(database, backup)
@@ -115,6 +123,9 @@ def test_backup_of_v1_database_restores_and_opens_as_v1(tmp_path: Path, v1) -> N
 
     restored = tmp_path / "restored.sqlite3"
     shutil.copyfile(backup, restored)
+    # Under the pre-activation configuration the restored backup opens
+    # as v1 unchanged; migration of the copy is covered separately.
+    activation_state(monkeypatch, activated=False)
     store = SQLiteTaskStore(restored)  # must open without error
     store.close()
     with sqlite3.connect(restored) as connection:
@@ -190,7 +201,8 @@ def test_shipped_build_refuses_v2_database_without_modifying_it(
     SQLiteTaskStore(copy, migrations_dir=migrations).close()
     v2_fingerprint = _fingerprint(copy)
 
-    monkeypatch.undo()  # restore shipped v1 configuration
+    # A pre-activation (v1) build must refuse the v2 database untouched.
+    activation_state(monkeypatch, activated=False)
     with pytest.raises(PersistenceIntegrityError):
         SQLiteTaskStore(copy)
     assert _fingerprint(copy) == v2_fingerprint, "v2 database was downgraded or reset"

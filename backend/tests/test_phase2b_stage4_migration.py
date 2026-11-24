@@ -159,9 +159,17 @@ def _assert_written_bytes_match_pin(path: Path, intended: str) -> None:
 
 
 def _v1_database(database: Path) -> SQLiteTaskStore:
-    """A realistic schema-v1 database written by the shipped configuration."""
+    """A realistic schema-v1 database (pre-activation configuration).
 
-    store = SQLiteTaskStore(database)
+    Proposal A activated v2 in the shipped build, so a genuine v1
+    database is produced under the test-scoped deactivated state.
+    """
+
+    from stage4_support import activation_state
+
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        activation_state(monkeypatch, activated=False)
+        store = SQLiteTaskStore(database)
     return store
 
 
@@ -249,15 +257,15 @@ def test_migration_0001_bytes_are_not_rewritten() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_shipped_configuration_prepares_but_does_not_activate_version_two() -> None:
-    """The delivered build creates v1 databases and records only v1."""
+def test_shipped_configuration_activates_version_two_after_proposal_a() -> None:
+    """Proposal A: the delivered build creates and accepts v2 databases."""
 
-    assert ACTIVE_SCHEMA_VERSION == 1
-    assert frozenset({2}) == PENDING_MIGRATION_VERSIONS
+    assert ACTIVE_SCHEMA_VERSION == 2
+    assert frozenset() == PENDING_MIGRATION_VERSIONS
 
 
-def test_clean_install_records_only_version_one(tmp_path: Path) -> None:
-    """A fresh database is version 1 even though version 2 is registered."""
+def test_clean_install_records_version_two_after_proposal_a(tmp_path: Path) -> None:
+    """A fresh database is version 2 (Proposal A activated)."""
 
     database = tmp_path / "store.sqlite3"
     store = _v1_database(database)
@@ -276,6 +284,9 @@ def test_pending_migration_is_refused_even_if_active_version_is_bumped(
 ) -> None:
     """Bumping the active version alone cannot apply an unauthorized migration."""
 
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     monkeypatch.setattr(sqlite_store, "ACTIVE_SCHEMA_VERSION", 2)
     database = tmp_path / "store.sqlite3"
     with pytest.raises(PersistenceIntegrityError, match="not authorized to apply"):
@@ -293,6 +304,9 @@ def test_refused_activation_does_not_touch_an_existing_v1_database(
 ) -> None:
     """A refused upgrade leaves an existing v1 database byte-identical."""
 
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     database = tmp_path / "store.sqlite3"
     store = _v1_database(database)
     store.create_task("synthetic v1 task", now=None)
@@ -540,7 +554,7 @@ def test_upgrade_failure_rolls_back_atomically(
 
     migrations = _scratch_migrations(tmp_path / "migrations")
     database = tmp_path / "store.sqlite3"
-    SQLiteTaskStore(database).close()  # realistic v1 database
+    _v1_database(database).close()  # realistic v1 database
     original = (migrations / MIGRATION_V2.name).read_text(encoding="utf-8")
     broken = original.replace("CREATE TABLE exact_approval_grants", "CREATE TABLE", 1)
     # ``write_text`` applies newline translation, so on Windows every LF became
@@ -579,7 +593,7 @@ def test_interrupted_migration_leaves_no_half_applied_schema(
 
     migrations = _scratch_migrations(tmp_path / "migrations")
     database = tmp_path / "store.sqlite3"
-    SQLiteTaskStore(database).close()
+    _v1_database(database).close()
     original = (migrations / MIGRATION_V2.name).read_text(encoding="utf-8")
     truncated = original[: original.index("CREATE TABLE exact_approval_grant_state")]
     # Bytes, not text: see the note in test_upgrade_failure_rolls_back_atomically.
@@ -713,20 +727,24 @@ def test_forged_permit_is_refused_on_a_migrated_database(
 def test_activation_gate_is_the_only_thing_standing_between_pending_and_applied(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Mutation guard for the activation boundary.
+    """Mutation guard for the activation boundary (pre-activation state).
 
-    With the gate deleted but ``ACTIVE_SCHEMA_VERSION`` still 1, nothing migrates
-    (the pending version is never targeted); with the version bumped but the
-    version still pending, opens fail closed. Verified by mutation against both
-    changes.
+    Proposal A flipped the shipped configuration; the gate mechanics are
+    still guarded here under the test-scoped deactivated state: with the
+    gate deleted but ``ACTIVE_SCHEMA_VERSION`` still 1, nothing migrates
+    (the pending version is never targeted); with the version bumped but
+    the version still pending, opens fail closed.
     """
 
-    assert ACTIVE_SCHEMA_VERSION < 2
-    assert 2 in PENDING_MIGRATION_VERSIONS
-    assert ACTIVE_SCHEMA_VERSION in _EXPECTED_MIGRATIONS
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
+    assert sqlite_store.ACTIVE_SCHEMA_VERSION < 2
+    assert 2 in sqlite_store.PENDING_MIGRATION_VERSIONS
+    assert sqlite_store.ACTIVE_SCHEMA_VERSION in _EXPECTED_MIGRATIONS
     # The gate must be consulted *before* any target version is used, and the
     # active version must never be a pending one in the shipped build.
-    assert ACTIVE_SCHEMA_VERSION not in PENDING_MIGRATION_VERSIONS
+    assert sqlite_store.ACTIVE_SCHEMA_VERSION not in sqlite_store.PENDING_MIGRATION_VERSIONS
     # And the shipped build must not target the pending version even if the
     # version registry knows about it.
     database = tmp_path / "store.sqlite3"

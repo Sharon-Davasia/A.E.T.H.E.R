@@ -12,8 +12,10 @@ Two halves:
   signatures, forged bindings, replayed gestures, and execution attempts
   without any authorization must all fail closed with the file untouched.
 
-The schema-v2 migration is activated in memory only (the Stage 4 test
-pattern); shipped configuration is never changed.
+The schema-v2 migration is activated test-scoped for v2 fixtures and
+deactivated test-scoped for the v1 negative coverage; the shipped
+configuration (Proposal A: v2 active, issuance disabled) is exercised
+as-is by the production-ledger tests.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from stage4_support import NOW, open_tests_scoped_ledger, stage4_store
+from stage4_support import NOW, activation_state, open_tests_scoped_ledger, stage4_store
 
 from aether.channel.live_bridge import LiveBridge
 from aether.core.composition import TrustedComposition
@@ -104,8 +106,10 @@ def _assert_unavailable(result: dict, reason: str | None = None) -> None:
 
 
 @pytest.fixture()
-def shipped_v1(tmp_path):
+def shipped_v1(tmp_path, monkeypatch):
     project = _make_project(tmp_path)
+    # Pre-activation configuration, test-scoped: a genuine v1 database.
+    activation_state(monkeypatch, activated=False)
     store = SQLiteTaskStore(tmp_path / "store.sqlite3")
     composition = TrustedComposition.build(store=store, gesture_key=GESTURE_KEY, clock=lambda: NOW)
     yield {
