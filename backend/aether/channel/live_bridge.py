@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import contextlib
 import hashlib
 import json
 import re
@@ -347,6 +346,8 @@ class LiveBridge:
             composition = self._composition
             if composition.executor is None:
                 raise _Refused("schema_activation_pending")
+            if composition.reconciliation_failed or task_id in composition.unresolved_task_ids:
+                raise _Refused("startup_reconciliation_required")
             store = composition.store
             task = store.get_task(task_id)
             plan = store.get_plan(task_id, int(task.plan_revision))
@@ -354,23 +355,105 @@ class LiveBridge:
             if step.capability_id not in _EDIT_CAPABILITIES:
                 raise _Refused("not_an_edit_plan")
             approval_id = UUID(str(step.arguments["approval_id"]))
+            evidence = ExecutionEvidence(approval_id=approval_id)
+            # Build the request before any state transition: a missing
+            # process-local proposal (e.g. after a restart) refuses cleanly
+            # without touching execution states.
             proposed = self._proposed.get((str(task_id), int(task.plan_revision)))
+            receipt_id: UUID | None = None
+            snapshot_id: UUID | None = None
             if step.capability_id == "fs.apply_approved_edit":
                 if proposed is None:
                     raise _Refused("proposed_content_unavailable")
                 request = self._edit_request(task, plan, step, proposed_content=proposed)
-                outcome = composition.executor.apply(request)
-                return self._execution_result(task_id, approval_id, outcome)
-            # fs.undo_edit: content comes from the vault snapshot, never the wire.
-            receipt_id = UUID(str(step.arguments["receipt_id"]))
-            snapshot_id = UUID(str(step.arguments["snapshot_id"]))
-            request = self._edit_request(task, plan, step, proposed_content=b"")
-            outcome = composition.executor.undo(
-                request, snapshot_id=snapshot_id, receipt_id=receipt_id
-            )
-            return self._execution_result(task_id, approval_id, outcome)
+            else:
+                receipt_id = UUID(str(step.arguments["receipt_id"]))
+                snapshot_id = UUID(str(step.arguments["snapshot_id"]))
+                request = self._edit_request(task, plan, step, proposed_content=b"")
+
+            # FI-04: PRECHECK is recorded BEFORE the executor runs, from the
+            # live grant the ledger already holds. A transition failure here
+            # refuses execution outright — it is never suppressed to obtain
+            # a successful-looking response.
+            store.advance_execution_state(task_id, PersistentTaskState.PRECHECK, evidence=evidence)
+
+            progress = {"consumed": False, "verified": False}
+
+            def checkpoint(phase: str) -> None:
+                # Invoked by the executor at the real checkpoints: the grant
+                # use is durably spent (pre-mutation), then the durable
+                # verified receipt exists. Failures propagate and abort.
+                if phase == "consumed":
+                    progress["consumed"] = True
+                    store.advance_execution_state(
+                        task_id, PersistentTaskState.EXECUTING, evidence=evidence
+                    )
+                elif phase == "verified":
+                    progress["verified"] = True
+                    store.advance_execution_state(
+                        task_id, PersistentTaskState.POSTCHECK, evidence=evidence
+                    )
+
+            try:
+                if step.capability_id == "fs.apply_approved_edit":
+                    outcome = composition.executor.apply(request, checkpoint=checkpoint)
+                else:
+                    # fs.undo_edit: content comes from the vault snapshot,
+                    # never the wire.
+                    assert receipt_id is not None and snapshot_id is not None
+                    outcome = composition.executor.undo(
+                        request,
+                        snapshot_id=snapshot_id,
+                        receipt_id=receipt_id,
+                        checkpoint=checkpoint,
+                    )
+            except EditDenied:
+                self._settle_denied(task_id, evidence, progress)
+                raise
+            except (Exception, KeyboardInterrupt):
+                self._settle_interrupted(task_id, evidence, progress)
+                return {"status": "unavailable", "reason": "execution_interrupted"}
+            return self._execution_result(task_id, approval_id, outcome, progress)
 
         return self._guarded(run)
+
+    def _settle_denied(
+        self, task_id: UUID, evidence: ExecutionEvidence, progress: dict[str, bool]
+    ) -> None:
+        """Record a truthful terminal state for an executor denial (FI-04).
+
+        Pre-consumption denials mutate nothing: PRECHECK -> FAILED. A denial
+        after the durable spend but before verification also proves no
+        verified effect; the spent use routes through RECOVERING so the
+        consumption is reconciled, never silently dropped.
+        """
+
+        store = self._composition.store
+        if not progress["consumed"]:
+            store.advance_execution_state(task_id, PersistentTaskState.FAILED, evidence=evidence)
+        elif not progress["verified"]:
+            store.advance_execution_state(
+                task_id, PersistentTaskState.RECOVERING, evidence=evidence
+            )
+            store.advance_execution_state(task_id, PersistentTaskState.FAILED, evidence=evidence)
+
+    def _settle_interrupted(
+        self, task_id: UUID, evidence: ExecutionEvidence, progress: dict[str, bool]
+    ) -> None:
+        """Record an interruption truthfully; never retry it here (FI-04)."""
+
+        store = self._composition.store
+        uncertain = ExecutionEvidence(
+            approval_id=evidence.approval_id, mutation_may_have_happened=True
+        )
+        if progress["consumed"]:
+            # The spend is durable and the mutation may have happened:
+            # UNVERIFIED is the only honest state.
+            store.advance_execution_state(
+                task_id, PersistentTaskState.UNVERIFIED, evidence=uncertain
+            )
+        else:
+            store.advance_execution_state(task_id, PersistentTaskState.CANCELLED, evidence=evidence)
 
     def get_receipt(self, payload: object) -> dict[str, object]:
         def run() -> dict[str, object]:
@@ -494,25 +577,33 @@ class LiveBridge:
         )
 
     def _execution_result(
-        self, task_id: UUID, approval_id: UUID, outcome: EditOutcome
+        self,
+        task_id: UUID,
+        approval_id: UUID,
+        outcome: EditOutcome,
+        progress: dict[str, bool],
     ) -> dict[str, object]:
-        """Advance the persistent execution states from the verified outcome."""
+        """Record the terminal state for a returned outcome (FI-04).
+
+        PRECHECK/EXECUTING/POSTCHECK were already recorded at the real
+        checkpoints while the executor ran; this records only the terminal
+        transition the outcome proves. A SUCCEEDED outcome whose verified
+        checkpoint never fired is not promoted — the task stays EXECUTING
+        for reconciliation rather than being marked complete.
+        """
+
         store = self._composition.store
         evidence = ExecutionEvidence(approval_id=approval_id)
-        # Idempotent retry or not applicable: an already-advanced state is fine.
-        with contextlib.suppress(IllegalPersistentTransition):
-            store.advance_execution_state(task_id, PersistentTaskState.PRECHECK, evidence=evidence)
         if outcome.status == "SUCCEEDED":
+            if not progress["verified"]:
+                return {"status": "unavailable", "reason": "execution_checkpoint_missing"}
             receipt_id = outcome.receipt.receipt_id if outcome.receipt else None
-            store.advance_execution_state(task_id, PersistentTaskState.EXECUTING, evidence=evidence)
-            store.advance_execution_state(task_id, PersistentTaskState.POSTCHECK, evidence=evidence)
             store.advance_execution_state(
                 task_id,
                 PersistentTaskState.COMPLETED,
                 evidence=ExecutionEvidence(approval_id=approval_id, receipt_id=receipt_id),
             )
-        elif outcome.status == "UNVERIFIED":
-            store.advance_execution_state(task_id, PersistentTaskState.EXECUTING, evidence=evidence)
+        elif outcome.status in ("UNVERIFIED", "PARTIAL"):
             store.advance_execution_state(
                 task_id,
                 PersistentTaskState.UNVERIFIED,
@@ -520,6 +611,14 @@ class LiveBridge:
                     approval_id=approval_id, mutation_may_have_happened=True
                 ),
             )
+        elif outcome.status == "FAILED":
+            # The executor proved the replacement did not happen; route the
+            # spent use through RECOVERING like a post-consumption denial.
+            if progress["consumed"] and not progress["verified"]:
+                store.advance_execution_state(
+                    task_id, PersistentTaskState.RECOVERING, evidence=evidence
+                )
+            store.advance_execution_state(task_id, PersistentTaskState.FAILED, evidence=evidence)
         return {
             "taskId": str(task_id),
             "status": outcome.status,

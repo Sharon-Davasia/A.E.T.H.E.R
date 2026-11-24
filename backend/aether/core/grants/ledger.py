@@ -1045,8 +1045,9 @@ class GrantLedger:
                 task_id=task_id,
                 plan_revision=plan_revision,
                 plan_hash=plan_hash,
+                executing=True,
             )
-            self._check_fresh_consent(connection, task_id)
+            self._check_fresh_consent(connection, task_id, executing=True)
             decremented = connection.execute(
                 "UPDATE exact_approval_grant_state "
                 "SET uses_remaining = uses_remaining - 1, consumed_count = consumed_count + 1 "
@@ -1125,6 +1126,7 @@ class GrantLedger:
         task_id: UUID,
         plan_revision: int,
         plan_hash: str,
+        executing: bool = False,
     ) -> None:
         """S4-4: a grant cannot be spent once the task's current plan moved.
 
@@ -1146,7 +1148,15 @@ class GrantLedger:
                 "GRANT_PLAN_SUPERSEDED",
                 "the task's current plan revision no longer matches this grant",
             )
-        if row["state"] not in ("PREVIEW_READY", "AWAITING_APPROVAL"):
+        # FI-04: at spend time the task may legitimately be in PRECHECK —
+        # recorded execution progress against this very grant. Issuance
+        # (executing=False) keeps the original consent-bearing states.
+        allowed_states = (
+            ("PREVIEW_READY", "AWAITING_APPROVAL", "PRECHECK")
+            if executing
+            else ("PREVIEW_READY", "AWAITING_APPROVAL")
+        )
+        if row["state"] not in allowed_states:
             raise GrantDeniedError(
                 "TASK_STATE_NOT_AUTHORIZABLE",
                 "the task is no longer in a state that carries live user consent",
@@ -1225,7 +1235,9 @@ class GrantLedger:
                 "ISSUANCE_PERMIT_MISMATCH", "the test permit does not cover this exact grant"
             )
 
-    def _check_fresh_consent(self, connection: sqlite3.Connection, task_id: UUID) -> None:
+    def _check_fresh_consent(
+        self, connection: sqlite3.Connection, task_id: UUID, *, executing: bool = False
+    ) -> None:
         """S4-7: the store's own fresh-consent predicate, inside this transaction.
 
         Called inside the same transaction as the grant write or the use
@@ -1251,7 +1263,13 @@ class GrantLedger:
                 "fresh-consent state must be read inside the grant transaction",
             )
         try:
-            blocked = store.is_stage2_preview_blocked(task_id)
+            # FI-04: spend-time consent accepts the recorded PRECHECK
+            # execution state; issuance-time consent is unchanged.
+            blocked = (
+                not store.is_execution_consent_active(task_id)
+                if executing
+                else store.is_stage2_preview_blocked(task_id)
+            )
         except Exception as exc:  # fail closed on unreadable audit state
             raise GrantDeniedError(
                 "CONSENT_AUTHORITY_UNAVAILABLE", "fresh-consent state could not be verified"

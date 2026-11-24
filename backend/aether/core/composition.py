@@ -51,6 +51,7 @@ from aether.core.contracts.receipt import RecoveryClass
 from aether.core.edits.executor import EditExecutor
 from aether.core.edits.journal import MutationJournal
 from aether.core.edits.receipts import ReceiptStore
+from aether.core.edits.reconcile import MutationReconciler, ReconciliationReport
 from aether.core.fs.executor import FilesystemExecutor
 from aether.core.fs.session import CapabilitySession
 from aether.core.grants.attestation import AuthorizationAttestation
@@ -113,6 +114,16 @@ class CapabilityState:
     reason: str | None = None
 
 
+class _RegistryResourceResolver:
+    """Reconciler resource lookup backed by the authoritative registry."""
+
+    def __init__(self, registry: ResourceRegistry) -> None:
+        self._registry = registry
+
+    def path_for(self, resource_id: str) -> Path:
+        return self._registry.resource_by_id(resource_id).canonical_path
+
+
 class TrustedComposition:
     """Owns every trusted Phase 2 component for one channel session."""
 
@@ -137,6 +148,9 @@ class TrustedComposition:
         vault: UndoVault | None,
         schema_version: int,
         clock: Callable[[], datetime] | None = None,
+        startup_reconciliation: ReconciliationReport | None = None,
+        unresolved_task_ids: frozenset[UUID] = frozenset(),
+        reconciliation_failed: bool = False,
     ) -> None:
         self.clock = clock or (lambda: datetime.now(UTC))
         self.store = store
@@ -156,6 +170,11 @@ class TrustedComposition:
         self.journal = journal
         self.vault = vault
         self.schema_version = schema_version
+        # FI-05 startup reconciliation results (None on schema v1, where
+        # there is no mutation tier to reconcile).
+        self.startup_reconciliation = startup_reconciliation
+        self.unresolved_task_ids = unresolved_task_ids
+        self.reconciliation_failed = reconciliation_failed
         self._pending_gesture: SignedGesture | None = None
         self._gesture_lock = threading.Lock()
         self._closed = False
@@ -179,8 +198,13 @@ class TrustedComposition:
         ownership lock exist per database, shared by review, planning,
         issuance and execution. Receipts, journal, consumption and vault
         state live beside the database under deterministic sibling names.
-        Startup reconciliation already ran when the store opened (in-flight
-        tasks paused; fresh consent forced); nothing is auto-replayed here.
+        Two distinct startup mechanisms run before mutations enable: the
+        store's ``recover_on_startup`` (on open) pauses in-flight tasks and
+        forces fresh consent through replanning, and — on schema v2 — this
+        build runs the mutation reconciler over journal intents,
+        consumptions, receipts and vault state (FI-05). Uncertain mutations
+        are reported via ``startup_reconciliation``/``unresolved_task_ids``
+        and blocked, never auto-replayed.
         """
         clock = clock or (lambda: datetime.now(UTC))
         database_path = store.database_path
@@ -238,6 +262,9 @@ class TrustedComposition:
             receipts: ReceiptStore | None = None
             journal: MutationJournal | None = None
             vault: UndoVault | None = None
+            startup_reconciliation: ReconciliationReport | None = None
+            unresolved: set[UUID] = set()
+            reconciliation_failed = False
             if schema_version >= 2:
                 # The authoritative tier. GrantLedger.open shares the store's
                 # connection and lock; production issuance still refuses via
@@ -247,7 +274,9 @@ class TrustedComposition:
                 # never does.
                 if ledger is None:
                     ledger = GrantLedger.open(store)
-                authority = GrantAuthority(ledger, store=store)
+                # FI-04: the executor's authority checks at spend time,
+                # after PRECHECK has been recorded against the grant.
+                authority = GrantAuthority(ledger, store=store, execution_in_progress=True)
                 issuer = GrantIssuer(
                     store=store, ledger=ledger, attestations=verifier, previews=previews
                 )
@@ -277,6 +306,44 @@ class TrustedComposition:
                     journal=journal,
                     clock=clock,
                 )
+                # FI-05: startup reconciliation BEFORE any mutation can be
+                # enabled on this composition. Outstanding journal intents,
+                # authoritative (and unprojected) grant consumptions,
+                # durable receipts and vault state are compared by the
+                # existing MutationReconciler; uncertain mutations are
+                # reported, never auto-replayed. Tasks they touch stay
+                # blocked (see unresolved_task_ids) until a human reviews
+                # them and fresh consent is given through a new plan. The
+                # task store has already paused in-flight tasks at open,
+                # forcing that replanning; reconciliation failure blocks
+                # every mutation rather than guessing.
+                try:
+                    reconciler = MutationReconciler(
+                        journal=journal,
+                        receipts=receipts,
+                        consumption=consumption,
+                        snapshots=vault,
+                        resources=_RegistryResourceResolver(registry),
+                    )
+                    startup_reconciliation = reconciler.reconcile()
+                    intents = {intent.intent_id: intent for intent in journal.open_intents()}
+                    pending_by_id = {
+                        str(item.consumption_id): item for item in consumption.pending()
+                    }
+                    for item in startup_reconciliation.needs_review:
+                        if item.intent_id is not None and item.intent_id in intents:
+                            unresolved.add(intents[item.intent_id].task_id)
+                        if item.consumption_id is not None:
+                            record = pending_by_id.get(str(item.consumption_id))
+                            task_value = getattr(record, "task_id", None)
+                            if task_value is not None:
+                                unresolved.add(UUID(str(task_value)))
+                    for receipt_record in receipts.unresolved():
+                        with contextlib.suppress(ValueError):
+                            unresolved.add(UUID(receipt_record.task_id))
+                except Exception:
+                    reconciliation_failed = True
+                    startup_reconciliation = None
 
             composition = cls(
                 store=store,
@@ -297,6 +364,9 @@ class TrustedComposition:
                 vault=vault,
                 schema_version=schema_version,
                 clock=clock,
+                startup_reconciliation=startup_reconciliation,
+                unresolved_task_ids=frozenset(unresolved),
+                reconciliation_failed=reconciliation_failed,
             )
             composition_ref["self"] = composition
             return composition

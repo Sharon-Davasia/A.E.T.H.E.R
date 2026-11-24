@@ -197,8 +197,18 @@ class EditExecutor:
 
     # -- public operations -----------------------------------------------
 
-    def apply(self, request: EditRequest) -> EditOutcome:
-        """Apply exactly one approved edit, or refuse without writing."""
+    def apply(
+        self, request: EditRequest, *, checkpoint: Callable[[str], None] | None = None
+    ) -> EditOutcome:
+        """Apply exactly one approved edit, or refuse without writing.
+
+        ``checkpoint`` (FI-04) is invoked at the real execution checkpoints
+        so callers can record actual progress: ``"consumed"`` after the
+        grant use is durably spent and before any mutation, ``"verified"``
+        after the durable verified receipt exists. A checkpoint that raises
+        aborts the operation at that point (before mutation for
+        ``"consumed"``); progress is never reconstructed after the fact.
+        """
 
         if len(request.proposed_content) > _MAX_EDIT_BYTES:
             raise EditDenied("edit_too_large", "proposed content exceeds the edit bound")
@@ -209,6 +219,7 @@ class EditExecutor:
             request=request,
             capability_id=_FORWARD_EDIT_CAPABILITY,
             recovery_class="SNAPSHOT_RESTORABLE",
+            checkpoint=checkpoint,
         )
 
     def undo(
@@ -217,6 +228,7 @@ class EditExecutor:
         *,
         snapshot_id: UUID,
         receipt_id: UUID,
+        checkpoint: Callable[[str], None] | None = None,
     ) -> EditOutcome:
         """Restore a snapshot under its own fs.undo_edit authorization (S14-3).
 
@@ -256,6 +268,7 @@ class EditExecutor:
             recovery_class="SNAPSHOT_RESTORABLE",
             extra_warnings=(),
             undo_of=str(receipt_id),
+            checkpoint=checkpoint,
         )
 
     # -- internals -------------------------------------------------------
@@ -499,6 +512,7 @@ class EditExecutor:
         recovery_class: str,
         extra_warnings: tuple[str, ...] = (),
         undo_of: str | None = None,
+        checkpoint: Callable[[str], None] | None = None,
     ) -> EditOutcome:
         intended_sha256 = hashlib.sha256(content).hexdigest()
         # S14-9: mutation requires a durable journal. Without one there is no
@@ -541,6 +555,10 @@ class EditExecutor:
             capability_id=capability_id,
         )
         context = _OperationContext(consumption_id=consumption_id, capability_id=capability_id)
+        # FI-04 consumed checkpoint: the use is durably spent; nothing has
+        # been mutated yet. A raising checkpoint aborts here, pre-journal.
+        if checkpoint is not None:
+            checkpoint("consumed")
 
         # Freshness: the bytes the user approved must still be the bytes on disk.
         if pre_sha256 != request.expected_sha256:
@@ -690,6 +708,10 @@ class EditExecutor:
             undo_of,
             verified_at=self._clock(),
         )
+        # FI-04 verified checkpoint: the durable verified receipt now
+        # exists; only bookkeeping resolution remains.
+        if checkpoint is not None:
+            checkpoint("verified")
         self._resolve_consumption(context.consumption_id, "SUCCEEDED", "verified effect")
         self._resolve_journal(context.journal_id, "VERIFIED", "verified effect")
         return EditOutcome(

@@ -1261,18 +1261,57 @@ class SQLiteTaskStore:
                 PersistentTaskState.AWAITING_APPROVAL,
             }:
                 return True
-            latest_plan_sequence = int(
-                self._connection.execute(
-                    "SELECT COALESCE(MAX(seq), 0) FROM task_events "
-                    "WHERE task_id = ? AND event_type = 'PLAN_REVISION_SAVED'",
-                    (str(task_id),),
-                ).fetchone()[0]
-            )
             return self._has_fresh_consent_blocker(
                 self._connection,
                 task_id,
-                latest_plan_sequence,
+                self._latest_plan_sequence(self._connection, task_id),
             )
+
+    def _latest_plan_sequence(self, connection: sqlite3.Connection, task_id: UUID) -> int:
+        return int(
+            connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM task_events "
+                "WHERE task_id = ? AND event_type = 'PLAN_REVISION_SAVED'",
+                (str(task_id),),
+            ).fetchone()[0]
+        )
+
+    def is_execution_consent_active(self, task_id: UUID) -> bool:
+        """Whether live consent covers spending during recorded execution.
+
+        FI-04: execution states are now recorded at the real checkpoints,
+        so by the time the executor spends the grant the task legitimately
+        sits in PRECHECK — a state reachable only through
+        ``advance_execution_state`` against a live grant bound to the
+        current plan. Consumption-time consent therefore accepts PRECHECK
+        in addition to the consent-bearing states, with the identical
+        fresh-consent blocker checks. Issuance-time gates are unchanged:
+        a grant may still only be *created* from PREVIEW_READY /
+        AWAITING_APPROVAL (see ``is_stage2_preview_blocked``).
+        """
+
+        with self._lock:
+            self._verify_database_location()
+            task = self._connection.execute(
+                "SELECT state, plan_revision FROM tasks WHERE id = ?", (str(task_id),)
+            ).fetchone()
+            if task is None:
+                return False
+            state = PersistentTaskState(task["state"])
+            if state is PersistentTaskState.PRECHECK:
+                # Only the state gate widens (see docstring); the
+                # fresh-consent blocker logic stays the shared one.
+                return not self._has_fresh_consent_blocker(
+                    self._connection,
+                    task_id,
+                    self._latest_plan_sequence(self._connection, task_id),
+                )
+            if state not in {
+                PersistentTaskState.PREVIEW_READY,
+                PersistentTaskState.AWAITING_APPROVAL,
+            }:
+                return False
+            return not self.is_stage2_preview_blocked(task_id)
 
     def find_stage2_review_outcome(
         self,
