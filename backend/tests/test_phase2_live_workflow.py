@@ -15,16 +15,15 @@ from __future__ import annotations
 
 import base64
 import hashlib
-from pathlib import Path
 from uuid import UUID
 
 import pytest
+from stage4_support import NOW, open_tests_scoped_ledger, stage4_store
 
 from aether.channel.live_bridge import LiveBridge
 from aether.core.composition import TrustedComposition
 from aether.core.persistence import PersistentTaskState
 from aether.core.planning.authorizing_gesture import TrustedGestureAuthority
-from stage4_support import NOW, open_tests_scoped_ledger, stage4_store
 
 GESTURE_KEY = b"g" * 32
 ORIGINAL = b"hello world\n"
@@ -55,9 +54,7 @@ def live(tmp_path, monkeypatch):
 
 def _register_and_resolve(live) -> str:
     bridge = live["bridge"]
-    registered = bridge.register_project(
-        {"alias": "proj", "path": str(live["project"])}
-    )
+    registered = bridge.register_project({"alias": "proj", "path": str(live["project"])})
     assert "rootId" in registered, registered
     resolved = bridge.resolve_resource(
         {"rootId": registered["rootId"], "relativePath": "sample.txt"}
@@ -162,9 +159,9 @@ def test_read_flow_search_and_read(live) -> None:
     file_resource = bridge.resolve_resource(
         {"rootId": registered["rootId"], "relativePath": "sample.txt"}
     )["resourceId"]
-    root_resource = bridge.resolve_resource(
-        {"rootId": registered["rootId"], "relativePath": ""}
-    )["resourceId"]
+    root_resource = bridge.resolve_resource({"rootId": registered["rootId"], "relativePath": ""})[
+        "resourceId"
+    ]
 
     search_task = bridge.create_task({"goal": "find the token"})
     planned = bridge.plan_task(

@@ -25,16 +25,16 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from stage4_support import NOW, activation_state, copy_migrations
 
 from aether.core.contracts.policy import RiskTier
 from aether.core.persistence import (
     PersistenceIntegrityError,
     PersistentTaskState,
     SQLiteTaskStore,
+    sqlite_store,
 )
-from aether.core.persistence import sqlite_store
 from aether.core.persistence.models import PlanStep, TaskPlan, TaskPlanResource
-from stage4_support import NOW, activation_state, copy_migrations
 
 RESOURCE_ID = "file:00000000-0000-0000-0000-000000000001"
 
@@ -104,7 +104,7 @@ def v1(tmp_path: Path):
 
 def test_shipped_activation_configuration_is_unchanged() -> None:
     assert sqlite_store.ACTIVE_SCHEMA_VERSION == 1
-    assert sqlite_store.PENDING_MIGRATION_VERSIONS == frozenset({2})
+    assert frozenset({2}) == sqlite_store.PENDING_MIGRATION_VERSIONS
 
 
 def test_backup_of_v1_database_restores_and_opens_as_v1(tmp_path: Path, v1) -> None:
@@ -144,9 +144,12 @@ def test_migration_on_disposable_copy_preserves_records_and_original(
             assert after[table] >= before[table], table
     with sqlite3.connect(copy) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        assert connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='exact_approval_grants'"
-        ).fetchone() is not None
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='exact_approval_grants'"
+            ).fetchone()
+            is not None
+        )
 
 
 def test_failed_migration_on_copy_leaves_v1_intact(tmp_path: Path, v1, monkeypatch) -> None:
@@ -168,9 +171,12 @@ def test_failed_migration_on_copy_leaves_v1_intact(tmp_path: Path, v1, monkeypat
     with sqlite3.connect(copy) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT name FROM sqlite_master WHERE name='exact_approval_grants'"
-        ).fetchone() is None
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name='exact_approval_grants'"
+            ).fetchone()
+            is None
+        )
 
 
 def test_shipped_build_refuses_v2_database_without_modifying_it(

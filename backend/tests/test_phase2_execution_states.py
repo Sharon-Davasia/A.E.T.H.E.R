@@ -21,15 +21,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-
-from aether.core.contracts.approval import ExactApprovalGrant, exact_approval_scope_digest
-from aether.core.grants.issuance import GrantIssuer
-from aether.core.persistence import (
-    ExecutionEvidence,
-    IllegalPersistentTransition,
-    PersistentTaskState,
-    SQLiteTaskStore,
-)
 from stage4_support import (
     NOW,
     SimulatedAttestationVerifier,
@@ -39,6 +30,15 @@ from stage4_support import (
     open_tests_scoped_ledger,
     sha256_json,
     stage4_store,
+)
+
+from aether.core.contracts.approval import ExactApprovalGrant, exact_approval_scope_digest
+from aether.core.grants.issuance import GrantIssuer
+from aether.core.persistence import (
+    ExecutionEvidence,
+    IllegalPersistentTransition,
+    PersistentTaskState,
+    SQLiteTaskStore,
 )
 
 
@@ -80,9 +80,7 @@ def world(tmp_path, monkeypatch):
         attestations=SimulatedAttestationVerifier(),
         previews=previews,
     )
-    outcome = issuer.issue(
-        attestation=attestation, **{**plan.issue_kwargs(), "uses_remaining": 2}
-    )
+    outcome = issuer.issue(attestation=attestation, **{**plan.issue_kwargs(), "uses_remaining": 2})
 
     yield {
         "store": store,
@@ -184,8 +182,12 @@ def test_completed_requires_a_verified_receipt_identity(world) -> None:
     evidence = _evidence(world)
     _consume(world)
     store.advance_execution_state(task_id, PersistentTaskState.PRECHECK, evidence=evidence, now=NOW)
-    store.advance_execution_state(task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW)
-    store.advance_execution_state(task_id, PersistentTaskState.POSTCHECK, evidence=evidence, now=NOW)
+    store.advance_execution_state(
+        task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW
+    )
+    store.advance_execution_state(
+        task_id, PersistentTaskState.POSTCHECK, evidence=evidence, now=NOW
+    )
     with pytest.raises(IllegalPersistentTransition):
         store.advance_execution_state(
             task_id, PersistentTaskState.COMPLETED, evidence=evidence, now=NOW
@@ -219,7 +221,9 @@ def test_unverified_requires_honest_may_have_happened_claim(world) -> None:
     evidence = _evidence(world)
     _consume(world)
     store.advance_execution_state(task_id, PersistentTaskState.PRECHECK, evidence=evidence, now=NOW)
-    store.advance_execution_state(task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW)
+    store.advance_execution_state(
+        task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW
+    )
     with pytest.raises(IllegalPersistentTransition):
         store.advance_execution_state(
             task_id, PersistentTaskState.UNVERIFIED, evidence=evidence, now=NOW
@@ -238,7 +242,9 @@ def test_recovery_path_from_interrupted_execution(world) -> None:
     evidence = _evidence(world)
     _consume(world)
     store.advance_execution_state(task_id, PersistentTaskState.PRECHECK, evidence=evidence, now=NOW)
-    store.advance_execution_state(task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW)
+    store.advance_execution_state(
+        task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW
+    )
     task = store.advance_execution_state(
         task_id, PersistentTaskState.RECOVERING, evidence=evidence, now=NOW
     )
@@ -257,7 +263,9 @@ def test_spend_is_still_refused_once_executing(world) -> None:
     evidence = _evidence(world)
     _consume(world)
     store.advance_execution_state(task_id, PersistentTaskState.PRECHECK, evidence=evidence, now=NOW)
-    store.advance_execution_state(task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW)
+    store.advance_execution_state(
+        task_id, PersistentTaskState.EXECUTING, evidence=evidence, now=NOW
+    )
     with pytest.raises(GrantDeniedError) as denied:
         _consume(world)
     assert denied.value.reason_code == "TASK_STATE_NOT_AUTHORIZABLE"
