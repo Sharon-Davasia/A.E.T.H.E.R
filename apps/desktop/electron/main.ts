@@ -1,9 +1,10 @@
-import { app, BrowserWindow, ipcMain, session, type IpcMainInvokeEvent } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, session, type IpcMainInvokeEvent } from 'electron';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
+import { createLiveApprovalProvider, type ApprovalSummary } from './live-approval-provider';
 import { parseReviewOutcomeRequest } from '../shared/review';
 
 const APP_ROOT = app.getAppPath();
@@ -12,6 +13,36 @@ const PRELOAD_FILE = resolve(join(APP_ROOT, 'dist-electron', 'electron', 'preloa
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
 const backend = new BackendClient({ launchSpec: resolveBackendLaunchSpec });
 const reviewProvider = createChannelReviewProvider({ backend, resolveTaskId: configuredReviewTaskId });
+
+/**
+ * Genuine native confirmation for one live approval. The renderer can only
+ * ask main to start the flow; the affirmation itself happens in this OS
+ * dialog, outside renderer control. Anything but the explicit Approve
+ * button — dismissal, Escape, a missing window — declines.
+ */
+async function confirmLiveApproval(summary: ApprovalSummary): Promise<boolean> {
+  if (!mainWindow) return false;
+  const effect = summary.proposedEffect.length > 300
+    ? `${summary.proposedEffect.slice(0, 300)}…`
+    : summary.proposedEffect;
+  const result = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    buttons: ['Cancel', 'Approve exact action'],
+    defaultId: 0,
+    cancelId: 0,
+    noLink: true,
+    title: 'Approve exact action',
+    message: `Approve this exact action?\n\n${summary.actionIntent}\n\nEffect: ${effect}\n\nPlan revision ${summary.planRevision} · Preview ${summary.previewDigest.slice(0, 16)}…`,
+    detail: 'Approving signs a single-use authorization for exactly this preview and executes it immediately. Any change to the plan or file invalidates it.',
+  });
+  return result.response === 1;
+}
+
+const liveApprovalProvider = createLiveApprovalProvider({
+  backend,
+  resolveTaskId: configuredReviewTaskId,
+  confirm: confirmLiveApproval,
+});
 let mainWindow: BrowserWindow | undefined;
 let shuttingDown = false;
 
@@ -113,6 +144,14 @@ function registerIpc(): void {
     validateInvoke(event);
     const request = parseReviewOutcomeRequest(rawRequest);
     return reviewProvider.recordOutcome(request);
+  });
+  // The renderer supplies no arguments and chooses nothing: the task comes
+  // from trusted main-process configuration, and the approval itself is the
+  // native dialog above. The result is a bounded summary (no nonce, no
+  // signature, no binding crosses this boundary).
+  ipcMain.handle('desktop:live-approve', async (event) => {
+    validateInvoke(event);
+    return liveApprovalProvider.approveAndExecute();
   });
 }
 

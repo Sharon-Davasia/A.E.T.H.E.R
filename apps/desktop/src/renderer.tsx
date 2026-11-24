@@ -2,6 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
+import type { LiveApprovalState } from '../shared/live';
 import {
   parseReviewAcknowledgement,
   parseReviewPreviewState,
@@ -18,6 +19,7 @@ declare global {
       demoPing: () => Promise<string>;
       getApprovalReview: () => Promise<ReviewPreviewState>;
       recordReviewOutcome: (request: ReturnType<typeof reviewRequestFor>) => Promise<ReviewAcknowledgement>;
+      approveLiveAction: () => Promise<LiveApprovalState>;
     };
   }
 }
@@ -30,6 +32,8 @@ function App(): React.JSX.Element {
   const [reviewBusy, setReviewBusy] = React.useState(false);
   const [reviewAcknowledgement, setReviewAcknowledgement] = React.useState<ReviewAcknowledgement>();
   const [reviewError, setReviewError] = React.useState<string>();
+  const [liveBusy, setLiveBusy] = React.useState(false);
+  const [liveResult, setLiveResult] = React.useState<string>();
 
   React.useEffect(() => {
     let active = true;
@@ -72,6 +76,25 @@ function App(): React.JSX.Element {
     }
   }
 
+  async function approveLive(): Promise<void> {
+    setLiveBusy(true);
+    setLiveResult(undefined);
+    try {
+      const outcome = await window.aetherDesktop.approveLiveAction();
+      if (outcome.status === 'executed') {
+        setLiveResult(`Live action executed (${outcome.outcome})${outcome.receiptId ? ` · receipt ${outcome.receiptId}` : ''}.`);
+      } else if (outcome.status === 'declined') {
+        setLiveResult('Approval declined in the native confirmation. Nothing was signed or executed.');
+      } else {
+        setLiveResult(`Live approval unavailable (${outcome.reason}). Nothing was signed or executed.`);
+      }
+    } catch {
+      setLiveResult('Live approval unavailable. Nothing was signed or executed.');
+    } finally {
+      setLiveBusy(false);
+    }
+  }
+
   return <main className="shell min-h-screen">
     <div className="eyebrow">AETHER OS · DESKTOP FOUNDATION</div>
     <h1>Local control channel</h1>
@@ -91,7 +114,11 @@ function App(): React.JSX.Element {
       error={reviewError}
       onOutcome={(outcome, acknowledged) => { void recordOutcome(outcome, acknowledged); }}
     />
-    <p className="notice">This build has no grants, permission issuance, filesystem capability, or execution path. Every displayed review outcome is non-authorizing audit evidence only.</p>
+    <button type="button" className="ping-button" onClick={() => void approveLive()} disabled={liveBusy || !status.startsWith('ready')}>
+      {liveBusy ? 'Awaiting native confirmation…' : 'Approve & execute exact action…'}
+    </button>
+    {liveResult && <p className="result" role="status">{liveResult}</p>}
+    <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires a native confirmation dialog, schema version 2 activation, and separately approved production grant issuance; until those land, live approval reports unavailable and nothing executes.</p>
   </main>;
 }
 

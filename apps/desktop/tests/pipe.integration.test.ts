@@ -76,7 +76,7 @@ test('Node parent and Python child authenticate, exchange a bounded ping, and cl
   const session = randomBytes(16).toString('hex');
   const challenge = randomBytes(32);
   const worker = new PipeChild();
-  const bootstrap = Buffer.concat([MAGIC, Buffer.from(session, 'hex'), key, challenge]);
+  const bootstrap = Buffer.concat([MAGIC, Buffer.from(session, 'hex'), key, challenge, randomBytes(32)]);
   worker.child.stdin.write(bootstrap);
   const hello = await worker.nextFrame();
   assert.equal(hello.session, session);
@@ -113,7 +113,7 @@ test('unexpected child termination after authenticated startup is observable', a
   const key = randomBytes(32);
   const session = randomBytes(16).toString('hex');
   const challenge = randomBytes(32);
-  worker.child.stdin.write(Buffer.concat([MAGIC, Buffer.from(session, 'hex'), key, challenge]));
+  worker.child.stdin.write(Buffer.concat([MAGIC, Buffer.from(session, 'hex'), key, challenge, randomBytes(32)]));
   assert.equal((await worker.nextFrame()).kind, 'channel.hello');
   worker.child.kill();
   await worker.exited();

@@ -5,6 +5,7 @@ import {
   verifyEnvelopeMac,
 } from '../shared/channel';
 import type { ReviewOutcomeRequest } from '../shared/review';
+import type { SignedGestureWire } from '../shared/live';
 import {
   signAuthorizingGesture, type GestureBindingInput, type SignedGesturePayload,
 } from './gesture';
@@ -357,6 +358,52 @@ export class BackendClient {
     this.validateReviewOutcomeRequest(request);
     const session = this.reviewSession();
     return this.request(session, 'review.get_outcome', BackendClient.outcomeWirePayload(request), ['review.outcome', 'review.error']);
+  }
+
+  /**
+   * Begin a live authorizing gesture for one persisted task. The backend
+   * recomputes the binding from persisted state; the returned payload is
+   * strictly parsed by the trusted live-approval provider before use.
+   */
+  async liveBeginGesture(taskId: string): Promise<unknown> {
+    if (typeof taskId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(taskId)) {
+      throw backendError('malformed live task identity');
+    }
+    const session = this.reviewSession();
+    return this.request(session, 'gesture.begin', { taskId }, ['gesture.challenge', 'live.error']);
+  }
+
+  /**
+   * Submit one signed authorizing gesture. Only the live-approval provider
+   * calls this, after native confirmation and main-process signing; the
+   * wire payload is validated field-by-field before anything is sent.
+   */
+  async liveSubmitGesture(payload: SignedGestureWire): Promise<unknown> {
+    const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+    const SHA256 = /^[0-9a-fA-F]{64}$/;
+    const binding = payload?.binding;
+    if (
+      !binding || typeof payload.nonce !== 'string' || !/^[0-9a-f]{64}$/.test(payload.nonce)
+      || !UUID.test(binding.taskId) || !UUID.test(binding.previewId)
+      || !Number.isSafeInteger(binding.planRevision) || binding.planRevision < 1
+      || !SHA256.test(binding.planHash) || !SHA256.test(binding.previewDigest) || !SHA256.test(binding.scopeDigest)
+      || typeof payload.assertedAt !== 'string' || payload.assertedAt.length > 40
+      || payload.userIntent !== 'APPROVE'
+      || typeof payload.signature !== 'string' || !SHA256.test(payload.signature)
+    ) {
+      throw backendError('malformed signed gesture');
+    }
+    const session = this.reviewSession();
+    return this.request(session, 'gesture.submit', payload, ['gesture.authorized', 'live.error']);
+  }
+
+  /** Execute the approved edit for one task whose grant was just issued. */
+  async liveExecuteEdit(taskId: string): Promise<unknown> {
+    if (typeof taskId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(taskId)) {
+      throw backendError('malformed live task identity');
+    }
+    const session = this.reviewSession();
+    return this.request(session, 'edit.execute', { taskId }, ['edit.executed', 'live.error']);
   }
 
   stop(): Promise<void> {
