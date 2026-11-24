@@ -5,6 +5,9 @@ import {
   verifyEnvelopeMac,
 } from '../shared/channel';
 import type { ReviewOutcomeRequest } from '../shared/review';
+import {
+  signAuthorizingGesture, type GestureBindingInput, type SignedGesturePayload,
+} from './gesture';
 
 const MAX_PENDING = 32;
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
@@ -55,6 +58,7 @@ interface Session {
   readonly child: Child;
   readonly sessionId: string;
   readonly key: Buffer;
+  readonly gestureKey: Buffer;
   readonly challenge: Buffer;
   readonly hello: Deferred<void>;
   readonly exited: Deferred<void>;
@@ -116,6 +120,23 @@ export class BackendClient {
 
   status(): BackendStatus { return { state: this.state, message: this.message }; }
 
+  /**
+   * Sign one authorizing gesture with this session's ephemeral gesture key.
+   *
+   * Main-process only: the key never leaves this class, and this method is
+   * invoked exclusively by the trusted native-confirmation flow after a
+   * genuine affirmative user action. There is no renderer-reachable path to
+   * it. Outstanding gestures die with the session: a restarted backend
+   * holds a different key and a fresh nonce register.
+   */
+  signGesture(nonce: string, binding: GestureBindingInput, userIntent: string): SignedGesturePayload {
+    const session = this.active;
+    if (!session || session.phase !== 'ready') {
+      throw backendError('backend session is not ready for gesture signing');
+    }
+    return signAuthorizingGesture(session.gestureKey, nonce, binding, new Date(), userIntent);
+  }
+
   start(): Promise<BackendStatus> {
     if (this.active?.phase === 'ready') return Promise.resolve(this.status());
     if (this.startPromise) return this.startPromise;
@@ -170,6 +191,10 @@ export class BackendClient {
       child,
       sessionId: randomBytes(16).toString('hex'),
       key,
+      // Decision A: an independent per-launch gesture secret, delivered to
+      // the trusted backend child in the same private bootstrap and held
+      // only in main-process memory for gesture signing.
+      gestureKey: randomBytes(32),
       challenge: randomBytes(32),
       hello: deferred<void>(),
       exited: deferred<void>(),
@@ -196,6 +221,7 @@ export class BackendClient {
     );
     session.bootstrap = Buffer.concat([
       BOOTSTRAP_MAGIC, Buffer.from(session.sessionId, 'hex'), session.key, session.challenge,
+      session.gestureKey,
     ]);
     const bootstrap = session.bootstrap;
     try {
@@ -521,6 +547,7 @@ export class BackendClient {
 
   private zeroSecrets(session: Session): void {
     session.key.fill(0);
+    session.gestureKey.fill(0);
     session.challenge.fill(0);
     session.guard = undefined;
   }

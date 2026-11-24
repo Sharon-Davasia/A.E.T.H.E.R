@@ -66,7 +66,7 @@ class ChannelChildTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         assert process.stdin is not None and process.stdout is not None
-        process.stdin.write(MAGIC + bytes.fromhex(session) + key + challenge)
+        process.stdin.write(MAGIC + bytes.fromhex(session) + key + challenge + bytes(32))
         process.stdin.flush()
         hello = read_frame(process.stdout)
         self.assertEqual(hello["kind"], "channel.hello")

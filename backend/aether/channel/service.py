@@ -51,6 +51,7 @@ from typing import Any
 from aether.channel import protocol
 from aether.channel.protocol import canonical
 from aether.channel.review_bridge import ReviewBridge
+from aether.core.composition import CompositionUnavailable, TrustedComposition
 
 _PING_KIND = "demo.ping"
 _GET_PREVIEW_KIND = "review.get_preview"
@@ -115,16 +116,30 @@ def _error_payload(reason: str) -> dict[str, object]:
 
 
 def main() -> int:
-    bootstrap = protocol.read_exact(sys.stdin.buffer, len(protocol.MAGIC) + 16 + 32 + 32)
+    # Bootstrap (private stdin pipe, written once by Electron main):
+    # MAGIC | 16B session id | 32B channel HMAC key | 32B challenge |
+    # 32B gesture key. The gesture key is an independent per-launch secret
+    # (Decision A): cryptographically separated from the channel key, held
+    # only by main and this child, never logged or persisted.
+    bootstrap = protocol.read_exact(sys.stdin.buffer, len(protocol.MAGIC) + 16 + 32 + 32 + 32)
     if bootstrap[: len(protocol.MAGIC)] != protocol.MAGIC:
         raise ValueError("invalid startup bootstrap")
     offset = len(protocol.MAGIC)
     session = bootstrap[offset : offset + 16].hex()
     key = bootstrap[offset + 16 : offset + 48]
     challenge = bootstrap[offset + 48 : offset + 80].hex()
+    gesture_key = bootstrap[offset + 80 : offset + 112]
     _emit_bounded(_hello(session, challenge, key))
 
     bridge = ReviewBridge.from_env(dict(os.environ))
+    composition = None
+    if bridge is not None:
+        try:
+            composition = TrustedComposition.build(store=bridge.store, gesture_key=gesture_key)
+        except CompositionUnavailable:
+            # Fail closed for the trusted-execution tier only; the audit-only
+            # review surface is independent and keeps working.
+            composition = None
     try:
         inbound_seen: set[str] = set()
         inbound_seq = 1
@@ -216,6 +231,8 @@ def main() -> int:
                 _emit_bounded(envelope)
             outbound_seq += 1
     finally:
+        if composition is not None:
+            composition.close()
         if bridge is not None:
             bridge.close()
 
