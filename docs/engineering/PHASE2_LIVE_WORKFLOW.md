@@ -87,6 +87,21 @@ review surface keeps working.
 - Every failure is a bounded `{"status": "unavailable", "reason": …}`
   response; nothing throws across the channel.
 
+### Supported application storage (FI-02A)
+
+The shipped desktop initializes storage independently of the
+development review seed: Electron main passes `AETHER_APP_DB` (an
+absolute path inside the OS per-user application-data directory) for
+every build, and `aether.channel.app_storage` opens it through
+`SQLiteTaskStore` — exclusive owner lock, private permissions, and
+only the shipped active schema applied (pending migrations are never
+applied implicitly). Misconfiguration fails closed
+(`composition_unavailable`) while the ping path keeps working. For the
+Windows acceptance campaign, an isolated fixture database is selected
+with `AETHER_FIXTURE_DB` (development/fixture launches only, absolute
+path inside the fixture root), so acceptance never touches real user
+storage.
+
 ## 4. Shipped-configuration behaviour (what a user gets today)
 
 | Configuration | Reads/planning/preview | Authorization | Execution |
@@ -138,7 +153,10 @@ rehearsed on fixtures. Production issuance stays disabled until this
 proposal is separately approved and implemented.
 
 Neither proposal is implemented here. `NullAttestationVerifier` and the
-`GRANT_ISSUANCE_DISABLED` default remain exactly as shipped.
+`GRANT_ISSUANCE_DISABLED` default remain exactly as shipped. Concrete,
+separately reviewable diffs for both proposals (not applied) live in
+`docs/engineering/activation-proposals/` (`proposal-a-schema-v2.diff`,
+`proposal-b-production-issuance.diff`).
 
 ## 6. Windows acceptance procedure (18 scenarios)
 
@@ -175,7 +193,8 @@ Two different things must not be conflated:
 
 Setup (once): create the fixture project under the fixture base with two
 small text files (`sample.txt` containing `hello world`, `other.txt`),
-start the activation-approved build, and record SHA-256 hashes of the
+start the activation-approved build with isolated fixture storage
+(`AETHER_FIXTURE_DB` pointing inside the fixture root, FI-02A), and record SHA-256 hashes of the
 whole fixture tree as the baseline for scenarios 17–18. Evidence for
 every scenario: the verifier evidence JSON/Markdown, plus dated
 screenshots or notes naming the scenario, the observed dialog text, and
@@ -190,10 +209,11 @@ synthetic copy (never by editing hashes or deleting receipts).
    registered; opening `../` paths or absolute outside paths is refused.
    PASS: registration only after native affirmation; outside reads
    refused. Cleanup: none (session state only).
-2. **Search + read an allowed file.** Actions: open `sample.txt` via the
-   workflow; use search/read. Expected: exact bytes displayed, hash
-   shown matches `Get-FileHash`. PASS: byte-identical content. Cleanup:
-   none.
+2. **Search + read an allowed file.** Actions: use the workflow's
+   *Search project* for `hello` (results list shows
+   `sample.txt:1: hello world`), then open `sample.txt`. Expected:
+   exact bytes displayed, hash shown matches `Get-FileHash`. PASS:
+   search result listed + byte-identical content. Cleanup: none.
 3. **Refuse reads outside authorized roots.** Actions: attempt to open a
    file outside the fixture root. Expected: bounded refusal, no content.
    PASS: refusal observed. Cleanup: none.
@@ -208,10 +228,23 @@ synthetic copy (never by editing hashes or deleting receipts).
    (removes the junction only).
 6. **Human-visible exact patch preview before approval.** Actions:
    prepare an edit `hello world` → `hello aether`; read the preview in
-   the UI and in the native approval dialog. Expected: complete unified
-   diff including CRLF/EOF notes, resource identity, recovery class and
-   plan hash — not truncated. PASS: dialog text contains the complete
-   changed lines. Cleanup: cancel the dialog.
+   the UI and in the native approval dialog. Expected: the dialog names
+   the **unambiguous affected path** (full canonical path, not a
+   basename) and the complete unified diff including CRLF/EOF notes,
+   recovery class and plan hash — not truncated. PASS: dialog text
+   contains the full path and the complete changed lines. Cleanup:
+   cancel the dialog.
+   **Native Windows display check (mandatory, this scenario):**
+   (a) repeat with a synthetic file whose diff is long (several
+   hundred changed lines): if the preview exceeds the host display
+   bound, approval must report `preview_not_displayable_completely`
+   and sign nothing — record this; a dialog that silently truncates
+   is a FAIL and blocks acceptance until the bound/surface is fixed;
+   (b) repeat with a CRLF file whose line endings change: the CRLF/EOF
+   summary must be visible in the dialog; (c) cancel via the Cancel
+   button, via Escape, and by closing the dialog: each must decline,
+   sign nothing and leave the file byte-identical. Evidence:
+   screenshots of the dialog for (a)–(c) plus before/after hashes.
 7. **Refuse mutation before approval.** Actions: prepare the edit, then
    inspect the file without approving. Expected: file hash unchanged;
    no receipt. PASS: baseline hash intact. Cleanup: none.

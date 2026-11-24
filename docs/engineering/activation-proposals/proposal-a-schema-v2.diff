@@ -1,0 +1,21 @@
+Proposal A — schema v2 activation (NOT APPLIED; apply only after
+separate approval, verified backup/rollback procedure, and green
+backend gates on the target machine).
+
+diff --git a/backend/aether/core/persistence/sqlite_store.py b/backend/aether/core/persistence/sqlite_store.py
+--- a/backend/aether/core/persistence/sqlite_store.py
++++ b/backend/aether/core/persistence/sqlite_store.py
+@@
+-ACTIVE_SCHEMA_VERSION = 1
+-PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset({2})
++ACTIVE_SCHEMA_VERSION = 2
++PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset()
+
+Notes for the applying commit (no other hunks):
+* The surrounding comment block (lines ~319-328) must be updated to
+  record the activation decision, date and approver.
+* Existing v1 databases migrate only through the already-reviewed
+  migration path with its backup/restore evidence; user data migration
+  remains an operator action with a verified backup first.
+* Shipped-configuration tests that pin v1 behaviour must be updated
+  in the same reviewed commit, never silently.

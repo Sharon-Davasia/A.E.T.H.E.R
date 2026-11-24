@@ -117,7 +117,9 @@ def test_planner_binds_pre_image_through_bounded_read(tmp_path) -> None:
     big = tree.readme
     with big.open("wb") as handle:
         handle.truncate(4 * 1024 * 1024 + 1)
-    registry = build_registry(tree, capabilities=frozenset({"fs.inspect_file", "fs.read_file", "fs.apply_approved_edit"}))
+    registry = build_registry(
+        tree, capabilities=frozenset({"fs.inspect_file", "fs.read_file", "fs.apply_approved_edit"})
+    )
     planner = Planner(
         capabilities=CapabilityRegistry.phase2_filesystem(),
         resources=registry,

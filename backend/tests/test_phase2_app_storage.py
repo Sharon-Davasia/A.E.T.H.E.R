@@ -62,7 +62,9 @@ def test_app_store_owner_lock_excludes_a_second_store(tmp_path) -> None:
     store = open_application_store({"AETHER_APP_DB": str(db_path)})
     assert store is not None
     try:
-        with pytest.raises(Exception):
+        from aether.core.persistence.sqlite_store import PersistenceError
+
+        with pytest.raises(PersistenceError):
             SQLiteTaskStore(db_path)
     finally:
         store.close()
@@ -75,7 +77,9 @@ def test_app_store_owner_lock_excludes_a_second_store(tmp_path) -> None:
 def test_app_store_misconfiguration_fails_closed(tmp_path) -> None:
     assert open_application_store({}) is None
     assert open_application_store({"AETHER_APP_DB": "relative/path.sqlite3"}) is None
-    assert open_application_store({"AETHER_APP_DB": str(tmp_path / "a" / ".." / "x.sqlite3")}) is None
+    assert (
+        open_application_store({"AETHER_APP_DB": str(tmp_path / "a" / ".." / "x.sqlite3")}) is None
+    )
     # A directory where the database file should be is unusable.
     blocker = tmp_path / "blocked.sqlite3"
     blocker.mkdir()

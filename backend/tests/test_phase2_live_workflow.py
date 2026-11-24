@@ -210,9 +210,9 @@ def test_search_matches_cross_the_bridge_as_bounded_strings(live) -> None:
     """FI-02B: search results are usable by the desktop workflow."""
     bridge = live["bridge"]
     registered = bridge.register_project({"alias": "proj", "path": str(live["project"])})
-    root_resource = bridge.resolve_resource(
-        {"rootId": registered["rootId"], "relativePath": ""}
-    )["resourceId"]
+    root_resource = bridge.resolve_resource({"rootId": registered["rootId"], "relativePath": ""})[
+        "resourceId"
+    ]
     task = bridge.create_task({"goal": "find the token"})
     planned = bridge.plan_task(
         {
@@ -228,3 +228,17 @@ def test_search_matches_cross_the_bridge_as_bounded_strings(live) -> None:
     matches = result["data"]["matches"]
     assert matches and all(isinstance(item, str) for item in matches), matches
     assert any(item.startswith("sample.txt:1:") for item in matches), matches
+
+
+def test_planned_preview_carries_unambiguous_affected_paths(live) -> None:
+    """Native-confirmation verification: full canonical path, not basename."""
+    bridge = live["bridge"]
+    resource_id = _register_and_resolve(live)
+    planned = _plan_edit(live, resource_id)
+    fetched = bridge.get_planned_preview({"taskId": planned["taskId"]})
+    assert fetched["preview"]["previewId"] == planned["preview"]["previewId"], fetched
+    paths = fetched["affectedPaths"]
+    assert len(paths) == 1 and paths[0]["resourceId"] == resource_id, paths
+    canonical = paths[0]["canonicalPath"]
+    assert canonical.endswith("sample.txt") and str(live["project"]) in canonical, canonical
+    assert canonical != "sample.txt"  # never a bare basename

@@ -286,6 +286,7 @@ def main() -> int:
             bridge.close()
         if app_store is not None:
             app_store.close()
+    return 0
 
 
 if __name__ == "__main__":

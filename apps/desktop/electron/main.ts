@@ -4,7 +4,12 @@ import { pathToFileURL } from 'node:url';
 import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
-import { createLiveApprovalProvider, type ApprovalSummary } from './live-approval-provider';
+import {
+  createLiveApprovalProvider,
+  MAX_NATIVE_PREVIEW_DISPLAY_CHARS,
+  type ApprovalSummary,
+  type ConfirmationOutcome,
+} from './live-approval-provider';
 import { LiveWorkflow } from './workflow';
 import { parseEditReceipt } from '../shared/live';
 import { parseReviewOutcomeRequest } from '../shared/review';
@@ -26,13 +31,20 @@ let navigationEpoch = 0;
  * dialog, outside renderer control. Anything but the explicit Approve
  * button — dismissal, Escape, a missing window — declines.
  */
-async function confirmLiveApproval(summary: ApprovalSummary): Promise<boolean> {
-  if (!mainWindow) return false;
-  // FI-01: the dialog shows the COMPLETE rendered preview (affected
-  // resources, complete unified diffs, recovery implications and the
-  // exact plan/preview binding). Nothing is truncated; if the complete
-  // preview is implausibly large for a native dialog we refuse instead.
-  if (summary.renderedPreview.length > 60_000) return false;
+async function confirmLiveApproval(summary: ApprovalSummary): Promise<ConfirmationOutcome> {
+  if (!mainWindow) return { affirmed: false, displayedCompletely: false };
+  // Native-confirmation verification: the dialog identifies the
+  // unambiguous affected path(s) and presents the COMPLETE rendered
+  // preview. Merely handing a string to showMessageBox is not proof
+  // Windows displayed it completely, so the host attests displayability
+  // against a conservative bound — beyond it, authorization is
+  // unavailable (never a truncated approval). The bound is validated
+  // by the native Windows display check in the acceptance procedure
+  // (PHASE2_LIVE_WORKFLOW.md section 6, scenario 6).
+  const pathsBlock = summary.affectedPaths.map((entry) => `Affected path: ${entry}`).join('\n');
+  const message = `Approve this exact action?\n\n${pathsBlock}\n\n${summary.renderedPreview}`;
+  const displayedCompletely = message.length <= MAX_NATIVE_PREVIEW_DISPLAY_CHARS;
+  if (!displayedCompletely) return { affirmed: false, displayedCompletely: false };
   const result = await dialog.showMessageBox(mainWindow, {
     type: 'warning',
     buttons: ['Cancel', 'Approve exact action'],
@@ -40,10 +52,10 @@ async function confirmLiveApproval(summary: ApprovalSummary): Promise<boolean> {
     cancelId: 0,
     noLink: true,
     title: 'Approve exact action',
-    message: `Approve this exact action?\n\n${summary.renderedPreview}`,
+    message,
     detail: 'Approving signs a single-use authorization for exactly this preview and executes it immediately. Any change to the plan or file invalidates it.',
   });
-  return result.response === 1;
+  return { affirmed: result.response === 1, displayedCompletely };
 }
 
 const liveApprovalProvider = createLiveApprovalProvider({

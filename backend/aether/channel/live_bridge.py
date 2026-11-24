@@ -510,10 +510,28 @@ class LiveBridge:
             preview = self._composition.previews.preview_for(
                 task_id, plan_revision=int(task.plan_revision), plan_hash=str(task.plan_hash)
             )
+            # Native-confirmation verification: the trusted dialog must
+            # identify the unambiguous affected path for every preview
+            # resource — not merely a basename. Paths are re-resolved
+            # through the registry here; an unresolvable resource makes
+            # the whole preview unusable for authorization.
+            affected_paths: list[dict[str, object]] = []
+            for resource in preview.resources:
+                try:
+                    resolved = self._composition.registry.resource_by_id(resource.resource_id)
+                except ResourceRegistryError as exc:
+                    raise _Refused("planned_preview_path_unavailable") from exc
+                affected_paths.append(
+                    {
+                        "resourceId": resource.resource_id,
+                        "canonicalPath": str(resolved.canonical_path),
+                    }
+                )
             return {
                 "taskId": str(task_id),
                 "planRevision": int(task.plan_revision),
                 "preview": electron_preview_payload(preview),
+                "affectedPaths": affected_paths,
             }
 
         return self._guarded(run)

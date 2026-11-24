@@ -1,0 +1,80 @@
+Proposal B — production grant issuance (NOT APPLIED; requires
+Proposal A live, FI-01/FI-02 complete, full gates green on the target
+Windows machine, and the section 6 procedure rehearsed).
+
+The change has exactly two parts. It does not use, extend or rely on
+the test-module allowlist: that mechanism remains test-scoped
+composition discipline only.
+
+diff --git a/backend/aether/core/grants/ledger.py b/backend/aether/core/grants/ledger.py
+--- a/backend/aether/core/grants/ledger.py
++++ b/backend/aether/core/grants/ledger.py
+@@
+ _TRUSTED_TRUST_SOURCE = "trusted_verifier"
+ _TEST_TRUST_SOURCE = "test_simulation"
++# Activation-only policy: accepts permits exclusively from the central
++# trusted authorization decision (production verifier over the FI-01
++# trusted confirmation + authenticated gesture). Set solely through
++# GrantLedger.open(..., production_trusted=True) by the composition
++# root in the activation commit; no caller-supplied object selects it.
++_PRODUCTION_TRUSTED_POLICY = "production_trusted"
+@@ class GrantLedger:
+     @classmethod
+-    def open(cls, store: SQLiteTaskStore) -> GrantLedger:
++    def open(cls, store: SQLiteTaskStore, *, production_trusted: bool = False) -> GrantLedger:
+         ...
+-        instance._trust_source_policy = "production"
++        instance._trust_source_policy = (
++            _PRODUCTION_TRUSTED_POLICY if production_trusted else "production"
++        )
+@@ def _check_permit_trust(...):
+         # 1. Default-deny, decided by configuration and checked before the
+         #    permit is inspected at all: no caller-supplied object changes this.
+-        if self._trust_source_policy != "test_scoped":
++        if self._trust_source_policy == _PRODUCTION_TRUSTED_POLICY:
++            # Enabled only by the reviewed activation commit. Accept
++            # solely the central decision's permit, bound to this exact
++            # grant (same binding check as the test-scoped trusted
++            # branch); test simulations remain refused here.
++            if permit.trust_source != _TRUSTED_TRUST_SOURCE:
++                raise GrantIssuanceDenied(
++                    "AUTHORIZATION_EVIDENCE_REQUIRED",
++                    "production issuance requires the trusted authorization decision",
++                )
++            binding = permit.binding
++            if (
++                binding.get("task_id") != str(grant.task_id)
++                or binding.get("plan_revision") != grant.plan_revision
++                or str(binding.get("plan_hash", "")).casefold() != grant.plan_hash.casefold()
++                or binding.get("issuance_key") != str(issuance_key)
++            ):
++                raise GrantIssuanceDenied(
++                    "ISSUANCE_PERMIT_MISMATCH",
++                    "the authorization decision does not cover this exact grant",
++                )
++            return
++        if self._trust_source_policy != "test_scoped":
+             raise GrantIssuanceDenied(
+                 "GRANT_ISSUANCE_DISABLED",
+                 ...
+             )
+
+diff --git a/backend/aether/core/composition.py b/backend/aether/core/composition.py
+--- a/backend/aether/core/composition.py
++++ b/backend/aether/core/composition.py
+@@
+                 if ledger is None:
+-                    ledger = GrantLedger.open(store)
++                    # ACTIVATION (Proposal B): production issuance is
++                    # enabled by this reviewed change only, together
++                    # with the production attestation verifier already
++                    # constructed above (FI-01 trusted confirmation ->
++                    # authenticated gesture -> authoritative preview ->
++                    # exact grant binding -> central issuance decision).
++                    ledger = GrantLedger.open(store, production_trusted=True)
+
+Notes for the applying commit (no other hunks):
+* Update the shipped-configuration refusal tests and the
+  PHASE2_LIVE_WORKFLOW.md section 4 table in the same reviewed commit.
+* `open_tests_scoped` and TEST_AUTHORIZATION_MODULES are untouched:
+  test isolation is unchanged and remains non-production evidence.

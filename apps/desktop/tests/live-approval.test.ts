@@ -42,6 +42,8 @@ interface StubOptions {
   readonly previewResponse?: () => unknown;
   readonly confirmResult?: boolean;
   readonly confirmImpl?: (summary: ApprovalSummary) => Promise<boolean>;
+  readonly displayedCompletely?: boolean;
+  readonly withPaths?: boolean;
 }
 
 function stub(options: StubOptions = {}) {
@@ -53,9 +55,17 @@ function stub(options: StubOptions = {}) {
     status: () => ({ state: options.state ?? 'ready', message: 'test' }),
     async liveGetPlannedPreview(): Promise<unknown> {
       calls.push('preview');
-      return options.previewResponse
-        ? options.previewResponse()
-        : { taskId: TASK_ID, preview: goldenPreview() };
+      if (options.previewResponse) return options.previewResponse();
+      return {
+        taskId: TASK_ID,
+        preview: goldenPreview(),
+        affectedPaths: options.withPaths === false
+          ? []
+          : preview.resources.map((resource) => ({
+              resourceId: resource.resourceId,
+              canonicalPath: `/fixture/project/${resource.displayName}`,
+            })),
+      };
     },
     async liveBeginGesture(): Promise<unknown> {
       calls.push('begin');
@@ -109,9 +119,10 @@ function stub(options: StubOptions = {}) {
     confirm: async (summary) => {
       calls.push('confirm');
       summaries.push(summary);
-      return options.confirmImpl
-        ? options.confirmImpl(summary)
+      const affirmed = options.confirmImpl
+        ? await options.confirmImpl(summary)
         : (options.confirmResult ?? true);
+      return { affirmed, displayedCompletely: options.displayedCompletely ?? true };
     },
   });
   return { provider, calls, submitted, summaries, signs: () => signCount, contextState };
@@ -283,4 +294,31 @@ test('a changed planned preview during the dialog signs nothing', async () => {
   const result = await handle.provider.approveAndExecute();
   assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
   assert.equal(handle.signs(), 0);
+});
+
+/* Native-confirmation verification */
+
+test('the confirmation summary carries the unambiguous affected path', async () => {
+  const { provider, summaries } = stub();
+  const result = await provider.approveAndExecute();
+  assert.equal(result.status, 'executed');
+  assert.deepEqual(summaries[0].affectedPaths, ['/fixture/project/golden-example.py']);
+  assert.ok(summaries[0].affectedPaths[0].includes('/'), 'must not be a bare basename');
+});
+
+test('a preview without authoritative affected paths cannot be approved', async () => {
+  const { provider, signs } = stub({ withPaths: false });
+  const result = await provider.approveAndExecute();
+  assert.deepEqual(result, { status: 'unavailable', reason: 'preview_path_unavailable' });
+  assert.equal(signs(), 0);
+});
+
+test('a preview the native dialog cannot display completely is never signed', async () => {
+  const { provider, calls, signs } = stub({ displayedCompletely: false, confirmResult: true });
+  const result = await provider.approveAndExecute();
+  assert.deepEqual(result, {
+    status: 'unavailable', reason: 'preview_not_displayable_completely',
+  });
+  assert.equal(signs(), 0);
+  assert.ok(!calls.includes('submit'));
 });

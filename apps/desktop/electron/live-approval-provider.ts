@@ -71,9 +71,31 @@ export interface ApprovalSummary {
   readonly actionIntent: string;
   readonly proposedEffect: string;
   readonly renderedPreview: string;
+  /** Unambiguous canonical affected paths from the trusted backend. */
+  readonly affectedPaths: string[];
   /** Monotonic per-attempt token: embeds session/generation identity. */
   readonly approvalToken: string;
 }
+
+/**
+ * What the native confirmation reports back. `displayedCompletely` is
+ * the trusted host's own attestation that the complete preview was
+ * actually presented reviewably; passing a long string to an OS dialog
+ * is NOT treated as proof of display (native Windows check, §6).
+ */
+export interface ConfirmationOutcome {
+  readonly affirmed: boolean;
+  readonly displayedCompletely: boolean;
+}
+
+/**
+ * Conservative upper bound for a preview the native message dialog can
+ * present reviewably. Longer previews refuse authorization
+ * (`preview_not_displayable_completely`) rather than risking an
+ * unreviewable confirmation. Validated/tightened by the native
+ * Windows display check in the acceptance procedure.
+ */
+export const MAX_NATIVE_PREVIEW_DISPLAY_CHARS = 16_000;
 
 export interface ApprovalContext {
   /** Snapshot of the signed-for task and its verified preview. */
@@ -89,10 +111,31 @@ export interface LiveApprovalProviderOptions {
   readonly backend: LiveApprovalBackend;
   /** Supplies the main-owned workflow's current task + verified preview. */
   readonly resolveApprovalContext: () => ApprovalContext | null;
-  /** Genuine native confirmation; resolves true only on explicit affirmation. */
-  readonly confirm: (summary: ApprovalSummary) => Promise<boolean>;
+  /** Genuine native confirmation; affirms only on explicit approval. */
+  readonly confirm: (summary: ApprovalSummary) => Promise<ConfirmationOutcome>;
   /** Extra generation source (e.g., main-window navigation) invalidates. */
   readonly approvalGeneration?: () => number;
+}
+
+function parseAffectedPaths(fetched: unknown, preview: ExactPreview): string[] | null {
+  if (typeof fetched !== 'object' || fetched === null) return null;
+  const raw = (fetched as { affectedPaths?: unknown }).affectedPaths;
+  if (!Array.isArray(raw)) return null;
+  const byId = new Map<string, string>();
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) return null;
+    const { resourceId, canonicalPath } = entry as { resourceId?: unknown; canonicalPath?: unknown };
+    if (typeof resourceId !== 'string' || typeof canonicalPath !== 'string') return null;
+    if (!canonicalPath.includes('/') && !canonicalPath.includes('\\')) return null;
+    byId.set(resourceId, canonicalPath);
+  }
+  const paths: string[] = [];
+  for (const resource of preview.resources) {
+    const path = byId.get(resource.resourceId);
+    if (!path) return null;
+    paths.push(path);
+  }
+  return paths;
 }
 
 function unavailable(reason: string): LiveApprovalState {
@@ -144,11 +187,13 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
       //    which must be exactly the preview the main-owned workflow
       //    planned and displayed (FI-01: shown == signed).
       let authoritative: ExactPreview;
+      let affectedPaths: string[] | null;
       try {
         const fetched = await backend.liveGetPlannedPreview(taskId);
         authoritative = parseExactPreview(
           (fetched as { preview?: unknown } | null)?.preview ?? fetched,
         );
+        affectedPaths = parseAffectedPaths(fetched, authoritative);
       } catch {
         return unavailable('live_unavailable');
       }
@@ -168,6 +213,10 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
         return unavailable('binding_mismatch');
       }
 
+      if (!affectedPaths || affectedPaths.length === 0) {
+        return unavailable('preview_path_unavailable');
+      }
+
       // 4. Native confirmation over the COMPLETE rendered preview.
       let renderedPreview: string;
       try {
@@ -179,9 +228,9 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
         return unavailable('preview_incomplete');
       }
       if (staleWithGeneration()) return unavailable('approval_invalidated');
-      let affirmed: boolean;
+      let outcome: ConfirmationOutcome;
       try {
-        affirmed = await confirm({
+        outcome = await confirm({
           taskId,
           planRevision: binding.planRevision,
           planHash: binding.planHash,
@@ -189,13 +238,20 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
           actionIntent: authoritative.actionIntent,
           proposedEffect: authoritative.proposedEffect,
           renderedPreview,
+          affectedPaths,
           approvalToken: `${context.sessionMarker}:${String(attemptId)}`,
         });
       } catch {
         return unavailable('confirmation_unavailable');
       }
       if (staleWithGeneration()) return unavailable('approval_invalidated');
-      if (!affirmed) return { status: 'declined' };
+      // The complete preview must have been *actually* presented
+      // reviewably — an over-long or undisplayable preview means
+      // authorization is unavailable, never a truncated approval.
+      if (!outcome.displayedCompletely) {
+        return unavailable('preview_not_displayable_completely');
+      }
+      if (!outcome.affirmed) return { status: 'declined' };
 
       // 5. Sign (main-process key), submit, verify scope, execute.
       let signed: SignedGesturePayload;

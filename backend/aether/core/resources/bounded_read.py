@@ -40,7 +40,8 @@ class BoundedReadError(ValueError):
 
 
 class _Resolved(Protocol):
-    canonical_path: Path
+    @property
+    def canonical_path(self) -> Path: ...
 
 
 def read_bounded_bytes(resolved: _Resolved, *, max_bytes: int = MAX_BOUNDED_READ_BYTES) -> bytes:
