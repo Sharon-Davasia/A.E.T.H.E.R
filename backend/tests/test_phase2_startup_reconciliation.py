@@ -137,7 +137,7 @@ def _open_world_rebuilt(tmp_path, monkeypatch):
 
 def test_clean_restart_reconciles_consistent_and_serves_receipts(tmp_path, monkeypatch) -> None:
     project = _make_project(tmp_path)
-    store, composition, bridge = _open_world(tmp_path, monkeypatch)
+    store, composition, _bridge = _open_world(tmp_path, monkeypatch)
     assert composition.startup_reconciliation is not None
     assert composition.startup_reconciliation.consistent
     assert composition.unresolved_task_ids == frozenset()
