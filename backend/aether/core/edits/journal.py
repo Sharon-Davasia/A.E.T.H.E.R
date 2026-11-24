@@ -140,14 +140,20 @@ class MutationJournal:
     def __init__(self, database: Path | str, *, clock: object | None = None) -> None:
         self._lock = threading.RLock()
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._connection = sqlite3.connect(
-            str(database), isolation_level=None, check_same_thread=False
-        )
-        self._connection.row_factory = sqlite3.Row
-        with self._lock:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            for statement in _SCHEMA:
-                self._connection.execute(statement)
+        connection = sqlite3.connect(str(database), isolation_level=None, check_same_thread=False)
+        try:
+            connection.row_factory = sqlite3.Row
+            with self._lock:
+                connection.execute("PRAGMA journal_mode=WAL")
+                for statement in _SCHEMA:
+                    connection.execute(statement)
+        except BaseException:
+            # W-A3: deterministic constructor cleanup (see ReceiptStore):
+            # a partially constructed journal is owned by no one, so its
+            # connection must be closed here, preserving the failure.
+            connection.close()
+            raise
+        self._connection = connection
 
     def close(self) -> None:
         with self._lock:

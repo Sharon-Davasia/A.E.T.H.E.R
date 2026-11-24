@@ -95,14 +95,25 @@ class ReceiptStore:
 
     def __init__(self, database: Path) -> None:
         self._database = Path(database)
-        self._connection = sqlite3.connect(
+        connection = sqlite3.connect(
             self._database, timeout=5.0, isolation_level=None, check_same_thread=False
         )
-        self._connection.row_factory = sqlite3.Row
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._connection.execute("PRAGMA synchronous = FULL")
-        self._connection.execute("PRAGMA foreign_keys = ON")
-        self._connection.executescript(_SCHEMA)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = FULL")
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.executescript(_SCHEMA)
+        except BaseException:
+            # W-A3: deterministic constructor cleanup. If schema
+            # initialization fails (e.g. a corrupt database file), the
+            # partially constructed store is never assigned anywhere,
+            # so nothing else can close this connection — leaking it
+            # kept the file locked (Windows WinError 32). Close it and
+            # re-raise the original failure unchanged.
+            connection.close()
+            raise
+        self._connection = connection
         if os.name != "nt":
             self._database.chmod(0o600)
 

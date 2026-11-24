@@ -13,6 +13,7 @@ resolution refuses (resource substitution / reparse escape).
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -49,11 +50,20 @@ def test_hard_linked_target_refused(tmp_path) -> None:
     assert caught.value.reason_code == "hard_link_not_allowed"
 
 
+def _symlink(link: Path, target: Path, *, directory: bool = False) -> None:
+    from fs_support import skip_if_symlink_unavailable
+
+    try:
+        link.symlink_to(target, target_is_directory=directory)
+    except (OSError, NotImplementedError) as exc:
+        skip_if_symlink_unavailable(exc)
+
+
 def test_symlink_target_refused(tmp_path) -> None:
     outside = tmp_path / "outside.txt"
     outside.write_bytes(b"outside\n")
     target = tmp_path / "sample.txt"
-    target.symlink_to(outside)
+    _symlink(target, outside)
     with pytest.raises(BoundedReadError) as caught:
         read_bounded_bytes(_resolved(target))
     assert caught.value.reason_code in {"reparse_point_not_allowed", "target_unavailable"}
@@ -98,7 +108,7 @@ def test_substituted_path_after_resolution_refused(tmp_path) -> None:
     # via rename): the descriptor-vs-path identity and reparse checks
     # operate on the opened file, and a symlink substitution refuses.
     target.unlink()
-    target.symlink_to(tmp_path / "elsewhere.txt")
+    _symlink(target, tmp_path / "elsewhere.txt")
     (tmp_path / "elsewhere.txt").write_bytes(b"substituted\n")
     with pytest.raises(BoundedReadError):
         read_bounded_bytes(resolved)
@@ -157,3 +167,65 @@ def test_rename_substitution_after_resolution_refused(tmp_path) -> None:
     with pytest.raises(BoundedReadError) as caught:
         read_bounded_bytes(resolved)
     assert caught.value.reason_code == "resource_identity_mismatch"
+
+
+def test_junction_escape_refused_without_elevation(tmp_path) -> None:
+    """Non-elevated native Windows reparse coverage (W-A1).
+
+    A directory junction needs no privilege, so this runs where the
+    symlink tests must skip. The bounded reader must refuse a file
+    reached through the junction, and the outside bytes stay intact.
+    Skips only where junctions genuinely cannot be created (or off
+    Windows); a skip is not evidence the scenario passed.
+    """
+    from fs_support import make_junction
+
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    secret = outside_dir / "secret.txt"
+    secret.write_bytes(b"outside the project\n")
+    project = tmp_path / "project"
+    project.mkdir()
+    make_junction(project / "escape", outside_dir)
+    info = secret.lstat()
+    resolved = SimpleNamespace(
+        canonical_path=project / "escape" / "secret.txt",
+        device_id=info.st_dev,
+        file_id=info.st_ino,
+    )
+    with pytest.raises(BoundedReadError) as caught:
+        read_bounded_bytes(resolved)
+    assert caught.value.reason_code == "reparse_point_not_allowed"
+    assert secret.read_bytes() == b"outside the project\n"
+
+
+# ----------------------------------------------------------------------
+# W-A3: deterministic constructor cleanup on initialization failure
+# ----------------------------------------------------------------------
+
+
+def test_sqlite_store_constructors_close_connections_on_failure(tmp_path) -> None:
+    """Corrupt sibling databases: construction fails, nothing leaks.
+
+    After each failed construction the file must be immediately
+    removable/replaceable (on Windows a leaked connection keeps it
+    locked, WinError 32) and the original sqlite failure must
+    propagate unchanged. No garbage-collection reliance.
+    """
+    import sqlite3
+
+    from aether.core.edits.journal import MutationJournal
+    from aether.core.edits.receipts import ReceiptStore
+    from aether.core.grants.consumption import ConsumptionLedger
+
+    for factory, name in (
+        (ReceiptStore, "receipts.sqlite3"),
+        (MutationJournal, "journal.sqlite3"),
+        (ConsumptionLedger, "consumption.sqlite3"),
+    ):
+        database = tmp_path / name
+        database.write_bytes(b"this is not a sqlite database" * 4)
+        with pytest.raises(sqlite3.DatabaseError):
+            factory(database)  # type: ignore[operator]
+        database.unlink()  # would raise PermissionError if a handle leaked
+        assert not database.exists()

@@ -64,6 +64,17 @@ def read_bounded_bytes(resolved: _Resolved, *, max_bytes: int = MAX_BOUNDED_READ
         raise BoundedReadError(
             "reparse_point_not_allowed", "the target path crosses a reparse point"
         ) from exc
+    # Pre-open file-type classification (W-A2): on Windows, os.open on
+    # a directory fails before any descriptor exists, which would hide
+    # the real reason behind a generic open failure. lstat classifies
+    # the target first (reparse components were already rejected above,
+    # and the descriptor checks below remain authoritative).
+    try:
+        pre_open = path.lstat()
+    except OSError as exc:
+        raise BoundedReadError("target_unavailable", "the target could not be examined") from exc
+    if not stat.S_ISREG(pre_open.st_mode):
+        raise BoundedReadError("target_not_a_regular_file", "the target is not a regular file")
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)

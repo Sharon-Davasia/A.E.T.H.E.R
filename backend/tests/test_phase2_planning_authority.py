@@ -189,7 +189,12 @@ def test_symlink_swap_after_resolution_is_refused(live) -> None:
     outside.write_bytes(b"outside the project\n")
     target = live["project"] / "sample.txt"
     target.unlink()
-    target.symlink_to(outside)
+    from fs_support import skip_if_symlink_unavailable
+
+    try:
+        target.symlink_to(outside)
+    except (OSError, NotImplementedError) as exc:
+        skip_if_symlink_unavailable(exc)
     task = bridge.create_task({"goal": "edit through a symlink"})
     planned = _plan(
         live,
