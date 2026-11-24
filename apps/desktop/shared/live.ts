@@ -8,6 +8,9 @@
  * a nonce, a signature, or a binding it could replay.
  */
 
+import { parseExactPreview } from './review.js';
+import type { ExactPreview } from './review.js';
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const SHA256 = /^[0-9a-fA-F]{64}$/;
 const NONCE = /^[0-9a-f]{64}$/;
@@ -39,6 +42,10 @@ export type LiveApprovalState =
   | { status: 'executed'; outcome: string; receiptId: string | null }
   | { status: 'declined' }
   | { status: 'unavailable'; reason: string };
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
 
 function record(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
@@ -167,4 +174,219 @@ export interface SignedGestureWire {
   assertedAt: string;
   userIntent: string;
   signature: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* FI-02: user-operable project workflow types and parsers             */
+/* ------------------------------------------------------------------ */
+
+export interface RegisteredProject {
+  rootId: string;
+  alias: string;
+}
+
+export interface ResolvedFile {
+  resourceId: string;
+  version: string;
+  kind: string;
+}
+
+export interface FileContents {
+  encoding: string;
+  sha256: string;
+  text: string;
+  truncated: boolean;
+}
+
+export interface EditReceipt {
+  receiptId: string;
+  taskId: string;
+  status: string;
+  capabilityId: string;
+  resourceId: string;
+  preSha256: string | null;
+  postSha256: string | null;
+  snapshotId: string | null;
+  verifiedAt: string | null;
+  verified: boolean;
+}
+
+export type LiveReceiptState =
+  | { status: 'loading' }
+  | { status: 'unavailable'; message: string }
+  | { status: 'ready'; receipt: EditReceipt };
+
+/** A workflow step result: parsed data, or a typed refusal. */
+export type WorkflowStep<T> =
+  | { status: 'ready'; value: T }
+  | { status: 'unavailable'; reason: string };
+
+function requireRecord(value: unknown, what: string): Record<string, unknown> {
+  if (!isRecord(value)) throw new Error(`${what} response is malformed`);
+  return value as Record<string, unknown>;
+}
+
+function requireString(record: Record<string, unknown>, key: string, what: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || !value) throw new Error(`${what} ${key} is malformed`);
+  return value;
+}
+
+function nullableString(record: Record<string, unknown>, key: string, what: string): string | null {
+  const value = record[key] ?? null;
+  if (value !== null && typeof value !== 'string') {
+    throw new Error(`${what} ${key} is malformed`);
+  }
+  return value as string | null;
+}
+
+/** Parse a bridge refusal, or return null so success parsing proceeds. */
+function unavailable<T>(value: unknown): WorkflowStep<T> | null {
+  if (isRecord(value) && value.status === 'unavailable') {
+    return {
+      status: 'unavailable',
+      reason: typeof value.reason === 'string' ? value.reason : 'unavailable',
+    };
+  }
+  return null;
+}
+
+export function parseRegisteredProject(value: unknown): RegisteredProject {
+  const record = requireRecord(value, 'project registration');
+  const rootId = requireString(record, 'rootId', 'project registration');
+  if (!UUID.test(rootId)) throw new Error('project registration rootId is malformed');
+  return { rootId, alias: requireString(record, 'alias', 'project registration') };
+}
+
+export function parseCreatedTask(value: unknown): string {
+  const record = requireRecord(value, 'task creation');
+  const taskId = requireString(record, 'taskId', 'task creation');
+  if (!UUID.test(taskId)) throw new Error('task creation taskId is malformed');
+  return taskId;
+}
+
+export function parseResolvedFile(value: unknown): WorkflowStep<ResolvedFile> {
+  const refused = unavailable<ResolvedFile>(value);
+  if (refused) return refused;
+  const record = requireRecord(value, 'resource resolution');
+  const resourceId = requireString(record, 'resourceId', 'resource resolution');
+  if (!UUID.test(resourceId)) throw new Error('resource resolution resourceId is malformed');
+  return {
+    status: 'ready',
+    value: {
+      resourceId,
+      version: requireString(record, 'version', 'resource resolution'),
+      kind: requireString(record, 'kind', 'resource resolution'),
+    },
+  };
+}
+
+/** Parse an `fs.execute_read` outcome: bounded file text plus hashes. */
+export function parseFileContents(value: unknown): WorkflowStep<FileContents> {
+  const refused = unavailable<FileContents>(value);
+  if (refused) return refused;
+  const record = requireRecord(value, 'file read');
+  if (record.succeeded !== true || !isRecord(record.data)) {
+    return { status: 'unavailable', reason: 'read_failed' };
+  }
+  const data = record.data;
+  return {
+    status: 'ready',
+    value: {
+      encoding: requireString(data, 'encoding', 'file read'),
+      sha256: requireString(data, 'sha256', 'file read'),
+      text: requireString(data, 'text', 'file read'),
+      truncated: data.truncated === true,
+    },
+  };
+}
+
+export function parseEditReceipt(value: unknown): LiveReceiptState {
+  if (isRecord(value) && value.status === 'unavailable') {
+    return {
+      status: 'unavailable',
+      message: typeof value.reason === 'string' ? value.reason : 'unavailable',
+    };
+  }
+  const record = requireRecord(value, 'edit receipt');
+  const snapshotId = nullableString(record, 'snapshotId', 'edit receipt');
+  if (snapshotId !== null && !UUID.test(snapshotId)) {
+    throw new Error('edit receipt snapshot identity is malformed');
+  }
+  const verifiedAt = nullableString(record, 'verifiedAt', 'edit receipt');
+  return {
+    status: 'ready',
+    receipt: {
+      receiptId: requireString(record, 'receiptId', 'edit receipt'),
+      taskId: requireString(record, 'taskId', 'edit receipt'),
+      status: requireString(record, 'status', 'edit receipt'),
+      capabilityId: requireString(record, 'capabilityId', 'edit receipt'),
+      resourceId: requireString(record, 'resourceId', 'edit receipt'),
+      preSha256: nullableString(record, 'preSha256', 'edit receipt'),
+      postSha256: nullableString(record, 'postSha256', 'edit receipt'),
+      snapshotId,
+      verifiedAt,
+      verified: verifiedAt !== null,
+    },
+  };
+}
+
+export function buildProposedContents(current: string, find: string, replace: string): string {
+  if (!find || !current.includes(find)) {
+    throw new Error('the text to replace does not occur in the opened file');
+  }
+  return current.replace(find, replace);
+}
+
+/**
+ * Render the complete, authorization-essential exact preview for the
+ * main-process trusted dialog (FI-01). Every field arrives from the
+ * channel-verified preview; the renderer supplies nothing. The caller
+ * refuses to approve when this cannot be produced in full.
+ */
+export function renderFullPreview(preview: ExactPreview): string {
+  const lines: string[] = [
+    `Plan ${preview.planHash} (revision ${String(preview.planRevision)})`,
+    `Intent: ${preview.actionIntent}`,
+    `Explanation: ${preview.explanation}`,
+    `Proposed effect: ${preview.proposedEffect}`,
+    `Recovery: ${preview.recoveryClass}`,
+    `Highest risk tier: ${String(preview.highestRiskTier)}`,
+    'Resources:',
+  ];
+  for (const resource of preview.resources) {
+    lines.push(
+      `- ${resource.displayName} [${resource.resourceId}] expected version ` +
+        `${resource.expectedVersion}; operations: ${resource.operations.join(', ')}`,
+    );
+    const diff = preview.fullDiff.find((entry) => entry.resourceId === resource.resourceId);
+    lines.push(diff ? diff.unifiedDiff : '(no unified diff available)');
+  }
+  lines.push('Steps:');
+  for (const step of preview.steps) {
+    lines.push(
+      `- ${step.capabilityId} tier ${String(step.riskTier)} recovery ${step.recoveryClass}`,
+      `  arguments ${step.argumentsSha256}`,
+      `  expected state ${step.expectedStateSha256}: ${step.expectedStateJson}`,
+      `  expected effect ${step.expectedEffectSha256}: ${step.expectedEffectJson}`,
+    );
+  }
+  lines.push(
+    `Preconditions: ${preview.preconditions.join('; ')}`,
+    `External effects: ${preview.externalEffects.join('; ')}`,
+    `Risks: ${preview.risks.join('; ')}`,
+    `Verification: ${preview.verificationStrategy.join('; ')}`,
+  );
+  return lines.join('\n');
+}
+
+/** Parse a plan response: the channel-verified exact preview, or a refusal. */
+export function parsePlannedPreview(value: unknown): WorkflowStep<ExactPreview> {
+  const refused = unavailable<ExactPreview>(value);
+  if (refused) return refused;
+  const record = requireRecord(value, 'task planning');
+  if (typeof record.planRevision !== 'number') {
+    throw new Error('task planning planRevision is malformed');
+  }
+  return { status: 'ready', value: parseExactPreview(record.preview) };
 }

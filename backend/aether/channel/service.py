@@ -68,6 +68,7 @@ _LIVE_KINDS = {
     "project.resolve": ("resolve_resource", "project.resolved"),
     "task.create": ("create_task", "task.created"),
     "task.plan": ("plan_task", "task.preview"),
+    "task.planned_preview": ("get_planned_preview", "task.planned"),
     "fs.execute_read": ("execute_read", "fs.read_result"),
     "gesture.begin": ("begin_gesture", "gesture.challenge"),
     "gesture.submit": ("submit_gesture", "gesture.authorized"),

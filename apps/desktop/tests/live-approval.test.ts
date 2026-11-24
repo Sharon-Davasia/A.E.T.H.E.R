@@ -4,6 +4,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { parseExactPreview } from '../shared/review';
+import { renderFullPreview } from '../shared/live';
 import type { GestureBindingWire, SignedGestureWire } from '../shared/live';
 import {
   createLiveApprovalProvider,
@@ -40,6 +41,7 @@ interface StubOptions {
   readonly execute?: () => unknown;
   readonly previewResponse?: () => unknown;
   readonly confirmResult?: boolean;
+  readonly confirmImpl?: (summary: ApprovalSummary) => Promise<boolean>;
 }
 
 function stub(options: StubOptions = {}) {
@@ -49,11 +51,11 @@ function stub(options: StubOptions = {}) {
   let signCount = 0;
   const backend: LiveApprovalBackend = {
     status: () => ({ state: options.state ?? 'ready', message: 'test' }),
-    async reviewGetPreview(): Promise<unknown> {
+    async liveGetPlannedPreview(): Promise<unknown> {
       calls.push('preview');
       return options.previewResponse
         ? options.previewResponse()
-        : { status: 'ready', preview: goldenPreview() };
+        : { taskId: TASK_ID, preview: goldenPreview() };
     },
     async liveBeginGesture(): Promise<unknown> {
       calls.push('begin');
@@ -91,16 +93,28 @@ function stub(options: StubOptions = {}) {
       };
     },
   };
+  const contextState = {
+    preview,
+    sessionMarker: 'session-1',
+    backendAlive: true,
+  };
   const provider = createLiveApprovalProvider({
     backend,
-    resolveTaskId: () => TASK_ID,
+    resolveApprovalContext: () => ({
+      taskId: TASK_ID,
+      preview: contextState.preview,
+      sessionMarker: contextState.sessionMarker,
+      backendAlive: () => contextState.backendAlive,
+    }),
     confirm: async (summary) => {
       calls.push('confirm');
       summaries.push(summary);
-      return options.confirmResult ?? true;
+      return options.confirmImpl
+        ? options.confirmImpl(summary)
+        : (options.confirmResult ?? true);
     },
   });
-  return { provider, calls, submitted, summaries, signs: () => signCount };
+  return { provider, calls, submitted, summaries, signs: () => signCount, contextState };
 }
 
 test('happy path: begin -> verify -> confirm -> sign -> submit -> execute', async () => {
@@ -184,11 +198,89 @@ test('backend not ready and unconfigured task fail closed without any channel ca
   const { backend } = stub();
   const unconfigured = createLiveApprovalProvider({
     backend,
-    resolveTaskId: () => undefined,
+    resolveApprovalContext: () => null,
     confirm: async () => true,
   });
   assert.deepEqual(await unconfigured.approveAndExecute(), {
     status: 'unavailable',
     reason: 'live_task_unconfigured',
   });
+});
+
+/* FI-01: trusted exact-preview confirmation hardening */
+
+test('the native dialog receives the complete rendered preview (shown == signed)', async () => {
+  const { provider, summaries } = stub();
+  const result = await provider.approveAndExecute();
+  assert.equal(result.status, 'executed');
+  assert.equal(summaries.length, 1);
+  const rendered = summaries[0].renderedPreview;
+  assert.equal(rendered, renderFullPreview(preview));
+  assert.ok(rendered.includes('golden-example.py'));
+  assert.ok(rendered.includes('SYNTHETIC-CANONICAL-CANARY-2b9e31'));
+  assert.ok(rendered.includes(preview.planHash));
+  assert.ok(rendered.includes('eof: original=newline replacement=newline'));
+  assert.ok(rendered.length > 300, 'preview must never be truncated to a summary');
+});
+
+test('a second approval while the dialog is outstanding is refused', async () => {
+  let release!: (value: boolean) => void;
+  const gate = new Promise<boolean>((resolve) => { release = resolve; });
+  const { provider, signs } = stub({ confirmImpl: () => gate });
+  const first = provider.approveAndExecute();
+  const second = await provider.approveAndExecute();
+  assert.deepEqual(second, { status: 'unavailable', reason: 'approval_already_in_progress' });
+  release(true);
+  const completed = await first;
+  assert.equal(completed.status, 'executed');
+  assert.equal(signs(), 1);
+});
+
+test('invalidation during the dialog signs nothing', async () => {
+  const handle = stub({
+    confirmImpl: async () => {
+      handle.provider.invalidateOutstanding();
+      return true;
+    },
+  });
+  const result = await handle.provider.approveAndExecute();
+  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(handle.signs(), 0);
+  assert.ok(!handle.calls.includes('submit'));
+});
+
+test('session replacement during the dialog signs nothing', async () => {
+  const handle = stub({
+    confirmImpl: async () => {
+      handle.contextState.sessionMarker = 'session-2';
+      return true;
+    },
+  });
+  const result = await handle.provider.approveAndExecute();
+  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(handle.signs(), 0);
+});
+
+test('backend termination during the dialog signs nothing', async () => {
+  const handle = stub({
+    confirmImpl: async () => {
+      handle.contextState.backendAlive = false;
+      return true;
+    },
+  });
+  const result = await handle.provider.approveAndExecute();
+  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(handle.signs(), 0);
+});
+
+test('a changed planned preview during the dialog signs nothing', async () => {
+  const handle = stub({
+    confirmImpl: async () => {
+      handle.contextState.preview = { ...preview, previewDigest: 'f'.repeat(64) };
+      return true;
+    },
+  });
+  const result = await handle.provider.approveAndExecute();
+  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(handle.signs(), 0);
 });

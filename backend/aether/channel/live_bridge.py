@@ -491,6 +491,32 @@ class LiveBridge:
         else:
             store.advance_execution_state(task_id, PersistentTaskState.CANCELLED, evidence=evidence)
 
+    def get_planned_preview(self, payload: object) -> dict[str, object]:
+        """Recompute the authoritative exact preview for the current plan.
+
+        The trusted host compares this against the preview it displayed
+        before signing; any divergence refuses the approval (FI-01).
+        """
+
+        def run() -> dict[str, object]:
+            if not isinstance(payload, dict) or set(payload) != {"taskId"}:
+                raise _Refused("invalid_request")
+            task_id = _uuid_field(payload["taskId"])
+            store = self._composition.store
+            task = store.get_task(task_id)
+            if task.plan_hash is None:
+                raise _Refused("planned_preview_unavailable")
+            preview = self._composition.previews.preview_for(
+                task_id, plan_revision=int(task.plan_revision), plan_hash=str(task.plan_hash)
+            )
+            return {
+                "taskId": str(task_id),
+                "planRevision": int(task.plan_revision),
+                "preview": electron_preview_payload(preview),
+            }
+
+        return self._guarded(run)
+
     def get_receipt(self, payload: object) -> dict[str, object]:
         def run() -> dict[str, object]:
             if not isinstance(payload, dict) or set(payload) != {"receiptId"}:

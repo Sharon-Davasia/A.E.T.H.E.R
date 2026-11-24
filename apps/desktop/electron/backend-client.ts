@@ -121,6 +121,11 @@ export class BackendClient {
 
   status(): BackendStatus { return { state: this.state, message: this.message }; }
 
+  /** Identity of the current child session; changes on any replacement. */
+  sessionMarker(): string {
+    return `${String(this.generation)}:${this.active?.sessionId ?? 'none'}`;
+  }
+
   /**
    * Sign one authorizing gesture with this session's ephemeral gesture key.
    *
@@ -397,6 +402,83 @@ export class BackendClient {
     return this.request(session, 'gesture.submit', payload, ['gesture.authorized', 'live.error']);
   }
 
+  /** The authoritative preview the backend recomputes for the current plan. */
+  async liveGetPlannedPreview(taskId: string): Promise<unknown> {
+    if (typeof taskId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(taskId)) {
+      throw backendError('malformed live task identity');
+    }
+    const session = this.reviewSession();
+    return this.request(session, 'task.planned_preview', { taskId }, ['task.planned', 'live.error']);
+  }
+
+  /** FI-02 workflow: register one user-authorized project directory. */
+  async liveRegisterProject(path: string, alias: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'project.register', { alias, path }, ['project.registered', 'live.error']);
+  }
+
+  /** FI-02 workflow: resolve one file inside a registered project. */
+  async liveResolveResource(rootId: string, relativePath: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'project.resolve', { rootId, relativePath }, ['project.resolved', 'live.error']);
+  }
+
+  /** FI-02 workflow: create a real task in the trusted store. */
+  async liveCreateTask(goal: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'task.create', { goal }, ['task.created', 'live.error']);
+  }
+
+  /** FI-02 workflow: plan a bounded read of the opened file. */
+  async livePlanRead(taskId: string, resourceId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(
+      session,
+      'task.plan',
+      { taskId, goal: 'read_file', resourceId },
+      ['task.preview', 'live.error'],
+    );
+  }
+
+  /** FI-02 workflow: plan the exact edit over main-held proposed bytes. */
+  async livePlanEdit(taskId: string, resourceId: string, proposedText: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(
+      session,
+      'task.plan',
+      {
+        taskId,
+        goal: 'apply_edit',
+        resourceId,
+        proposedContentBase64: Buffer.from(proposedText, 'utf8').toString('base64'),
+      },
+      ['task.preview', 'live.error'],
+    );
+  }
+
+  /** FI-07 workflow: plan an undo derived from the durable receipt. */
+  async livePlanUndo(taskId: string, resourceId: string, receiptId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(
+      session,
+      'task.plan',
+      { taskId, goal: 'undo_edit', resourceId, receiptId },
+      ['task.preview', 'live.error'],
+    );
+  }
+
+  /** FI-02 workflow: execute the planned bounded read. */
+  async liveExecuteRead(taskId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'fs.execute_read', { taskId }, ['fs.read_result', 'live.error']);
+  }
+
+  /** FI-02 workflow: fetch the durable receipt for display and Undo. */
+  async liveGetReceipt(receiptId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'edit.receipt', { receiptId }, ['edit.receipt', 'live.error']);
+  }
+
   /** Execute the approved edit for one task whose grant was just issued. */
   async liveExecuteEdit(taskId: string): Promise<unknown> {
     if (typeof taskId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(taskId)) {
@@ -602,4 +684,16 @@ export class BackendClient {
 
 function asError(error: unknown): Error {
   return error instanceof Error ? error : backendError('backend startup failed');
+}
+
+/** Main-process workflow surface consumed by `LiveWorkflow` (FI-02). */
+export interface LiveWorkflowBackend {
+  liveRegisterProject(path: string, alias: string): Promise<unknown>;
+  liveResolveResource(rootId: string, relativePath: string): Promise<unknown>;
+  liveCreateTask(goal: string): Promise<unknown>;
+  livePlanRead(taskId: string, resourceId: string): Promise<unknown>;
+  livePlanEdit(taskId: string, resourceId: string, proposedText: string): Promise<unknown>;
+  livePlanUndo(taskId: string, resourceId: string, receiptId: string): Promise<unknown>;
+  liveExecuteRead(taskId: string): Promise<unknown>;
+  liveGetReceipt(receiptId: string): Promise<unknown>;
 }

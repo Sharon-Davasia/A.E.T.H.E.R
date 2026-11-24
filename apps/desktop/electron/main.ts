@@ -5,6 +5,8 @@ import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
 import { createLiveApprovalProvider, type ApprovalSummary } from './live-approval-provider';
+import { LiveWorkflow } from './workflow';
+import { parseEditReceipt } from '../shared/live';
 import { parseReviewOutcomeRequest } from '../shared/review';
 
 const APP_ROOT = app.getAppPath();
@@ -13,6 +15,10 @@ const PRELOAD_FILE = resolve(join(APP_ROOT, 'dist-electron', 'electron', 'preloa
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
 const backend = new BackendClient({ launchSpec: resolveBackendLaunchSpec });
 const reviewProvider = createChannelReviewProvider({ backend, resolveTaskId: configuredReviewTaskId });
+// FI-02: the production workflow is main-owned state — project, file,
+// task and exact preview are chosen here, never by the renderer.
+const workflow = new LiveWorkflow(backend);
+let navigationEpoch = 0;
 
 /**
  * Genuine native confirmation for one live approval. The renderer can only
@@ -22,9 +28,11 @@ const reviewProvider = createChannelReviewProvider({ backend, resolveTaskId: con
  */
 async function confirmLiveApproval(summary: ApprovalSummary): Promise<boolean> {
   if (!mainWindow) return false;
-  const effect = summary.proposedEffect.length > 300
-    ? `${summary.proposedEffect.slice(0, 300)}…`
-    : summary.proposedEffect;
+  // FI-01: the dialog shows the COMPLETE rendered preview (affected
+  // resources, complete unified diffs, recovery implications and the
+  // exact plan/preview binding). Nothing is truncated; if the complete
+  // preview is implausibly large for a native dialog we refuse instead.
+  if (summary.renderedPreview.length > 60_000) return false;
   const result = await dialog.showMessageBox(mainWindow, {
     type: 'warning',
     buttons: ['Cancel', 'Approve exact action'],
@@ -32,7 +40,7 @@ async function confirmLiveApproval(summary: ApprovalSummary): Promise<boolean> {
     cancelId: 0,
     noLink: true,
     title: 'Approve exact action',
-    message: `Approve this exact action?\n\n${summary.actionIntent}\n\nEffect: ${effect}\n\nPlan revision ${summary.planRevision} · Preview ${summary.previewDigest.slice(0, 16)}…`,
+    message: `Approve this exact action?\n\n${summary.renderedPreview}`,
     detail: 'Approving signs a single-use authorization for exactly this preview and executes it immediately. Any change to the plan or file invalidates it.',
   });
   return result.response === 1;
@@ -40,8 +48,19 @@ async function confirmLiveApproval(summary: ApprovalSummary): Promise<boolean> {
 
 const liveApprovalProvider = createLiveApprovalProvider({
   backend,
-  resolveTaskId: configuredReviewTaskId,
+  resolveApprovalContext: () => {
+    const taskId = workflow.plannedTaskId();
+    const preview = workflow.plannedPreview();
+    if (!taskId || !preview) return null;
+    return {
+      taskId,
+      preview,
+      sessionMarker: backend.sessionMarker(),
+      backendAlive: () => backend.status().state === 'ready',
+    };
+  },
   confirm: confirmLiveApproval,
+  approvalGeneration: () => navigationEpoch,
 });
 let mainWindow: BrowserWindow | undefined;
 let shuttingDown = false;
@@ -153,6 +172,87 @@ function registerIpc(): void {
     validateInvoke(event);
     return liveApprovalProvider.approveAndExecute();
   });
+  // FI-02 workflow steps. The renderer requests operations; main owns
+  // every identity. Project registration additionally requires a native
+  // confirmation naming the directory — that dialog *is* the explicit
+  // user authorization for the bounded capability scope.
+  ipcMain.handle('desktop:workflow-select-project', async (event) => {
+    validateInvoke(event);
+    if (!mainWindow) return { status: 'unavailable', reason: 'window_unavailable' };
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose a project directory',
+      properties: ['openDirectory'],
+    });
+    if (picked.canceled || picked.filePaths.length !== 1) {
+      return { status: 'unavailable', reason: 'selection_cancelled' };
+    }
+    const directory = picked.filePaths[0]!;
+    const granted = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Grant project access'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: 'Grant project access',
+      message: `Allow AETHER to inspect, read, search and — only after exact-preview approval — edit files in:\n\n${directory}`,
+      detail: 'Access is limited to this directory and this session. It is never broadened or silently restored after a restart.',
+    });
+    if (granted.response !== 1) return { status: 'unavailable', reason: 'registration_declined' };
+    try {
+      const project = await workflow.registerProject(directory);
+      return { status: 'ready', project };
+    } catch {
+      return { status: 'unavailable', reason: 'registration_failed' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-open-file', async (event, relativePath: unknown) => {
+    validateInvoke(event);
+    if (typeof relativePath !== 'string' || !relativePath || relativePath.length > 512) {
+      return { status: 'unavailable', reason: 'invalid_path' };
+    }
+    try {
+      return await workflow.openFile(relativePath);
+    } catch {
+      return { status: 'unavailable', reason: 'open_failed' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-prepare-edit', async (event, find: unknown, replace: unknown) => {
+    validateInvoke(event);
+    if (typeof find !== 'string' || typeof replace !== 'string' || find.length > 4096 || replace.length > 4096) {
+      return { status: 'unavailable', reason: 'invalid_edit' };
+    }
+    try {
+      return await workflow.prepareEdit(find, replace);
+    } catch {
+      return { status: 'unavailable', reason: 'prepare_failed' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-prepare-undo', async (event, receiptId: unknown) => {
+    validateInvoke(event);
+    if (typeof receiptId !== 'string' || !UUID.test(receiptId)) {
+      return { status: 'unavailable', reason: 'invalid_receipt' };
+    }
+    try {
+      return await workflow.prepareUndo(receiptId);
+    } catch {
+      return { status: 'unavailable', reason: 'prepare_failed' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-receipt', async (event, receiptId: unknown) => {
+    validateInvoke(event);
+    if (typeof receiptId !== 'string' || !UUID.test(receiptId)) {
+      return { status: 'unavailable', message: 'invalid_receipt' };
+    }
+    try {
+      return parseEditReceipt(await backend.liveGetReceipt(receiptId));
+    } catch {
+      return { status: 'unavailable', message: 'receipt_unavailable' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-state', (event) => {
+    validateInvoke(event);
+    return workflow.state();
+  });
 }
 
 function createWindow(): void {
@@ -176,16 +276,23 @@ function createWindow(): void {
   const trustedUrl = pathToFileURL(RENDERER_FILE).href;
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event, target) => {
+    navigationEpoch += 1;
+    liveApprovalProvider.invalidateOutstanding();
     if (target !== trustedUrl) event.preventDefault();
   });
   mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
   mainWindow.webContents.on('render-process-gone', () => { void backend.stop(); });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
-  mainWindow.on('closed', () => { mainWindow = undefined; });
+  mainWindow.on('closed', () => {
+    navigationEpoch += 1;
+    liveApprovalProvider.invalidateOutstanding();
+    mainWindow = undefined;
+  });
   void mainWindow.loadFile(RENDERER_FILE);
 }
 
 async function shutdown(): Promise<void> {
+  liveApprovalProvider.invalidateOutstanding();
   await backend.stop();
   app.exit(0);
 }
