@@ -338,16 +338,28 @@ class EditExecutor:
             raise EditDenied(fs_errors.UNSUPPORTED_RESOURCE_TYPE, "target is not a regular file")
         if getattr(current, "st_nlink", 1) > 1:
             raise EditDenied(fs_errors.HARD_LINK_DENIED, "hard-linked targets are refused")
+        arguments: dict[str, Any] = {
+            "resource_id": request.resource_id,
+            "step_id": str(request.step_id),
+            "approval_id": str(request.approval_id),
+            "expected_sha256": request.expected_sha256,
+        }
+        if self._plans is not None:
+            # Phase 2 final integration: the grant binds the persisted step's
+            # exact arguments — the same hash the consumption presents — so
+            # present those verbatim rather than a reconstructed subset. A
+            # subset silently drops undo's receipt/snapshot identity and can
+            # never match the issued operation. If the step cannot be loaded,
+            # keep the historical shape and let the binding checks below
+            # refuse with their usual reason; the scope check never gets a
+            # chance to authorize anything on this path either way.
+            with contextlib.suppress(EditDenied):
+                arguments = dict(self._plan_step(request, capability_id=capability_id).arguments)
         request_shape = ToolRequest(
             request_id=str(request.step_id),
             task_id=str(request.task_id),
             capability_id=capability_id,
-            arguments={
-                "resource_id": request.resource_id,
-                "step_id": str(request.step_id),
-                "approval_id": str(request.approval_id),
-                "expected_sha256": request.expected_sha256,
-            },
+            arguments=arguments,
             resources=[
                 ResourceRef(
                     kind="file",

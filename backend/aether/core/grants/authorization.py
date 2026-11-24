@@ -160,10 +160,30 @@ def _canonical_json(payload: object) -> str:
     )
 
 
+def operation_hashes(step: PlanStep) -> tuple[str, str]:
+    """The (arguments, effect) hashes an ``ApprovedOperation`` must carry.
+
+    Public so the composition layer builds operations with exactly the rule
+    issuance verifies; see :func:`_step_operation_hashes` for the semantics.
+    """
+
+    return _step_operation_hashes(step)
+
+
 def _step_operation_hashes(step: PlanStep) -> tuple[str, str]:
     arguments_json = _canonical_json(_thaw_json(step.arguments))
-    effect_json = _canonical_json(_thaw_json(step.expected_effect))
-    return _hash_text(arguments_json), _hash_text(effect_json)
+    effect = _thaw_json(step.expected_effect)
+    # Phase 2 final integration: for edit steps the executor's effect identity
+    # is the persisted ``approved_effect_digest`` — it is what the executor
+    # presents at grant scope-check and consumption time, and it refuses any
+    # other value (``approved_effect_digest_mismatch``). The operation must
+    # therefore bind that same digest, or no issued grant could ever be spent
+    # by the real executor. Steps without an approved-effect binding (all
+    # non-edit steps) keep the whole-effect canonical hash as before.
+    approved_effect = effect.get("approved_effect_digest") if isinstance(effect, dict) else None
+    if isinstance(approved_effect, str) and approved_effect:
+        return _hash_text(arguments_json), approved_effect.casefold()
+    return _hash_text(arguments_json), _hash_text(_canonical_json(effect))
 
 
 def check_operation_binding(

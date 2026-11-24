@@ -615,7 +615,10 @@ class SQLiteTaskStore:
                 raise IllegalPersistentTransition(
                     f"illegal execution transition: {current} -> {to_state}"
                 )
-            if to_state is PersistentTaskState.UNVERIFIED and not evidence.mutation_may_have_happened:
+            if (
+                to_state is PersistentTaskState.UNVERIFIED
+                and not evidence.mutation_may_have_happened
+            ):
                 raise IllegalPersistentTransition(
                     "an UNVERIFIED claim requires evidence the mutation may have happened"
                 )
