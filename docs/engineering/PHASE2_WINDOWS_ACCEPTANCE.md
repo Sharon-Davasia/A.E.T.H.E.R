@@ -170,12 +170,17 @@ verdict.
 
 **Production-wiring fact that bounds several scenarios:** production grant
 issuance remains disabled (`GRANT_ISSUANCE_DISABLED`,
-`NullAttestationVerifier`, `IssuanceDisabledConsumptionLedger` default) and
-no live mutation path is wired into the running service. Scenarios whose
-*live* form requires issuing a real grant or mutating a real file are
-therefore **blocked as acceptance demonstrations** until a separately
-authorized, supported live workflow exists. They must not be "demonstrated"
-by bypassing those controls.
+`NullAttestationVerifier`, `IssuanceDisabledConsumptionLedger` default).
+The final integration (branch `integration/phase2-final-live-workflow`,
+see `PHASE2_LIVE_WORKFLOW.md`) now wires a live mutation path into the
+running service and the desktop, but it is gated twice: on the shipped
+schema v1 the mutation tier is absent (`schema_activation_pending`), and
+on schema v2 the production issuer still refuses
+(`grant_issuance_disabled`). Scenarios whose *live* form requires issuing
+a real grant or mutating a real file therefore remain **blocked as
+acceptance demonstrations** until schema activation and production
+issuance are enabled by separately approved changes. They must not be
+"demonstrated" by bypassing those controls.
 
 | # | Scenario (expected behaviour) | Implementation / test files | Automated | Native Windows evidence | Human demonstration | Final verdict |
 |---|---|---|---|---|---|---|
@@ -203,4 +208,26 @@ by bypassing those controls.
 Every scenario still lacks at least one required evidence class — archived
 native Windows evidence, a human demonstration, a genuine interruption, or
 a supported live workflow for the presently disabled mutation path.
+**Formal Phase 2 acceptance remains NOT COMPLETE.**
+
+---
+
+## 9. Live-workflow addendum (final integration, 2026-11-24)
+
+The live workflow is now implemented and wired (channel `LiveBridge`,
+trusted composition root, main-process native-confirmation approval) and
+is exercised end to end in automated tests
+(`test_phase2_live_workflow.py`, `test_phase2_live_adversarial.py`,
+desktop `live-approval.test.ts`) — including edit → receipt → undo under
+the test-scoped ledger configuration. It changes no verdict above:
+
+- the shipped configuration still cannot authorize or mutate
+  (`schema_activation_pending` on v1, `grant_issuance_disabled` on v2 —
+  both asserted by automated tests against the production classes);
+- schema v2 activation and production issuance enablement are separate,
+  not-yet-approved proposals (`PHASE2_LIVE_WORKFLOW.md` §5);
+- once — and only once — those are approved, §6 of
+  `PHASE2_LIVE_WORKFLOW.md` defines the human demonstration procedure
+  for the presently blocked scenarios (6–15, 17, 18) on this machine.
+
 **Formal Phase 2 acceptance remains NOT COMPLETE.**
