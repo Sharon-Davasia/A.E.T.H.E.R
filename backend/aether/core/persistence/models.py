@@ -66,6 +66,28 @@ DISABLED_EXECUTION_STATES = frozenset(
 )
 
 
+class ExecutionEvidence(BaseModel):
+    """Authoritative backend execution evidence (Decision D).
+
+    This is the *only* carrier through which a task may enter an
+    execution/recovery state, via ``SQLiteTaskStore.advance_execution_state``.
+    It is deliberately not satisfiable by renderer or model output: the
+    referenced durable backend artifacts (grant/issuance/consumption rows in
+    the schema-v2 ledger) are re-read by the store itself inside the
+    transition transaction rather than trusted from the caller's claim.
+    ``receipt_id`` names the executor's independently verified receipt;
+    requiring it (non-``None``) is what permits a ``COMPLETED`` claim, so an
+    unverified action can never be recorded as a success. A missing artifact
+    never satisfies a state that requires it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    approval_id: UUID
+    receipt_id: UUID | None = None
+    mutation_may_have_happened: bool = False
+
+
 class PlanStepApprovalStatus(StrEnum):
     NOT_REQUIRED = "NOT_REQUIRED"
     REQUIRED = "REQUIRED"
@@ -302,6 +324,10 @@ class EventMetadata(BaseModel):
             "resource_id",
             "receipt_id",
             "snapshot_id",
+            # Execution-evidence audit (Phase 2 final integration, Decision D).
+            # Records that a backend-evidence-driven transition happened and
+            # whether its mutation may have happened; never file content.
+            "mutation_may_have_happened",
             "pre_sha256",
             "post_sha256",
         }
@@ -338,10 +364,18 @@ class EventMetadata(BaseModel):
                 raise ValueError("event requested outcome is invalid")
             if key == "decision" and item not in {"APPROVE", "REJECT"}:
                 raise ValueError("event decision is invalid")
-            if key == "authority" and item != "NON_AUTHORIZING_AUDIT_RECORD":
+            if key == "authority" and item not in {
+                "NON_AUTHORIZING_AUDIT_RECORD",
+                # Phase 2 final integration (Decision D): marks a state-record
+                # written by the evidence-gated execution transition path. The
+                # event still authorizes nothing; the ledger rows did.
+                "BACKEND_EXECUTION_EVIDENCE",
+            }:
                 raise ValueError("event authority metadata is invalid")
             if key == "requires_fresh_plan_and_consent" and not isinstance(item, bool):
                 raise ValueError("fresh-consent metadata must be boolean")
+            if key == "mutation_may_have_happened" and not isinstance(item, bool):
+                raise ValueError("mutation-may-have-happened metadata must be boolean")
             if key == "preview_digest" and (
                 not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
             ):

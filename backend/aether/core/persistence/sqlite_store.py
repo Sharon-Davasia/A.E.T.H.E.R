@@ -32,6 +32,7 @@ from aether.core.persistence.models import (
     ApprovalDecisionRecord,
     ApprovalDecisionValue,
     EventMetadata,
+    ExecutionEvidence,
     PersistentTaskState,
     TaskPlan,
 )
@@ -208,6 +209,50 @@ _TRANSITIONS: dict[PersistentTaskState, frozenset[PersistentTaskState]] = {
     PersistentTaskState.RECOVERING: frozenset(),
     PersistentTaskState.PARTIALLY_COMPLETED: frozenset(),
     PersistentTaskState.UNVERIFIED: frozenset(),
+}
+
+# Narrow execution/recovery transitions (Decision D). Reachable only through
+# ``advance_execution_state``, never through the general ``transition_task``
+# (which hard-refuses every ``DISABLED_EXECUTION_STATES`` target). Each edge
+# names the minimum durable backend evidence the store re-reads from the
+# schema-v2 grant ledger inside the transition transaction:
+#
+# * ``"grant"``       — an issued, unrevoked grant bound to the task's current
+#                       plan revision and hash;
+# * ``"consumption"`` — ``"grant"`` plus a recorded authoritative consumption
+#                       of that grant for this exact task/plan;
+# * ``"receipt"``     — ``"consumption"`` plus the executor's verified receipt
+#                       identity, which is what makes a success claim honest.
+#
+# Renderer input, model output and audit-only review records can never create
+# these rows, so they can never drive these states. On a schema-v1 database
+# the ledger tables do not exist and every edge fails closed.
+_EXECUTION_TRANSITIONS: dict[PersistentTaskState, dict[PersistentTaskState, str]] = {
+    PersistentTaskState.AWAITING_APPROVAL: {
+        PersistentTaskState.PRECHECK: "grant",
+    },
+    PersistentTaskState.PRECHECK: {
+        PersistentTaskState.EXECUTING: "consumption",
+        PersistentTaskState.CANCELLED: "grant",
+        PersistentTaskState.FAILED: "grant",
+        PersistentTaskState.RECOVERING: "grant",
+    },
+    PersistentTaskState.EXECUTING: {
+        PersistentTaskState.POSTCHECK: "consumption",
+        PersistentTaskState.RECOVERING: "consumption",
+        PersistentTaskState.UNVERIFIED: "consumption",
+    },
+    PersistentTaskState.POSTCHECK: {
+        PersistentTaskState.COMPLETED: "receipt",
+        PersistentTaskState.UNVERIFIED: "consumption",
+        PersistentTaskState.RECOVERING: "consumption",
+    },
+    PersistentTaskState.RECOVERING: {
+        PersistentTaskState.COMPLETED: "receipt",
+        PersistentTaskState.PARTIALLY_COMPLETED: "receipt",
+        PersistentTaskState.UNVERIFIED: "consumption",
+        PersistentTaskState.FAILED: "grant",
+    },
 }
 
 _PHASE1_TO_PERSISTENT: dict[TaskState, PersistentTaskState] = {
@@ -521,6 +566,105 @@ class SQLiteTaskStore:
                 metadata_values=values,
                 now=timestamp,
                 error_code=error_code,
+            )
+        return self.get_task(task_id)
+
+    def advance_execution_state(
+        self,
+        task_id: UUID,
+        to_state: PersistentTaskState,
+        *,
+        evidence: ExecutionEvidence,
+        now: datetime | None = None,
+    ) -> StoredTask:
+        """Advance a task through one narrow execution/recovery transition.
+
+        This is the *only* way to enter ``PRECHECK``, ``EXECUTING``,
+        ``POSTCHECK``, ``RECOVERING``, ``PARTIALLY_COMPLETED`` or
+        ``UNVERIFIED`` (and to leave them for ``COMPLETED``/``FAILED``/
+        ``CANCELLED``); the general :meth:`transition_task` hard-refuses those
+        targets. The transition is granted only when the store itself, inside
+        this transaction, re-reads the durable backend evidence the edge
+        requires from the schema-v2 grant ledger (see
+        ``_EXECUTION_TRANSITIONS``): the authoritative grant bound to the
+        task's *current* plan revision/hash, a recorded consumption of it, and
+        — for any success claim — the executor's verified receipt identity.
+
+        Renderer input, model output and audit-only review records cannot
+        create those rows and therefore can never drive these states. On a
+        schema-v1 database the ledger tables do not exist and this method
+        fails closed, so the shipped configuration (schema v1) keeps every
+        execution state unreachable until schema activation is separately
+        approved.
+        """
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            if int(connection.execute("PRAGMA user_version").fetchone()[0]) < 2:
+                raise IllegalPersistentTransition(
+                    "execution/recovery states require the schema version 2 grant ledger"
+                )
+            row = connection.execute(
+                "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown task id")
+            current = PersistentTaskState(row["state"])
+            required = _EXECUTION_TRANSITIONS.get(current, {}).get(to_state)
+            if required is None:
+                raise IllegalPersistentTransition(
+                    f"illegal execution transition: {current} -> {to_state}"
+                )
+            if to_state is PersistentTaskState.UNVERIFIED and not evidence.mutation_may_have_happened:
+                raise IllegalPersistentTransition(
+                    "an UNVERIFIED claim requires evidence the mutation may have happened"
+                )
+            plan_revision = int(row["plan_revision"])
+            plan_hash = row["plan_hash"]
+            grant = connection.execute(
+                "SELECT g.approval_id AS approval_id, s.revoked_at AS revoked_at "
+                "FROM exact_approval_grants AS g "
+                "JOIN exact_approval_grant_state AS s ON s.approval_id = g.approval_id "
+                "WHERE g.approval_id = ? AND g.task_id = ? AND g.plan_revision = ? "
+                "AND g.plan_hash = ?",
+                (str(evidence.approval_id), str(task_id), plan_revision, plan_hash),
+            ).fetchone()
+            if grant is None or grant["revoked_at"] is not None:
+                raise IllegalPersistentTransition(
+                    "execution evidence names no live grant for the task's current plan"
+                )
+            if required in ("consumption", "receipt"):
+                consumed = connection.execute(
+                    "SELECT 1 FROM exact_approval_grant_consumptions "
+                    "WHERE approval_id = ? AND task_id = ? AND plan_revision = ? "
+                    "AND plan_hash = ? LIMIT 1",
+                    (str(evidence.approval_id), str(task_id), plan_revision, plan_hash),
+                ).fetchone()
+                if consumed is None:
+                    raise IllegalPersistentTransition(
+                        "execution evidence names no recorded grant consumption for this task"
+                    )
+            if required == "receipt" and evidence.receipt_id is None:
+                raise IllegalPersistentTransition(
+                    "a verified receipt is required before this state may be recorded"
+                )
+            values: dict[str, str | int | float | bool | None] = {
+                "approval_id": str(evidence.approval_id),
+                "authority": "BACKEND_EXECUTION_EVIDENCE",
+            }
+            if evidence.receipt_id is not None:
+                values["receipt_id"] = str(evidence.receipt_id)
+            if evidence.mutation_may_have_happened:
+                values["mutation_may_have_happened"] = True
+            self._commit_transition_unlocked(
+                connection,
+                task_id,
+                current,
+                to_state,
+                event_type=f"TASK_{to_state.value}",
+                metadata_values=values,
+                now=timestamp,
+                error_code=None,
             )
         return self.get_task(task_id)
 
