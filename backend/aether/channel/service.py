@@ -49,6 +49,7 @@ import time
 from typing import Any
 
 from aether.channel import protocol
+from aether.channel.live_bridge import LiveBridge
 from aether.channel.protocol import canonical
 from aether.channel.review_bridge import ReviewBridge
 from aether.core.composition import CompositionUnavailable, TrustedComposition
@@ -57,6 +58,22 @@ _PING_KIND = "demo.ping"
 _GET_PREVIEW_KIND = "review.get_preview"
 _RECORD_OUTCOME_KIND = "review.record_outcome"
 _GET_OUTCOME_KIND = "review.get_outcome"
+
+# Live workflow kinds (Phase 2 final integration), served by the trusted
+# composition when it could be built; otherwise each answers a bounded
+# `live.error` with reason `composition_unavailable`. There is no generic
+# privileged operation: unknown kinds still terminate the session.
+_LIVE_KINDS = {
+    "project.register": ("register_project", "project.registered"),
+    "project.resolve": ("resolve_resource", "project.resolved"),
+    "task.create": ("create_task", "task.created"),
+    "task.plan": ("plan_task", "task.preview"),
+    "fs.execute_read": ("execute_read", "fs.read_result"),
+    "gesture.begin": ("begin_gesture", "gesture.challenge"),
+    "gesture.submit": ("submit_gesture", "gesture.authorized"),
+    "edit.execute": ("execute_edit", "edit.executed"),
+    "edit.receipt": ("get_receipt", "edit.receipt"),
+}
 
 
 def _hello(session: str, challenge: str, key: bytes) -> dict[str, object]:
@@ -133,13 +150,16 @@ def main() -> int:
 
     bridge = ReviewBridge.from_env(dict(os.environ))
     composition = None
+    live_bridge = None
     if bridge is not None:
         try:
             composition = TrustedComposition.build(store=bridge.store, gesture_key=gesture_key)
+            live_bridge = LiveBridge(composition)
         except CompositionUnavailable:
             # Fail closed for the trusted-execution tier only; the audit-only
             # review surface is independent and keeps working.
             composition = None
+            live_bridge = None
     try:
         inbound_seen: set[str] = set()
         inbound_seq = 1
@@ -202,6 +222,19 @@ def main() -> int:
                     else:
                         response_kind = "review.error"
                         response_payload = _error_payload(reason or "review_unavailable")
+            elif kind in _LIVE_KINDS:
+                method_name, success_kind = _LIVE_KINDS[kind]
+                if live_bridge is None:
+                    response_kind = "live.error"
+                    response_payload = _error_payload("composition_unavailable")
+                else:
+                    result = getattr(live_bridge, method_name)(payload)
+                    if result.get("status") == "unavailable":
+                        response_kind = "live.error"
+                        response_payload = _error_payload(str(result.get("reason")))
+                    else:
+                        response_kind = success_kind
+                        response_payload = result
             else:
                 raise ValueError("unsupported channel message")
 

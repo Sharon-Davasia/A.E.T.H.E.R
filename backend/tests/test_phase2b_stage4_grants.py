@@ -1704,6 +1704,16 @@ def test_no_production_module_issues_grants_or_exposes_ipc() -> None:
     Neither the issuer, the attestation model, the storage primitive nor the
     single-use permit may be referenced elsewhere, so there is no second
     production-capable path into the ledger.
+
+    Sole reviewed exception (Phase 2 final integration, Decision C):
+    ``aether/core/composition.py`` is the single trusted composition root. It
+    is the one place allowed to construct the issuer and the attestation,
+    because every trusted component must be built over the same store, lock
+    and clock. The exception does not enable issuance: the composition builds
+    the ledger in its production configuration, so the issuer still refuses
+    every call with ``GRANT_ISSUANCE_DISABLED`` until a separately approved
+    activation enables it. Any other module referencing these markers fails
+    this scan.
     """
 
     backend = Path(__file__).parents[1]
@@ -1713,13 +1723,17 @@ def test_no_production_module_issues_grants_or_exposes_ipc() -> None:
         "_persist_verified_grant",
         "IssuancePermit",
     )
+    reviewed_composition_root = "aether/core/composition.py"
     offenders: list[str] = []
     for path in (backend / "aether").rglob("*.py"):
         if "core/grants" in path.as_posix():
             continue
+        relative = path.relative_to(backend).as_posix()
+        if relative == reviewed_composition_root:
+            continue
         text = path.read_text(encoding="utf-8")
         if any(marker in text for marker in markers):
-            offenders.append(path.relative_to(backend).as_posix())
+            offenders.append(relative)
     assert offenders == []
 
 
