@@ -30,9 +30,7 @@ import base64
 import binascii
 import hashlib
 import json
-import os
 import re
-import stat
 from collections.abc import Callable
 from datetime import datetime
 from uuid import UUID, uuid4
@@ -54,7 +52,8 @@ from aether.core.planning.authorizing_gesture import (
     SignedGesture,
 )
 from aether.core.planning.planner import PlanGoal, PlanIntent, PlannerError
-from aether.core.resources.path_safety import PathSafetyError, reject_reparse_components
+from aether.core.resources.bounded_read import BoundedReadError, read_bounded_bytes
+from aether.core.resources.path_safety import PathSafetyError
 from aether.core.resources.registry import ResourceRegistryError
 from aether.core.review_contract import electron_preview_payload
 from aether.core.vault.undo_vault import VaultError
@@ -615,16 +614,14 @@ class LiveBridge:
         }
 
     def _current_file_sha256(self, resource_id: str) -> str:
-        """Bounded, revalidating SHA-256 of a registered file (FI-06).
+        """Bounded, revalidating SHA-256 of a registered file (FI-06/FI-06A).
 
-        The stored resolution is never trusted at face value: the resource
-        is re-resolved through the registry (containment + reparse-point
-        rejection), the re-resolved identity must match the issued one,
-        and the file is then hashed by streaming bounded chunks from an
-        opened descriptor whose fstat identity must match the resolved
-        path (regular file, single hard link, size-capped). No unbounded
-        allocation, and the descriptor — not a second path lookup — is
-        what gets read.
+        The stored resolution is never trusted at face value: the
+        resource is re-resolved through the registry (containment +
+        reparse-point rejection), the re-resolved identity must match
+        the issued one, and the bytes come from the shared
+        security-reviewed bounded read (descriptor identity, regular
+        file, hard-link and size checks, consistent snapshot).
         """
 
         registry = self._composition.registry
@@ -632,37 +629,11 @@ class LiveBridge:
         resolved = registry.resolve(stored.root_id, stored.relative_path)
         if resolved.ref.resource_id != stored.ref.resource_id:
             raise _Refused("resource_identity_mismatch")
-        path = resolved.canonical_path
-        reject_reparse_components(path)
-        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(path, flags)
-        except OSError as exc:
-            raise _Refused("target_unavailable") from exc
-        try:
-            info = os.fstat(descriptor)
-            path_info = path.lstat()
-            if (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino):
-                raise _Refused("resource_identity_mismatch")
-            if not stat.S_ISREG(info.st_mode):
-                raise _Refused("target_not_a_regular_file")
-            if info.st_nlink > 1:
-                raise _Refused("target_hard_linked")
-            if info.st_size > _MAX_TARGET_BYTES:
-                raise _Refused("target_too_large")
-            digest = hashlib.sha256()
-            total = 0
-            while True:
-                chunk = os.read(descriptor, _HASH_CHUNK_BYTES)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > _MAX_TARGET_BYTES:
-                    raise _Refused("target_too_large")
-                digest.update(chunk)
-            return digest.hexdigest()
-        finally:
-            os.close(descriptor)
+            data = read_bounded_bytes(resolved, max_bytes=_MAX_TARGET_BYTES)
+        except BoundedReadError as exc:
+            raise _Refused(exc.reason_code) from exc
+        return hashlib.sha256(data).hexdigest()
 
     def _parse_gesture(self, payload: object) -> SignedGesture:
         if not isinstance(payload, dict) or set(payload) != {

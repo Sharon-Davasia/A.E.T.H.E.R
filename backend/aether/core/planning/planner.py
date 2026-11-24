@@ -35,6 +35,7 @@ from aether.core.contracts.policy import RiskTier
 from aether.core.persistence.models import PlanStep, TaskPlan, TaskPlanResource
 from aether.core.planning.edit_binding import ApprovedEdit, EditBindingError
 from aether.core.policy.capabilities import CapabilityRegistry, CapabilityRegistryError
+from aether.core.resources.bounded_read import BoundedReadError, read_bounded_bytes
 from aether.core.resources.registry import ResourceRegistry, ResourceRegistryError
 
 _PLAN_NAMESPACE = UUID("6f1f4a52-2c3e-4b7a-9b1e-6a1d2c3b4a50")
@@ -222,13 +223,14 @@ class Planner:
         """Render and bind the exact change the user is being asked to approve."""
 
         assert intent.proposed_content is not None  # guarded by plan()
+        # FI-06A: the pre-image comes from the shared security-reviewed
+        # bounded access mechanism (identity-validated, size-capped,
+        # consistent snapshot) — never an unbounded read_bytes(). The
+        # same bytes feed the hash and the exact diff.
         try:
-            pre_image = resolved.canonical_path.read_bytes()
-        except OSError as exc:
-            raise PlannerError(
-                "PLAN_SOURCE_UNREADABLE",
-                "the current content could not be read, so no exact diff can be shown",
-            ) from exc
+            pre_image = read_bounded_bytes(resolved)
+        except BoundedReadError as exc:
+            raise PlannerError(exc.reason_code, str(exc)) from exc
         try:
             return ApprovedEdit.build(
                 resource_id=resolved.ref.resource_id,
