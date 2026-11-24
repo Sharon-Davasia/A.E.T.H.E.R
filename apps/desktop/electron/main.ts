@@ -114,6 +114,17 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
   const env: NodeJS.ProcessEnv = process.platform === 'win32'
     ? { SYSTEMROOT: systemRoot, WINDIR: systemRoot, PATH: `${runtimeDir};${join(systemRoot, 'System32')}` }
     : { PATH: `${runtimeDir}:/usr/bin:/bin`, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
+  // FI-02A: supported application storage for EVERY build. The database
+  // lives in the OS per-user application-data directory; the renderer
+  // can neither see nor influence the path. Windows acceptance uses an
+  // isolated fixture database via AETHER_FIXTURE_DB (development /
+  // fixture launches only, absolute path inside the fixture root) so no
+  // real user data is ever touched.
+  const fixtureDb = process.env.AETHER_FIXTURE_DB;
+  const appDatabasePath = (!packaged && fixtureDb && isAbsolute(fixtureDb))
+    ? resolve(fixtureDb)
+    : join(app.getPath('userData'), 'aether', 'tasks.sqlite3');
+  env.AETHER_APP_DB = appDatabasePath;
   if (!packaged) {
     // Development-only, absolute-path passthroughs for the trusted review
     // source. The renderer can neither see nor influence them. Without them

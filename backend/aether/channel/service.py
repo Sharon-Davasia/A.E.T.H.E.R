@@ -31,9 +31,14 @@ review operations backed by the real persisted task/plan store:
   it only reports what the persisted audit records already prove.
 
 There is no generic privileged operation: unknown kinds terminate the session.
-The service holds an exclusive owner lock on the development database named by
-``AETHER_REVIEW_DB``; when the variable is absent or unusable, review
-operations answer ``review_unavailable`` and the ping path keeps working.
+Storage initialization (FI-02A): the supported application database named
+by ``AETHER_APP_DB`` (passed by Electron main for every build) opens via
+``aether.channel.app_storage`` with the store's owner lock, private
+permissions and active-schema-only migrations. The development review
+database named by ``AETHER_REVIEW_DB`` is a dev-only seed mechanism; when
+it is explicitly configured it takes precedence for the shared store.
+When neither is usable, live operations answer ``composition_unavailable``
+and review operations ``review_unavailable``; the ping path keeps working.
 
 No operation here issues, stores, consumes or implies an ExactApprovalGrant;
 every acknowledgement carries ``NON_AUTHORIZING_AUDIT_RECORD`` semantics.
@@ -49,6 +54,7 @@ import time
 from typing import Any
 
 from aether.channel import protocol
+from aether.channel.app_storage import open_application_store
 from aether.channel.live_bridge import LiveBridge
 from aether.channel.protocol import canonical
 from aether.channel.review_bridge import ReviewBridge
@@ -149,12 +155,21 @@ def main() -> int:
     gesture_key = bootstrap[offset + 80 : offset + 112]
     _emit_bounded(_hello(session, challenge, key))
 
-    bridge = ReviewBridge.from_env(dict(os.environ))
+    env = dict(os.environ)
+    bridge = ReviewBridge.from_env(env)
+    # FI-02A: the supported application store (AETHER_APP_DB, passed by
+    # Electron main for every build) initializes the trusted composition
+    # independently of the development review seed. The review seed —
+    # when explicitly configured — keeps precedence for the store the
+    # composition shares, exactly as before; otherwise the application
+    # store is used. Misconfiguration fails closed to no composition.
+    app_store = None if bridge is not None else open_application_store(env)
     composition = None
     live_bridge = None
-    if bridge is not None:
+    composition_store = bridge.store if bridge is not None else app_store
+    if composition_store is not None:
         try:
-            composition = TrustedComposition.build(store=bridge.store, gesture_key=gesture_key)
+            composition = TrustedComposition.build(store=composition_store, gesture_key=gesture_key)
             live_bridge = LiveBridge(composition)
         except CompositionUnavailable:
             # Fail closed for the trusted-execution tier only; the audit-only
@@ -169,7 +184,7 @@ def main() -> int:
         while True:
             raw = protocol.read_frame(sys.stdin.buffer)
             if raw is None:
-                return 0
+                break
             request = protocol.validate(
                 raw,
                 key=key,
@@ -269,6 +284,8 @@ def main() -> int:
             composition.close()
         if bridge is not None:
             bridge.close()
+        if app_store is not None:
+            app_store.close()
 
 
 if __name__ == "__main__":
