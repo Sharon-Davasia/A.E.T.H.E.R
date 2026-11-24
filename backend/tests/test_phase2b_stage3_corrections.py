@@ -103,7 +103,9 @@ class ServiceProcess:
         self.session = secrets.token_hex(16)
         challenge = secrets.token_bytes(32)
         try:
-            self.process.stdin.write(MAGIC + bytes.fromhex(self.session) + self.key + challenge + bytes(32))
+            self.process.stdin.write(
+                MAGIC + bytes.fromhex(self.session) + self.key + challenge + bytes(32)
+            )
             self.process.stdin.flush()
             hello = read_frame(self.process.stdout)
             assert hello["kind"] == "channel.hello"

@@ -58,7 +58,9 @@ GOLDEN_SIGNATURE_FRACTIONAL = "a20500762dbd03d58d7a8bb72362b345c1dc6ef494e11f823
 NOW = datetime(2026, 11, 15, 12, 0, 30, tzinfo=UTC)
 
 
-def _register_with_golden_nonce(monkeypatch: pytest.MonkeyPatch, *, at: datetime) -> GestureNonceRegister:
+def _register_with_golden_nonce(
+    monkeypatch: pytest.MonkeyPatch, *, at: datetime
+) -> GestureNonceRegister:
     monkeypatch.setattr(gesture_module.secrets, "token_hex", lambda _n: GOLDEN_NONCE)
     nonces = GestureNonceRegister(clock=lambda: at)
     assert nonces.issue(GOLDEN_BINDING) == GOLDEN_NONCE
