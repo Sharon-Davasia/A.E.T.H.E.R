@@ -93,7 +93,7 @@ review surface keeps working.
 |---|---|---|---|
 | Schema v1 (shipped) | work | mutation tier absent → `schema_activation_pending` | `schema_activation_pending` |
 | Schema v2, production ledger | work | valid signed gesture refused → `grant_issuance_disabled` | refused; file untouched |
-| Schema v2, test-scoped ledger (tests only) | work | works | works — reachable only from allow-listed test modules |
+| Schema v2, test-scoped ledger (tests only) | work | works | works — reachable only via test-scoped construction. These tests are **not** production-enablement evidence: the construction discipline they exercise is not an authorization boundary (see Proposal B correction). |
 
 ## 5. Separately reviewable activation proposals (NOT in this PR)
 
@@ -108,57 +108,226 @@ migration itself remains an operator action with a verified backup first.
 
 ### Proposal B — production grant issuance enablement
 
-Give the production ledger a production trust-source policy settable only
-from `aether/core/composition.py` (caller-module allowlist, the same
-mechanism that isolates the test seam), so `GrantIssuer.issue` accepts
-the central `authorize_issuance` permit for gestures verified by
-`ProductionAttestationVerifier` against the per-launch gesture authority.
-Prerequisites: Proposal A live, full backend + desktop suites green on
-the target Windows machine, `verify_phase2.ps1` updated to exercise the
-live path, and the §6 demonstration procedure rehearsed on fixtures.
+Give the production ledger a production trust-source policy so
+`GrantIssuer.issue` accepts the central `authorize_issuance` permit for
+gestures verified by `ProductionAttestationVerifier` against the
+per-launch gesture authority, fed by the FI-01 trusted confirmation
+(complete exact preview in a main-owned native dialog, shown == signed).
+
+**Correction (independent review, FI): a caller-module allowlist is NOT
+an authorization boundary.** The allowlist used to isolate the
+test-scoped ledger seam enforces *composition discipline only* — it
+shows which module constructed an object. It cannot establish human
+consent, and inside a single process it is not unforgeable: any code
+running in the process could satisfy it. It must therefore never be
+described or relied upon as the mechanism that authorizes production
+issuance. The real authorization chain is, and must remain:
+
+1. an independently verified trusted confirmation (FI-01) over the
+   complete authoritative exact preview;
+2. an authenticated authorizing gesture (per-launch HMAC key, single-use
+   nonce, exact binding);
+3. the authoritative preview recomputed and matched server-side;
+4. an exact grant binding (task, plan, step, scope and result digests);
+5. the central issuance decision in the grant authority/ledger.
+
+Prerequisites: Proposal A live, FI-01/FI-02 complete, full backend +
+desktop suites green on the target Windows machine, `verify_phase2.ps1`
+updated to exercise the live path, and the §6 demonstration procedure
+rehearsed on fixtures. Production issuance stays disabled until this
+proposal is separately approved and implemented.
 
 Neither proposal is implemented here. `NullAttestationVerifier` and the
 `GRANT_ISSUANCE_DISABLED` default remain exactly as shipped.
 
-## 6. Windows demonstration procedure (after activation is approved)
+## 6. Windows acceptance procedure (18 scenarios)
 
-On the target Windows 11 laptop (normal user, fixtures only — never real
-data), with a separately approved activation build:
+Target: Windows 11 laptop, **normal (non-elevated) user**, PowerShell 5.1,
+synthetic fixtures only — never real data. Use `npm.cmd` (never bare
+`npm`, never an execution-policy bypass: if script policy blocks a step,
+stop and have the machine owner set an approved policy; do not work
+around it).
 
-1. Run `scripts/verify_phase2.ps1` — every recorded item must be `PASS`
-   (exit 0). Do not proceed on `NOT VERIFIED`.
-2. Start the desktop app pointed at a fixture project (dev configuration:
-   `AETHER_REVIEW_DB`, `AETHER_REVIEW_TASK_ID`, fixture root only).
-3. Scenario 6: read the exact preview (incl. CRLF/EOF summary) in the UI.
-4. Scenario 7→8: click *Approve & execute exact action…*; confirm the
-   native dialog names the exact effect; affirm. Verify the file's new
-   hash matches the preview's approved bytes and a receipt exists.
-5. Scenario 13: plan an undo for that receipt, approve natively, verify
-   the original bytes are restored exactly.
-6. Scenarios 9/14: modify the file after preview (and after an edit, for
-   undo) and confirm both stale-approval and silent-overwrite refusals.
-7. Scenario 10: attempt a replayed gesture (restart the app and re-use a
-   spent approval) — refused; the file does not change.
-8. Scenario 12: restart the app; receipts re-read from disk.
-9. Scenario 15: kill the app mid-execution; on restart the task must be
-   `UNVERIFIED` or truthfully recovered — never false success.
-10. Scenarios 17/18: fixture tree hashes unchanged outside the approved
-    edits; machine offline throughout.
+### 6.0 Gate semantics — automated success is not formal acceptance
 
-Record results in `PHASE2_ACCEPTANCE_REPORT.md`; any `NOT VERIFIED`
-keeps formal acceptance **NOT COMPLETE**.
+Two different things must not be conflated:
+
+- **Automated gate success**: `scripts/verify_phase2.ps1` records every
+  automated item `PASS`. Because the verifier *by design* always records
+  the human-demonstration items `NOT VERIFIED`, a fully successful
+  automated run exits **2**, not 0. **Exit 2 / NOT VERIFIED does not
+  block starting the human demonstrations below** — the demonstrations
+  are precisely what can convert those items. Only an automated `FAIL`
+  (exit 1) blocks proceeding.
+- **Formal acceptance**: complete only when all 18 scenarios below are
+  recorded `PASS` with archived evidence on the target machine, *after*
+  separately approved schema activation and production-issuance
+  enablement. Until then formal Phase 2 acceptance is **NOT COMPLETE**,
+  regardless of automated results.
+
+> **Safety warning (preserved):** the verifier has not been
+> independently reviewed and must not be run on a machine holding real
+> data until it is. Before recommending its execution, independently
+> review `aether.core.acceptance.fixture_safety` and its negative tests
+> (sibling prefixes, unmarked directories, junctions and arbitrary paths
+> are refused). The procedure below uses only fixture directories under
+> an explicit fixture base; nothing outside them may be touched.
+
+Setup (once): create the fixture project under the fixture base with two
+small text files (`sample.txt` containing `hello world`, `other.txt`),
+start the activation-approved build, and record SHA-256 hashes of the
+whole fixture tree as the baseline for scenarios 17–18. Evidence for
+every scenario: the verifier evidence JSON/Markdown, plus dated
+screenshots or notes naming the scenario, the observed dialog text, and
+the before/after file hashes. Record each scenario PASS or FAIL;
+cleanup after each scenario restores the fixture from the pristine
+synthetic copy (never by editing hashes or deleting receipts).
+
+1. **Open a registered project; bounded access only.**
+   Prereq: clean fixture, app started. Actions: *Choose project
+   directory…*, select the fixture directory, affirm the native
+   grant-access dialog naming that directory. Expected: project
+   registered; opening `../` paths or absolute outside paths is refused.
+   PASS: registration only after native affirmation; outside reads
+   refused. Cleanup: none (session state only).
+2. **Search + read an allowed file.** Actions: open `sample.txt` via the
+   workflow; use search/read. Expected: exact bytes displayed, hash
+   shown matches `Get-FileHash`. PASS: byte-identical content. Cleanup:
+   none.
+3. **Refuse reads outside authorized roots.** Actions: attempt to open a
+   file outside the fixture root. Expected: bounded refusal, no content.
+   PASS: refusal observed. Cleanup: none.
+4. **Refuse `.env`/sensitive files without authorization.** Actions:
+   place a synthetic `.env` in the fixture; attempt to open it.
+   Expected: refusal. PASS: no bytes disclosed. Cleanup: delete the
+   synthetic `.env`.
+5. **Deny junction/symlink escape.** Actions (non-elevated):
+   `cmd /c mklink /J fixture\escape <outside-dir>`; attempt to open a
+   file through it. Expected: `reparse_point_not_allowed` refusal.
+   PASS: no outside bytes read. Cleanup: `cmd /c rmdir fixture\escape`
+   (removes the junction only).
+6. **Human-visible exact patch preview before approval.** Actions:
+   prepare an edit `hello world` → `hello aether`; read the preview in
+   the UI and in the native approval dialog. Expected: complete unified
+   diff including CRLF/EOF notes, resource identity, recovery class and
+   plan hash — not truncated. PASS: dialog text contains the complete
+   changed lines. Cleanup: cancel the dialog.
+7. **Refuse mutation before approval.** Actions: prepare the edit, then
+   inspect the file without approving. Expected: file hash unchanged;
+   no receipt. PASS: baseline hash intact. Cleanup: none.
+8. **Apply the exact approved edit; hash matches.** Actions: affirm the
+   native dialog. Expected: executed outcome with a receipt id; file
+   hash equals the preview's approved result hash. PASS: hash equality
+   + receipt displayed. Cleanup: keep the receipt id for 12–14.
+9. **Refuse stale approval after post-preview modification.** Actions:
+   prepare an edit; modify `sample.txt` externally; then approve.
+   Expected: refusal (stale target/conflict); the external bytes remain.
+   PASS: no overwrite. Cleanup: restore fixture file from pristine copy.
+10. **Reject forged/expired/revoked/exhausted/replayed grants.**
+    Actions: after scenario 8, restart the app and attempt to re-use
+    the spent approval; observe refusal. (Forged/expired variants are
+    covered by the automated adversarial suites; the live half is the
+    replay refusal.) Expected: refusal, file unchanged. PASS: refusal.
+    Cleanup: none.
+11. **Consumption binds the exact action.** Actions: prepare edit A,
+    approve; verify only A's bytes were applied and a second, different
+    prepared edit B was not. Expected: file equals A exactly. PASS:
+    byte equality with A, B absent. Cleanup: restore pristine fixture.
+12. **Receipts durable across restart.** Actions: note scenario 8's
+    receipt id; fully restart the app; *Show receipt*. Expected: same
+    receipt, `SUCCEEDED`, verified, with snapshot id. PASS: identical
+    receipt fields. Cleanup: none.
+13. **Undo restores the exact original bytes.** Actions: *Prepare undo
+    from receipt* (scenario 8 receipt); affirm the native dialog (the
+    preview must show the derived restoration; no content is typed).
+    Expected: file hash equals the pre-edit baseline. PASS: hash
+    equality. Cleanup: none.
+14. **Undo refuses silent overwrite of a newer edit.** Actions: edit the
+    file again (scenario 8), then modify it externally, then prepare
+    undo of the first receipt. Expected: `undo_conflict_newer_change`
+    refusal; newer bytes intact. PASS: refusal + intact bytes. Cleanup:
+    restore pristine fixture.
+15. **Truthful crash/cancel recovery.** Actions: begin an approved edit
+    and kill the app process mid-execution (Task Manager, fixture only);
+    restart. Expected: task is `UNVERIFIED` or truthfully reconciled —
+    never a false success; on restart, mutation is blocked pending
+    reconciliation for unresolved tasks. PASS: no false `COMPLETED`;
+    file is either fully old or fully new, hash-verified. Cleanup:
+    restore pristine fixture; record the observed state.
+16. **T3/shell/unsupported capabilities denied.** Actions: attempt any
+    UI path beyond inspect/read/search/approved edit/undo (none should
+    exist); confirm no shell or arbitrary-command surface is offered.
+    Expected: denial/absence. PASS: no unsupported action possible.
+    Cleanup: none.
+17. **Zero unauthorized mutation across the run.** Actions: after all
+    scenarios, re-hash the fixture tree. Expected: only the approved
+    edits (8, 13, 14's approved half) differ from baseline; receipts
+    account for each difference. PASS: every changed hash maps to a
+    receipt. Cleanup: remove the fixture via the reviewed fixture
+    procedure only.
+18. **Offline; zero unauthorized outbound disclosure.** Actions: run
+    the whole procedure with the machine offline (airplane mode);
+    observe no network dependency or failure, and no outbound traffic
+    in the OS network view. Expected: full workflow works offline.
+    PASS: completed offline. Cleanup: restore network settings.
+
+Record results in `PHASE2_ACCEPTANCE_REPORT.md`; any scenario not run or
+`FAIL` keeps formal acceptance **NOT COMPLETE**.
 
 ## 7. Evidence for this integration (Linux, Python 3.11.2)
 
+Corrected head (FI-01…FI-08) results, this sandbox:
+
 | Gate | Result |
 |---|---|
-| Backend full suite | **882 passed / 5 skipped** (`pytest backend/tests`) |
+| Backend full suite | **918 passed / 5 skipped** (`pytest backend/tests`) |
 | Backend ruff / format / mypy (strict) | PASS (97 files) |
-| Desktop suite | **77 passed / 0 failed / 7 skipped** (`npm test`, 84 tests) |
-| Desktop typecheck (electron + renderer) + build | PASS |
+| Desktop suite (`npm test`, no Python env) | **83 passed / 0 failed / 7 skipped** (90 tests) |
+| Desktop suite with `AETHER_DEV_PYTHON` set | **90 passed / 0 failed / 0 skipped** (real Python child, production-shaped channel) |
+| Desktop full gate (`npm run check`: lint, typecheck, tests, Python tests, electron build) | PASS |
 | Gesture golden interop (Python ↔ TS) | PASS (vectors pinned both sides) |
 
-Python 3.12.10 was unavailable in the Linux sandbox; native Windows
-evidence is still required and unarchived. The desktop count includes
-`pipe.integration.test.ts`, whose pre-WS3 104-byte bootstrap (fixed in
-this integration) previously made the suite hang rather than fail.
+Skip inventory (nothing is silently skipped):
+
+- Backend (5): model-integration test requires
+  `AETHER_RUN_MODEL_INTEGRATION=1` (needs a local model runtime);
+  two vault-key tests are native-Windows-ACL-only; one stage-3 test
+  requires Windows access-denial semantics; one migration test requires
+  `hatchling` (wheel packaging check) which is not installed here.
+- Desktop (7, only when `AETHER_DEV_PYTHON` is unset): all seven are
+  Python-child integration tests in `stage3-review-channel.test.ts`
+  gated on an interpreter with the backend installed; with the venv
+  interpreter provided they run and pass (90/90 above). They are
+  environment-gated, not disabled.
+
+Test-scoped ledger runs (all live-workflow tests above) are **not**
+production-enablement evidence: production issuance remains
+`GRANT_ISSUANCE_DISABLED` and schema v2 remains pending.
+
+### Cryptography dependency review (`cryptography`)
+
+The only third-party cryptographic dependency is PyPI `cryptography`
+(`backend/pyproject.toml`: `>=43,<47`; 46.0.7 in this venv), used
+solely for AES-256-GCM snapshot encryption in the Undo Vault. Licence:
+Apache-2.0 OR BSD-3-Clause (dual-licensed; either is permissive and
+compatible with this project's pending licence decision — see
+`DEPENDENCY_INVENTORY.md`). It links OpenSSL on most wheels; the
+licence notice obligations travel with redistribution, which is a
+release-packaging concern, not a code concern. It never authorizes an
+action; HMAC gesture signing uses the standard library. No other
+component performs cryptography beyond stdlib `hashlib`/`hmac` and the
+desktop's Node `crypto`.
+
+### Python runtime limitations (honest statement)
+
+- All Linux evidence here is **Python 3.11.2**. The target runtime is
+  Python 3.12.10 on native Windows; 3.11.2 results must never be
+  presented as 3.12.10 evidence.
+- The desktop launches the backend with `-P -I -B -u`; `-P`
+  (safe_path) requires Python ≥ 3.11. Anything older is unsupported.
+- Owner-lock, DACL and junction behaviour are Windows-specific and are
+  only verifiable on the target machine (verifier steps; several
+  backend tests skip elsewhere by design, listed above).
+- The backend is a single-process stdio channel service; it has no
+  network listener, no concurrency beyond one child session, and file
+  bounds (4 MiB edit/read caps) are deliberate product limits.
