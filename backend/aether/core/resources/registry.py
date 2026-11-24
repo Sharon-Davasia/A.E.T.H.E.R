@@ -8,7 +8,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from uuid import UUID, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from aether.core.contracts.resource import DataClass, Provenance, ResourceKind, ResourceRef
 from aether.core.resources.path_safety import (
@@ -117,8 +117,19 @@ class ResourceRegistry:
         ):
             raise ResourceRegistryError("explicit_capability_scope_required")
 
+        # Deterministic root identity (FI-02 restart lifecycle): the same
+        # canonical directory, explicitly re-registered after a restart,
+        # re-issues the same root (and therefore the same resource ids),
+        # so durable receipts remain resolvable. This never *restores* a
+        # registration by itself — registration remains an explicit,
+        # user-authorized act — and a second live registration of the same
+        # directory is refused rather than silently aliased.
+        root_id = uuid5(NAMESPACE_URL, f"aether:project-root:{canonical}")
+        if root_id in self._roots:
+            raise ResourceRegistryError("root_already_registered")
+
         root = RegisteredRoot(
-            root_id=uuid4(),
+            root_id=root_id,
             alias=alias.strip(),
             canonical_root=canonical,
             volume=volume,

@@ -329,3 +329,66 @@ def test_undo_refuses_a_failed_receipt(live) -> None:
         receiptId=str(failed.receipt_id),
     )
     assert planned == {"status": "unavailable", "reason": "receipt_not_undoable"}, planned
+
+
+def test_undo_survives_restart_after_explicit_reregistration(live, tmp_path, monkeypatch) -> None:
+    """FI-02 restart lifecycle: nothing is silently restored.
+
+    After a full restart (new store, new registry, new composition),
+    durable receipts remain readable, and explicitly re-registering the
+    same project directory re-issues the same root/resource identities
+    (deterministic uuid5), so the pre-restart receipt can be undone
+    under a fresh plan, gesture and grant. Without re-registration the
+    resource does not exist and undo planning refuses.
+    """
+    from aether.core.persistence.sqlite_store import SQLiteTaskStore
+
+    resource_id, executed = _completed_edit(live)
+    receipt_id = executed["receiptId"]
+    live["composition"].close()
+    live["store"].close()
+
+    store2 = SQLiteTaskStore(tmp_path / "store.sqlite3")
+    ledger2 = open_tests_scoped_ledger(store2)
+    composition2 = TrustedComposition.build(
+        store=store2, gesture_key=GESTURE_KEY, ledger=ledger2, clock=lambda: NOW
+    )
+    bridge2 = LiveBridge(composition2)
+    live2 = {
+        "project": live["project"],
+        "store": store2,
+        "composition": composition2,
+        "bridge": bridge2,
+    }
+    try:
+        # The durable receipt survived the restart and is readable.
+        receipt = bridge2.get_receipt({"receiptId": receipt_id})
+        assert receipt["status"] == "SUCCEEDED", receipt
+        # But the resource is not silently restored: planning refuses
+        # until the user explicitly re-registers the project.
+        task_id = _undo_task(live2)
+        refused = _plan(
+            live2,
+            task_id,
+            goal="undo_edit",
+            resourceId=resource_id,
+            receiptId=receipt_id,
+        )
+        assert refused["status"] == "unavailable", refused
+        # Explicit re-registration re-issues the identical identities.
+        assert _resolve(live2) == resource_id
+        planned = _plan(
+            live2,
+            task_id,
+            goal="undo_edit",
+            resourceId=resource_id,
+            receiptId=receipt_id,
+        )
+        assert "preview" in planned, planned
+        _authorize(live2, task_id)
+        undone = bridge2.execute_edit({"taskId": task_id})
+        assert undone["status"] == "SUCCEEDED", undone
+        assert (live["project"] / "sample.txt").read_bytes() == ORIGINAL
+    finally:
+        composition2.close()
+        store2.close()
