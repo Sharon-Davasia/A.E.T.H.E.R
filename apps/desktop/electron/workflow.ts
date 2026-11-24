@@ -3,12 +3,16 @@ import {
   parseCreatedTask,
   parseEditReceipt,
   parseFileContents,
+  parseOpenOutcome,
   parsePlannedPreview,
+  parseSearchOutcome,
   parseRegisteredProject,
   parseResolvedFile,
   type EditExecuted,
   type FileContents,
+  type OpenOutcome,
   type RegisteredProject,
+  type SearchOutcome,
   type ResolvedFile,
   type WorkflowStep,
 } from '../shared/live.js';
@@ -100,8 +104,57 @@ export class LiveWorkflow {
     return resolved;
   }
 
+  public async searchProject(query: string): Promise<WorkflowStep<SearchOutcome>> {
+    if (!this.project) throw new Error('register a project before searching');
+    const root = parseResolvedFile(
+      await this.backend.liveResolveResource(this.project.rootId, ''),
+    );
+    if (root.status !== 'ready') return root;
+    const taskId = parseCreatedTask(await this.backend.liveCreateTask('Search the project'));
+    const planned = parsePlannedPreview(
+      await this.backend.livePlanSearch(taskId, root.value.resourceId, query),
+    );
+    if (planned.status !== 'ready') return planned;
+    return parseSearchOutcome(await this.backend.liveExecuteRead(taskId));
+  }
+
+  public async openProjectFolder(): Promise<WorkflowStep<OpenOutcome>> {
+    if (!this.project) throw new Error('register a project before opening it');
+    const root = parseResolvedFile(
+      await this.backend.liveResolveResource(this.project.rootId, ''),
+    );
+    if (root.status !== 'ready') return root;
+    const taskId = parseCreatedTask(await this.backend.liveCreateTask('Open the project folder'));
+    const planned = parsePlannedPreview(
+      await this.backend.livePlanOpen(taskId, root.value.resourceId),
+    );
+    if (planned.status !== 'ready') return planned;
+    return parseOpenOutcome(await this.backend.liveExecuteRead(taskId));
+  }
+
   public async prepareEdit(find: string, replace: string): Promise<WorkflowStep<ExactPreview>> {
     if (!this.file || !this.contents) throw new Error('open a file before preparing an edit');
+    // FI-06A: never build a proposed edit from an untrustworthy source
+    // read. A truncated, incomplete, stale or lossy source would make
+    // the proposed bytes silently truncate or corrupt the real file.
+    if (this.contents.truncated) {
+      return { status: 'unavailable', reason: 'source_read_truncated' };
+    }
+    if (
+      this.contents.totalBytes < 0
+      || this.contents.returnedBytes !== this.contents.totalBytes
+    ) {
+      return { status: 'unavailable', reason: 'source_read_incomplete' };
+    }
+    if (this.contents.versionToken !== this.file.version) {
+      return { status: 'unavailable', reason: 'source_stale' };
+    }
+    if (
+      this.contents.encoding !== 'utf-8'
+      || Buffer.from(this.contents.text, 'utf8').byteLength !== this.contents.returnedBytes
+    ) {
+      return { status: 'unavailable', reason: 'source_not_losslessly_representable' };
+    }
     const proposed = buildProposedContents(this.contents.text, find, replace);
     const taskId = parseCreatedTask(await this.backend.liveCreateTask('Apply an approved edit'));
     const planned = parsePlannedPreview(

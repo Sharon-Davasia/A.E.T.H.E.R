@@ -467,6 +467,28 @@ export class BackendClient {
     );
   }
 
+  /** FI-02B workflow: plan a bounded project search. */
+  async livePlanSearch(taskId: string, resourceId: string, query: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(
+      session,
+      'task.plan',
+      { taskId, goal: 'search_project', resourceId, arguments: { query } },
+      ['task.preview', 'live.error'],
+    );
+  }
+
+  /** FI-02B workflow: plan opening the project folder (OS, allow-listed). */
+  async livePlanOpen(taskId: string, resourceId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(
+      session,
+      'task.plan',
+      { taskId, goal: 'open_folder', resourceId },
+      ['task.preview', 'live.error'],
+    );
+  }
+
   /** FI-02 workflow: execute the planned bounded read. */
   async liveExecuteRead(taskId: string): Promise<unknown> {
     const session = this.reviewSession();
@@ -695,5 +717,7 @@ export interface LiveWorkflowBackend {
   livePlanEdit(taskId: string, resourceId: string, proposedText: string): Promise<unknown>;
   livePlanUndo(taskId: string, resourceId: string, receiptId: string): Promise<unknown>;
   liveExecuteRead(taskId: string): Promise<unknown>;
+  livePlanSearch(taskId: string, resourceId: string, query: string): Promise<unknown>;
+  livePlanOpen(taskId: string, resourceId: string): Promise<unknown>;
   liveGetReceipt(receiptId: string): Promise<unknown>;
 }

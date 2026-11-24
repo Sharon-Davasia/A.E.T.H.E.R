@@ -196,6 +196,9 @@ export interface FileContents {
   sha256: string;
   text: string;
   truncated: boolean;
+  totalBytes: number;
+  returnedBytes: number;
+  versionToken: string;
 }
 
 export interface EditReceipt {
@@ -297,6 +300,9 @@ export function parseFileContents(value: unknown): WorkflowStep<FileContents> {
       sha256: requireString(data, 'sha256', 'file read'),
       text: requireString(data, 'text', 'file read'),
       truncated: data.truncated === true,
+      totalBytes: typeof data.total_bytes === 'number' ? data.total_bytes : -1,
+      returnedBytes: typeof data.returned_bytes === 'number' ? data.returned_bytes : -1,
+      versionToken: requireString(data, 'version_token', 'file read'),
     },
   };
 }
@@ -389,4 +395,68 @@ export function parsePlannedPreview(value: unknown): WorkflowStep<ExactPreview> 
     throw new Error('task planning planRevision is malformed');
   }
   return { status: 'ready', value: parseExactPreview(record.preview) };
+}
+
+/* ------------------------------------------------------------------ */
+/* FI-02B: project search / open outcome parsers                       */
+/* ------------------------------------------------------------------ */
+
+export interface SearchOutcome {
+  matches: string[];
+  filesScanned: number;
+  filesSkipped: number;
+  status: string;
+  partialReason: string | null;
+}
+
+export interface OpenOutcome {
+  status: string;
+  displayName: string;
+  targetKind: string;
+  verification: string;
+  detail: string;
+}
+
+export function parseSearchOutcome(value: unknown): WorkflowStep<SearchOutcome> {
+  const refused = unavailable<SearchOutcome>(value);
+  if (refused) return refused;
+  const record = requireRecord(value, 'project search');
+  if (record.succeeded !== true || !isRecord(record.data)) {
+    return { status: 'unavailable', reason: 'search_failed' };
+  }
+  const data = record.data;
+  const matches = data.matches;
+  if (!Array.isArray(matches) || matches.some((item) => typeof item !== 'string')) {
+    throw new Error('project search matches are malformed');
+  }
+  return {
+    status: 'ready',
+    value: {
+      matches: matches as string[],
+      filesScanned: typeof data.files_scanned === 'number' ? data.files_scanned : 0,
+      filesSkipped: typeof data.files_skipped === 'number' ? data.files_skipped : 0,
+      status: requireString(data, 'status', 'project search'),
+      partialReason: nullableString(data, 'partial_reason', 'project search'),
+    },
+  };
+}
+
+export function parseOpenOutcome(value: unknown): WorkflowStep<OpenOutcome> {
+  const refused = unavailable<OpenOutcome>(value);
+  if (refused) return refused;
+  const record = requireRecord(value, 'project open');
+  if (record.succeeded !== true || !isRecord(record.data)) {
+    return { status: 'unavailable', reason: 'open_failed' };
+  }
+  const data = record.data;
+  return {
+    status: 'ready',
+    value: {
+      status: requireString(data, 'status', 'project open'),
+      displayName: requireString(data, 'display_name', 'project open'),
+      targetKind: requireString(data, 'target_kind', 'project open'),
+      verification: requireString(data, 'verification', 'project open'),
+      detail: requireString(data, 'detail', 'project open'),
+    },
+  };
 }

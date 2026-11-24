@@ -260,6 +260,25 @@ function registerIpc(): void {
       return { status: 'unavailable', message: 'receipt_unavailable' };
     }
   });
+  ipcMain.handle('desktop:workflow-search', async (event, query: unknown) => {
+    validateInvoke(event);
+    if (typeof query !== 'string' || !query || query.length > 512) {
+      return { status: 'unavailable', reason: 'invalid_query' };
+    }
+    try {
+      return await workflow.searchProject(query);
+    } catch {
+      return { status: 'unavailable', reason: 'search_failed' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-open-folder', async (event) => {
+    validateInvoke(event);
+    try {
+      return await workflow.openProjectFolder();
+    } catch {
+      return { status: 'unavailable', reason: 'open_failed' };
+    }
+  });
   ipcMain.handle('desktop:workflow-state', (event) => {
     validateInvoke(event);
     return workflow.state();

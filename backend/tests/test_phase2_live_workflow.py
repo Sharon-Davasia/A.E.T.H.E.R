@@ -204,3 +204,27 @@ def test_registration_rejects_path_escape(live) -> None:
         {"rootId": registered["rootId"], "relativePath": "../outside.txt"}
     )
     assert escaped.get("status") == "unavailable", escaped
+
+
+def test_search_matches_cross_the_bridge_as_bounded_strings(live) -> None:
+    """FI-02B: search results are usable by the desktop workflow."""
+    bridge = live["bridge"]
+    registered = bridge.register_project({"alias": "proj", "path": str(live["project"])})
+    root_resource = bridge.resolve_resource(
+        {"rootId": registered["rootId"], "relativePath": ""}
+    )["resourceId"]
+    task = bridge.create_task({"goal": "find the token"})
+    planned = bridge.plan_task(
+        {
+            "taskId": task["taskId"],
+            "goal": "search_project",
+            "resourceId": root_resource,
+            "arguments": {"query": "hello"},
+        }
+    )
+    assert "preview" in planned, planned
+    result = bridge.execute_read({"taskId": task["taskId"]})
+    assert result["succeeded"] is True, result
+    matches = result["data"]["matches"]
+    assert matches and all(isinstance(item, str) for item in matches), matches
+    assert any(item.startswith("sample.txt:1:") for item in matches), matches

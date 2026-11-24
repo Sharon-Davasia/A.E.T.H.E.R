@@ -15,6 +15,8 @@ export interface WorkflowView {
   fileText: string | null;
   preview: ExactPreview | null;
   message: string | null;
+  searchMatches: string[] | null;
+  openMessage: string | null;
 }
 
 export function LiveWorkflowSurface(props: {
@@ -23,12 +25,15 @@ export function LiveWorkflowSurface(props: {
   receipt: LiveReceiptState | null;
   onSelectProject: () => void;
   onOpenFile: (relativePath: string) => void;
+  onSearch: (query: string) => void;
+  onOpenFolder: () => void;
   onPrepareEdit: (find: string, replace: string) => void;
   onApprove: () => void;
   onShowReceipt: (receiptId: string) => void;
   onPrepareUndo: (receiptId: string) => void;
 }): React.JSX.Element {
   const [relativePath, setRelativePath] = React.useState('');
+  const [query, setQuery] = React.useState('');
   const [find, setFind] = React.useState('');
   const [replace, setReplace] = React.useState('');
   const [receiptId, setReceiptId] = React.useState('');
@@ -59,6 +64,31 @@ export function LiveWorkflowSurface(props: {
           Open file
         </button>
       </form>
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          props.onSearch(query);
+        }}
+      >
+        <label>
+          Search project{' '}
+          <input value={query} onChange={(event) => setQuery(event.target.value)} />
+        </label>
+        <button type="submit" disabled={props.busy || !view.projectAlias}>
+          Search
+        </button>
+        <button type="button" disabled={props.busy || !view.projectAlias} onClick={props.onOpenFolder}>
+          Open project folder
+        </button>
+      </form>
+      {view.searchMatches && (
+        <ul aria-label="Search results">
+          {view.searchMatches.map((match) => (
+            <li key={match}>{match}</li>
+          ))}
+        </ul>
+      )}
+      {view.openMessage && <p role="status">{view.openMessage}</p>}
       {view.fileText !== null && (
         <pre aria-label="Opened file contents">{view.fileText}</pre>
       )}

@@ -32,6 +32,8 @@ import hashlib
 import json
 import re
 from collections.abc import Callable
+from dataclasses import fields as fields_of
+from dataclasses import is_dataclass
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -760,7 +762,14 @@ class LiveBridge:
         # only, lists flattened to scalars, text truncated to the wire bound.
         result = outcome.result
         payload: dict[str, object] = {"succeeded": bool(outcome.succeeded)}
-        fields = vars(result) if result is not None and hasattr(result, "__dict__") else {}
+        if result is not None and is_dataclass(result):
+            # Slots dataclasses have no __dict__; project their declared
+            # fields (FI-02B — search/read outcomes must actually cross).
+            fields = {field.name: getattr(result, field.name) for field in fields_of(result)}
+        elif result is not None and hasattr(result, "__dict__"):
+            fields = vars(result)
+        else:
+            fields = {}
         safe: dict[str, object] = {}
         for key, value in fields.items():
             if isinstance(value, bool) or value is None or isinstance(value, (int, float)):
@@ -768,9 +777,31 @@ class LiveBridge:
             elif isinstance(value, str):
                 safe[key] = value[:_MAX_READ_WIRE_BYTES]
             elif isinstance(value, (list, tuple)):
-                safe[key] = [item for item in value if isinstance(item, (str, int, float, bool))][
-                    :50
-                ]
+                flattened: list[object] = []
+                for item in value[:50]:
+                    if isinstance(item, (str, int, float, bool)):
+                        flattened.append(item)
+                    elif isinstance(item, dict) and (
+                        isinstance(item.get("relative_path"), str)
+                        and isinstance(item.get("line_number"), int)
+                        and isinstance(item.get("line_text"), str)
+                    ):
+                        # FI-02B: search matches cross as bounded
+                        # "path:line: text" strings — scalars only, no
+                        # structured objects and no extra file access.
+                        flattened.append(
+                            f"{item['relative_path']}:{item['line_number']}: "
+                            f"{str(item['line_text'])[:256]}"
+                        )
+                    elif (
+                        isinstance(getattr(item, "relative_path", None), str)
+                        and isinstance(getattr(item, "line_number", None), int)
+                        and isinstance(getattr(item, "line_text", None), str)
+                    ):
+                        flattened.append(
+                            f"{item.relative_path}:{item.line_number}: {item.line_text[:256]}"
+                        )
+                safe[key] = flattened
         if safe:
             payload["data"] = safe
         return payload

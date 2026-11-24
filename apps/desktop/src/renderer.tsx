@@ -6,7 +6,9 @@ import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkf
 import type {
   LiveApprovalState,
   LiveReceiptState,
+  OpenOutcome,
   RegisteredProject,
+  SearchOutcome,
   WorkflowStep,
 } from '../shared/live';
 import type { ExactPreview } from '../shared/review';
@@ -32,6 +34,8 @@ declare global {
       prepareEdit: (find: string, replace: string) => Promise<WorkflowStep<ExactPreview>>;
       prepareUndo: (receiptId: string) => Promise<WorkflowStep<ExactPreview>>;
       getEditReceipt: (receiptId: string) => Promise<LiveReceiptState>;
+      searchProject: (query: string) => Promise<WorkflowStep<SearchOutcome>>;
+      openProjectFolder: () => Promise<WorkflowStep<OpenOutcome>>;
       getWorkflowState: () => Promise<{
         project: RegisteredProject | null;
         file: { resourceId: string } | null;
@@ -54,6 +58,7 @@ function App(): React.JSX.Element {
   const [liveResult, setLiveResult] = React.useState<string>();
   const [workflow, setWorkflow] = React.useState<WorkflowView>({
     projectAlias: null, fileName: null, fileText: null, preview: null, message: null,
+    searchMatches: null, openMessage: null,
   });
   const [receipt, setReceipt] = React.useState<LiveReceiptState | null>(null);
 
@@ -120,13 +125,14 @@ function App(): React.JSX.Element {
   async function refreshWorkflow(message?: string): Promise<void> {
     try {
       const state = await window.aetherDesktop.getWorkflowState();
-      setWorkflow({
+      setWorkflow((current) => ({
+        ...current,
         projectAlias: state.project?.alias ?? null,
         fileName: state.file?.resourceId ?? null,
         fileText: state.contents?.text ?? null,
         preview: state.preview,
         message: message ?? null,
-      });
+      }));
     } catch {
       setWorkflow((current) => ({ ...current, message: 'Workflow state unavailable.' }));
     }
@@ -166,6 +172,31 @@ function App(): React.JSX.Element {
     } finally { setLiveBusy(false); }
   }
 
+  async function searchProject(query: string): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const found = await window.aetherDesktop.searchProject(query);
+      setWorkflow((current) => ({
+        ...current,
+        searchMatches: found.status === 'ready' ? found.value.matches : null,
+        message: stepMessage(found, 'Search complete.'),
+      }));
+    } finally { setLiveBusy(false); }
+  }
+
+  async function openFolder(): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const opened = await window.aetherDesktop.openProjectFolder();
+      setWorkflow((current) => ({
+        ...current,
+        openMessage: opened.status === 'ready'
+          ? `Open requested for ${opened.value.displayName} (${opened.value.verification}).`
+          : `Open unavailable (${opened.reason}).`,
+      }));
+    } finally { setLiveBusy(false); }
+  }
+
   async function showReceipt(receiptId: string): Promise<void> {
     setReceipt({ status: 'loading' });
     try { setReceipt(await window.aetherDesktop.getEditReceipt(receiptId)); }
@@ -201,6 +232,8 @@ function App(): React.JSX.Element {
       receipt={receipt}
       onSelectProject={() => void selectProject()}
       onOpenFile={(path) => void openFile(path)}
+      onSearch={(query) => void searchProject(query)}
+      onOpenFolder={() => void openFolder()}
       onPrepareEdit={(find, replace) => void prepareEdit(find, replace)}
       onApprove={() => void approveLive()}
       onShowReceipt={(id) => void showReceipt(id)}

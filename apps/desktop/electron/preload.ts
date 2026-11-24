@@ -7,7 +7,9 @@ import type {
 import type {
   LiveApprovalState,
   LiveReceiptState,
+  OpenOutcome,
   RegisteredProject,
+  SearchOutcome,
   WorkflowStep,
 } from '../shared/live';
 import type { ExactPreview } from '../shared/review';
@@ -35,6 +37,10 @@ const desktopApi = Object.freeze({
     ipcRenderer.invoke('desktop:workflow-prepare-undo', receiptId),
   getEditReceipt: (receiptId: string): Promise<LiveReceiptState> =>
     ipcRenderer.invoke('desktop:workflow-receipt', receiptId),
+  searchProject: (query: string): Promise<WorkflowStep<SearchOutcome>> =>
+    ipcRenderer.invoke('desktop:workflow-search', query),
+  openProjectFolder: (): Promise<WorkflowStep<OpenOutcome>> =>
+    ipcRenderer.invoke('desktop:workflow-open-folder'),
   getWorkflowState: (): Promise<WorkflowState> => ipcRenderer.invoke('desktop:workflow-state'),
 });
 
