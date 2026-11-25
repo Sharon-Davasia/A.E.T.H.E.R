@@ -83,7 +83,9 @@ class ServiceProcess:
         self.key = secrets.token_bytes(32)
         self.session = secrets.token_hex(16)
         challenge = secrets.token_bytes(32)
-        self.process.stdin.write(MAGIC + bytes.fromhex(self.session) + self.key + challenge)
+        self.process.stdin.write(
+            MAGIC + bytes.fromhex(self.session) + self.key + challenge + bytes(32)
+        )
         self.process.stdin.flush()
         hello = read_frame(self.process.stdout)
         assert hello["kind"] == "channel.hello"
@@ -178,7 +180,7 @@ def test_review_unavailable_without_configuration(tmp_path: Path) -> None:
     assert process.stdin is not None and process.stdout is not None
     key = secrets.token_bytes(32)
     session = secrets.token_hex(16)
-    process.stdin.write(MAGIC + bytes.fromhex(session) + key + secrets.token_bytes(32))
+    process.stdin.write(MAGIC + bytes.fromhex(session) + key + secrets.token_bytes(32) + bytes(32))
     process.stdin.flush()
     read_frame(process.stdout)
 

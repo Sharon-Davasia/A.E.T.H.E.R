@@ -617,8 +617,9 @@ def test_production_issuance_is_still_disabled() -> None:
         PENDING_MIGRATION_VERSIONS,
     )
 
-    assert ACTIVE_SCHEMA_VERSION == 1
-    assert frozenset({2}) == PENDING_MIGRATION_VERSIONS
+    # Proposal A activated the schema; issuance remains disabled.
+    assert ACTIVE_SCHEMA_VERSION == 2
+    assert frozenset() == PENDING_MIGRATION_VERSIONS
     source = (
         Path(__file__).resolve().parents[1] / "aether" / "core" / "grants" / "ledger.py"
     ).read_text(encoding="utf-8")

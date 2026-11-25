@@ -400,3 +400,144 @@ with the acceptance signed per the procedure §7. Until then:
 - Phase 2 code integration: **COMPLETE**
 - Automated verification: **PASS with qualifications** (§2.1)
 - Formal Phase 2 acceptance: **NOT COMPLETE**
+
+---
+
+## Addendum — native Windows confirmation findings at `e0aa3d9` (user-reported)
+
+Native automated gates passed (desktop 104 Node + 6 Python channel,
+zero failures/skips; backend 924 passed / 21 skipped) and the actual
+Electron demonstrations confirmed: project registration, Explorer
+project opening, file reading, search, exact edit preparation
+(`hello` → `hello aether`), native confirmation opening, cancellation,
+and affirmative confirmation reaching `grant_issuance_disabled`.
+
+**Positive refusal / file-integrity evidence (preserved):** after the
+demonstrations, SHA-256 comparison against the original fixture
+baseline succeeded — **all five synthetic fixture files remain
+byte-identical**. Production issuance refusal therefore held end to
+end on the native machine: an affirmative trusted confirmation signed
+and submitted a single-use gesture, issuance refused it, and no file
+was mutated.
+
+**Defects found (corrected in the candidate following this addendum):**
+(1) the Windows `showMessageBox` visibly elided the canonical affected
+path, plan hash and other long lines — the 16,000-character
+displayability assumption is **disproven**; replaced by a dedicated
+main-controlled isolated trusted approval modal (complete paths/hashes,
+full scrollable diff with explicit CRLF/EOF, explicit review
+acknowledgement, no signing authority in the modal renderer);
+(2) `hello world` → `hello aether` returned generic `prepare_failed`
+while `hello` → `hello aether` succeeded — both cases now reproduce
+through the genuine workflow in regression tests and preparation
+failures carry bounded stage reasons (`edit_text_not_found`,
+`response_malformed`, `backend_timeout`, `backend_unavailable`, …)
+instead of the generic catch-all; (3) the renderer claimed "Nothing
+was signed or executed" for every unavailable outcome — approval
+results now report per-stage truth (signed / submitted / authorized /
+executed / uncertain) via `describeLiveApprovalOutcome`.
+
+Formal Phase 2 acceptance remains **NOT COMPLETE**.
+
+---
+
+## Addendum — native Windows demonstrations at `c9b1d10` (user-reported)
+
+Passed natively: approval controls readable; complete affected paths
+and hashes; review-acknowledgement gating; stale-plan invalidation;
+CRLF and EOF representation; long-preview horizontal and vertical
+scrolling; Cancel button functionality; production issuance refusal.
+**Positive file-integrity evidence (preserved): all six fixture files
+unchanged, verified by SHA-256 comparison.**
+
+Sole remaining defect: Escape-key cancellation silently did nothing
+(a stale React closure over `measured`/`renderConfirmed`). Corrected
+in the following candidate: cancellation now runs through a stable
+interaction controller fed the latest state every render, works
+before load / before rendering completes / after rendering / before
+or after acknowledgement, and never signs (regression coverage
+included). Formal Phase 2 acceptance remains **NOT COMPLETE**.
+
+---
+
+## Addendum — Controlled Activation B (this PR)
+
+Proposal B is implemented as adapted: the production-trusted ledger
+policy (accepts only the central trusted authorization decision's
+permit, bound to the exact grant; test-simulation permits refused)
+is enabled solely when the channel service derives an
+`ActivationScope` from a validated acceptance-fixture launch, and
+the resource registry refuses project registration outside the
+canonical fixture boundary (canonical containment with reparse
+checks, never a name prefix). Ordinary application launches carry
+no scope and remain issuance-disabled — pinned by separate negative
+coverage (`grant_issuance_disabled`).
+
+Backend regression coverage (new `test_phase2_activation_b.py`,
+genuine production-shaped composition, no test-scoped ledger):
+approved edit produces exactly the approved bytes; no mutation
+before approval; gesture replay, forged signature and stale-plan
+authorization refused; expired and revoked grants refused at
+execution; durable receipt survives restart and a separately
+approved Undo restores the original SHA-256; Undo refuses
+conflicting newer content; outside-boundary registration refused
+(including a prefix-sharing sibling). Desktop genuine cross-process
+coverage (`live-workflow-activation.integration.test.ts`) performs
+the actual approved edit, receipt retrieval, restart, and verified
+Undo over the authenticated channel, and caught a latent wire
+mismatch (execution responses carry pre/post SHA-256 and snapshot
+id; the TS parser now validates the full authoritative shape).
+
+Outstanding: the native Windows execution campaign on the target
+machine (actual approved edit, receipt inspection, restart, Undo,
+and the remaining mandatory acceptance scenarios). Formal Phase 2
+acceptance remains **NOT COMPLETE**.
+
+**Boundary correction (following candidate):** review found the
+registration boundary was the whole fixture root. It is now the
+designated project subtree only, with the canonical layout validated
+before storage opens; the fixture root, storage and outside
+directories refuse registration in Python and genuine TS coverage.
+Ordinary launches additionally refuse execution
+(`mutation_not_enabled`) over databases holding previously issued
+Activation B grants, with the persisted grant left unconsumed —
+an execution-disable guarantee, not just issuance denial.
+
+---
+
+## Final closeout addendum — PR #36 (Activation A + controlled Activation B)
+
+The owner has confirmed successful native Windows verification at
+implementation head `35f9bb0e344441ed86878b6b22e8b9d8765de5d8`:
+Activation A and controlled Activation B; final automated quality
+gates; trusted approval, acknowledgement and cancellation; CRLF/EOF
+and long-line preview; stale-plan invalidation; project registration,
+reading, search and opening; an actual explicitly approved file edit
+(original receipt `9900df8e-9157-43a3-85b0-0e7d0d5203e2`); durable
+receipt retrieval across application restart; separately approved
+Undo with all six original fixture SHA-256 hashes restored; fixture
+root, storage and outside registration refusals; path traversal and
+secret-file protection; stale approval rejection preserving
+externally modified content; Undo conflict rejection; and absence of
+arbitrary shell execution.
+
+Evidence provenance, kept distinct: the implementation is
+source-reviewed in PR #36; automated suites pass on Linux at the
+closeout head (backend 955 passed / 7 skipped; desktop 126 passed)
+and were owner-confirmed passing natively (Python 3.12.10); the
+demonstrations above are **owner-confirmed**, with artifacts held by
+the owner at `D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a`
+and **not archived in this repository**. No counts, screenshots or
+outcomes beyond those confirmations are claimed. The consolidated
+18-scenario matrix and the finite list of remaining mandatory
+evidence are in `PHASE2_WINDOWS_ACCEPTANCE.md` §8 and §10
+(scenarios 5, 10, 11, 15, 18 demonstrations/archiving, evidence
+archival, machine record, §7 sign-off).
+
+**Merge recommendation:** PR #36 is ready to merge as a controlled
+integration checkpoint. Merging changes nothing for real users:
+ordinary launches refuse issuance and execution, mutation remains
+bounded to the designated disposable fixture project, the combined
+verifier safety warning and the real-data migration restriction
+remain in force, and formal Phase 2 acceptance remains **NOT
+COMPLETE** until the §10 closeout is finished and signed.

@@ -680,5 +680,6 @@ def test_gates_are_unchanged(tmp_path) -> None:
         PENDING_MIGRATION_VERSIONS,
     )
 
-    assert ACTIVE_SCHEMA_VERSION == 1
-    assert frozenset({2}) == PENDING_MIGRATION_VERSIONS
+    # Proposal A activated the schema; issuance remains disabled.
+    assert ACTIVE_SCHEMA_VERSION == 2
+    assert frozenset() == PENDING_MIGRATION_VERSIONS

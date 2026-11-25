@@ -39,6 +39,10 @@ from aether.core.persistence import PersistentTaskState
 _CONSENT_STATES = frozenset(
     {PersistentTaskState.PREVIEW_READY, PersistentTaskState.AWAITING_APPROVAL}
 )
+# FI-04: spend-time only. PRECHECK is reachable solely through
+# advance_execution_state against a live grant for the current plan, so
+# consent is already established; this never applies at issuance time.
+_EXECUTION_CONSENT_STATES = _CONSENT_STATES | {PersistentTaskState.PRECHECK}
 
 
 def canonical_arguments_sha256(arguments: Mapping[str, object]) -> str:
@@ -75,10 +79,21 @@ class GrantRequest:
 class GrantAuthority:
     """Validates one proposed action against the persisted grant ledger."""
 
-    def __init__(self, ledger: GrantLedger | None, *, store: object | None = None) -> None:
+    def __init__(
+        self,
+        ledger: GrantLedger | None,
+        *,
+        store: object | None = None,
+        execution_in_progress: bool = False,
+    ) -> None:
         # A missing ledger is the production configuration in this phase:
         # grant validation fails closed with GRANT_AUTHORITY_UNAVAILABLE.
         self._ledger = ledger
+        # FI-04: the executor's dedicated authority instance checks at
+        # spend time, after PRECHECK has been recorded against the grant.
+        # Issuance-adjacent instances leave this False and keep the exact
+        # consent-bearing state gate.
+        self._execution_in_progress = execution_in_progress
         # Current-plan authority is mandatory. Without it, scope verification
         # could report success for a grant whose plan has been superseded, so
         # the check below fails closed instead.
@@ -199,14 +214,23 @@ class GrantAuthority:
             return GrantCheck(False, "TASK_NOT_AVAILABLE", approval_id)
         except Exception:
             return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", approval_id)
-        if PersistentTaskState(task.state) not in _CONSENT_STATES:
+        # FI-04: the executor's spend-time check runs after PRECHECK has
+        # been recorded against this grant; issuance-time checks
+        # (execution_in_progress=False) keep the consent-bearing states.
+        consent_states = (
+            _EXECUTION_CONSENT_STATES if self._execution_in_progress else _CONSENT_STATES
+        )
+        if PersistentTaskState(task.state) not in consent_states:
             return GrantCheck(False, "TASK_STATE_NOT_AUTHORIZABLE", approval_id)
         if int(task.plan_revision) != plan_revision or (task.plan_hash or "").casefold() != (
             plan_hash.casefold()
         ):
             return GrantCheck(False, "GRANT_PLAN_SUPERSEDED", approval_id)
         try:
-            if self._store.is_stage2_preview_blocked(task_id):  # type: ignore[union-attr]
+            if self._execution_in_progress:
+                if not self._store.is_execution_consent_active(task_id):  # type: ignore[union-attr]
+                    return GrantCheck(False, "CONSENT_INVALIDATED", approval_id)
+            elif self._store.is_stage2_preview_blocked(task_id):  # type: ignore[union-attr]
                 return GrantCheck(False, "CONSENT_INVALIDATED", approval_id)
         except Exception:
             return GrantCheck(False, "GRANT_AUTHORITY_UNAVAILABLE", approval_id)

@@ -150,6 +150,11 @@ class ReviewBridge:
         except Exception:
             return None
 
+    @property
+    def store(self) -> SQLiteTaskStore:
+        """The bridge's one open store (shared with the trusted composition)."""
+        return self._store
+
     def close(self) -> None:
         with contextlib.suppress(Exception):
             self._store.close()

@@ -66,6 +66,57 @@ DISABLED_EXECUTION_STATES = frozenset(
 )
 
 
+class DurableReceiptFacts(BaseModel):
+    """The durable receipt fields the task store independently re-reads.
+
+    Receipts live in their own database (a separate persistence boundary),
+    so the task store cannot read them inside its transaction. Instead, the
+    composition registers a loader (see
+    ``SQLiteTaskStore.set_receipt_evidence_source``) backed by the real
+    ``ReceiptStore``; the store validates every field below against the
+    task, plan step, grant and consumption it can see. This is a
+    point-in-time re-read, **not** cross-database atomicity: receipt
+    durability causally precedes the transition because the executor
+    records the receipt before it reports an outcome.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    receipt_id: UUID
+    task_id: str
+    step_id: str
+    approval_id: str | None
+    capability_id: str
+    status: str
+    resource_id: str
+    post_sha256: str | None
+    verified: bool
+
+
+class ExecutionEvidence(BaseModel):
+    """Authoritative backend execution evidence (Decision D).
+
+    This is the *only* carrier through which a task may enter an
+    execution/recovery state, via ``SQLiteTaskStore.advance_execution_state``.
+    It is deliberately not satisfiable by renderer or model output: the
+    referenced durable backend artifacts (grant/issuance/consumption rows in
+    the schema-v2 ledger) are re-read by the store itself inside the
+    transition transaction rather than trusted from the caller's claim.
+    ``receipt_id`` names the executor's receipt; it is never accepted as
+    proof by itself — before ``COMPLETED`` the store independently loads
+    the durable receipt through the registered evidence source and checks
+    it belongs to this exact task, step, grant, consumption and resource
+    and records a successfully verified resulting hash (FI-03). A missing
+    or mismatched artifact never satisfies a state that requires it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    approval_id: UUID
+    receipt_id: UUID | None = None
+    mutation_may_have_happened: bool = False
+
+
 class PlanStepApprovalStatus(StrEnum):
     NOT_REQUIRED = "NOT_REQUIRED"
     REQUIRED = "REQUIRED"
@@ -302,6 +353,10 @@ class EventMetadata(BaseModel):
             "resource_id",
             "receipt_id",
             "snapshot_id",
+            # Execution-evidence audit (Phase 2 final integration, Decision D).
+            # Records that a backend-evidence-driven transition happened and
+            # whether its mutation may have happened; never file content.
+            "mutation_may_have_happened",
             "pre_sha256",
             "post_sha256",
         }
@@ -338,10 +393,18 @@ class EventMetadata(BaseModel):
                 raise ValueError("event requested outcome is invalid")
             if key == "decision" and item not in {"APPROVE", "REJECT"}:
                 raise ValueError("event decision is invalid")
-            if key == "authority" and item != "NON_AUTHORIZING_AUDIT_RECORD":
+            if key == "authority" and item not in {
+                "NON_AUTHORIZING_AUDIT_RECORD",
+                # Phase 2 final integration (Decision D): marks a state-record
+                # written by the evidence-gated execution transition path. The
+                # event still authorizes nothing; the ledger rows did.
+                "BACKEND_EXECUTION_EVIDENCE",
+            }:
                 raise ValueError("event authority metadata is invalid")
             if key == "requires_fresh_plan_and_consent" and not isinstance(item, bool):
                 raise ValueError("fresh-consent metadata must be boolean")
+            if key == "mutation_may_have_happened" and not isinstance(item, bool):
+                raise ValueError("mutation-may-have-happened metadata must be boolean")
             if key == "preview_digest" and (
                 not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{64}", item)
             ):

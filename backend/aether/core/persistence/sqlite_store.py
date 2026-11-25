@@ -14,7 +14,7 @@ import re
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -31,7 +31,9 @@ from aether.core.persistence.models import (
     DISABLED_EXECUTION_STATES,
     ApprovalDecisionRecord,
     ApprovalDecisionValue,
+    DurableReceiptFacts,
     EventMetadata,
+    ExecutionEvidence,
     PersistentTaskState,
     TaskPlan,
 )
@@ -210,6 +212,50 @@ _TRANSITIONS: dict[PersistentTaskState, frozenset[PersistentTaskState]] = {
     PersistentTaskState.UNVERIFIED: frozenset(),
 }
 
+# Narrow execution/recovery transitions (Decision D). Reachable only through
+# ``advance_execution_state``, never through the general ``transition_task``
+# (which hard-refuses every ``DISABLED_EXECUTION_STATES`` target). Each edge
+# names the minimum durable backend evidence the store re-reads from the
+# schema-v2 grant ledger inside the transition transaction:
+#
+# * ``"grant"``       — an issued, unrevoked grant bound to the task's current
+#                       plan revision and hash;
+# * ``"consumption"`` — ``"grant"`` plus a recorded authoritative consumption
+#                       of that grant for this exact task/plan;
+# * ``"receipt"``     — ``"consumption"`` plus the executor's verified receipt
+#                       identity, which is what makes a success claim honest.
+#
+# Renderer input, model output and audit-only review records can never create
+# these rows, so they can never drive these states. On a schema-v1 database
+# the ledger tables do not exist and every edge fails closed.
+_EXECUTION_TRANSITIONS: dict[PersistentTaskState, dict[PersistentTaskState, str]] = {
+    PersistentTaskState.AWAITING_APPROVAL: {
+        PersistentTaskState.PRECHECK: "grant",
+    },
+    PersistentTaskState.PRECHECK: {
+        PersistentTaskState.EXECUTING: "consumption",
+        PersistentTaskState.CANCELLED: "grant",
+        PersistentTaskState.FAILED: "grant",
+        PersistentTaskState.RECOVERING: "grant",
+    },
+    PersistentTaskState.EXECUTING: {
+        PersistentTaskState.POSTCHECK: "consumption",
+        PersistentTaskState.RECOVERING: "consumption",
+        PersistentTaskState.UNVERIFIED: "consumption",
+    },
+    PersistentTaskState.POSTCHECK: {
+        PersistentTaskState.COMPLETED: "receipt",
+        PersistentTaskState.UNVERIFIED: "consumption",
+        PersistentTaskState.RECOVERING: "consumption",
+    },
+    PersistentTaskState.RECOVERING: {
+        PersistentTaskState.COMPLETED: "receipt",
+        PersistentTaskState.PARTIALLY_COMPLETED: "receipt",
+        PersistentTaskState.UNVERIFIED: "consumption",
+        PersistentTaskState.FAILED: "grant",
+    },
+}
+
 _PHASE1_TO_PERSISTENT: dict[TaskState, PersistentTaskState] = {
     TaskState.CREATED: PersistentTaskState.RECEIVED,
     TaskState.PLANNING: PersistentTaskState.PLANNING,
@@ -277,11 +323,20 @@ _EXPECTED_SCHEMA_SHA256: dict[int, str] = {
 #   never run until explicitly authorized. Activation refuses to target a
 #   pending version, so bumping the active version alone cannot apply one.
 #
-# Activating version 2 requires separate explicit user approval after
-# independent review; that change sets ``ACTIVE_SCHEMA_VERSION = 2`` and clears
-# version 2 from ``PENDING_MIGRATION_VERSIONS`` in the same reviewed commit.
-ACTIVE_SCHEMA_VERSION = 1
-PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset({2})
+# Activation record (Proposal A, PR #36): version 2 was activated by
+# explicit user authorization for a controlled Windows acceptance
+# candidate, after independent review of the FI-01..FI-08 corrections.
+# This build therefore creates and accepts schema version 2 and applies
+# migration 0002 through the verified migration path. Production grant
+# issuance remains disabled (Proposal B is a separate, unapproved
+# change); activation of the schema does not enable issuance.
+# Existing real user databases are NOT migrated by this code change in
+# the acceptance candidate: the acceptance configuration uses only
+# disposable fixture storage (AETHER_FIXTURE_DB / AETHER_APP_DB inside
+# an isolated fixture directory), and migrating any pre-existing real
+# database still requires separate authorization and a verified backup.
+ACTIVE_SCHEMA_VERSION = 2
+PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset()
 
 
 def _activation_error(version: int) -> str:
@@ -379,6 +434,10 @@ class SQLiteTaskStore:
         self._lock = threading.RLock()
         self._owner_lock_file: BinaryIO | None = None
         self._closed = False
+        # FI-03: loader for durable receipt facts (separate receipts
+        # database), registered by the composition. Without it, no
+        # receipt-gated transition (COMPLETED) can ever be satisfied.
+        self._receipt_evidence_source: Callable[[UUID], DurableReceiptFacts | None] | None = None
         self._storage_volume_id = ""
         self._parent_identity: tuple[int, int] | None = None
         self._database_identity: tuple[int, int] | None = None
@@ -523,6 +582,214 @@ class SQLiteTaskStore:
                 error_code=error_code,
             )
         return self.get_task(task_id)
+
+    def set_receipt_evidence_source(
+        self, source: Callable[[UUID], DurableReceiptFacts | None] | None
+    ) -> None:
+        """Register the durable-receipt loader used for FI-03 verification.
+
+        The composition registers the real ``ReceiptStore`` loader once the
+        sibling receipts database exists. Registration is deliberately not
+        a constructor concern: the store is opened by the review surface
+        before the trusted tier is composed, and receipt-gated transitions
+        must fail closed until a real source is registered.
+        """
+
+        self._receipt_evidence_source = source
+
+    def advance_execution_state(
+        self,
+        task_id: UUID,
+        to_state: PersistentTaskState,
+        *,
+        evidence: ExecutionEvidence,
+        now: datetime | None = None,
+    ) -> StoredTask:
+        """Advance a task through one narrow execution/recovery transition.
+
+        This is the *only* way to enter ``PRECHECK``, ``EXECUTING``,
+        ``POSTCHECK``, ``RECOVERING``, ``PARTIALLY_COMPLETED`` or
+        ``UNVERIFIED`` (and to leave them for ``COMPLETED``/``FAILED``/
+        ``CANCELLED``); the general :meth:`transition_task` hard-refuses those
+        targets. The transition is granted only when the store itself, inside
+        this transaction, re-reads the durable backend evidence the edge
+        requires from the schema-v2 grant ledger (see
+        ``_EXECUTION_TRANSITIONS``): the authoritative grant bound to the
+        task's *current* plan revision/hash, a recorded consumption of it, and
+        — for any success claim — the executor's verified receipt identity.
+
+        Renderer input, model output and audit-only review records cannot
+        create those rows and therefore can never drive these states. On a
+        schema-v1 database the ledger tables do not exist and this method
+        fails closed, so the shipped configuration (schema v1) keeps every
+        execution state unreachable until schema activation is separately
+        approved.
+        """
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            if int(connection.execute("PRAGMA user_version").fetchone()[0]) < 2:
+                raise IllegalPersistentTransition(
+                    "execution/recovery states require the schema version 2 grant ledger"
+                )
+            row = connection.execute(
+                "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?",
+                (str(task_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown task id")
+            current = PersistentTaskState(row["state"])
+            required = _EXECUTION_TRANSITIONS.get(current, {}).get(to_state)
+            if required is None:
+                raise IllegalPersistentTransition(
+                    f"illegal execution transition: {current} -> {to_state}"
+                )
+            if (
+                to_state is PersistentTaskState.UNVERIFIED
+                and not evidence.mutation_may_have_happened
+            ):
+                raise IllegalPersistentTransition(
+                    "an UNVERIFIED claim requires evidence the mutation may have happened"
+                )
+            plan_revision = int(row["plan_revision"])
+            plan_hash = row["plan_hash"]
+            grant = connection.execute(
+                "SELECT g.approval_id AS approval_id, s.revoked_at AS revoked_at "
+                "FROM exact_approval_grants AS g "
+                "JOIN exact_approval_grant_state AS s ON s.approval_id = g.approval_id "
+                "WHERE g.approval_id = ? AND g.task_id = ? AND g.plan_revision = ? "
+                "AND g.plan_hash = ?",
+                (str(evidence.approval_id), str(task_id), plan_revision, plan_hash),
+            ).fetchone()
+            if grant is None or grant["revoked_at"] is not None:
+                raise IllegalPersistentTransition(
+                    "execution evidence names no live grant for the task's current plan"
+                )
+            if required in ("consumption", "receipt"):
+                consumed = connection.execute(
+                    "SELECT 1 FROM exact_approval_grant_consumptions "
+                    "WHERE approval_id = ? AND task_id = ? AND plan_revision = ? "
+                    "AND plan_hash = ? LIMIT 1",
+                    (str(evidence.approval_id), str(task_id), plan_revision, plan_hash),
+                ).fetchone()
+                if consumed is None:
+                    raise IllegalPersistentTransition(
+                        "execution evidence names no recorded grant consumption for this task"
+                    )
+            if required == "receipt":
+                self._verify_receipt_evidence(
+                    connection,
+                    task_id=task_id,
+                    plan_revision=plan_revision,
+                    evidence=evidence,
+                )
+            values: dict[str, str | int | float | bool | None] = {
+                "approval_id": str(evidence.approval_id),
+                "authority": "BACKEND_EXECUTION_EVIDENCE",
+            }
+            if evidence.receipt_id is not None:
+                values["receipt_id"] = str(evidence.receipt_id)
+            if evidence.mutation_may_have_happened:
+                values["mutation_may_have_happened"] = True
+            self._commit_transition_unlocked(
+                connection,
+                task_id,
+                current,
+                to_state,
+                event_type=f"TASK_{to_state.value}",
+                metadata_values=values,
+                now=timestamp,
+                error_code=None,
+            )
+        return self.get_task(task_id)
+
+    def _verify_receipt_evidence(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: UUID,
+        plan_revision: int,
+        evidence: ExecutionEvidence,
+    ) -> None:
+        """Independently verify the durable receipt behind a COMPLETED claim.
+
+        FI-03: a caller-supplied receipt UUID is an identity, never proof.
+        The durable record is loaded through the registered evidence source
+        (the real receipts database, a separate persistence boundary — this
+        re-read is point-in-time under the store lock, not cross-database
+        atomicity) and must belong to this exact task, plan step, grant and
+        consumption, name the step's resource, and record a successfully
+        verified outcome whose resulting hash matches the approved effect.
+        """
+
+        if evidence.receipt_id is None:
+            raise IllegalPersistentTransition(
+                "a verified receipt is required before this state may be recorded"
+            )
+        source = self._receipt_evidence_source
+        if source is None:
+            raise IllegalPersistentTransition(
+                "no durable receipt evidence source is registered; completion cannot be verified"
+            )
+        try:
+            facts = source(evidence.receipt_id)
+        except Exception as exc:
+            raise IllegalPersistentTransition(
+                "the durable receipt could not be loaded; completion cannot be verified"
+            ) from exc
+        if facts is None:
+            raise IllegalPersistentTransition("execution evidence names no durable receipt")
+        if facts.task_id != str(task_id):
+            raise IllegalPersistentTransition("the durable receipt belongs to a different task")
+        if facts.approval_id != str(evidence.approval_id):
+            raise IllegalPersistentTransition("the durable receipt belongs to a different grant")
+        if facts.status != "SUCCEEDED" or not facts.verified or not facts.post_sha256:
+            raise IllegalPersistentTransition(
+                "the durable receipt does not record a successfully verified outcome"
+            )
+        step = connection.execute(
+            "SELECT capability_id, resources_json, effect_json FROM task_steps "
+            "WHERE task_id = ? AND plan_revision = ? AND id = ?",
+            (str(task_id), plan_revision, facts.step_id),
+        ).fetchone()
+        if step is None:
+            raise IllegalPersistentTransition(
+                "the durable receipt names no step of the task's current plan"
+            )
+        if step["capability_id"] != facts.capability_id:
+            raise IllegalPersistentTransition(
+                "the durable receipt records a different operation than the plan step"
+            )
+        resource_ids = {
+            str(resource.get("resource_id"))
+            for resource in json.loads(step["resources_json"])
+            if isinstance(resource, dict)
+        }
+        if facts.resource_id not in resource_ids:
+            raise IllegalPersistentTransition(
+                "the durable receipt names a different resource than the plan step"
+            )
+        consumed_step = connection.execute(
+            "SELECT 1 FROM exact_approval_grant_consumptions "
+            "WHERE approval_id = ? AND task_id = ? AND plan_revision = ? AND step_id = ? "
+            "LIMIT 1",
+            (str(evidence.approval_id), str(task_id), plan_revision, facts.step_id),
+        ).fetchone()
+        if consumed_step is None:
+            raise IllegalPersistentTransition(
+                "no recorded grant consumption binds this receipt's step"
+            )
+        effect = json.loads(step["effect_json"])
+        # The approved *resulting content* hash (the post-image the user
+        # approved), distinct from the effect descriptor digest.
+        result_digest = effect.get("approved_result_digest") if isinstance(effect, dict) else None
+        if (
+            isinstance(result_digest, str)
+            and result_digest
+            and facts.post_sha256.casefold() != result_digest.casefold()
+        ):
+            raise IllegalPersistentTransition(
+                "the durable receipt's resulting content does not match the approved effect"
+            )
 
     def save_plan(self, plan: TaskPlan) -> str:
         """Append the next immutable plan revision and update the task pointer."""
@@ -1003,18 +1270,57 @@ class SQLiteTaskStore:
                 PersistentTaskState.AWAITING_APPROVAL,
             }:
                 return True
-            latest_plan_sequence = int(
-                self._connection.execute(
-                    "SELECT COALESCE(MAX(seq), 0) FROM task_events "
-                    "WHERE task_id = ? AND event_type = 'PLAN_REVISION_SAVED'",
-                    (str(task_id),),
-                ).fetchone()[0]
-            )
             return self._has_fresh_consent_blocker(
                 self._connection,
                 task_id,
-                latest_plan_sequence,
+                self._latest_plan_sequence(self._connection, task_id),
             )
+
+    def _latest_plan_sequence(self, connection: sqlite3.Connection, task_id: UUID) -> int:
+        return int(
+            connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM task_events "
+                "WHERE task_id = ? AND event_type = 'PLAN_REVISION_SAVED'",
+                (str(task_id),),
+            ).fetchone()[0]
+        )
+
+    def is_execution_consent_active(self, task_id: UUID) -> bool:
+        """Whether live consent covers spending during recorded execution.
+
+        FI-04: execution states are now recorded at the real checkpoints,
+        so by the time the executor spends the grant the task legitimately
+        sits in PRECHECK — a state reachable only through
+        ``advance_execution_state`` against a live grant bound to the
+        current plan. Consumption-time consent therefore accepts PRECHECK
+        in addition to the consent-bearing states, with the identical
+        fresh-consent blocker checks. Issuance-time gates are unchanged:
+        a grant may still only be *created* from PREVIEW_READY /
+        AWAITING_APPROVAL (see ``is_stage2_preview_blocked``).
+        """
+
+        with self._lock:
+            self._verify_database_location()
+            task = self._connection.execute(
+                "SELECT state, plan_revision FROM tasks WHERE id = ?", (str(task_id),)
+            ).fetchone()
+            if task is None:
+                return False
+            state = PersistentTaskState(task["state"])
+            if state is PersistentTaskState.PRECHECK:
+                # Only the state gate widens (see docstring); the
+                # fresh-consent blocker logic stays the shared one.
+                return not self._has_fresh_consent_blocker(
+                    self._connection,
+                    task_id,
+                    self._latest_plan_sequence(self._connection, task_id),
+                )
+            if state not in {
+                PersistentTaskState.PREVIEW_READY,
+                PersistentTaskState.AWAITING_APPROVAL,
+            }:
+                return False
+            return not self.is_stage2_preview_blocked(task_id)
 
     def find_stage2_review_outcome(
         self,

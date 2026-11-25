@@ -355,15 +355,21 @@ class ConsumptionLedger:
         self._authority = authority
         self._simulated_authority = False
         self._clock = clock or (lambda: datetime.now(UTC))
-        self._connection = sqlite3.connect(
-            str(database), isolation_level=None, check_same_thread=False
-        )
-        self._connection.row_factory = sqlite3.Row
-        with self._lock:
-            self._connection.execute("PRAGMA journal_mode=WAL")
-            self._connection.execute("PRAGMA foreign_keys=ON")
-            for statement in _SCHEMA:
-                self._connection.execute(statement)
+        connection = sqlite3.connect(str(database), isolation_level=None, check_same_thread=False)
+        try:
+            connection.row_factory = sqlite3.Row
+            with self._lock:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA foreign_keys=ON")
+                for statement in _SCHEMA:
+                    connection.execute(statement)
+        except BaseException:
+            # W-A3: deterministic constructor cleanup (see ReceiptStore):
+            # a partially constructed ledger is owned by no one, so its
+            # connection must be closed here, preserving the failure.
+            connection.close()
+            raise
+        self._connection = connection
 
     @classmethod
     def open_tests_scoped(

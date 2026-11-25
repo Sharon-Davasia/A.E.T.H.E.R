@@ -127,13 +127,18 @@ def validate(
 
 
 def main() -> int:
-    bootstrap = read_exact(sys.stdin.buffer, len(MAGIC) + 16 + 32 + 32)
+    # Wire mirror of the real service bootstrap: MAGIC | 16B session |
+    # 32B channel key | 32B challenge | 32B gesture key. This Stage 1 test
+    # child is not a trusted backend: it consumes and discards the gesture
+    # key bytes so the frame stream stays aligned, and never uses them.
+    bootstrap = read_exact(sys.stdin.buffer, len(MAGIC) + 16 + 32 + 32 + 32)
     if bootstrap[: len(MAGIC)] != MAGIC:
         raise ValueError("invalid startup bootstrap")
     offset = len(MAGIC)
     session = bootstrap[offset : offset + 16].hex()
     key = bootstrap[offset + 16 : offset + 48]
     challenge = bootstrap[offset + 48 : offset + 80].hex()
+    del bootstrap  # gesture key bytes intentionally unused by this mirror
     hello = {
         "v": PROTOCOL,
         "session": session,

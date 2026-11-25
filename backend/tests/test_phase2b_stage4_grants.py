@@ -1043,8 +1043,12 @@ def test_recovery_class_comes_from_the_trusted_plan_step(tmp_path, monkeypatch) 
 # ---------------------------------------------------------------------------
 
 
-def test_ledger_refuses_v1_database_without_the_approved_migration(tmp_path) -> None:
+def test_ledger_refuses_v1_database_without_the_approved_migration(tmp_path, monkeypatch) -> None:
     database = tmp_path / "store.sqlite3"
+    # A genuine v1 database (pre-activation configuration, test-scoped).
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     store = SQLiteTaskStore(database)
     store.create_task("synthetic", task_id=uuid4(), now=NOW)
     try:
@@ -1072,9 +1076,15 @@ def test_ledger_rejects_tampered_migration_ledger_and_schema(tmp_path, monkeypat
         GrantLedger.read_only(database2)
 
 
-def test_raw_applied_migration_without_ledger_row_is_untrusted(tmp_path) -> None:
+def test_raw_applied_migration_without_ledger_row_is_untrusted(tmp_path, monkeypatch) -> None:
     database = tmp_path / "store.sqlite3"
+    # Start from a genuine v1 database so the raw migration is the only
+    # thing that creates the v2 objects (pre-activation framing).
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     SQLiteTaskStore(database).close()
+    monkeypatch.undo()
     apply_proposed_migration_raw(database)
     with sqlite3.connect(database) as connection:
         connection.execute("DELETE FROM schema_migrations WHERE version = 2")
@@ -1391,9 +1401,13 @@ def test_unsafe_database_paths_fail_closed(tmp_path, monkeypatch) -> None:
         GrantLedger(tmp_path / "store.sqlite3\x00")
 
 
-def test_ledger_never_applies_migrations(tmp_path) -> None:
+def test_ledger_never_applies_migrations(tmp_path, monkeypatch) -> None:
     database = tmp_path / "store.sqlite3"
+    from stage4_support import activation_state
+
+    activation_state(monkeypatch, activated=False)
     SQLiteTaskStore(database).close()
+    monkeypatch.undo()
     before = database.read_bytes()
     with pytest.raises((GrantUnavailableError, GrantIntegrityError, GrantLedgerError)):
         GrantLedger(database)
@@ -1704,6 +1718,16 @@ def test_no_production_module_issues_grants_or_exposes_ipc() -> None:
     Neither the issuer, the attestation model, the storage primitive nor the
     single-use permit may be referenced elsewhere, so there is no second
     production-capable path into the ledger.
+
+    Sole reviewed exception (Phase 2 final integration, Decision C):
+    ``aether/core/composition.py`` is the single trusted composition root. It
+    is the one place allowed to construct the issuer and the attestation,
+    because every trusted component must be built over the same store, lock
+    and clock. The exception does not enable issuance: the composition builds
+    the ledger in its production configuration, so the issuer still refuses
+    every call with ``GRANT_ISSUANCE_DISABLED`` until a separately approved
+    activation enables it. Any other module referencing these markers fails
+    this scan.
     """
 
     backend = Path(__file__).parents[1]
@@ -1713,13 +1737,17 @@ def test_no_production_module_issues_grants_or_exposes_ipc() -> None:
         "_persist_verified_grant",
         "IssuancePermit",
     )
+    reviewed_composition_root = "aether/core/composition.py"
     offenders: list[str] = []
     for path in (backend / "aether").rglob("*.py"):
         if "core/grants" in path.as_posix():
             continue
+        relative = path.relative_to(backend).as_posix()
+        if relative == reviewed_composition_root:
+            continue
         text = path.read_text(encoding="utf-8")
         if any(marker in text for marker in markers):
-            offenders.append(path.relative_to(backend).as_posix())
+            offenders.append(relative)
     assert offenders == []
 
 

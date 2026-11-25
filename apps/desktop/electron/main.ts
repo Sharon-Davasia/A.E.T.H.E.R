@@ -1,9 +1,14 @@
-import { app, BrowserWindow, ipcMain, session, type IpcMainInvokeEvent } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, session, type IpcMainInvokeEvent } from 'electron';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
+import { createLiveApprovalProvider } from './live-approval-provider';
+import { createApprovalWindowConfirmer } from './approval-window';
+import { workflowFailureReason } from './workflow';
+import { LiveWorkflow } from './workflow';
+import { parseEditReceipt } from '../shared/live';
 import { parseReviewOutcomeRequest } from '../shared/review';
 
 const APP_ROOT = app.getAppPath();
@@ -12,6 +17,46 @@ const PRELOAD_FILE = resolve(join(APP_ROOT, 'dist-electron', 'electron', 'preloa
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'";
 const backend = new BackendClient({ launchSpec: resolveBackendLaunchSpec });
 const reviewProvider = createChannelReviewProvider({ backend, resolveTaskId: configuredReviewTaskId });
+// FI-02: the production workflow is main-owned state — project, file,
+// task and exact preview are chosen here, never by the renderer.
+const workflow = new LiveWorkflow(backend);
+let navigationEpoch = 0;
+
+const APPROVAL_FILE = resolve(join(APP_ROOT, 'dist', 'approval.html'));
+const APPROVAL_PRELOAD_FILE = resolve(join(APP_ROOT, 'dist-electron', 'electron', 'approval-preload.js'));
+
+/**
+ * Trusted confirmation for one live approval: the dedicated,
+ * main-controlled approval modal (isolated window + dedicated
+ * preload). The ordinary renderer can only ask main to start the
+ * flow; the affirmation itself happens in that window, which holds
+ * no signing authority. The former `showMessageBox` presentation was
+ * removed: native Windows evidence showed it elides the canonical
+ * path, plan hash and diff lines even for a one-line edit, so it
+ * could never attest a complete review.
+ */
+const approvalConfirmer = createApprovalWindowConfirmer({
+  getParent: () => mainWindow,
+  approvalFile: APPROVAL_FILE,
+  preloadFile: APPROVAL_PRELOAD_FILE,
+});
+
+const liveApprovalProvider = createLiveApprovalProvider({
+  backend,
+  resolveApprovalContext: () => {
+    const taskId = workflow.plannedTaskId();
+    const preview = workflow.plannedPreview();
+    if (!taskId || !preview) return null;
+    return {
+      taskId,
+      preview,
+      sessionMarker: backend.sessionMarker(),
+      backendAlive: () => backend.status().state === 'ready',
+    };
+  },
+  confirm: (summary) => approvalConfirmer.confirmApproval(summary),
+  approvalGeneration: () => navigationEpoch,
+});
 let mainWindow: BrowserWindow | undefined;
 let shuttingDown = false;
 
@@ -64,7 +109,33 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
   const env: NodeJS.ProcessEnv = process.platform === 'win32'
     ? { SYSTEMROOT: systemRoot, WINDIR: systemRoot, PATH: `${runtimeDir};${join(systemRoot, 'System32')}` }
     : { PATH: `${runtimeDir}:/usr/bin:/bin`, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
-  if (!packaged) {
+  // FI-02A: supported application storage for EVERY build. The database
+  // lives in the OS per-user application-data directory; the renderer
+  // can neither see nor influence the path.
+  //
+  // Controlled-activation acceptance launches set
+  // AETHER_ACCEPTANCE_MODE=fixture: storage MUST be the explicitly
+  // configured fixture database under an AETHER-Phase2-Fixture-*
+  // directory. An invalid or missing fixture configuration throws here
+  // — the backend refuses to start rather than fall back to the real
+  // application database — and development review-seed settings are
+  // never passed through, so they cannot redirect the launch.
+  const acceptanceFixture = process.env.AETHER_ACCEPTANCE_MODE === 'fixture';
+  const fixtureDb = process.env.AETHER_FIXTURE_DB;
+  if (acceptanceFixture) {
+    if (!fixtureDb || !isAbsolute(fixtureDb) || !fixtureDb.includes('AETHER-Phase2-Fixture-')) {
+      throw new Error('acceptance fixture storage is not explicitly configured');
+    }
+    env.AETHER_ACCEPTANCE_MODE = 'fixture';
+    env.AETHER_FIXTURE_DB = resolve(fixtureDb);
+    env.AETHER_APP_DB = resolve(fixtureDb);
+  } else {
+    const appDatabasePath = (!packaged && fixtureDb && isAbsolute(fixtureDb))
+      ? resolve(fixtureDb)
+      : join(app.getPath('userData'), 'aether', 'tasks.sqlite3');
+    env.AETHER_APP_DB = appDatabasePath;
+  }
+  if (!packaged && !acceptanceFixture) {
     // Development-only, absolute-path passthroughs for the trusted review
     // source. The renderer can neither see nor influence them. Without them
     // the review surface reports unavailable by design.
@@ -97,6 +168,7 @@ function validateInvoke(event: IpcMainInvokeEvent): void {
 }
 
 function registerIpc(): void {
+  approvalConfirmer.registerIpc();
   ipcMain.handle('desktop:backend-status', (event) => {
     validateInvoke(event);
     return backend.status();
@@ -113,6 +185,114 @@ function registerIpc(): void {
     validateInvoke(event);
     const request = parseReviewOutcomeRequest(rawRequest);
     return reviewProvider.recordOutcome(request);
+  });
+  // The renderer supplies no arguments and chooses nothing: the task comes
+  // from trusted main-process configuration, and the approval itself is the
+  // native dialog above. The result is a bounded summary (no nonce, no
+  // signature, no binding crosses this boundary).
+  ipcMain.handle('desktop:live-approve', async (event) => {
+    validateInvoke(event);
+    return liveApprovalProvider.approveAndExecute();
+  });
+  // FI-02 workflow steps. The renderer requests operations; main owns
+  // every identity. Project registration additionally requires a native
+  // confirmation naming the directory — that dialog *is* the explicit
+  // user authorization for the bounded capability scope.
+  ipcMain.handle('desktop:workflow-select-project', async (event) => {
+    validateInvoke(event);
+    if (!mainWindow) return { status: 'unavailable', reason: 'window_unavailable' };
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose a project directory',
+      properties: ['openDirectory'],
+    });
+    if (picked.canceled || picked.filePaths.length !== 1) {
+      return { status: 'unavailable', reason: 'selection_cancelled' };
+    }
+    const directory = picked.filePaths[0]!;
+    const granted = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Grant project access'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: 'Grant project access',
+      message: `Allow AETHER to inspect, read, search and — only after exact-preview approval — edit files in:\n\n${directory}`,
+      detail: 'Access is limited to this directory and this session. It is never broadened or silently restored after a restart.',
+    });
+    if (granted.response !== 1) return { status: 'unavailable', reason: 'registration_declined' };
+    try {
+      const project = await workflow.registerProject(directory);
+      return { status: 'ready', project };
+    } catch {
+      return { status: 'unavailable', reason: 'registration_failed' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-open-file', async (event, relativePath: unknown) => {
+    validateInvoke(event);
+    if (typeof relativePath !== 'string' || !relativePath || relativePath.length > 512) {
+      return { status: 'unavailable', reason: 'invalid_path' };
+    }
+    try {
+      return await workflow.openFile(relativePath);
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'open_failed') };
+    }
+  });
+  ipcMain.handle('desktop:workflow-prepare-edit', async (event, find: unknown, replace: unknown) => {
+    validateInvoke(event);
+    if (typeof find !== 'string' || typeof replace !== 'string' || find.length > 4096 || replace.length > 4096) {
+      return { status: 'unavailable', reason: 'invalid_edit' };
+    }
+    try {
+      return await workflow.prepareEdit(find, replace);
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'prepare_failed') };
+    }
+  });
+  ipcMain.handle('desktop:workflow-prepare-undo', async (event, receiptId: unknown) => {
+    validateInvoke(event);
+    if (typeof receiptId !== 'string' || !UUID.test(receiptId)) {
+      return { status: 'unavailable', reason: 'invalid_receipt' };
+    }
+    try {
+      return await workflow.prepareUndo(receiptId);
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'prepare_failed') };
+    }
+  });
+  ipcMain.handle('desktop:workflow-receipt', async (event, receiptId: unknown) => {
+    validateInvoke(event);
+    if (typeof receiptId !== 'string' || !UUID.test(receiptId)) {
+      return { status: 'unavailable', message: 'invalid_receipt' };
+    }
+    try {
+      return parseEditReceipt(await backend.liveGetReceipt(receiptId));
+    } catch {
+      return { status: 'unavailable', message: 'receipt_unavailable' };
+    }
+  });
+  ipcMain.handle('desktop:workflow-search', async (event, query: unknown) => {
+    validateInvoke(event);
+    if (typeof query !== 'string' || !query || query.length > 512) {
+      return { status: 'unavailable', reason: 'invalid_query' };
+    }
+    try {
+      return await workflow.searchProject(query);
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'search_failed') };
+    }
+  });
+  ipcMain.handle('desktop:workflow-open-folder', async (event) => {
+    validateInvoke(event);
+    try {
+      return await workflow.openProjectFolder();
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'open_failed') };
+    }
+  });
+  ipcMain.handle('desktop:workflow-state', (event) => {
+    validateInvoke(event);
+    return workflow.state();
   });
 }
 
@@ -137,16 +317,26 @@ function createWindow(): void {
   const trustedUrl = pathToFileURL(RENDERER_FILE).href;
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('will-navigate', (event, target) => {
+    navigationEpoch += 1;
+    liveApprovalProvider.invalidateOutstanding();
+    approvalConfirmer.cancelOutstanding();
     if (target !== trustedUrl) event.preventDefault();
   });
   mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
   mainWindow.webContents.on('render-process-gone', () => { void backend.stop(); });
   mainWindow.once('ready-to-show', () => mainWindow?.show());
-  mainWindow.on('closed', () => { mainWindow = undefined; });
+  mainWindow.on('closed', () => {
+    navigationEpoch += 1;
+    liveApprovalProvider.invalidateOutstanding();
+    approvalConfirmer.cancelOutstanding();
+    mainWindow = undefined;
+  });
   void mainWindow.loadFile(RENDERER_FILE);
 }
 
 async function shutdown(): Promise<void> {
+  liveApprovalProvider.invalidateOutstanding();
+  approvalConfirmer.cancelOutstanding();
   await backend.stop();
   app.exit(0);
 }

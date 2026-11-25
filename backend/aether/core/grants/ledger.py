@@ -139,6 +139,14 @@ _ISSUER_CODE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 # denies all new issuance (see ``_check_permit_trust``).
 _TRUSTED_TRUST_SOURCE = "trusted_verifier"
 _TEST_TRUST_SOURCE = "test_simulation"
+# Activation B policy: accepts permits exclusively from the central
+# trusted authorization decision (production verifier over the trusted
+# approval window + authenticated single-use gesture). Selected only
+# by GrantLedger.open(..., production_trusted=True) from the
+# composition root under a validated controlled-activation scope; no
+# caller-supplied object, module name, environment variable or
+# renderer request selects it.
+_PRODUCTION_TRUSTED_POLICY = "production_trusted"
 
 # S4-9: the only modules allowed to request or spend test-only persistence.
 # Both spellings are listed because pytest may import the Stage 4 test modules
@@ -456,8 +464,14 @@ class GrantLedger:
     # ------------------------------------------------------------------
 
     @classmethod
-    def open(cls, store: SQLiteTaskStore) -> GrantLedger:
+    def open(cls, store: SQLiteTaskStore, *, production_trusted: bool = False) -> GrantLedger:
         """Open the ledger for a live store, **sharing** its lock and connection.
+
+        ``production_trusted`` is the Activation B opt-in: only the
+        composition root passes it, and only under a validated
+        controlled-activation scope. Default construction stays
+        default-deny (``GRANT_ISSUANCE_DISABLED`` for every permit).
+
 
         This is the only supported path for operations that write grants. It
         requires the store to be open, verifies that this ledger targets the
@@ -489,6 +503,9 @@ class GrantLedger:
                 _shared_transaction=store._transaction,
             )
             ledger._store = store
+            ledger._trust_source_policy = (
+                _PRODUCTION_TRUSTED_POLICY if production_trusted else "production"
+            )
             # One shared connection means one synchronization mechanism: adopt
             # the store's lock so grant reads and grant writes serialize with
             # every task/plan/audit operation on that connection (S4-8).
@@ -1045,8 +1062,9 @@ class GrantLedger:
                 task_id=task_id,
                 plan_revision=plan_revision,
                 plan_hash=plan_hash,
+                executing=True,
             )
-            self._check_fresh_consent(connection, task_id)
+            self._check_fresh_consent(connection, task_id, executing=True)
             decremented = connection.execute(
                 "UPDATE exact_approval_grant_state "
                 "SET uses_remaining = uses_remaining - 1, consumed_count = consumed_count + 1 "
@@ -1125,6 +1143,7 @@ class GrantLedger:
         task_id: UUID,
         plan_revision: int,
         plan_hash: str,
+        executing: bool = False,
     ) -> None:
         """S4-4: a grant cannot be spent once the task's current plan moved.
 
@@ -1146,7 +1165,15 @@ class GrantLedger:
                 "GRANT_PLAN_SUPERSEDED",
                 "the task's current plan revision no longer matches this grant",
             )
-        if row["state"] not in ("PREVIEW_READY", "AWAITING_APPROVAL"):
+        # FI-04: at spend time the task may legitimately be in PRECHECK —
+        # recorded execution progress against this very grant. Issuance
+        # (executing=False) keeps the original consent-bearing states.
+        allowed_states = (
+            ("PREVIEW_READY", "AWAITING_APPROVAL", "PRECHECK")
+            if executing
+            else ("PREVIEW_READY", "AWAITING_APPROVAL")
+        )
+        if row["state"] not in allowed_states:
             raise GrantDeniedError(
                 "TASK_STATE_NOT_AUTHORIZABLE",
                 "the task is no longer in a state that carries live user consent",
@@ -1159,18 +1186,22 @@ class GrantLedger:
         grant: ExactApprovalGrant,
         issuance_key: UUID,
     ) -> None:
-        """S4-9: default-deny. New grant issuance is disabled by configuration.
+        """S4-9: default-deny. New grant issuance is denied by configuration.
 
-        The production-configured ledger — ``GrantLedger.open(store)`` — refuses
-        **every** new grant, whatever permit the caller supplies. A permit is an
-        ordinary Python object, so its fields cannot prove that a trusted
-        verifier or an authoritative preview source ever ran; checking more
-        fields would only make forgery slightly longer to type.
+        The default production-configured ledger — ``GrantLedger.open(store)``
+        — refuses **every** new grant, whatever permit the caller supplies. A
+        permit is an ordinary Python object, so its fields cannot prove that a
+        trusted verifier or an authoritative preview source ever ran; checking
+        more fields would only make forgery slightly longer to type.
 
-        Production issuance therefore stays switched off until the separately
-        reviewed authenticated authorizing boundary exists (see
-        :mod:`aether.core.grants.authorization`). Enabling it is a deliberate
-        code change to this gate, not something a caller can supply at runtime.
+        Activation B adds exactly one more configuration, selected only by
+        the composition root under a validated controlled-activation scope
+        (``production_trusted``): it accepts solely the central trusted
+        authorization decision's ``trusted_verifier`` permit, bound to this
+        exact grant (task, revision, plan hash, issuance key). Test
+        simulations remain refused there. Enabling either is a deliberate
+        code/configuration decision in trusted composition code, never
+        something a caller can supply at runtime.
 
         :meth:`open_tests_scoped` — reachable solely from allow-listed test
         modules — accepts the central decision's ``trusted_verifier`` permit and
@@ -1179,6 +1210,27 @@ class GrantLedger:
         production configuration.
         """
 
+        # 0. Activation B: production-trusted configuration. Accept only
+        #    the central decision's permit, bound to this exact grant;
+        #    test simulations are refused in this configuration.
+        if self._trust_source_policy == _PRODUCTION_TRUSTED_POLICY:
+            if permit.trust_source != _TRUSTED_TRUST_SOURCE:
+                raise GrantIssuanceDenied(
+                    "AUTHORIZATION_EVIDENCE_REQUIRED",
+                    "production issuance requires the trusted authorization decision",
+                )
+            binding = permit.binding
+            if (
+                binding.get("task_id") != str(grant.task_id)
+                or binding.get("plan_revision") != grant.plan_revision
+                or str(binding.get("plan_hash", "")).casefold() != grant.plan_hash.casefold()
+                or binding.get("issuance_key") != str(issuance_key)
+            ):
+                raise GrantIssuanceDenied(
+                    "ISSUANCE_PERMIT_MISMATCH",
+                    "the authorization decision does not cover this exact grant",
+                )
+            return
         # 1. Default-deny, decided by configuration and checked before the
         #    permit is inspected at all: no caller-supplied object changes this.
         if self._trust_source_policy != "test_scoped":
@@ -1225,7 +1277,9 @@ class GrantLedger:
                 "ISSUANCE_PERMIT_MISMATCH", "the test permit does not cover this exact grant"
             )
 
-    def _check_fresh_consent(self, connection: sqlite3.Connection, task_id: UUID) -> None:
+    def _check_fresh_consent(
+        self, connection: sqlite3.Connection, task_id: UUID, *, executing: bool = False
+    ) -> None:
         """S4-7: the store's own fresh-consent predicate, inside this transaction.
 
         Called inside the same transaction as the grant write or the use
@@ -1251,7 +1305,13 @@ class GrantLedger:
                 "fresh-consent state must be read inside the grant transaction",
             )
         try:
-            blocked = store.is_stage2_preview_blocked(task_id)
+            # FI-04: spend-time consent accepts the recorded PRECHECK
+            # execution state; issuance-time consent is unchanged.
+            blocked = (
+                not store.is_execution_consent_active(task_id)
+                if executing
+                else store.is_stage2_preview_blocked(task_id)
+            )
         except Exception as exc:  # fail closed on unreadable audit state
             raise GrantDeniedError(
                 "CONSENT_AUTHORITY_UNAVAILABLE", "fresh-consent state could not be verified"

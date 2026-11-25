@@ -2,6 +2,17 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
+import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
+import { describeLiveApprovalOutcome } from '../shared/live';
+import type {
+  LiveApprovalState,
+  LiveReceiptState,
+  OpenOutcome,
+  RegisteredProject,
+  SearchOutcome,
+  WorkflowStep,
+} from '../shared/live';
+import type { ExactPreview } from '../shared/review';
 import {
   parseReviewAcknowledgement,
   parseReviewPreviewState,
@@ -18,6 +29,20 @@ declare global {
       demoPing: () => Promise<string>;
       getApprovalReview: () => Promise<ReviewPreviewState>;
       recordReviewOutcome: (request: ReturnType<typeof reviewRequestFor>) => Promise<ReviewAcknowledgement>;
+      approveLiveAction: () => Promise<LiveApprovalState>;
+      selectProject: () => Promise<{ status: 'ready'; project: RegisteredProject } | { status: 'unavailable'; reason: string }>;
+      openProjectFile: (relativePath: string) => Promise<WorkflowStep<{ resourceId: string }>>;
+      prepareEdit: (find: string, replace: string) => Promise<WorkflowStep<ExactPreview>>;
+      prepareUndo: (receiptId: string) => Promise<WorkflowStep<ExactPreview>>;
+      getEditReceipt: (receiptId: string) => Promise<LiveReceiptState>;
+      searchProject: (query: string) => Promise<WorkflowStep<SearchOutcome>>;
+      openProjectFolder: () => Promise<WorkflowStep<OpenOutcome>>;
+      getWorkflowState: () => Promise<{
+        project: RegisteredProject | null;
+        file: { resourceId: string } | null;
+        contents: { text: string } | null;
+        preview: ExactPreview | null;
+      }>;
     };
   }
 }
@@ -30,6 +55,13 @@ function App(): React.JSX.Element {
   const [reviewBusy, setReviewBusy] = React.useState(false);
   const [reviewAcknowledgement, setReviewAcknowledgement] = React.useState<ReviewAcknowledgement>();
   const [reviewError, setReviewError] = React.useState<string>();
+  const [liveBusy, setLiveBusy] = React.useState(false);
+  const [liveResult, setLiveResult] = React.useState<string>();
+  const [workflow, setWorkflow] = React.useState<WorkflowView>({
+    projectAlias: null, fileName: null, fileText: null, preview: null, message: null,
+    searchMatches: null, openMessage: null,
+  });
+  const [receipt, setReceipt] = React.useState<LiveReceiptState | null>(null);
 
   React.useEffect(() => {
     let active = true;
@@ -72,6 +104,104 @@ function App(): React.JSX.Element {
     }
   }
 
+  async function approveLive(): Promise<void> {
+    setLiveBusy(true);
+    setLiveResult(undefined);
+    try {
+      const outcome = await window.aetherDesktop.approveLiveAction();
+      // Truthful per-stage reporting: the provider states exactly what
+      // was signed, submitted, authorized and executed — never a
+      // blanket "nothing was signed" when a gesture was in fact signed
+      // and submitted (e.g. refused at production issuance).
+      setLiveResult(describeLiveApprovalOutcome(outcome));
+    } catch {
+      setLiveResult('Live approval outcome unknown: the attempt was interrupted before a result was reported. Do not assume nothing was signed — check the task and receipt state before retrying.');
+    } finally {
+      setLiveBusy(false);
+    }
+  }
+
+  async function refreshWorkflow(message?: string): Promise<void> {
+    try {
+      const state = await window.aetherDesktop.getWorkflowState();
+      setWorkflow((current) => ({
+        ...current,
+        projectAlias: state.project?.alias ?? null,
+        fileName: state.file?.resourceId ?? null,
+        fileText: state.contents?.text ?? null,
+        preview: state.preview,
+        message: message ?? null,
+      }));
+    } catch {
+      setWorkflow((current) => ({ ...current, message: 'Workflow state unavailable.' }));
+    }
+  }
+
+  async function selectProject(): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const picked = await window.aetherDesktop.selectProject();
+      await refreshWorkflow(picked.status === 'ready'
+        ? `Project registered: ${picked.project.alias}`
+        : `Project registration unavailable (${picked.reason}).`);
+    } finally { setLiveBusy(false); }
+  }
+
+  async function openFile(relativePath: string): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const opened = await window.aetherDesktop.openProjectFile(relativePath);
+      await refreshWorkflow(stepMessage(opened, 'File opened.'));
+    } finally { setLiveBusy(false); }
+  }
+
+  async function prepareEdit(find: string, replace: string): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const planned = await window.aetherDesktop.prepareEdit(find, replace);
+      await refreshWorkflow(stepMessage(planned, 'Exact preview ready for native approval.'));
+    } finally { setLiveBusy(false); }
+  }
+
+  async function prepareUndo(receiptId: string): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const planned = await window.aetherDesktop.prepareUndo(receiptId);
+      await refreshWorkflow(stepMessage(planned, 'Undo preview ready for native approval.'));
+    } finally { setLiveBusy(false); }
+  }
+
+  async function searchProject(query: string): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const found = await window.aetherDesktop.searchProject(query);
+      setWorkflow((current) => ({
+        ...current,
+        searchMatches: found.status === 'ready' ? found.value.matches : null,
+        message: stepMessage(found, 'Search complete.'),
+      }));
+    } finally { setLiveBusy(false); }
+  }
+
+  async function openFolder(): Promise<void> {
+    setLiveBusy(true);
+    try {
+      const opened = await window.aetherDesktop.openProjectFolder();
+      setWorkflow((current) => ({
+        ...current,
+        openMessage: opened.status === 'ready'
+          ? `Open requested for ${opened.value.displayName} (${opened.value.verification}).`
+          : `Open unavailable (${opened.reason}).`,
+      }));
+    } finally { setLiveBusy(false); }
+  }
+
+  async function showReceipt(receiptId: string): Promise<void> {
+    setReceipt({ status: 'loading' });
+    try { setReceipt(await window.aetherDesktop.getEditReceipt(receiptId)); }
+    catch { setReceipt({ status: 'unavailable', message: 'receipt_unavailable' }); }
+  }
+
   return <main className="shell min-h-screen">
     <div className="eyebrow">AETHER OS · DESKTOP FOUNDATION</div>
     <h1>Local control channel</h1>
@@ -91,7 +221,24 @@ function App(): React.JSX.Element {
       error={reviewError}
       onOutcome={(outcome, acknowledged) => { void recordOutcome(outcome, acknowledged); }}
     />
-    <p className="notice">This build has no grants, permission issuance, filesystem capability, or execution path. Every displayed review outcome is non-authorizing audit evidence only.</p>
+    <button type="button" className="ping-button" onClick={() => void approveLive()} disabled={liveBusy || !status.startsWith('ready')}>
+      {liveBusy ? 'Awaiting trusted approval…' : 'Approve & execute exact action…'}
+    </button>
+    {liveResult && <p className="result" role="status">{liveResult}</p>}
+    <LiveWorkflowSurface
+      view={workflow}
+      busy={liveBusy}
+      receipt={receipt}
+      onSelectProject={() => void selectProject()}
+      onOpenFile={(path) => void openFile(path)}
+      onSearch={(query) => void searchProject(query)}
+      onOpenFolder={() => void openFolder()}
+      onPrepareEdit={(find, replace) => void prepareEdit(find, replace)}
+      onApprove={() => void approveLive()}
+      onShowReceipt={(id) => void showReceipt(id)}
+      onPrepareUndo={(id) => void prepareUndo(id)}
+    />
+    <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires the trusted approval window (complete exact preview with explicit review acknowledgement) and production grant issuance. Issuance is enabled only for the controlled acceptance fixture — validated fixture storage and its designated project directory. In ordinary application launches, issuance and execution remain disabled: an approved gesture is refused and nothing executes.</p>
   </main>;
 }
 

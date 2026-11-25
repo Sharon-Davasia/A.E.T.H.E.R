@@ -68,9 +68,11 @@ class FakeChild extends EventEmitter {
 
   private consume(chunk: Buffer): void {
     this.received = Buffer.concat([this.received, chunk]);
-    if (!this.initialized && this.received.length >= 88) {
-      const bootstrap = this.received.subarray(0, 88);
-      this.received = this.received.subarray(88);
+    // Bootstrap: MAGIC(8) | session(16) | channel key(32) | challenge(32)
+    // | gesture key(32). This double discards the gesture key bytes.
+    if (!this.initialized && this.received.length >= 120) {
+      const bootstrap = this.received.subarray(0, 120);
+      this.received = this.received.subarray(120);
       assert.deepEqual(bootstrap.subarray(0, 8), MAGIC);
       this.sessionId = bootstrap.subarray(8, 24).toString('hex');
       this.key = Buffer.from(bootstrap.subarray(24, 56));

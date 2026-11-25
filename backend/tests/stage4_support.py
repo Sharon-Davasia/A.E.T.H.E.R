@@ -110,6 +110,7 @@ class SyntheticT2Plan:
         revision: int = 1,
         resource_id: str | None = None,
         resource_version: str | None = None,
+        expected_effect: dict[str, object] | None = None,
     ) -> None:
         self.database = database
         self.task_id = uuid4()
@@ -123,7 +124,7 @@ class SyntheticT2Plan:
             "approval_id": str(self.approval_id),
             "expected_sha256": "a" * 64,
         }
-        self.expected_effect = {"effect": "replace-one-token"}
+        self.expected_effect = expected_effect or {"effect": "replace-one-token"}
         self.revision = revision
         self.plan = TaskPlan(
             task_id=self.task_id,

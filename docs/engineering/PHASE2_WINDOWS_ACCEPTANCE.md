@@ -156,51 +156,121 @@ git SHA, and their own statement of what they observed with their own eyes
 
 ---
 
-## 8. Evidence matrix (post-merge reconciliation, 2026-11-23)
+## 8. Evidence matrix (final-integration closeout)
 
-Reconciled against merged `main` (`a58bd68`, via PR #34), the automated
-results at verified commit `bf08ca9`, and the user-reported native Windows
-run. Statuses distinguish four evidence classes: **automated** (test-suite
-results), **native Windows** (executed on the target OS), **human
-demonstration** (a person operating the shipped application), and the
-**final verdict**, which is `PASS` only when every required class is
-present. User-reported Windows results have no archived logs in this
-repository; they are marked "reported" and do not by themselves satisfy a
-verdict.
+Consolidated against PR #36 at the native-tested implementation head
+`35f9bb0e344441ed86878b6b22e8b9d8765de5d8` (closeout commits after it
+are documentation and renderer-copy only). Evidence classes are kept
+deliberately separate and never merged into a claim stronger than
+their source:
 
-**Production-wiring fact that bounds several scenarios:** production grant
-issuance remains disabled (`GRANT_ISSUANCE_DISABLED`,
-`NullAttestationVerifier`, `IssuanceDisabledConsumptionLedger` default) and
-no live mutation path is wired into the running service. Scenarios whose
-*live* form requires issuing a real grant or mutating a real file are
-therefore **blocked as acceptance demonstrations** until a separately
-authorized, supported live workflow exists. They must not be "demonstrated"
-by bypassing those controls.
+- **Source-reviewed** — implementation inspected in review (PR #36).
+- **Automated** — test suites on Linux (Python 3.11.2) at the closeout
+  head: backend 955 passed / 7 skipped; desktop 126 passed.
+- **Native automated** — the same gates executed on the target
+  Windows machine (Python 3.12.10): owner-confirmed PASS.
+- **Owner-confirmed native demonstration** — a person operating the
+  shipped application on the target machine, confirmed by the
+  repository owner. The underlying artifacts (evidence directory
+  `D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a`, including
+  the original successful edit receipt
+  `9900df8e-9157-43a3-85b0-0e7d0d5203e2`) are held by the owner and are
+  **not archived in this repository**; confirmation is recorded here
+  as owner-reported evidence, not as archived evidence.
+- **Unverified** — no evidence of the required class exists yet.
 
-| # | Scenario (expected behaviour) | Implementation / test files | Automated | Native Windows evidence | Human demonstration | Final verdict |
-|---|---|---|---|---|---|---|
-| 1 | Open a registered project; bounded access only | `core/fs/session.py`; `test_phase2_end_to_end.py::test_01_*`, `test_phase2c_session.py` | PASS (Linux 847-suite) | Reported PASS (full suite, Win 3.12.10; logs not archived) | Required — open the shipped app on a registered project | **NOT VERIFIED** |
-| 2 | Search + read an allowed file | `core/fs/search.py`, `content.py`; `test_02_*` | PASS | Reported PASS (as above) | Required — live search/read in the app | **NOT VERIFIED** |
-| 3 | Refuse reads outside authorized roots | `core/resources/registry.py`; `test_03_*` | PASS | Reported PASS | Required — attempt an outside-root read live | **NOT VERIFIED** |
-| 4 | Refuse `.env`/sensitive files without authorization | `registry.py`, `fs/content.py`; `test_04_*` | PASS | Reported PASS | Required — live refusal observation | **NOT VERIFIED** |
-| 5 | Deny junction/symlink (reparse-point) escape | `core/resources/path_safety.py`; `test_05_*` (symlink on Linux); native junction probe in verifier step 5 | PASS (symlink); junction NTFS-only | Junction probe is part of `verify_phase2.ps1`; execution/archived output not in repo | Required — create a junction on NTFS and observe refusal | **NOT VERIFIED** |
-| 6 | Human-visible exact patch preview before approval | `core/planning/preview_authority.py`, `planning/exact_diff.py` (aether-diff-v2 EOF trailer), `apps/desktop/src/ApprovalReviewSurface.tsx`; `test_06_*`, desktop CRLF/EOF tests | PASS | Desktop suite reported PASS on Windows | Required — a human reads the exact diff (incl. CRLF/EOF summary) in the real UI | **NOT VERIFIED** |
-| 7 | Refuse mutation before approval | `core/grants/attestation.py`; `test_07_*` | PASS | Reported PASS | Required live — but **blocked**: production grant issuance disabled, no live mutation path; refusal is the only live-observable half | **NOT VERIFIED** (live demo blocked) |
-| 8 | Apply the exact approved edit; hash matches | `core/edits/executor.py`; `test_08_*`, `test_phase2_approved_bytes.py`, `test_phase2d_edits.py` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
-| 9 | Refuse stale approval after post-preview modification | `edits/executor.py`; `test_09_*` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
-| 10 | Reject forged/expired/revoked/exhausted/replayed grants | `core/grants/*`, `planning/authorizing_gesture.py`; `test_10_*` (7 cases), `test_phase2b_stage4_grants.py`, `test_phase2_authoritative_consumption.py` | PASS | Reported PASS | Required against the real ledger — **blocked** for live issuance as #7 | **NOT VERIFIED** (live demo blocked) |
-| 11 | Consumption binds the exact action | `grants/authority.py`, `grants/consumption.py`; `test_11_*` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
-| 12 | Receipts durable across restart | `core/edits/receipts.py`; `test_12_*` | PASS | Reported PASS | Required — real application restart with receipts re-read | **NOT VERIFIED** |
-| 13 | Undo restores the exact original bytes | `core/vault/undo_vault.py`, `edits/executor.py` undo; `test_13_*`, `test_phase2_undo_authorization.py` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
-| 14 | Undo refuses silent overwrite of a newer edit | `edits/executor.py` undo; `test_14_*` | PASS | Reported PASS | Required live — **blocked** as #7 | **NOT VERIFIED** (live demo blocked) |
-| 15 | Truthful crash/cancel recovery (UNVERIFIED, never false success) | `edits/executor.py`, `edits/journal.py`; `test_15_*` (simulated kill, re-opened from disk) | PASS (simulated) | No real interruption performed | Required — a genuine interruption (kill/power) on Windows; simulation does not satisfy this | **NOT VERIFIED** |
-| 16 | T3/shell/unsupported capabilities denied | `core/policy/broker.py`, `fs/executor.py`; `test_16_*` | PASS | Reported PASS | Required — live denial observation in the app | **NOT VERIFIED** |
-| 17 | Zero unauthorized mutation across the run | whole stack; `test_17_*` | PASS | Not observed on a live machine | Required — observed across the acceptance run (fixture hashes before/after) | **NOT VERIFIED** |
-| 18 | Offline; zero unauthorized outbound disclosure | no network client in Phase 2 packages; `test_18_*` | PASS (code-level) | Not observed on a live machine | Required — observed offline behaviour on the machine, not inferred from tests | **NOT VERIFIED** |
+**Production-wiring fact (current):** schema v2 is active for the
+controlled candidate; production grant issuance is enabled *only*
+for validated acceptance-fixture launches, bounded to the designated
+fixture project subtree (`Activation B`). Ordinary application
+launches refuse issuance (`grant_issuance_disabled`) and execution
+(`mutation_not_enabled`). Fixture-only mutation, the combined
+verifier safety warning and the real-data migration restriction
+remain in force.
 
-**Summary:** 18/18 implemented; 18/18 automated PASS on Linux at `bf08ca9`
-(user-reported PASS on native Windows, unarchived); 0/18 formally accepted.
-Every scenario still lacks at least one required evidence class — archived
-native Windows evidence, a human demonstration, a genuine interruption, or
-a supported live workflow for the presently disabled mutation path.
+A final verdict of `PASS` requires every required class, archived.
+Owner confirmation without archived artifacts therefore leaves the
+verdict **NOT VERIFIED (evidence not archived)** — a bookkeeping
+state, not a doubt about the reported observation.
+
+| # | Scenario (expected behaviour) | Automated (Linux) | Native automated (Windows) | Owner-confirmed native demonstration | Final verdict |
+|---|---|---|---|---|---|
+| 1 | Open a registered project; bounded access only | PASS | PASS (owner-confirmed) | Confirmed — registration and Explorer opening | **NOT VERIFIED** (evidence not archived) |
+| 2 | Search + read an allowed file | PASS | PASS (owner-confirmed) | Confirmed — reading and search | **NOT VERIFIED** (evidence not archived) |
+| 3 | Refuse reads/registrations outside authorized roots | PASS | PASS (owner-confirmed) | Confirmed — fixture root, storage and outside registration refusals; path traversal refusals | **NOT VERIFIED** (evidence not archived) |
+| 4 | Refuse `.env`/sensitive files without authorization | PASS | PASS (owner-confirmed) | Confirmed — secret-file protection observed | **NOT VERIFIED** (evidence not archived) |
+| 5 | Deny junction/symlink (reparse-point) escape | PASS | PASS (owner-confirmed; junction variant runs without elevation) | Not separately demonstrated live | **NOT VERIFIED** |
+| 6 | Human-visible exact patch preview before approval | PASS | PASS (owner-confirmed) | Confirmed — trusted approval window, acknowledgement gating, CRLF/EOF and long-line scrolling, cancellation incl. Escape | **NOT VERIFIED** (evidence not archived) |
+| 7 | Refuse mutation before approval | PASS | PASS (owner-confirmed) | Confirmed — no mutation before approval; cancellations signed nothing (fixture hashes unchanged) | **NOT VERIFIED** (evidence not archived) |
+| 8 | Apply the exact approved edit; hash matches | PASS | PASS (owner-confirmed) | Confirmed — actual explicitly approved edit; original receipt `9900df8e-9157-43a3-85b0-0e7d0d5203e2` | **NOT VERIFIED** (evidence not archived) |
+| 9 | Refuse stale approval after post-preview modification | PASS | PASS (owner-confirmed) | Confirmed — stale-plan invalidation and stale approval rejection preserving externally modified content | **NOT VERIFIED** (evidence not archived) |
+| 10 | Reject forged/expired/revoked/exhausted/replayed grants | PASS | PASS (owner-confirmed) | Not demonstrated live against the fixture ledger | **NOT VERIFIED** |
+| 11 | Consumption binds the exact action | PASS | PASS (owner-confirmed) | Not demonstrated live | **NOT VERIFIED** |
+| 12 | Receipts durable across restart | PASS | PASS (owner-confirmed) | Confirmed — receipt retrieved across application restart | **NOT VERIFIED** (evidence not archived) |
+| 13 | Undo restores the exact original bytes | PASS | PASS (owner-confirmed) | Confirmed — separately approved Undo; all six original fixture SHA-256 hashes restored | **NOT VERIFIED** (evidence not archived) |
+| 14 | Undo refuses silent overwrite of a newer edit | PASS | PASS (owner-confirmed) | Confirmed — Undo conflict rejection | **NOT VERIFIED** (evidence not archived) |
+| 15 | Truthful crash/cancel recovery (UNVERIFIED, never false success) | PASS (simulated) | No genuine interruption performed | Not demonstrated — simulation does not satisfy this scenario | **NOT VERIFIED** |
+| 16 | T3/shell/unsupported capabilities denied | PASS | PASS (owner-confirmed) | Confirmed — absence of arbitrary shell execution | **NOT VERIFIED** (evidence not archived) |
+| 17 | Zero unauthorized mutation across the run | PASS | PASS (owner-confirmed) | Confirmed — all six fixture files verified by SHA-256 across the campaign | **NOT VERIFIED** (evidence not archived) |
+| 18 | Offline; zero unauthorized outbound disclosure | PASS (code-level) | Not observed live | Not demonstrated — must be observed on the machine, not inferred | **NOT VERIFIED** |
+
+**Summary:** 18/18 implemented and source-reviewed; 18/18 automated
+PASS (Linux at closeout head; native Windows gates owner-confirmed
+PASS at `35f9bb0`); owner-confirmed native demonstrations for
+scenarios 1–4, 6–9, 12–14, 16, 17; **0/18 formally accepted** —
+archived evidence and the §10 closeout items remain outstanding.
 **Formal Phase 2 acceptance remains NOT COMPLETE.**
+
+---
+
+## 9. Live-workflow addendum (superseded by §8 closeout)
+
+The live workflow (Activation A schema v2 + controlled Activation B
+production-trusted issuance for the disposable fixture) is implemented
+in PR #36 and natively demonstrated as recorded in §8. The earlier
+statement that activation proposals were "not yet approved" is
+superseded: both were separately authorized and implemented for the
+controlled candidate, with ordinary launches remaining
+issuance/execution-disabled. **Formal Phase 2 acceptance remains NOT
+COMPLETE.**
+
+---
+
+## 10. Final closeout checklist (remaining mandatory evidence — finite)
+
+Implementation and owner-confirmed demonstrations are complete. The
+following, and only the following, remain before formal acceptance
+can be declared under §7. No new test cycles are required beyond
+these items; existing native automated evidence is reused wherever
+the procedure permits.
+
+- [ ] Archive the owner-held native evidence (evidence directory
+      `D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a`,
+      including receipt `9900df8e-9157-43a3-85b0-0e7d0d5203e2` and the
+      fixture SHA-256 comparisons) into the repository or an
+      owner-signed evidence bundle naming head `35f9bb0`.
+- [ ] Record machine identity, Windows OS/build and NTFS details for
+      the acceptance machine alongside the archived evidence.
+- [ ] Scenario 5: human junction-escape demonstration on NTFS with
+      archived output (native automated junction coverage already
+      passes without elevation).
+- [ ] Scenarios 10–11: live demonstration against the fixture ledger
+      (forged/replayed authorization refusal; single-use exact-action
+      consumption), or an explicit owner acceptance, recorded per §7,
+      of the existing native automated evidence for these scenarios.
+- [ ] Scenario 15: one genuine interruption (process kill during an
+      approved execution) on Windows, with the resulting UNVERIFIED /
+      reconciliation outcome recorded.
+- [ ] Scenario 18: offline observation on the acceptance machine
+      (no network route; no outbound disclosure), recorded.
+- [ ] Owner visual confirmation of the corrected desktop footer text
+      (controlled fixture activation vs ordinary-mode denial) in the
+      merged build — copy-only change after `35f9bb0`.
+- [ ] §7 sign-off: date, machine identity, git SHA (merged head), and
+      the owner's own statement of what was personally observed; only
+      then may the matrix verdicts be advanced to PASS.
+
+Until every box is checked: **Formal Phase 2 acceptance: NOT
+COMPLETE.** Merging PR #36 as a controlled integration checkpoint
+does not change that verdict and does not authorize real-data
+migration, general mutation enablement, or Phase 3.

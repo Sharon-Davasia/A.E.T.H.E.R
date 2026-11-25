@@ -57,6 +57,52 @@ class FixtureTree:
     nested_file: Path
 
 
+def skip_if_symlink_unavailable(exc: BaseException) -> None:
+    """Skip only when this host genuinely cannot create a symlink.
+
+    Mirrors the repository convention (test_phase2b_persistence): on
+    Windows, WinError 5/1314 means the account lacks the symlink
+    privilege (no Developer Mode / elevation) — the capability is
+    unavailable, so the test skips with the reason recorded. Anything
+    else is a real failure and is re-raised. A skip here is never
+    evidence that the Windows security scenario passed.
+    """
+
+    import os
+
+    import pytest
+
+    if isinstance(exc, NotImplementedError) or os.name != "nt":
+        pytest.skip("symlink creation is unavailable on this host")
+    if getattr(exc, "winerror", None) in {5, 1314}:
+        pytest.skip(f"Windows denied symlink creation (WinError {exc.winerror})")
+    raise exc
+
+
+def make_junction(link: Path, target: Path) -> None:
+    """Create a directory junction (no privilege required on Windows).
+
+    Used for non-elevated native reparse-point coverage on Windows;
+    skips anywhere junctions cannot be created.
+    """
+
+    import os
+    import subprocess
+
+    import pytest
+
+    if os.name != "nt":
+        pytest.skip("directory junctions are a Windows reparse-point mechanism")
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0 or not link.exists():
+        pytest.skip(f"junction creation unavailable: {result.stdout} {result.stderr}")
+
+
 def build_tree(base: Path) -> FixtureTree:
     """Create a disposable project tree and return its interesting paths."""
 

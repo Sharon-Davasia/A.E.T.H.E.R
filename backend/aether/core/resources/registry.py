@@ -8,7 +8,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from uuid import UUID, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from aether.core.contracts.resource import DataClass, Provenance, ResourceKind, ResourceRef
 from aether.core.resources.path_safety import (
@@ -69,9 +69,17 @@ class ResourceRegistry:
         volume_inspector: VolumeInspector | None = None,
         allowed_volume_kinds: frozenset[VolumeKind] = frozenset({VolumeKind.FIXED}),
         windows_semantics: bool | None = None,
+        registration_boundary: Path | None = None,
     ) -> None:
         self._volume_inspector = volume_inspector or _SystemVolumeInspector()
         self._allowed_volume_kinds = allowed_volume_kinds
+        # Controlled-activation boundary (Activation B): when set, roots
+        # may register only at or below this canonical directory. The
+        # comparison uses the canonical (reparse-checked, resolved)
+        # root path, never a string prefix.
+        self._registration_boundary = (
+            Path(registration_boundary).resolve() if registration_boundary is not None else None
+        )
         self._windows_semantics = (
             os.name == "nt" if windows_semantics is None else windows_semantics
         )
@@ -102,6 +110,10 @@ class ResourceRegistry:
             raise ResourceRegistryError(_path_error_code(exc)) from exc
         if not stat.S_ISDIR(metadata.st_mode):
             raise ResourceRegistryError("root_not_directory")
+        if self._registration_boundary is not None and not canonical.is_relative_to(
+            self._registration_boundary
+        ):
+            raise ResourceRegistryError("root_outside_activation_boundary")
         if _is_volume_root(canonical):
             raise ResourceRegistryError("volume_root_registration_forbidden")
         if is_protected_path(canonical) or data_class == DataClass.SECRET:
@@ -117,8 +129,19 @@ class ResourceRegistry:
         ):
             raise ResourceRegistryError("explicit_capability_scope_required")
 
+        # Deterministic root identity (FI-02 restart lifecycle): the same
+        # canonical directory, explicitly re-registered after a restart,
+        # re-issues the same root (and therefore the same resource ids),
+        # so durable receipts remain resolvable. This never *restores* a
+        # registration by itself — registration remains an explicit,
+        # user-authorized act — and a second live registration of the same
+        # directory is refused rather than silently aliased.
+        root_id = uuid5(NAMESPACE_URL, f"aether:project-root:{canonical}")
+        if root_id in self._roots:
+            raise ResourceRegistryError("root_already_registered")
+
         root = RegisteredRoot(
-            root_id=uuid4(),
+            root_id=root_id,
             alias=alias.strip(),
             canonical_root=canonical,
             volume=volume,

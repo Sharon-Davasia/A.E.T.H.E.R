@@ -31,9 +31,14 @@ review operations backed by the real persisted task/plan store:
   it only reports what the persisted audit records already prove.
 
 There is no generic privileged operation: unknown kinds terminate the session.
-The service holds an exclusive owner lock on the development database named by
-``AETHER_REVIEW_DB``; when the variable is absent or unusable, review
-operations answer ``review_unavailable`` and the ping path keeps working.
+Storage initialization (FI-02A): the supported application database named
+by ``AETHER_APP_DB`` (passed by Electron main for every build) opens via
+``aether.channel.app_storage`` with the store's owner lock, private
+permissions and active-schema-only migrations. The development review
+database named by ``AETHER_REVIEW_DB`` is a dev-only seed mechanism; when
+it is explicitly configured it takes precedence for the shared store.
+When neither is usable, live operations answer ``composition_unavailable``
+and review operations ``review_unavailable``; the ping path keeps working.
 
 No operation here issues, stores, consumes or implies an ExactApprovalGrant;
 every acknowledgement carries ``NON_AUTHORIZING_AUDIT_RECORD`` semantics.
@@ -46,16 +51,44 @@ import platform
 import secrets
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from aether.channel import protocol
+from aether.channel.app_storage import (
+    ACCEPTANCE_MODE_ENV,
+    AcceptanceStorageError,
+    fixture_layout,
+    open_application_store,
+    open_fixture_store,
+)
+from aether.channel.live_bridge import LiveBridge
 from aether.channel.protocol import canonical
 from aether.channel.review_bridge import ReviewBridge
+from aether.core.composition import ActivationScope, CompositionUnavailable, TrustedComposition
+from aether.core.persistence.sqlite_store import SQLiteTaskStore
 
 _PING_KIND = "demo.ping"
 _GET_PREVIEW_KIND = "review.get_preview"
 _RECORD_OUTCOME_KIND = "review.record_outcome"
 _GET_OUTCOME_KIND = "review.get_outcome"
+
+# Live workflow kinds (Phase 2 final integration), served by the trusted
+# composition when it could be built; otherwise each answers a bounded
+# `live.error` with reason `composition_unavailable`. There is no generic
+# privileged operation: unknown kinds still terminate the session.
+_LIVE_KINDS = {
+    "project.register": ("register_project", "project.registered"),
+    "project.resolve": ("resolve_resource", "project.resolved"),
+    "task.create": ("create_task", "task.created"),
+    "task.plan": ("plan_task", "task.preview"),
+    "task.planned_preview": ("get_planned_preview", "task.planned"),
+    "fs.execute_read": ("execute_read", "fs.read_result"),
+    "gesture.begin": ("begin_gesture", "gesture.challenge"),
+    "gesture.submit": ("submit_gesture", "gesture.authorized"),
+    "edit.execute": ("execute_edit", "edit.executed"),
+    "edit.receipt": ("get_receipt", "edit.receipt"),
+}
 
 
 def _hello(session: str, challenge: str, key: bytes) -> dict[str, object]:
@@ -115,16 +148,75 @@ def _error_payload(reason: str) -> dict[str, object]:
 
 
 def main() -> int:
-    bootstrap = protocol.read_exact(sys.stdin.buffer, len(protocol.MAGIC) + 16 + 32 + 32)
+    # Bootstrap (private stdin pipe, written once by Electron main):
+    # MAGIC | 16B session id | 32B channel HMAC key | 32B challenge |
+    # 32B gesture key. The gesture key is an independent per-launch secret
+    # (Decision A): cryptographically separated from the channel key, held
+    # only by main and this child, never logged or persisted.
+    bootstrap = protocol.read_exact(sys.stdin.buffer, len(protocol.MAGIC) + 16 + 32 + 32 + 32)
     if bootstrap[: len(protocol.MAGIC)] != protocol.MAGIC:
         raise ValueError("invalid startup bootstrap")
     offset = len(protocol.MAGIC)
     session = bootstrap[offset : offset + 16].hex()
     key = bootstrap[offset + 16 : offset + 48]
     challenge = bootstrap[offset + 48 : offset + 80].hex()
-    _emit_bounded(_hello(session, challenge, key))
+    gesture_key = bootstrap[offset + 80 : offset + 112]
 
-    bridge = ReviewBridge.from_env(dict(os.environ))
+    env = dict(os.environ)
+    # Controlled-activation acceptance launches (AETHER_ACCEPTANCE_MODE
+    # =fixture) run ONLY against explicitly configured fixture storage:
+    # an invalid or missing fixture configuration refuses startup here
+    # (no hello is emitted, the backend never becomes ready) instead of
+    # falling back to the real application database, and a development
+    # review seed cannot redirect the launch.
+    app_store: SQLiteTaskStore | None
+    fixture_project_root: Path | None = None
+    if env.get(ACCEPTANCE_MODE_ENV) == "fixture":
+        try:
+            # Canonical fixture layout is validated BEFORE storage is
+            # opened or Activation B is enabled; an invalid layout
+            # refuses startup outright.
+            fixture_project_root = fixture_layout(env).project_dir
+            app_store = open_fixture_store(env)
+        except AcceptanceStorageError:
+            return 3
+        bridge = None
+    else:
+        bridge = ReviewBridge.from_env(env)
+        # FI-02A: the supported application store (AETHER_APP_DB, passed by
+        # Electron main for every build) initializes the trusted composition
+        # independently of the development review seed. The review seed —
+        # when explicitly configured — keeps precedence for the store the
+        # composition shares, exactly as before; otherwise the application
+        # store is used. Misconfiguration fails closed to no composition.
+        app_store = None if bridge is not None else open_application_store(env)
+    composition = None
+    live_bridge = None
+    # Hello is emitted only after storage resolution: an acceptance
+    # launch with invalid fixture storage exits above without ever
+    # becoming ready.
+    _emit_bounded(_hello(session, challenge, key))
+    composition_store = bridge.store if bridge is not None else app_store
+    if composition_store is not None:
+        try:
+            # Activation B: only a validated acceptance-fixture launch
+            # carries a controlled-activation scope (production-trusted
+            # issuance bounded to the fixture root). Ordinary launches
+            # pass no scope and remain issuance-disabled.
+            activation_scope = None
+            if fixture_project_root is not None:
+                activation_scope = ActivationScope(project_root=fixture_project_root)
+            composition = TrustedComposition.build(
+                store=composition_store,
+                gesture_key=gesture_key,
+                activation_scope=activation_scope,
+            )
+            live_bridge = LiveBridge(composition)
+        except CompositionUnavailable:
+            # Fail closed for the trusted-execution tier only; the audit-only
+            # review surface is independent and keeps working.
+            composition = None
+            live_bridge = None
     try:
         inbound_seen: set[str] = set()
         inbound_seq = 1
@@ -133,7 +225,7 @@ def main() -> int:
         while True:
             raw = protocol.read_frame(sys.stdin.buffer)
             if raw is None:
-                return 0
+                break
             request = protocol.validate(
                 raw,
                 key=key,
@@ -187,6 +279,19 @@ def main() -> int:
                     else:
                         response_kind = "review.error"
                         response_payload = _error_payload(reason or "review_unavailable")
+            elif kind in _LIVE_KINDS:
+                method_name, success_kind = _LIVE_KINDS[kind]
+                if live_bridge is None:
+                    response_kind = "live.error"
+                    response_payload = _error_payload("composition_unavailable")
+                else:
+                    result = getattr(live_bridge, method_name)(payload)
+                    if result.get("status") == "unavailable":
+                        response_kind = "live.error"
+                        response_payload = _error_payload(str(result.get("reason")))
+                    else:
+                        response_kind = success_kind
+                        response_payload = result
             else:
                 raise ValueError("unsupported channel message")
 
@@ -216,8 +321,13 @@ def main() -> int:
                 _emit_bounded(envelope)
             outbound_seq += 1
     finally:
+        if composition is not None:
+            composition.close()
         if bridge is not None:
             bridge.close()
+        if app_store is not None:
+            app_store.close()
+    return 0
 
 
 if __name__ == "__main__":
