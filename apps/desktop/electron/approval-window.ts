@@ -12,16 +12,21 @@
  * provider's binding/digest/staleness checks after the decision.
  *
  * Displayability is attested by evidence, not by a character limit:
- * the renderer must report rendered-stats identical to the view model
- * main sent (see shared/approval-modal.ts). Without that, or if the
- * window/renderer fails, the confirmation reports
+ * the renderer measures its rendered DOM and main requires a matching
+ * measurement plus a prior successful rendering acknowledgement
+ * before accepting any affirmative decision. A DOM measurement shows
+ * the content was rendered into the modal document; it is not, alone,
+ * proof a human saw every line (the explicit acknowledgement and the
+ * native confirmation check cover that). Without the acknowledgement,
+ * or if the window/renderer fails, the confirmation reports
  * `displayedCompletely: false` and nothing is signed.
  */
 
 import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron';
+import { pathToFileURL } from 'node:url';
 import {
   buildApprovalViewModel,
-  parseApprovalDecision,
+  settleApprovalDecision,
   type ApprovalViewModel,
 } from '../shared/approval-modal';
 import type { ApprovalSummary, ConfirmationOutcome } from './live-approval-provider';
@@ -50,7 +55,7 @@ export function createApprovalWindowConfirmer(options: ApprovalWindowHostOptions
     if (typeof stats !== 'object' || stats === null) return false;
     const candidate = stats as Record<string, unknown>;
     return candidate.diffLineCount === view.contentStats.diffLineCount
-      && candidate.diffCharCount === view.contentStats.diffCharCount
+      && candidate.diffTextCharCount === view.contentStats.diffTextCharCount
       && candidate.affectedPathCount === view.contentStats.affectedPathCount;
   }
 
@@ -66,11 +71,21 @@ export function createApprovalWindowConfirmer(options: ApprovalWindowHostOptions
     resolve(outcome);
   }
 
+  const expectedApprovalUrl = pathToFileURL(options.approvalFile).href;
+
   function isApprovalSender(event: IpcMainInvokeEvent): boolean {
-    return approvalWindow !== undefined
-      && !approvalWindow.isDestroyed()
-      && pending !== null
-      && event.sender === approvalWindow.webContents;
+    if (!approvalWindow || approvalWindow.isDestroyed() || pending === null) return false;
+    const sender = event.sender;
+    if (sender !== approvalWindow.webContents || sender.isDestroyed()) return false;
+    // Main frame only, at exactly the trusted approval page URL —
+    // the same discipline as the ordinary renderer's sender check.
+    const frame = event.senderFrame;
+    if (!frame || frame !== sender.mainFrame) return false;
+    try {
+      return frame.url === expectedApprovalUrl;
+    } catch {
+      return false;
+    }
   }
 
   /** Register the two approval-only IPC channels (call once). */
@@ -92,15 +107,10 @@ export function createApprovalWindowConfirmer(options: ApprovalWindowHostOptions
     });
     ipcMain.handle('approval:decide', (event, rawDecision: unknown) => {
       if (!isApprovalSender(event)) throw new Error('untrusted approval sender');
-      const decision = parseApprovalDecision(rawDecision, pending!.view);
-      const displayedCompletely = decision.decision === 'approve'
-        ? true // parseApprovalDecision already enforced an exact stats match
-        : statsMatch(pending!.view, decision.renderedStats);
-      settle({
-        affirmed: decision.decision === 'approve',
-        displayedCompletely,
-        reviewAcknowledged: decision.reviewAcknowledged,
-      });
+      // An affirmative decision is accepted only after a successful
+      // rendering acknowledgement (pending.renderedConfirmed) — the
+      // decision's own measured stats are additionally bound here.
+      settle(settleApprovalDecision(pending!.view, pending!.renderedConfirmed, rawDecision));
       return true;
     });
   }

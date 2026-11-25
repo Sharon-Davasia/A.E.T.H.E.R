@@ -81,10 +81,16 @@ export interface ApprovalViewModel {
   readonly externalEffects: readonly string[];
   readonly risks: readonly string[];
   readonly verificationStrategy: readonly string[];
-  /** Integrity stats the renderer must echo back from what it rendered. */
+  /**
+   * Expected rendered-content measurements. The renderer measures the
+   * actual DOM it built (rendered diff lines, rendered diff-text
+   * characters, rendered affected-path entries) and main compares the
+   * measurement against these values — the renderer never just echoes
+   * this object back.
+   */
   readonly contentStats: {
     readonly diffLineCount: number;
-    readonly diffCharCount: number;
+    readonly diffTextCharCount: number;
     readonly affectedPathCount: number;
   };
 }
@@ -108,7 +114,7 @@ export function buildApprovalViewModel(
   }
   const diffs: ApprovalDiffView[] = [];
   let diffLineCount = 0;
-  let diffCharCount = 0;
+  let diffTextCharCount = 0;
   for (const resource of preview.resources) {
     const diff = preview.fullDiff.find((entry) => entry.resourceId === resource.resourceId);
     if (!diff) throw new Error('approval preview lacks a diff for a resource');
@@ -116,7 +122,7 @@ export function buildApprovalViewModel(
     if (!eof) throw new Error('approval preview diff lacks EOF evidence');
     const lines = diffDisplayLines(diff.unifiedDiff);
     diffLineCount += lines.length;
-    diffCharCount += diff.unifiedDiff.length;
+    diffTextCharCount += lines.reduce((total, line) => total + line.text.length, 0);
     diffs.push({ resourceId: resource.resourceId, displayName: resource.displayName, lines, eof });
   }
   return {
@@ -152,7 +158,7 @@ export function buildApprovalViewModel(
     verificationStrategy: [...preview.verificationStrategy],
     contentStats: {
       diffLineCount,
-      diffCharCount,
+      diffTextCharCount,
       affectedPathCount: input.affectedPaths.length,
     },
   };
@@ -166,7 +172,7 @@ export interface ApprovalDecision {
   readonly reviewAcknowledged: boolean;
   readonly renderedStats: {
     readonly diffLineCount: number;
-    readonly diffCharCount: number;
+    readonly diffTextCharCount: number;
     readonly affectedPathCount: number;
   };
 }
@@ -209,10 +215,10 @@ export function parseApprovalDecision(value: unknown, view: ApprovalViewModel): 
     throw new Error('approval decision acknowledgement is malformed');
   }
   if (!isRecord(value.renderedStats)) throw new Error('approval decision stats are malformed');
-  exactKeys(value.renderedStats, ['diffLineCount', 'diffCharCount', 'affectedPathCount']);
+  exactKeys(value.renderedStats, ['diffLineCount', 'diffTextCharCount', 'affectedPathCount']);
   const renderedStats = {
     diffLineCount: boundedCount(value.renderedStats.diffLineCount),
-    diffCharCount: boundedCount(value.renderedStats.diffCharCount),
+    diffTextCharCount: boundedCount(value.renderedStats.diffTextCharCount),
     affectedPathCount: boundedCount(value.renderedStats.affectedPathCount),
   };
   if (value.decision === 'approve') {
@@ -221,7 +227,7 @@ export function parseApprovalDecision(value: unknown, view: ApprovalViewModel): 
     }
     if (
       renderedStats.diffLineCount !== view.contentStats.diffLineCount
-      || renderedStats.diffCharCount !== view.contentStats.diffCharCount
+      || renderedStats.diffTextCharCount !== view.contentStats.diffTextCharCount
       || renderedStats.affectedPathCount !== view.contentStats.affectedPathCount
     ) {
       throw new Error('rendered content does not match the approved content');
@@ -242,4 +248,35 @@ export function eofLabel(state: DiffEofState): string {
     case 'newline': return 'ends with a final newline';
     case 'no-newline': return 'no final newline at end of file';
   }
+}
+
+
+export interface ApprovalConfirmationOutcome {
+  readonly affirmed: boolean;
+  readonly displayedCompletely: boolean;
+  readonly reviewAcknowledged: boolean;
+}
+
+/**
+ * Settle one modal decision host-side. An affirmative decision is
+ * accepted only when a successful rendering acknowledgement arrived
+ * BEFORE the decision (`renderedConfirmed`) and the decision itself
+ * is well-formed with matching measured stats. Anything else is a
+ * non-affirmation; `displayedCompletely` reports whether complete
+ * rendering was ever confirmed.
+ */
+export function settleApprovalDecision(
+  view: ApprovalViewModel,
+  renderedConfirmed: boolean,
+  rawDecision: unknown,
+): ApprovalConfirmationOutcome {
+  const decision = parseApprovalDecision(rawDecision, view);
+  if (decision.decision === 'approve' && !renderedConfirmed) {
+    return { affirmed: false, displayedCompletely: false, reviewAcknowledged: false };
+  }
+  return {
+    affirmed: decision.decision === 'approve',
+    displayedCompletely: renderedConfirmed,
+    reviewAcknowledged: decision.reviewAcknowledged,
+  };
 }

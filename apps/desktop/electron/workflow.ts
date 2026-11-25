@@ -204,6 +204,10 @@ export class LiveWorkflow {
 
   public async prepareEdit(find: string, replace: string): Promise<WorkflowStep<ExactPreview>> {
     if (!this.file || !this.contents) throw new Error('open a file before preparing an edit');
+    // A new preparation attempt supersedes any earlier plan: whatever
+    // happens next, a FAILED preparation must never leave a previous
+    // approval-ready plan behind for the user to approve by mistake.
+    this.clearPlan();
     // FI-06A: never build a proposed edit from an untrustworthy source
     // read. A truncated, incomplete, stale or lossy source would make
     // the proposed bytes silently truncate or corrupt the real file.
@@ -263,6 +267,9 @@ export class LiveWorkflow {
   }
 
   public async prepareUndo(receiptId: string): Promise<WorkflowStep<ExactPreview>> {
+    // Same supersession rule as prepareEdit: a failed Undo preparation
+    // invalidates any previous approval-ready plan.
+    this.clearPlan();
     // FI-07: the receipt is fetched first so the undo plan names the
     // receipt's own resource; the bridge re-derives and re-checks every
     // binding server-side before anything can be approved.

@@ -274,3 +274,35 @@ test('live.error refusal payloads keep their bounded backend reason', async () =
     status: 'unavailable', reason: 'plan_arguments_invalid',
   });
 });
+
+test('a failed edit preparation invalidates the previous approval-ready plan', async () => {
+  const { backend } = stub();
+  const workflow = new LiveWorkflow(backend);
+  await workflow.registerProject('/fixture/project');
+  await workflow.openFile('sample.txt');
+  const prepared = await workflow.prepareEdit('hello', 'hello aether');
+  assert.equal(prepared.status, 'ready');
+  assert.notEqual(workflow.plannedPreview(), null);
+  assert.notEqual(workflow.plannedTaskId(), null);
+  // Absent replacement text: preparation fails — and the earlier plan
+  // must no longer be available for approval.
+  const failed = await workflow.prepareEdit('text that is absent', 'replacement');
+  assert.deepEqual(failed, { status: 'unavailable', reason: 'edit_text_not_found' });
+  assert.equal(workflow.plannedPreview(), null);
+  assert.equal(workflow.plannedTaskId(), null);
+});
+
+test('a failed Undo preparation invalidates the previous approval-ready plan', async () => {
+  const { backend } = stub();
+  const workflow = new LiveWorkflow(backend);
+  await workflow.registerProject('/fixture/project');
+  await workflow.openFile('sample.txt');
+  const prepared = await workflow.prepareEdit('hello', 'hello aether');
+  assert.equal(prepared.status, 'ready');
+  assert.notEqual(workflow.plannedPreview(), null);
+  // Receipt lookup fails (stub receipt_not_found): no plan may survive.
+  const failed = await workflow.prepareUndo('33333333-3333-4333-8333-333333333333');
+  assert.equal(failed.status, 'unavailable');
+  assert.equal(workflow.plannedPreview(), null);
+  assert.equal(workflow.plannedTaskId(), null);
+});

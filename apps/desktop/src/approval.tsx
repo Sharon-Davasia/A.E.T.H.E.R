@@ -30,11 +30,35 @@ declare global {
   }
 }
 
+type RenderedStats = ApprovalViewModel['contentStats'];
+
+/**
+ * Measure what was actually rendered into this document — rendered
+ * diff-line rows, rendered diff-text characters, rendered affected
+ * paths — rather than echoing the view model's expected stats back.
+ * This is a rendered-content measurement, not proof of human
+ * visibility; the explicit acknowledgement remains the human step.
+ */
+function measureRenderedContent(): RenderedStats {
+  const lines = document.querySelectorAll('[data-diff-line]');
+  let diffTextCharCount = 0;
+  lines.forEach((row) => {
+    diffTextCharCount += row.querySelector('[data-diff-text]')?.textContent?.length ?? 0;
+  });
+  return {
+    diffLineCount: lines.length,
+    diffTextCharCount,
+    affectedPathCount: document.querySelectorAll('[data-affected-path]').length,
+  };
+}
+
 function ApprovalApp(): React.JSX.Element {
   const [view, setView] = React.useState<ApprovalViewModel | null>(null);
   const [failed, setFailed] = React.useState(false);
   const [acknowledged, setAcknowledged] = React.useState(false);
   const [decided, setDecided] = React.useState(false);
+  const [renderConfirmed, setRenderConfirmed] = React.useState(false);
+  const [measured, setMeasured] = React.useState<RenderedStats | null>(null);
   const cancelRef = React.useRef<HTMLButtonElement>(null);
 
   React.useEffect(() => {
@@ -45,23 +69,35 @@ function ApprovalApp(): React.JSX.Element {
     return () => { active = false; };
   }, []);
 
-  // Attest — from what was actually rendered — that the complete
-  // content arrived; main compares these stats with what it sent.
+  // Measure the rendered DOM after paint and report the measurement;
+  // main confirms it against what it sent. Approve stays disabled
+  // until that rendering acknowledgement succeeds.
   React.useEffect(() => {
     if (!view) return;
-    void window.aetherApproval.reportRendered(view.contentStats).catch(() => undefined);
+    let active = true;
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        if (!active) return;
+        const stats = measureRenderedContent();
+        setMeasured(stats);
+        void window.aetherApproval.reportRendered(stats)
+          .then((confirmed) => { if (active) setRenderConfirmed(confirmed); })
+          .catch(() => undefined);
+      });
+    });
     cancelRef.current?.focus();
+    return () => { active = false; };
   }, [view]);
 
   const decide = (decision: 'approve' | 'cancel'): void => {
-    if (!view || decided) return;
-    if (decision === 'approve' && !acknowledged) return;
+    if (!view || decided || !measured) return;
+    if (decision === 'approve' && (!acknowledged || !renderConfirmed)) return;
     setDecided(true);
     void window.aetherApproval.decide({
       approvalToken: view.approvalToken,
       decision,
       reviewAcknowledged: acknowledged,
-      renderedStats: view.contentStats,
+      renderedStats: measured,
     }).catch(() => undefined);
   };
 
@@ -117,10 +153,11 @@ function ApprovalApp(): React.JSX.Element {
         </dl>
       </header>
 
+      <div className="approval-scroll">
       <section aria-labelledby="approval-paths-title" className="approval-section">
         <h2 id="approval-paths-title">Affected paths (complete)</h2>
         {view.affectedPaths.map((path) => (
-          <p key={path} className="approval-path"><code>{path}</code></p>
+          <p key={path} className="approval-path" data-affected-path><code>{path}</code></p>
         ))}
         {view.resources.map((resource) => (
           <p key={resource.resourceId} className="approval-resource">
@@ -131,7 +168,6 @@ function ApprovalApp(): React.JSX.Element {
         ))}
       </section>
 
-      <div className="approval-scroll">
         {view.diffs.map((diff) => (
           <section key={diff.resourceId} aria-label={`Exact diff for ${diff.displayName}`} className="approval-section">
             <h2>Exact diff — {diff.displayName}</h2>
@@ -142,9 +178,9 @@ function ApprovalApp(): React.JSX.Element {
             </p>
             <div className="approval-diff" role="region" aria-label={`Diff lines for ${diff.displayName}`} tabIndex={0}>
               {diff.lines.map((line, index) => (
-                <div key={index} className="approval-diff-line">
+                <div key={index} className="approval-diff-line" data-diff-line>
                   <span className="approval-diff-number" aria-hidden="true">{String(index + 1)}</span>
-                  <span className="approval-diff-text">{line.text === '' ? ' ' : line.text}</span>
+                  <span className="approval-diff-text" data-diff-text>{line.text}</span>
                   {line.crlf && <span className="crlf-badge" aria-label="CRLF line ending">CRLF</span>}
                 </div>
               ))}
@@ -195,7 +231,8 @@ function ApprovalApp(): React.JSX.Element {
             type="button"
             className="approval-approve"
             onClick={() => decide('approve')}
-            disabled={decided || !acknowledged}
+            disabled={decided || !acknowledged || !renderConfirmed}
+            aria-disabled={decided || !acknowledged || !renderConfirmed}
           >
             Approve exact action
           </button>

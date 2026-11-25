@@ -8,6 +8,7 @@ import {
   buildApprovalViewModel,
   eofLabel,
   parseApprovalDecision,
+  settleApprovalDecision,
   type ApprovalPresentationInput,
 } from '../shared/approval-modal';
 
@@ -38,7 +39,7 @@ test('view model carries complete paths, hashes and diff lines without elision',
   const allLines = view.diffs.flatMap((diff) => diff.lines.map((line) => line.text));
   assert.ok(allLines.some((line) => line.includes('SYNTHETIC-CANONICAL-CANARY-2b9e31')));
   assert.equal(view.contentStats.diffLineCount, allLines.length);
-  assert.ok(view.contentStats.diffCharCount > 0);
+  assert.ok(view.contentStats.diffTextCharCount > 0);
 });
 
 test('explicit CRLF and EOF representation survives into the view model', () => {
@@ -106,4 +107,29 @@ test('workflow failure classifier replaces the generic prepare_failed concealmen
   assert.equal(workflowFailureReason(new Error('review field unifiedDiff is malformed')), 'response_malformed');
   assert.equal(workflowFailureReason(new Error('backend handshake timed out')), 'backend_timeout');
   assert.equal(workflowFailureReason(new Error('something wholly unexpected'), 'prepare_failed'), 'prepare_failed');
+});
+
+
+test('host settlement requires a prior successful rendering acknowledgement', () => {
+  const view = buildApprovalViewModel(input(), 'token-10');
+  const approval = {
+    approvalToken: 'token-10',
+    decision: 'approve' as const,
+    reviewAcknowledged: true,
+    renderedStats: view.contentStats,
+  };
+  // No rendering acknowledgement yet: even a well-formed affirmative
+  // decision is not accepted, and display is reported unconfirmed.
+  assert.deepEqual(settleApprovalDecision(view, false, approval), {
+    affirmed: false, displayedCompletely: false, reviewAcknowledged: false,
+  });
+  // After a successful acknowledgement the same decision is accepted.
+  assert.deepEqual(settleApprovalDecision(view, true, approval), {
+    affirmed: true, displayedCompletely: true, reviewAcknowledged: true,
+  });
+  // Cancellation is honoured either way, but display truth follows the
+  // acknowledgement state.
+  assert.deepEqual(settleApprovalDecision(view, false, { ...approval, decision: 'cancel' }), {
+    affirmed: false, displayedCompletely: false, reviewAcknowledged: true,
+  });
 });
