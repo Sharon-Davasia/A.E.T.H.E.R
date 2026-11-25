@@ -438,3 +438,22 @@ results now report per-stage truth (signed / submitted / authorized /
 executed / uncertain) via `describeLiveApprovalOutcome`.
 
 Formal Phase 2 acceptance remains **NOT COMPLETE**.
+
+---
+
+## Addendum — native Windows demonstrations at `c9b1d10` (user-reported)
+
+Passed natively: approval controls readable; complete affected paths
+and hashes; review-acknowledgement gating; stale-plan invalidation;
+CRLF and EOF representation; long-preview horizontal and vertical
+scrolling; Cancel button functionality; production issuance refusal.
+**Positive file-integrity evidence (preserved): all six fixture files
+unchanged, verified by SHA-256 comparison.**
+
+Sole remaining defect: Escape-key cancellation silently did nothing
+(a stale React closure over `measured`/`renderConfirmed`). Corrected
+in the following candidate: cancellation now runs through a stable
+interaction controller fed the latest state every render, works
+before load / before rendering completes / after rendering / before
+or after acknowledgement, and never signs (regression coverage
+included). Formal Phase 2 acceptance remains **NOT COMPLETE**.

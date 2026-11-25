@@ -2,6 +2,7 @@ import React from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 import { eofLabel, type ApprovalViewModel } from '../shared/approval-modal';
+import { createApprovalInteraction, type ApprovalInteraction } from './approval-controller';
 
 /**
  * Trusted approval modal surface (dedicated window, main-controlled).
@@ -60,6 +61,21 @@ function ApprovalApp(): React.JSX.Element {
   const [renderConfirmed, setRenderConfirmed] = React.useState(false);
   const [measured, setMeasured] = React.useState<RenderedStats | null>(null);
   const cancelRef = React.useRef<HTMLButtonElement>(null);
+  // Stable interaction controller: created once, fed the latest state
+  // every render. Keyboard handlers registered once therefore never
+  // act on a stale closure.
+  const interactionRef = React.useRef<ApprovalInteraction | null>(null);
+  if (interactionRef.current === null) {
+    interactionRef.current = createApprovalInteraction(
+      (decision) => { void window.aetherApproval.decide(decision).catch(() => undefined); },
+      () => window.close(),
+    );
+  }
+  const interaction = interactionRef.current;
+
+  React.useEffect(() => {
+    interaction.update({ view, acknowledged, measured, renderConfirmed });
+  });
 
   React.useEffect(() => {
     let active = true;
@@ -89,26 +105,26 @@ function ApprovalApp(): React.JSX.Element {
     return () => { active = false; };
   }, [view]);
 
-  const decide = (decision: 'approve' | 'cancel'): void => {
-    if (!view || decided || !measured) return;
-    if (decision === 'approve' && (!acknowledged || !renderConfirmed)) return;
-    setDecided(true);
-    void window.aetherApproval.decide({
-      approvalToken: view.approvalToken,
-      decision,
-      reviewAcknowledged: acknowledged,
-      renderedStats: measured,
-    }).catch(() => undefined);
+  const cancel = (): void => {
+    interaction.cancel();
+    if (interaction.isDecided()) setDecided(true);
+  };
+  const approve = (): void => {
+    interaction.approve();
+    if (interaction.isDecided()) setDecided(true);
   };
 
+  // Escape cancels in every state — before rendering completes, after
+  // rendering, before or after acknowledgement — via the stable
+  // controller (registered once; complete current state via update).
   React.useEffect(() => {
     const onKey = (event: KeyboardEvent): void => {
-      if (event.key === 'Escape') decide('cancel');
+      if (event.key === 'Escape') cancel();
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [view, acknowledged, decided]);
+  }, []);
 
   if (failed) {
     return (
@@ -224,13 +240,13 @@ function ApprovalApp(): React.JSX.Element {
           to the plan or file invalidates it.
         </label>
         <div className="approval-actions">
-          <button type="button" ref={cancelRef} onClick={() => decide('cancel')} disabled={decided}>
+          <button type="button" ref={cancelRef} onClick={cancel} disabled={decided}>
             Cancel
           </button>
           <button
             type="button"
             className="approval-approve"
-            onClick={() => decide('approve')}
+            onClick={approve}
             disabled={decided || !acknowledged || !renderConfirmed}
             aria-disabled={decided || !acknowledged || !renderConfirmed}
           >

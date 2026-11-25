@@ -410,3 +410,23 @@ test('renderer wording distinguishes signing, submission, issuance and uncertain
   assert.match(uncertain, /uncertain/);
   assert.doesNotMatch(uncertain, /Nothing was signed/);
 });
+
+test('cancellation outcomes never sign a gesture (Escape in any render state)', async () => {
+  // Escape before rendering completed: host reports the attempt as
+  // not displayable-complete and unaffirmed — fail-closed, no signing.
+  const early = stub({ displayedCompletely: false, confirmResult: false });
+  const earlyResult = await early.provider.approveAndExecute();
+  assert.equal(earlyResult.status, 'unavailable');
+  if (earlyResult.status === 'unavailable') {
+    assert.equal(earlyResult.reason, 'preview_not_displayable_completely');
+    assert.equal(earlyResult.gestureSigned, false);
+  }
+  assert.equal(early.signs(), 0);
+  assert.ok(!early.calls.includes('submit'));
+  // Escape after complete rendering: a clean decline, still no signing.
+  const late = stub({ confirmResult: false });
+  const lateResult = await late.provider.approveAndExecute();
+  assert.deepEqual(lateResult, { status: 'declined' });
+  assert.equal(late.signs(), 0);
+  assert.ok(!late.calls.includes('submit'));
+});
