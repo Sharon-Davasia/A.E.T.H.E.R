@@ -77,6 +77,7 @@ from aether.core.planning.preview_authority import (
 from aether.core.planning.production_verifier import ProductionAttestationVerifier
 from aether.core.policy.broker import PolicyBroker
 from aether.core.policy.capabilities import CapabilityRegistry
+from aether.core.resources.path_safety import PathSafetyError, reject_reparse_components
 from aether.core.resources.registry import ResourceRegistry
 from aether.core.vault.undo_vault import UndoVault
 
@@ -95,6 +96,26 @@ CAPABILITY_GROUPS = (
     "edit_execution",
     "undo",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationScope:
+    """Validated controlled-activation scope (Activation B).
+
+    Constructed only by the channel service for a validated
+    acceptance-fixture launch. ``fixture_root`` is the
+    ``AETHER-Phase2-Fixture-*`` directory: the composition enables
+    production-trusted issuance only under this scope and restricts
+    project registration to canonical paths inside it. Ordinary
+    application launches never carry a scope and remain
+    issuance-disabled. Neither a caller-provided object outside the
+    composition's own construction sites, a module name, an
+    environment variable nor a renderer request constitutes this
+    authorization — the service derives it solely from the validated
+    fixture storage configuration.
+    """
+
+    fixture_root: Path
 
 
 class CompositionUnavailable(RuntimeError):
@@ -190,6 +211,7 @@ class TrustedComposition:
         gesture_key: bytes,
         clock: Callable[[], datetime] | None = None,
         ledger: GrantLedger | None = None,
+        activation_scope: ActivationScope | None = None,
     ) -> TrustedComposition:
         """Compose the trusted object graph around one open store, or fail closed.
 
@@ -198,6 +220,11 @@ class TrustedComposition:
         ownership lock exist per database, shared by review, planning,
         issuance and execution. Receipts, journal, consumption and vault
         state live beside the database under deterministic sibling names.
+        ``activation_scope`` (Activation B) is set only for validated
+        acceptance-fixture launches: it enables production-trusted
+        issuance and bounds registration to the fixture root. Ordinary
+        launches pass None and remain issuance-disabled.
+
         Two distinct startup mechanisms run before mutations enable: the
         store's ``recover_on_startup`` (on open) pauses in-flight tasks and
         forces fresh consent through replanning, and — on schema v2 — this
@@ -209,10 +236,28 @@ class TrustedComposition:
         clock = clock or (lambda: datetime.now(UTC))
         database_path = store.database_path
         consumption: ConsumptionLedger | None = None
+        # Activation B: validate the controlled-activation boundary
+        # before composing anything. Canonical containment is decided
+        # on reparse-checked resolved paths, never name prefixes.
+        activation_boundary: Path | None = None
+        if activation_scope is not None:
+            try:
+                reject_reparse_components(Path(activation_scope.fixture_root))
+                activation_boundary = Path(activation_scope.fixture_root).resolve(strict=True)
+                if not activation_boundary.is_dir():
+                    raise CompositionUnavailable(
+                        "activation_boundary_invalid",
+                        "the controlled-activation fixture root is not a directory",
+                    )
+            except (OSError, PathSafetyError) as exc:
+                raise CompositionUnavailable(
+                    "activation_boundary_invalid",
+                    "the controlled-activation fixture root could not be validated",
+                ) from exc
         try:
             schema_version = int(store._connection.execute("PRAGMA user_version").fetchone()[0])
 
-            registry = ResourceRegistry()
+            registry = ResourceRegistry(registration_boundary=activation_boundary)
             narratives = StoredNarrativeSource()
             previews = PersistedPreviewAuthority(
                 store, narratives=narratives, resources=registry, clock=clock
@@ -273,7 +318,13 @@ class TrustedComposition:
                 # way a test-scoped ledger can exist); the channel service
                 # never does.
                 if ledger is None:
-                    ledger = GrantLedger.open(store)
+                    # Activation B: production-trusted issuance only
+                    # under a validated controlled-activation scope
+                    # (acceptance fixture). Every other launch keeps
+                    # default-deny ledger construction.
+                    ledger = GrantLedger.open(
+                        store, production_trusted=activation_scope is not None
+                    )
                 # FI-04: the executor's authority checks at spend time,
                 # after PRECHECK has been recorded against the grant.
                 authority = GrantAuthority(ledger, store=store, execution_in_progress=True)
@@ -604,6 +655,7 @@ class TrustedComposition:
 __all__ = [
     "CAPABILITY_GROUPS",
     "GESTURE_AUTHORITY_ID",
+    "ActivationScope",
     "CapabilityState",
     "CompositionUnavailable",
     "TrustedComposition",

@@ -139,6 +139,14 @@ _ISSUER_CODE = re.compile(r"^[a-z][a-z0-9_.:-]{0,63}$")
 # denies all new issuance (see ``_check_permit_trust``).
 _TRUSTED_TRUST_SOURCE = "trusted_verifier"
 _TEST_TRUST_SOURCE = "test_simulation"
+# Activation B policy: accepts permits exclusively from the central
+# trusted authorization decision (production verifier over the trusted
+# approval window + authenticated single-use gesture). Selected only
+# by GrantLedger.open(..., production_trusted=True) from the
+# composition root under a validated controlled-activation scope; no
+# caller-supplied object, module name, environment variable or
+# renderer request selects it.
+_PRODUCTION_TRUSTED_POLICY = "production_trusted"
 
 # S4-9: the only modules allowed to request or spend test-only persistence.
 # Both spellings are listed because pytest may import the Stage 4 test modules
@@ -456,8 +464,14 @@ class GrantLedger:
     # ------------------------------------------------------------------
 
     @classmethod
-    def open(cls, store: SQLiteTaskStore) -> GrantLedger:
+    def open(cls, store: SQLiteTaskStore, *, production_trusted: bool = False) -> GrantLedger:
         """Open the ledger for a live store, **sharing** its lock and connection.
+
+        ``production_trusted`` is the Activation B opt-in: only the
+        composition root passes it, and only under a validated
+        controlled-activation scope. Default construction stays
+        default-deny (``GRANT_ISSUANCE_DISABLED`` for every permit).
+
 
         This is the only supported path for operations that write grants. It
         requires the store to be open, verifies that this ledger targets the
@@ -489,6 +503,9 @@ class GrantLedger:
                 _shared_transaction=store._transaction,
             )
             ledger._store = store
+            ledger._trust_source_policy = (
+                _PRODUCTION_TRUSTED_POLICY if production_trusted else "production"
+            )
             # One shared connection means one synchronization mechanism: adopt
             # the store's lock so grant reads and grant writes serialize with
             # every task/plan/audit operation on that connection (S4-8).
@@ -1169,18 +1186,22 @@ class GrantLedger:
         grant: ExactApprovalGrant,
         issuance_key: UUID,
     ) -> None:
-        """S4-9: default-deny. New grant issuance is disabled by configuration.
+        """S4-9: default-deny. New grant issuance is denied by configuration.
 
-        The production-configured ledger — ``GrantLedger.open(store)`` — refuses
-        **every** new grant, whatever permit the caller supplies. A permit is an
-        ordinary Python object, so its fields cannot prove that a trusted
-        verifier or an authoritative preview source ever ran; checking more
-        fields would only make forgery slightly longer to type.
+        The default production-configured ledger — ``GrantLedger.open(store)``
+        — refuses **every** new grant, whatever permit the caller supplies. A
+        permit is an ordinary Python object, so its fields cannot prove that a
+        trusted verifier or an authoritative preview source ever ran; checking
+        more fields would only make forgery slightly longer to type.
 
-        Production issuance therefore stays switched off until the separately
-        reviewed authenticated authorizing boundary exists (see
-        :mod:`aether.core.grants.authorization`). Enabling it is a deliberate
-        code change to this gate, not something a caller can supply at runtime.
+        Activation B adds exactly one more configuration, selected only by
+        the composition root under a validated controlled-activation scope
+        (``production_trusted``): it accepts solely the central trusted
+        authorization decision's ``trusted_verifier`` permit, bound to this
+        exact grant (task, revision, plan hash, issuance key). Test
+        simulations remain refused there. Enabling either is a deliberate
+        code/configuration decision in trusted composition code, never
+        something a caller can supply at runtime.
 
         :meth:`open_tests_scoped` — reachable solely from allow-listed test
         modules — accepts the central decision's ``trusted_verifier`` permit and
@@ -1189,6 +1210,27 @@ class GrantLedger:
         production configuration.
         """
 
+        # 0. Activation B: production-trusted configuration. Accept only
+        #    the central decision's permit, bound to this exact grant;
+        #    test simulations are refused in this configuration.
+        if self._trust_source_policy == _PRODUCTION_TRUSTED_POLICY:
+            if permit.trust_source != _TRUSTED_TRUST_SOURCE:
+                raise GrantIssuanceDenied(
+                    "AUTHORIZATION_EVIDENCE_REQUIRED",
+                    "production issuance requires the trusted authorization decision",
+                )
+            binding = permit.binding
+            if (
+                binding.get("task_id") != str(grant.task_id)
+                or binding.get("plan_revision") != grant.plan_revision
+                or str(binding.get("plan_hash", "")).casefold() != grant.plan_hash.casefold()
+                or binding.get("issuance_key") != str(issuance_key)
+            ):
+                raise GrantIssuanceDenied(
+                    "ISSUANCE_PERMIT_MISMATCH",
+                    "the authorization decision does not cover this exact grant",
+                )
+            return
         # 1. Default-deny, decided by configuration and checked before the
         #    permit is inspected at all: no caller-supplied object changes this.
         if self._trust_source_policy != "test_scoped":

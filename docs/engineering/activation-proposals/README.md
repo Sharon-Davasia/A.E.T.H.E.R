@@ -1,9 +1,14 @@
 # Activation proposals — concrete diffs, NOT APPLIED
 
 These two diffs are the complete, separately reviewable activation
-changes for Proposals A and B. Neither is applied to the shipped
-configuration in this PR: `ACTIVE_SCHEMA_VERSION` remains `1` and
-production grant issuance remains `GRANT_ISSUANCE_DISABLED`.
+changes for Proposals A and B. Status in this PR: Proposal A is
+APPLIED (controlled Activation A candidate, schema v2 active for
+disposable fixture storage). Proposal B is APPLIED as adapted for
+the controlled Activation B fixture candidate: production-trusted
+issuance is enabled only under a validated acceptance-fixture scope
+and bounded to the fixture root; ordinary launches keep the
+`GRANT_ISSUANCE_DISABLED` default. The diffs below remain the
+reviewable record of what was applied.
 
 Apply order is mandatory: **A first** (schema), then **B** (issuance),
 each in its own reviewed commit, each followed by the full backend +

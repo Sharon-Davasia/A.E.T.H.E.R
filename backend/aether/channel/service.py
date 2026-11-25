@@ -51,19 +51,22 @@ import platform
 import secrets
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from aether.channel import protocol
 from aether.channel.app_storage import (
     ACCEPTANCE_MODE_ENV,
+    FIXTURE_DB_ENV,
     AcceptanceStorageError,
+    fixture_root_for,
     open_application_store,
     open_fixture_store,
 )
 from aether.channel.live_bridge import LiveBridge
 from aether.channel.protocol import canonical
 from aether.channel.review_bridge import ReviewBridge
-from aether.core.composition import CompositionUnavailable, TrustedComposition
+from aether.core.composition import ActivationScope, CompositionUnavailable, TrustedComposition
 from aether.core.persistence.sqlite_store import SQLiteTaskStore
 
 _PING_KIND = "demo.ping"
@@ -192,7 +195,20 @@ def main() -> int:
     composition_store = bridge.store if bridge is not None else app_store
     if composition_store is not None:
         try:
-            composition = TrustedComposition.build(store=composition_store, gesture_key=gesture_key)
+            # Activation B: only a validated acceptance-fixture launch
+            # carries a controlled-activation scope (production-trusted
+            # issuance bounded to the fixture root). Ordinary launches
+            # pass no scope and remain issuance-disabled.
+            activation_scope = None
+            if env.get(ACCEPTANCE_MODE_ENV) == "fixture":
+                fixture_root = fixture_root_for(Path(env[FIXTURE_DB_ENV]))
+                if fixture_root is not None:
+                    activation_scope = ActivationScope(fixture_root=fixture_root)
+            composition = TrustedComposition.build(
+                store=composition_store,
+                gesture_key=gesture_key,
+                activation_scope=activation_scope,
+            )
             live_bridge = LiveBridge(composition)
         except CompositionUnavailable:
             # Fail closed for the trusted-execution tier only; the audit-only

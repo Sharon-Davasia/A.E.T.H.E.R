@@ -457,3 +457,38 @@ interaction controller fed the latest state every render, works
 before load / before rendering completes / after rendering / before
 or after acknowledgement, and never signs (regression coverage
 included). Formal Phase 2 acceptance remains **NOT COMPLETE**.
+
+---
+
+## Addendum — Controlled Activation B (this PR)
+
+Proposal B is implemented as adapted: the production-trusted ledger
+policy (accepts only the central trusted authorization decision's
+permit, bound to the exact grant; test-simulation permits refused)
+is enabled solely when the channel service derives an
+`ActivationScope` from a validated acceptance-fixture launch, and
+the resource registry refuses project registration outside the
+canonical fixture boundary (canonical containment with reparse
+checks, never a name prefix). Ordinary application launches carry
+no scope and remain issuance-disabled — pinned by separate negative
+coverage (`grant_issuance_disabled`).
+
+Backend regression coverage (new `test_phase2_activation_b.py`,
+genuine production-shaped composition, no test-scoped ledger):
+approved edit produces exactly the approved bytes; no mutation
+before approval; gesture replay, forged signature and stale-plan
+authorization refused; expired and revoked grants refused at
+execution; durable receipt survives restart and a separately
+approved Undo restores the original SHA-256; Undo refuses
+conflicting newer content; outside-boundary registration refused
+(including a prefix-sharing sibling). Desktop genuine cross-process
+coverage (`live-workflow-activation.integration.test.ts`) performs
+the actual approved edit, receipt retrieval, restart, and verified
+Undo over the authenticated channel, and caught a latent wire
+mismatch (execution responses carry pre/post SHA-256 and snapshot
+id; the TS parser now validates the full authoritative shape).
+
+Outstanding: the native Windows execution campaign on the target
+machine (actual approved edit, receipt inspection, restart, Undo,
+and the remaining mandatory acceptance scenarios). Formal Phase 2
+acceptance remains **NOT COMPLETE**.

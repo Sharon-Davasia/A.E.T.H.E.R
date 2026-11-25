@@ -34,7 +34,15 @@ export type GestureAuthorized =
   | { status: 'unavailable'; reason: string };
 
 export type EditExecuted =
-  | { status: 'ready'; outcome: string; reasonCode: string | null; receiptId: string | null }
+  | {
+      status: 'ready';
+      outcome: string;
+      reasonCode: string | null;
+      receiptId: string | null;
+      preSha256: string | null;
+      postSha256: string | null;
+      snapshotId: string | null;
+    }
   | { status: 'unavailable'; reason: string };
 
 /** What the renderer may see after a live approval attempt. */
@@ -188,8 +196,10 @@ export function parseEditExecuted(value: unknown): EditExecuted {
     keys(item, ['status', 'reason']);
     return { status: 'unavailable', reason: unavailableReason(item) };
   }
-  keys(item, ['taskId', 'status', 'reasonCode', 'receiptId']);
-  const { taskId, status, reasonCode, receiptId } = item;
+  // Authoritative execution shape (live_bridge._execution_result):
+  // the outcome plus the verified pre/post hashes and snapshot id.
+  keys(item, ['taskId', 'status', 'reasonCode', 'receiptId', 'preSha256', 'postSha256', 'snapshotId']);
+  const { taskId, status, reasonCode, receiptId, preSha256, postSha256, snapshotId } = item;
   if (typeof taskId !== 'string' || !UUID.test(taskId)) {
     throw new Error('edit execution identity is malformed');
   }
@@ -202,11 +212,22 @@ export function parseEditExecuted(value: unknown): EditExecuted {
   if (receiptId !== null && (typeof receiptId !== 'string' || !UUID.test(receiptId))) {
     throw new Error('edit execution receipt identity is malformed');
   }
+  if (snapshotId !== null && (typeof snapshotId !== 'string' || !UUID.test(snapshotId))) {
+    throw new Error('edit execution snapshot identity is malformed');
+  }
+  for (const digest of [preSha256, postSha256]) {
+    if (digest !== null && (typeof digest !== 'string' || !SHA256.test(digest))) {
+      throw new Error('edit execution digest is malformed');
+    }
+  }
   return {
     status: 'ready',
     outcome: status,
     reasonCode: reasonCode as string | null,
     receiptId: receiptId as string | null,
+    preSha256: preSha256 as string | null,
+    postSha256: postSha256 as string | null,
+    snapshotId: snapshotId as string | null,
   };
 }
 

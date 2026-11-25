@@ -51,6 +51,20 @@ def _is_fixture_path(candidate: Path) -> bool:
     return any(part.startswith(FIXTURE_MARKER) for part in candidate.parts)
 
 
+def fixture_root_for(candidate: Path) -> Path | None:
+    """The ``AETHER-Phase2-Fixture-*`` ancestor of a fixture path, if any.
+
+    This ancestor is the controlled-activation boundary: designated
+    synthetic project directories live under it, and the composition
+    refuses registration or mutation outside it during acceptance.
+    """
+
+    for parent in (candidate, *candidate.parents):
+        if parent.name.startswith(FIXTURE_MARKER):
+            return parent
+    return None
+
+
 def open_fixture_store(env: dict[str, str]) -> SQLiteTaskStore:
     """Open the explicitly configured acceptance fixture store.
 
@@ -100,6 +114,7 @@ __all__ = [
     "APP_DB_ENV",
     "FIXTURE_DB_ENV",
     "AcceptanceStorageError",
+    "fixture_root_for",
     "open_application_store",
     "open_fixture_store",
 ]

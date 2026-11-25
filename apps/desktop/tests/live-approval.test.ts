@@ -83,7 +83,10 @@ function stub(options: StubOptions = {}) {
       calls.push('execute');
       return options.execute
         ? options.execute()
-        : { taskId: TASK_ID, status: 'SUCCEEDED', reasonCode: null, receiptId: RECEIPT_ID };
+        : {
+            taskId: TASK_ID, status: 'SUCCEEDED', reasonCode: null, receiptId: RECEIPT_ID,
+            preSha256: 'a'.repeat(64), postSha256: 'b'.repeat(64), snapshotId: RECEIPT_ID,
+          };
     },
     signGesture(nonce: string): SignedGesturePayload {
       signCount += 1;

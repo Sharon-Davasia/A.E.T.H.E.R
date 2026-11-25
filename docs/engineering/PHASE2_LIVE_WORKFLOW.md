@@ -107,7 +107,8 @@ storage.
 | Configuration | Reads/planning/preview | Authorization | Execution |
 |---|---|---|---|
 | Schema v1 (pre-activation DB) | work | mutation tier absent → `schema_activation_pending` | `schema_activation_pending` |
-| Schema v2, production ledger | work | valid signed gesture refused → `grant_issuance_disabled` | refused; file untouched |
+| Schema v2, production ledger (ordinary launch) | work | valid signed gesture refused → `grant_issuance_disabled` | refused; file untouched |
+| Schema v2, controlled Activation B fixture launch | work | works — production-trusted policy, validated fixture scope only | works — bounded to the fixture root; registration/mutation outside it refused |
 | Schema v2, test-scoped ledger (tests only) | work | works | works — reachable only via test-scoped construction. These tests are **not** production-enablement evidence: the construction discipline they exercise is not an authorization boundary (see Proposal B correction). |
 
 ## 5. Separately reviewable activation proposals (NOT in this PR)
@@ -128,7 +129,22 @@ fails atomically; originals byte-identical), a recorded backup/rollback
 procedure for real databases, and the full backend suite green. User data
 migration itself remains an operator action with a verified backup first.
 
-### Proposal B — production grant issuance enablement
+### Proposal B — production grant issuance enablement — IMPLEMENTED for the controlled Activation B fixture candidate (this PR)
+
+Implemented as proposed (production-trusted ledger policy +
+composition opt-in), with the controlled-activation restriction the
+acceptance stage requires: the composition passes
+``production_trusted=True`` only when the channel service derived an
+``ActivationScope`` from a validated acceptance-fixture launch
+(``AETHER_ACCEPTANCE_MODE=fixture`` + fixture database under an
+``AETHER-Phase2-Fixture-*`` root), and the registry refuses project
+registration outside that canonical fixture boundary. Ordinary
+application launches carry no scope, keep default-deny ledger
+construction, and remain issuance-disabled. Test-simulation permits
+are refused by the production-trusted policy; neither a
+caller-provided object, module name, environment variable nor
+renderer request constitutes authorization. The original proposal
+text follows.
 
 Give the production ledger a production trust-source policy so
 `GrantIssuer.issue` accepts the central `authorize_issuance` permit for
@@ -159,9 +175,10 @@ updated to exercise the live path, and the §6 demonstration procedure
 rehearsed on fixtures. Production issuance stays disabled until this
 proposal is separately approved and implemented.
 
-Neither proposal is implemented here. `NullAttestationVerifier` and the
-`GRANT_ISSUANCE_DISABLED` default remain exactly as shipped. Concrete,
-separately reviewable diffs for both proposals (not applied) live in
+Proposal A is implemented (above) and Proposal B is implemented for
+the controlled fixture candidate (above). The `GRANT_ISSUANCE_DISABLED`
+default remains exactly as shipped for every non-fixture launch.
+Concrete, separately reviewable diffs for both proposals live in
 `docs/engineering/activation-proposals/` (`proposal-a-schema-v2.diff`,
 `proposal-b-production-issuance.diff`).
 

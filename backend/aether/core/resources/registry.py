@@ -69,9 +69,17 @@ class ResourceRegistry:
         volume_inspector: VolumeInspector | None = None,
         allowed_volume_kinds: frozenset[VolumeKind] = frozenset({VolumeKind.FIXED}),
         windows_semantics: bool | None = None,
+        registration_boundary: Path | None = None,
     ) -> None:
         self._volume_inspector = volume_inspector or _SystemVolumeInspector()
         self._allowed_volume_kinds = allowed_volume_kinds
+        # Controlled-activation boundary (Activation B): when set, roots
+        # may register only at or below this canonical directory. The
+        # comparison uses the canonical (reparse-checked, resolved)
+        # root path, never a string prefix.
+        self._registration_boundary = (
+            Path(registration_boundary).resolve() if registration_boundary is not None else None
+        )
         self._windows_semantics = (
             os.name == "nt" if windows_semantics is None else windows_semantics
         )
@@ -102,6 +110,10 @@ class ResourceRegistry:
             raise ResourceRegistryError(_path_error_code(exc)) from exc
         if not stat.S_ISDIR(metadata.st_mode):
             raise ResourceRegistryError("root_not_directory")
+        if self._registration_boundary is not None and not canonical.is_relative_to(
+            self._registration_boundary
+        ):
+            raise ResourceRegistryError("root_outside_activation_boundary")
         if _is_volume_root(canonical):
             raise ResourceRegistryError("volume_root_registration_forbidden")
         if is_protected_path(canonical) or data_class == DataClass.SECRET:
