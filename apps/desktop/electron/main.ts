@@ -4,12 +4,9 @@ import { pathToFileURL } from 'node:url';
 import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
-import {
-  createLiveApprovalProvider,
-  UNVERIFIED_NATIVE_PREVIEW_DISPLAY_CHARS,
-  type ApprovalSummary,
-  type ConfirmationOutcome,
-} from './live-approval-provider';
+import { createLiveApprovalProvider } from './live-approval-provider';
+import { createApprovalWindowConfirmer } from './approval-window';
+import { workflowFailureReason } from './workflow';
 import { LiveWorkflow } from './workflow';
 import { parseEditReceipt } from '../shared/live';
 import { parseReviewOutcomeRequest } from '../shared/review';
@@ -25,38 +22,24 @@ const reviewProvider = createChannelReviewProvider({ backend, resolveTaskId: con
 const workflow = new LiveWorkflow(backend);
 let navigationEpoch = 0;
 
+const APPROVAL_FILE = resolve(join(APP_ROOT, 'dist', 'approval.html'));
+const APPROVAL_PRELOAD_FILE = resolve(join(APP_ROOT, 'dist-electron', 'electron', 'approval-preload.js'));
+
 /**
- * Genuine native confirmation for one live approval. The renderer can only
- * ask main to start the flow; the affirmation itself happens in this OS
- * dialog, outside renderer control. Anything but the explicit Approve
- * button — dismissal, Escape, a missing window — declines.
+ * Trusted confirmation for one live approval: the dedicated,
+ * main-controlled approval modal (isolated window + dedicated
+ * preload). The ordinary renderer can only ask main to start the
+ * flow; the affirmation itself happens in that window, which holds
+ * no signing authority. The former `showMessageBox` presentation was
+ * removed: native Windows evidence showed it elides the canonical
+ * path, plan hash and diff lines even for a one-line edit, so it
+ * could never attest a complete review.
  */
-async function confirmLiveApproval(summary: ApprovalSummary): Promise<ConfirmationOutcome> {
-  if (!mainWindow) return { affirmed: false, displayedCompletely: false };
-  // Native-confirmation verification: the dialog identifies the
-  // unambiguous affected path(s) and presents the COMPLETE rendered
-  // preview. Merely handing a string to showMessageBox is not proof
-  // Windows displayed it completely, so the host attests displayability
-  // against a conservative bound — beyond it, authorization is
-  // unavailable (never a truncated approval). The bound is validated
-  // by the native Windows display check in the acceptance procedure
-  // (PHASE2_LIVE_WORKFLOW.md section 6, scenario 6).
-  const pathsBlock = summary.affectedPaths.map((entry) => `Affected path: ${entry}`).join('\n');
-  const message = `Approve this exact action?\n\n${pathsBlock}\n\n${summary.renderedPreview}`;
-  const displayedCompletely = message.length <= UNVERIFIED_NATIVE_PREVIEW_DISPLAY_CHARS;
-  if (!displayedCompletely) return { affirmed: false, displayedCompletely: false };
-  const result = await dialog.showMessageBox(mainWindow, {
-    type: 'warning',
-    buttons: ['Cancel', 'Approve exact action'],
-    defaultId: 0,
-    cancelId: 0,
-    noLink: true,
-    title: 'Approve exact action',
-    message,
-    detail: 'Approving signs a single-use authorization for exactly this preview and executes it immediately. Any change to the plan or file invalidates it.',
-  });
-  return { affirmed: result.response === 1, displayedCompletely };
-}
+const approvalConfirmer = createApprovalWindowConfirmer({
+  getParent: () => mainWindow,
+  approvalFile: APPROVAL_FILE,
+  preloadFile: APPROVAL_PRELOAD_FILE,
+});
 
 const liveApprovalProvider = createLiveApprovalProvider({
   backend,
@@ -71,7 +54,7 @@ const liveApprovalProvider = createLiveApprovalProvider({
       backendAlive: () => backend.status().state === 'ready',
     };
   },
-  confirm: confirmLiveApproval,
+  confirm: (summary) => approvalConfirmer.confirmApproval(summary),
   approvalGeneration: () => navigationEpoch,
 });
 let mainWindow: BrowserWindow | undefined;
@@ -185,6 +168,7 @@ function validateInvoke(event: IpcMainInvokeEvent): void {
 }
 
 function registerIpc(): void {
+  approvalConfirmer.registerIpc();
   ipcMain.handle('desktop:backend-status', (event) => {
     validateInvoke(event);
     return backend.status();
@@ -250,8 +234,8 @@ function registerIpc(): void {
     }
     try {
       return await workflow.openFile(relativePath);
-    } catch {
-      return { status: 'unavailable', reason: 'open_failed' };
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'open_failed') };
     }
   });
   ipcMain.handle('desktop:workflow-prepare-edit', async (event, find: unknown, replace: unknown) => {
@@ -261,8 +245,8 @@ function registerIpc(): void {
     }
     try {
       return await workflow.prepareEdit(find, replace);
-    } catch {
-      return { status: 'unavailable', reason: 'prepare_failed' };
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'prepare_failed') };
     }
   });
   ipcMain.handle('desktop:workflow-prepare-undo', async (event, receiptId: unknown) => {
@@ -272,8 +256,8 @@ function registerIpc(): void {
     }
     try {
       return await workflow.prepareUndo(receiptId);
-    } catch {
-      return { status: 'unavailable', reason: 'prepare_failed' };
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'prepare_failed') };
     }
   });
   ipcMain.handle('desktop:workflow-receipt', async (event, receiptId: unknown) => {
@@ -294,16 +278,16 @@ function registerIpc(): void {
     }
     try {
       return await workflow.searchProject(query);
-    } catch {
-      return { status: 'unavailable', reason: 'search_failed' };
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'search_failed') };
     }
   });
   ipcMain.handle('desktop:workflow-open-folder', async (event) => {
     validateInvoke(event);
     try {
       return await workflow.openProjectFolder();
-    } catch {
-      return { status: 'unavailable', reason: 'open_failed' };
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'open_failed') };
     }
   });
   ipcMain.handle('desktop:workflow-state', (event) => {
@@ -335,6 +319,7 @@ function createWindow(): void {
   mainWindow.webContents.on('will-navigate', (event, target) => {
     navigationEpoch += 1;
     liveApprovalProvider.invalidateOutstanding();
+    approvalConfirmer.cancelOutstanding();
     if (target !== trustedUrl) event.preventDefault();
   });
   mainWindow.webContents.on('will-attach-webview', (event) => event.preventDefault());
@@ -343,6 +328,7 @@ function createWindow(): void {
   mainWindow.on('closed', () => {
     navigationEpoch += 1;
     liveApprovalProvider.invalidateOutstanding();
+    approvalConfirmer.cancelOutstanding();
     mainWindow = undefined;
   });
   void mainWindow.loadFile(RENDERER_FILE);
@@ -350,6 +336,7 @@ function createWindow(): void {
 
 async function shutdown(): Promise<void> {
   liveApprovalProvider.invalidateOutstanding();
+  approvalConfirmer.cancelOutstanding();
   await backend.stop();
   app.exit(0);
 }

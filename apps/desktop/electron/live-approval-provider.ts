@@ -12,11 +12,15 @@
  *      + derived identities) and must equal, field for field, the preview
  *      the main-owned workflow planned; the binding must commit to
  *      exactly that preview, plan revision and plan hash;
- *   4. a genuine native confirmation dialog (injected by main; the OS
- *      dialog in production) is shown the COMPLETE rendered preview —
- *      affected resources, complete unified diffs, CRLF/EOF and recovery
- *      implications, and the exact plan/preview binding. If the complete
- *      preview cannot be rendered, approval is refused rather than
+ *   4. the dedicated trusted approval modal (main-controlled,
+ *      isolated window; see shared/approval-modal.ts) presents the
+ *      COMPLETE authoritative content — canonical affected paths in
+ *      full, the full plan hash, every diff line with explicit CRLF
+ *      and EOF representation, scrollable and accessible, with
+ *      explicit Cancel/Approve controls and an explicit review
+ *      acknowledgement. The native message-box presentation was
+ *      disproven on Windows (it elides long lines). If the complete
+ *      content cannot be presented, approval is refused rather than
  *      truncated. Declining or dismissing answers "No" and signs
  *      nothing;
  *   5. only then is the gesture signed with the per-launch key held by
@@ -71,6 +75,8 @@ export interface ApprovalSummary {
   readonly actionIntent: string;
   readonly proposedEffect: string;
   readonly renderedPreview: string;
+  /** The verified structured preview the trusted modal renders. */
+  readonly preview: ExactPreview;
   /** Unambiguous canonical affected paths from the trusted backend. */
   readonly affectedPaths: string[];
   /** Monotonic per-attempt token: embeds session/generation identity. */
@@ -86,23 +92,9 @@ export interface ApprovalSummary {
 export interface ConfirmationOutcome {
   readonly affirmed: boolean;
   readonly displayedCompletely: boolean;
+  /** The user explicitly acknowledged reviewing the complete content. */
+  readonly reviewAcknowledged: boolean;
 }
-
-/**
- * Conservative upper bound for a preview the native message dialog can
- * present reviewably. Longer previews refuse authorization
- * (`preview_not_displayable_completely`) rather than risking an
- * unreviewable confirmation.
- *
- * STATUS: UNVERIFIED DISPLAY ASSUMPTION. This number has never been
- * validated against the real Windows UI; it is a conservative guess,
- * not evidence. Until the native Windows display check (acceptance
- * procedure scenario 6) is executed and recorded, any approval whose
- * preview approaches this bound must be treated as not demonstrably
- * reviewable, and the check may tighten (never loosen without
- * evidence) this value.
- */
-export const UNVERIFIED_NATIVE_PREVIEW_DISPLAY_CHARS = 16_000;
 
 export interface ApprovalContext {
   /** Snapshot of the signed-for task and its verified preview. */
@@ -145,8 +137,16 @@ function parseAffectedPaths(fetched: unknown, preview: ExactPreview): string[] |
   return paths;
 }
 
-function unavailable(reason: string): LiveApprovalState {
-  return { status: 'unavailable', reason };
+interface ApprovalProgress {
+  stage: 'before_confirmation' | 'confirmation' | 'signing' | 'submission' | 'execution';
+  gestureSigned: boolean;
+  gestureSubmitted: boolean;
+  grantAuthorized: boolean;
+  outcomeUncertain: boolean;
+}
+
+function unavailable(reason: string, progress: ApprovalProgress): LiveApprovalState {
+  return { status: 'unavailable', reason, ...progress };
 }
 
 export function createLiveApprovalProvider(options: LiveApprovalProviderOptions) {
@@ -160,11 +160,21 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
   }
 
   async function approveAndExecute(): Promise<LiveApprovalState> {
+    // Truthful progress: exactly what this attempt has actually done,
+    // so the renderer never claims an action did not occur when it did
+    // (or may have). Updated at the moment each step is performed.
+    const progress: ApprovalProgress = {
+      stage: 'before_confirmation',
+      gestureSigned: false,
+      gestureSubmitted: false,
+      grantAuthorized: false,
+      outcomeUncertain: false,
+    };
     const context = resolveApprovalContext();
-    if (!context) return unavailable('live_task_unconfigured');
-    if (backend.status().state !== 'ready') return unavailable('backend_unavailable');
+    if (!context) return unavailable('live_task_unconfigured', progress);
+    if (backend.status().state !== 'ready') return unavailable('backend_unavailable', progress);
     // FI-01: never allow two trusted dialogs at once.
-    if (activeAttempts > 0) return unavailable('approval_already_in_progress');
+    if (activeAttempts > 0) return unavailable('approval_already_in_progress', progress);
     const attemptId = ++invalidationEpoch;
     activeAttempts += 1;
     const initialGeneration = approvalGeneration?.() ?? 0;
@@ -184,11 +194,11 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
       try {
         challenge = parseGestureChallenge(await backend.liveBeginGesture(taskId));
       } catch {
-        return unavailable('live_unavailable');
+        return unavailable('live_unavailable', progress);
       }
-      if (challenge.status === 'unavailable') return unavailable(challenge.reason);
+      if (challenge.status === 'unavailable') return unavailable(challenge.reason, progress);
       const binding: GestureBindingWire = challenge.binding;
-      if (binding.taskId !== taskId) return unavailable('binding_mismatch');
+      if (binding.taskId !== taskId) return unavailable('binding_mismatch', progress);
 
       // 3. The binding must commit to the verified authoritative preview,
       //    which must be exactly the preview the main-owned workflow
@@ -202,11 +212,11 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
         );
         affectedPaths = parseAffectedPaths(fetched, authoritative);
       } catch {
-        return unavailable('live_unavailable');
+        return unavailable('live_unavailable', progress);
       }
-      if (!verifyExactPreviewDigest(authoritative)) return unavailable('digest_mismatch');
+      if (!verifyExactPreviewDigest(authoritative)) return unavailable('digest_mismatch', progress);
       if (previewIdForDigest(authoritative.previewDigest) !== authoritative.previewId) {
-        return unavailable('identity_mismatch');
+        return unavailable('identity_mismatch', progress);
       }
       if (
         authoritative.taskId !== taskId
@@ -217,11 +227,11 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
         || authoritative.planRevision !== binding.planRevision
         || authoritative.planHash.toLowerCase() !== binding.planHash.toLowerCase()
       ) {
-        return unavailable('binding_mismatch');
+        return unavailable('binding_mismatch', progress);
       }
 
       if (!affectedPaths || affectedPaths.length === 0) {
-        return unavailable('preview_path_unavailable');
+        return unavailable('preview_path_unavailable', progress);
       }
 
       // 4. Native confirmation over the COMPLETE rendered preview.
@@ -229,12 +239,13 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
       try {
         renderedPreview = renderFullPreview(authoritative);
       } catch {
-        return unavailable('preview_render_failed');
+        return unavailable('preview_render_failed', progress);
       }
       if (!renderedPreview.trim() || !authoritative.fullDiffAvailable) {
-        return unavailable('preview_incomplete');
+        return unavailable('preview_incomplete', progress);
       }
-      if (staleWithGeneration()) return unavailable('approval_invalidated');
+      if (staleWithGeneration()) return unavailable('approval_invalidated', progress);
+      progress.stage = 'confirmation';
       let outcome: ConfirmationOutcome;
       try {
         outcome = await confirm({
@@ -245,28 +256,34 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
           actionIntent: authoritative.actionIntent,
           proposedEffect: authoritative.proposedEffect,
           renderedPreview,
+          preview: authoritative,
           affectedPaths,
           approvalToken: `${context.sessionMarker}:${String(attemptId)}`,
         });
       } catch {
-        return unavailable('confirmation_unavailable');
+        return unavailable('confirmation_unavailable', progress);
       }
-      if (staleWithGeneration()) return unavailable('approval_invalidated');
+      if (staleWithGeneration()) return unavailable('approval_invalidated', progress);
       // The complete preview must have been *actually* presented
       // reviewably — an over-long or undisplayable preview means
       // authorization is unavailable, never a truncated approval.
       if (!outcome.displayedCompletely) {
-        return unavailable('preview_not_displayable_completely');
+        return unavailable('preview_not_displayable_completely', progress);
       }
       if (!outcome.affirmed) return { status: 'declined' };
+      if (!outcome.reviewAcknowledged) {
+        return unavailable('review_acknowledgement_required', progress);
+      }
 
       // 5. Sign (main-process key), submit, verify scope, execute.
+      progress.stage = 'signing';
       let signed: SignedGesturePayload;
       try {
         signed = backend.signGesture(challenge.nonce, binding, 'APPROVE');
       } catch {
-        return unavailable('signing_unavailable');
+        return unavailable('signing_unavailable', progress);
       }
+      progress.gestureSigned = true;
       const wire: SignedGestureWire = {
         nonce: signed.nonce,
         binding,
@@ -274,25 +291,33 @@ export function createLiveApprovalProvider(options: LiveApprovalProviderOptions)
         userIntent: signed.user_intent,
         signature: signed.signature,
       };
+      progress.stage = 'submission';
+      progress.gestureSubmitted = true;
       let authorized;
       try {
         authorized = parseGestureAuthorized(await backend.liveSubmitGesture(wire));
       } catch {
-        return unavailable('live_unavailable');
+        // The request was submitted; whether the backend acted on it
+        // is unknown. Report uncertainty, never "nothing happened".
+        progress.outcomeUncertain = true;
+        return unavailable('submission_outcome_uncertain', progress);
       }
-      if (authorized.status === 'unavailable') return unavailable(authorized.reason);
+      if (authorized.status === 'unavailable') return unavailable(authorized.reason, progress);
+      progress.grantAuthorized = true;
       if (authorized.scopeDigest.toLowerCase() !== binding.scopeDigest.toLowerCase()) {
-        return unavailable('binding_mismatch');
+        return unavailable('binding_mismatch', progress);
       }
-      if (staleWithGeneration()) return unavailable('approval_invalidated');
+      if (staleWithGeneration()) return unavailable('approval_invalidated', progress);
 
+      progress.stage = 'execution';
       let executed;
       try {
         executed = parseEditExecuted(await backend.liveExecuteEdit(taskId));
       } catch {
-        return unavailable('live_unavailable');
+        progress.outcomeUncertain = true;
+        return unavailable('execution_outcome_uncertain', progress);
       }
-      if (executed.status === 'unavailable') return unavailable(executed.reason);
+      if (executed.status === 'unavailable') return unavailable(executed.reason, progress);
       return { status: 'executed', outcome: executed.outcome, receiptId: executed.receiptId };
     } finally {
       activeAttempts -= 1;

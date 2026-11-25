@@ -6,8 +6,8 @@ import type { LiveReceiptState, WorkflowStep } from '../shared/live';
  * FI-02 user-operable workflow surface.
  *
  * The renderer only *requests operations* and displays bounded summaries.
- * Authorization-essential information is shown again in the main-process
- * native dialog; nothing here can approve, sign, or choose an identity.
+ * Authorization-essential information is shown again in the main-controlled
+ * trusted approval window; nothing here can approve, sign, or choose an identity.
  */
 export interface WorkflowView {
   projectAlias: string | null;
@@ -116,7 +116,7 @@ export function LiveWorkflowSurface(props: {
             {String(view.preview.planRevision)} · recovery {view.preview.recoveryClass}
           </p>
           <button type="button" onClick={props.onApprove} disabled={props.busy}>
-            Approve &amp; execute in native dialog…
+            Approve &amp; execute in trusted approval window…
           </button>
         </div>
       )}

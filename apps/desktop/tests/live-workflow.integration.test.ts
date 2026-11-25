@@ -156,14 +156,31 @@ test(
         confirm: async (summary) => {
           assert.ok(summary.affectedPaths[0]?.endsWith('sample.txt'));
           assert.ok(summary.renderedPreview.includes('Affected path') === false);
-          return { affirmed: true, displayedCompletely: true };
+          return { affirmed: true, displayedCompletely: true, reviewAcknowledged: true };
         },
       });
       const approval = await provider.approveAndExecute();
-      assert.deepEqual(approval, {
-        status: 'unavailable',
-        reason: 'grant_issuance_disabled',
-      });
+      assert.equal(approval.status, 'unavailable');
+      if (approval.status === 'unavailable') {
+        // Truthful: the gesture was signed and submitted; production
+        // issuance refused it. No grant, no execution, bytes intact.
+        assert.equal(approval.reason, 'grant_issuance_disabled');
+        assert.equal(approval.gestureSigned, true);
+        assert.equal(approval.gestureSubmitted, true);
+        assert.equal(approval.grantAuthorized, false);
+        assert.equal(approval.outcomeUncertain, false);
+      }
+      assert.equal(readFileSync(sample, 'utf8'), original);
+
+      // Both demonstrated replacements prepare through the genuine
+      // workflow after the refused approval (regression coverage for
+      // the reported prepare_failed, which the generic catch-all
+      // concealed): a second, different exact edit, and the absent-text
+      // refusal with its bounded reason.
+      const second = await workflow.prepareEdit('hello world', 'hello aether');
+      assert.equal(second.status, 'ready', JSON.stringify(second));
+      const absent = await workflow.prepareEdit('text that is not present', 'replacement');
+      assert.deepEqual(absent, { status: 'unavailable', reason: 'edit_text_not_found' });
       assert.equal(readFileSync(sample, 'utf8'), original);
     } finally {
       await client.stop();

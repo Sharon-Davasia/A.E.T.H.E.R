@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
 import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
+import { describeLiveApprovalOutcome } from '../shared/live';
 import type {
   LiveApprovalState,
   LiveReceiptState,
@@ -108,15 +109,13 @@ function App(): React.JSX.Element {
     setLiveResult(undefined);
     try {
       const outcome = await window.aetherDesktop.approveLiveAction();
-      if (outcome.status === 'executed') {
-        setLiveResult(`Live action executed (${outcome.outcome})${outcome.receiptId ? ` · receipt ${outcome.receiptId}` : ''}.`);
-      } else if (outcome.status === 'declined') {
-        setLiveResult('Approval declined in the native confirmation. Nothing was signed or executed.');
-      } else {
-        setLiveResult(`Live approval unavailable (${outcome.reason}). Nothing was signed or executed.`);
-      }
+      // Truthful per-stage reporting: the provider states exactly what
+      // was signed, submitted, authorized and executed — never a
+      // blanket "nothing was signed" when a gesture was in fact signed
+      // and submitted (e.g. refused at production issuance).
+      setLiveResult(describeLiveApprovalOutcome(outcome));
     } catch {
-      setLiveResult('Live approval unavailable. Nothing was signed or executed.');
+      setLiveResult('Live approval outcome unknown: the attempt was interrupted before a result was reported. Do not assume nothing was signed — check the task and receipt state before retrying.');
     } finally {
       setLiveBusy(false);
     }
@@ -223,7 +222,7 @@ function App(): React.JSX.Element {
       onOutcome={(outcome, acknowledged) => { void recordOutcome(outcome, acknowledged); }}
     />
     <button type="button" className="ping-button" onClick={() => void approveLive()} disabled={liveBusy || !status.startsWith('ready')}>
-      {liveBusy ? 'Awaiting native confirmation…' : 'Approve & execute exact action…'}
+      {liveBusy ? 'Awaiting trusted approval…' : 'Approve & execute exact action…'}
     </button>
     {liveResult && <p className="result" role="status">{liveResult}</p>}
     <LiveWorkflowSurface
@@ -239,7 +238,7 @@ function App(): React.JSX.Element {
       onShowReceipt={(id) => void showReceipt(id)}
       onPrepareUndo={(id) => void prepareUndo(id)}
     />
-    <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires a native confirmation dialog, schema version 2 activation, and separately approved production grant issuance; until those land, live approval reports unavailable and nothing executes.</p>
+    <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires the trusted approval window (complete exact preview with explicit review acknowledgement), schema version 2 activation, and separately approved production grant issuance; production issuance is currently disabled, so an approved gesture is refused at issuance and nothing executes.</p>
   </main>;
 }
 

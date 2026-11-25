@@ -400,3 +400,41 @@ with the acceptance signed per the procedure §7. Until then:
 - Phase 2 code integration: **COMPLETE**
 - Automated verification: **PASS with qualifications** (§2.1)
 - Formal Phase 2 acceptance: **NOT COMPLETE**
+
+---
+
+## Addendum — native Windows confirmation findings at `e0aa3d9` (user-reported)
+
+Native automated gates passed (desktop 104 Node + 6 Python channel,
+zero failures/skips; backend 924 passed / 21 skipped) and the actual
+Electron demonstrations confirmed: project registration, Explorer
+project opening, file reading, search, exact edit preparation
+(`hello` → `hello aether`), native confirmation opening, cancellation,
+and affirmative confirmation reaching `grant_issuance_disabled`.
+
+**Positive refusal / file-integrity evidence (preserved):** after the
+demonstrations, SHA-256 comparison against the original fixture
+baseline succeeded — **all five synthetic fixture files remain
+byte-identical**. Production issuance refusal therefore held end to
+end on the native machine: an affirmative trusted confirmation signed
+and submitted a single-use gesture, issuance refused it, and no file
+was mutated.
+
+**Defects found (corrected in the candidate following this addendum):**
+(1) the Windows `showMessageBox` visibly elided the canonical affected
+path, plan hash and other long lines — the 16,000-character
+displayability assumption is **disproven**; replaced by a dedicated
+main-controlled isolated trusted approval modal (complete paths/hashes,
+full scrollable diff with explicit CRLF/EOF, explicit review
+acknowledgement, no signing authority in the modal renderer);
+(2) `hello world` → `hello aether` returned generic `prepare_failed`
+while `hello` → `hello aether` succeeded — both cases now reproduce
+through the genuine workflow in regression tests and preparation
+failures carry bounded stage reasons (`edit_text_not_found`,
+`response_malformed`, `backend_timeout`, `backend_unavailable`, …)
+instead of the generic catch-all; (3) the renderer claimed "Nothing
+was signed or executed" for every unavailable outcome — approval
+results now report per-stage truth (signed / submitted / authorized /
+executed / uncertain) via `describeLiveApprovalOutcome`.
+
+Formal Phase 2 acceptance remains **NOT COMPLETE**.

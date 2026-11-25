@@ -48,6 +48,33 @@ export interface WorkflowState {
  * recoverable because the trusted host derives the same resource
  * identity for the same directory (deterministic root identity).
  */
+/**
+ * Bounded, sanitized reason for a thrown workflow failure.
+ *
+ * Raw exception text never crosses to the renderer (it can contain
+ * paths or internals); instead the failure is classified into a small
+ * allow-listed vocabulary that distinguishes *which* stage refused —
+ * replacing the former generic `prepare_failed` concealment. Backend
+ * refusals that already carry a bounded wire reason are returned as
+ * steps by the parsers and never reach this classifier.
+ */
+export function workflowFailureReason(error: unknown, fallback = 'workflow_failed'): string {
+  const message = error instanceof Error ? error.message : '';
+  if (message.includes('does not occur in the opened file')) return 'edit_text_not_found';
+  if (message.includes('malformed')) return 'response_malformed';
+  if (message.includes('timed out') || message.includes('timeout')) return 'backend_timeout';
+  if (
+    message.includes('not ready') || message.includes('could not be started')
+    || message.includes('not configured') || message.includes('cancelled')
+    || message.includes('unavailable') || message.includes('closed')
+  ) {
+    return 'backend_unavailable';
+  }
+  if (message.includes('open a file before')) return 'no_file_open';
+  if (message.includes('register a project before')) return 'no_project_registered';
+  return fallback;
+}
+
 export class LiveWorkflow {
   private project: RegisteredProject | null = null;
   private file: ResolvedFile | null = null;
@@ -210,19 +237,29 @@ export class LiveWorkflow {
     ) {
       return { status: 'unavailable', reason: 'source_changed_since_read' };
     }
-    const proposed = buildProposedContents(this.contents.text, find, replace);
-    const taskId = parseCreatedTask(await this.backend.liveCreateTask('Apply an approved edit'));
-    const planned = parsePlannedPreview(
-      await this.backend.livePlanEdit(taskId, this.file.resourceId, proposed),
-    );
-    if (planned.status !== 'ready') {
-      this.clearPlan();
-      return planned;
+    let proposed: string;
+    try {
+      proposed = buildProposedContents(this.contents.text, find, replace);
+    } catch (error) {
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'prepare_failed') };
     }
-    this.taskId = taskId;
-    this.preview = planned.value;
-    this.executed = null;
-    return planned;
+    try {
+      const taskId = parseCreatedTask(await this.backend.liveCreateTask('Apply an approved edit'));
+      const planned = parsePlannedPreview(
+        await this.backend.livePlanEdit(taskId, this.file.resourceId, proposed),
+      );
+      if (planned.status !== 'ready') {
+        this.clearPlan();
+        return planned;
+      }
+      this.taskId = taskId;
+      this.preview = planned.value;
+      this.executed = null;
+      return planned;
+    } catch (error) {
+      this.clearPlan();
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'prepare_failed') };
+    }
   }
 
   public async prepareUndo(receiptId: string): Promise<WorkflowStep<ExactPreview>> {
@@ -233,18 +270,23 @@ export class LiveWorkflow {
     if (receiptState.status !== 'ready') {
       return { status: 'unavailable', reason: receiptState.status === 'unavailable' ? receiptState.message : 'receipt_unavailable' };
     }
-    const taskId = parseCreatedTask(await this.backend.liveCreateTask('Undo an approved edit'));
-    const planned = parsePlannedPreview(
-      await this.backend.livePlanUndo(taskId, receiptState.receipt.resourceId, receiptId),
-    );
-    if (planned.status !== 'ready') {
-      this.clearPlan();
+    try {
+      const taskId = parseCreatedTask(await this.backend.liveCreateTask('Undo an approved edit'));
+      const planned = parsePlannedPreview(
+        await this.backend.livePlanUndo(taskId, receiptState.receipt.resourceId, receiptId),
+      );
+      if (planned.status !== 'ready') {
+        this.clearPlan();
+        return planned;
+      }
+      this.taskId = taskId;
+      this.preview = planned.value;
+      this.executed = null;
       return planned;
+    } catch (error) {
+      this.clearPlan();
+      return { status: 'unavailable', reason: workflowFailureReason(error, 'prepare_failed') };
     }
-    this.taskId = taskId;
-    this.preview = planned.value;
-    this.executed = null;
-    return planned;
   }
 
   /**

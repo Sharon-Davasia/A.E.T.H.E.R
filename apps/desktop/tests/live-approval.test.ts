@@ -43,6 +43,7 @@ interface StubOptions {
   readonly confirmResult?: boolean;
   readonly confirmImpl?: (summary: ApprovalSummary) => Promise<boolean>;
   readonly displayedCompletely?: boolean;
+  readonly reviewAcknowledged?: boolean;
   readonly withPaths?: boolean;
 }
 
@@ -122,7 +123,11 @@ function stub(options: StubOptions = {}) {
       const affirmed = options.confirmImpl
         ? await options.confirmImpl(summary)
         : (options.confirmResult ?? true);
-      return { affirmed, displayedCompletely: options.displayedCompletely ?? true };
+      return {
+        affirmed,
+        displayedCompletely: options.displayedCompletely ?? true,
+        reviewAcknowledged: options.reviewAcknowledged ?? true,
+      };
     },
   });
   return { provider, calls, submitted, summaries, signs: () => signCount, contextState };
@@ -153,7 +158,12 @@ test('schema v1 refusal at begin: no preview fetch, no confirmation, no signing'
     begin: () => ({ reason: 'schema_activation_pending' }),
   });
   const result = await provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'schema_activation_pending' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') {
+    assert.equal(result.reason, 'schema_activation_pending');
+    assert.equal(result.gestureSigned, false);
+    assert.equal(result.gestureSubmitted, false);
+  }
   assert.deepEqual(calls, ['begin']);
   assert.equal(signs(), 0);
 });
@@ -163,7 +173,17 @@ test('production issuance refusal at submit: signed once, never executed', async
     submit: () => ({ reason: 'grant_issuance_disabled' }),
   });
   const result = await provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'grant_issuance_disabled' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') {
+    // Truthful status: the gesture WAS signed and submitted; issuance
+    // refused it, so no grant exists and nothing executed.
+    assert.equal(result.reason, 'grant_issuance_disabled');
+    assert.equal(result.stage, 'submission');
+    assert.equal(result.gestureSigned, true);
+    assert.equal(result.gestureSubmitted, true);
+    assert.equal(result.grantAuthorized, false);
+    assert.equal(result.outcomeUncertain, false);
+  }
   assert.deepEqual(calls, ['begin', 'preview', 'confirm', 'sign', 'submit']);
 });
 
@@ -172,7 +192,11 @@ test('binding that does not commit to the verified preview is refused before con
     begin: () => ({ nonce: NONCE, binding: { ...BINDING, previewDigest: '0'.repeat(64) } }),
   });
   const result = await provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'binding_mismatch' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') {
+    assert.equal(result.reason, 'binding_mismatch');
+    assert.equal(result.gestureSigned, false);
+  }
   assert.deepEqual(calls, ['begin', 'preview']);
   assert.equal(signs(), 0);
 });
@@ -184,7 +208,8 @@ test('forged preview digest is refused before confirmation', async () => {
     previewResponse: () => ({ status: 'ready', preview: forged }),
   });
   const result = await provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'digest_mismatch' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') assert.equal(result.reason, 'digest_mismatch');
   assert.deepEqual(calls, ['begin', 'preview']);
   assert.equal(signs(), 0);
 });
@@ -194,16 +219,23 @@ test('a submit scope digest different from the binding stops execution', async (
     submit: () => ({ approvalId: APPROVAL_ID, scopeDigest: '0'.repeat(64) }),
   });
   const result = await provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'binding_mismatch' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') {
+    assert.equal(result.reason, 'binding_mismatch');
+    assert.equal(result.grantAuthorized, true);
+    assert.equal(result.gestureSubmitted, true);
+  }
   assert.deepEqual(calls, ['begin', 'preview', 'confirm', 'sign', 'submit']);
 });
 
 test('backend not ready and unconfigured task fail closed without any channel call', async () => {
   const offline = stub({ state: 'offline' });
-  assert.deepEqual(await offline.provider.approveAndExecute(), {
-    status: 'unavailable',
-    reason: 'backend_unavailable',
-  });
+  const offlineResult = await offline.provider.approveAndExecute();
+  assert.equal(offlineResult.status, 'unavailable');
+  if (offlineResult.status === 'unavailable') {
+    assert.equal(offlineResult.reason, 'backend_unavailable');
+    assert.equal(offlineResult.gestureSigned, false);
+  }
   assert.deepEqual(offline.calls, []);
 
   const { backend } = stub();
@@ -212,10 +244,11 @@ test('backend not ready and unconfigured task fail closed without any channel ca
     resolveApprovalContext: () => null,
     confirm: async () => true,
   });
-  assert.deepEqual(await unconfigured.approveAndExecute(), {
-    status: 'unavailable',
-    reason: 'live_task_unconfigured',
-  });
+  const unconfiguredResult = await unconfigured.approveAndExecute();
+  assert.equal(unconfiguredResult.status, 'unavailable');
+  if (unconfiguredResult.status === 'unavailable') {
+    assert.equal(unconfiguredResult.reason, 'live_task_unconfigured');
+  }
 });
 
 /* FI-01: trusted exact-preview confirmation hardening */
@@ -240,7 +273,8 @@ test('a second approval while the dialog is outstanding is refused', async () =>
   const { provider, signs } = stub({ confirmImpl: () => gate });
   const first = provider.approveAndExecute();
   const second = await provider.approveAndExecute();
-  assert.deepEqual(second, { status: 'unavailable', reason: 'approval_already_in_progress' });
+  assert.equal(second.status, 'unavailable');
+  if (second.status === 'unavailable') assert.equal(second.reason, 'approval_already_in_progress');
   release(true);
   const completed = await first;
   assert.equal(completed.status, 'executed');
@@ -255,7 +289,8 @@ test('invalidation during the dialog signs nothing', async () => {
     },
   });
   const result = await handle.provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') assert.equal(result.reason, 'approval_invalidated');
   assert.equal(handle.signs(), 0);
   assert.ok(!handle.calls.includes('submit'));
 });
@@ -268,7 +303,8 @@ test('session replacement during the dialog signs nothing', async () => {
     },
   });
   const result = await handle.provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') assert.equal(result.reason, 'approval_invalidated');
   assert.equal(handle.signs(), 0);
 });
 
@@ -280,7 +316,8 @@ test('backend termination during the dialog signs nothing', async () => {
     },
   });
   const result = await handle.provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') assert.equal(result.reason, 'approval_invalidated');
   assert.equal(handle.signs(), 0);
 });
 
@@ -292,7 +329,8 @@ test('a changed planned preview during the dialog signs nothing', async () => {
     },
   });
   const result = await handle.provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'approval_invalidated' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') assert.equal(result.reason, 'approval_invalidated');
   assert.equal(handle.signs(), 0);
 });
 
@@ -309,16 +347,66 @@ test('the confirmation summary carries the unambiguous affected path', async () 
 test('a preview without authoritative affected paths cannot be approved', async () => {
   const { provider, signs } = stub({ withPaths: false });
   const result = await provider.approveAndExecute();
-  assert.deepEqual(result, { status: 'unavailable', reason: 'preview_path_unavailable' });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') assert.equal(result.reason, 'preview_path_unavailable');
   assert.equal(signs(), 0);
 });
 
 test('a preview the native dialog cannot display completely is never signed', async () => {
   const { provider, calls, signs } = stub({ displayedCompletely: false, confirmResult: true });
   const result = await provider.approveAndExecute();
-  assert.deepEqual(result, {
-    status: 'unavailable', reason: 'preview_not_displayable_completely',
-  });
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') {
+    assert.equal(result.reason, 'preview_not_displayable_completely');
+    assert.equal(result.gestureSigned, false);
+  }
   assert.equal(signs(), 0);
   assert.ok(!calls.includes('submit'));
+});
+
+
+/* Trusted modal acknowledgement + truthful outcome reporting */
+
+test('affirmation without the explicit review acknowledgement signs nothing', async () => {
+  const { provider, calls, signs } = stub({ reviewAcknowledged: false });
+  const result = await provider.approveAndExecute();
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') {
+    assert.equal(result.reason, 'review_acknowledgement_required');
+    assert.equal(result.stage, 'confirmation');
+    assert.equal(result.gestureSigned, false);
+  }
+  assert.deepEqual(calls, ['begin', 'preview', 'confirm']);
+  assert.equal(signs(), 0);
+});
+
+test('a submission transport failure after signing is reported uncertain', async () => {
+  const { provider } = stub({
+    submit: () => { throw new Error('channel closed'); },
+  });
+  const result = await provider.approveAndExecute();
+  assert.equal(result.status, 'unavailable');
+  if (result.status === 'unavailable') {
+    assert.equal(result.reason, 'submission_outcome_uncertain');
+    assert.equal(result.gestureSigned, true);
+    assert.equal(result.gestureSubmitted, true);
+    assert.equal(result.outcomeUncertain, true);
+  }
+});
+
+test('renderer wording distinguishes signing, submission, issuance and uncertainty', async () => {
+  const { describeLiveApprovalOutcome } = await import('../shared/live');
+  assert.match(describeLiveApprovalOutcome({ status: 'declined' }), /Nothing was signed, submitted or executed/);
+  const refused = describeLiveApprovalOutcome({
+    status: 'unavailable', reason: 'grant_issuance_disabled', stage: 'submission',
+    gestureSigned: true, gestureSubmitted: true, grantAuthorized: false, outcomeUncertain: false,
+  });
+  assert.match(refused, /signed and submitted/);
+  assert.match(refused, /No grant was issued and nothing was executed/);
+  const uncertain = describeLiveApprovalOutcome({
+    status: 'unavailable', reason: 'submission_outcome_uncertain', stage: 'submission',
+    gestureSigned: true, gestureSubmitted: true, grantAuthorized: false, outcomeUncertain: true,
+  });
+  assert.match(uncertain, /uncertain/);
+  assert.doesNotMatch(uncertain, /Nothing was signed/);
 });

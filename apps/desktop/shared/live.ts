@@ -41,7 +41,50 @@ export type EditExecuted =
 export type LiveApprovalState =
   | { status: 'executed'; outcome: string; receiptId: string | null }
   | { status: 'declined' }
-  | { status: 'unavailable'; reason: string };
+  | {
+      status: 'unavailable';
+      reason: string;
+      /** Stage the attempt reached before it stopped. */
+      stage: 'before_confirmation' | 'confirmation' | 'signing' | 'submission' | 'execution';
+      /** A gesture was actually signed in the main process. */
+      gestureSigned: boolean;
+      /** The signed gesture was actually submitted to the backend. */
+      gestureSubmitted: boolean;
+      /** The backend actually authorized (issued) a grant. */
+      grantAuthorized: boolean;
+      /** The attempt may have had an effect that cannot be ruled out. */
+      outcomeUncertain: boolean;
+    };
+
+/**
+ * Truthful renderer wording for one approval outcome. It never claims
+ * an action did not occur when it may have: a signed-and-submitted
+ * gesture refused at issuance is reported as signed and submitted
+ * (with no grant issued and nothing executed, which the backend's
+ * refusal does establish), and an interrupted submission/execution is
+ * reported as uncertain rather than as "nothing happened".
+ */
+export function describeLiveApprovalOutcome(state: LiveApprovalState): string {
+  if (state.status === 'executed') {
+    return `Live action executed (${state.outcome})${state.receiptId ? ` · receipt ${state.receiptId}` : ''}.`;
+  }
+  if (state.status === 'declined') {
+    return 'Approval declined or cancelled in the trusted confirmation. Nothing was signed, submitted or executed.';
+  }
+  if (state.outcomeUncertain) {
+    return `Live approval interrupted (${state.reason}) after a gesture was signed. Its outcome is uncertain: do not assume nothing happened — check the task and receipt state before retrying.`;
+  }
+  if (state.grantAuthorized) {
+    return `Live approval unavailable (${state.reason}). A gesture was signed, submitted and authorized, but execution did not complete. Check the task and receipt state before retrying.`;
+  }
+  if (state.gestureSubmitted) {
+    return `Live approval unavailable (${state.reason}). You approved the exact action and a single-use gesture was signed and submitted, but the backend refused it before issuing any grant. No grant was issued and nothing was executed; the signed gesture is consumed and cannot be replayed.`;
+  }
+  if (state.gestureSigned) {
+    return `Live approval unavailable (${state.reason}). A gesture was signed in the main process but was not submitted. Nothing was executed.`;
+  }
+  return `Live approval unavailable (${state.reason}). Nothing was signed, submitted or executed.`;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
