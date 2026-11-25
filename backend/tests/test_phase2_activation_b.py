@@ -523,3 +523,93 @@ def test_ordinary_launch_cannot_execute_a_persisted_activation_grant(tmp_path, m
     finally:
         composition2.close()
         store2.close()
+
+
+# ----------------------------------------------------------------------
+# fixture_layout reparse validation order (lexical before resolution)
+# ----------------------------------------------------------------------
+
+
+def _layout_env(root: Path) -> dict[str, str]:
+    from aether.channel.app_storage import FIXTURE_DB_ENV
+
+    return {FIXTURE_DB_ENV: str(root / "storage" / "tasks.sqlite3")}
+
+
+def _make_layout(root: Path) -> None:
+    (root / "project").mkdir(parents=True, exist_ok=True)
+    (root / "outside").mkdir(parents=True, exist_ok=True)
+    (root / "storage").mkdir(parents=True, exist_ok=True)
+
+
+def _symlink_dir(link: Path, target: Path) -> None:
+    from fs_support import skip_if_symlink_unavailable
+
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        skip_if_symlink_unavailable(exc)
+
+
+def test_project_redirected_to_outside_is_refused_before_resolution(tmp_path) -> None:
+    from aether.channel.app_storage import AcceptanceStorageError, fixture_layout
+
+    root = tmp_path / "AETHER-Phase2-Fixture-redirect"
+    _make_layout(root)
+    (root / "project").rmdir()
+    _symlink_dir(root / "project", root / "outside")
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout(_layout_env(root))
+
+
+def test_project_redirected_to_storage_is_refused_before_resolution(tmp_path) -> None:
+    from aether.channel.app_storage import AcceptanceStorageError, fixture_layout
+
+    root = tmp_path / "AETHER-Phase2-Fixture-storage-redirect"
+    _make_layout(root)
+    (root / "project").rmdir()
+    _symlink_dir(root / "project", root / "storage")
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout(_layout_env(root))
+
+
+def test_redirected_fixture_ancestor_is_refused(tmp_path) -> None:
+    from aether.channel.app_storage import AcceptanceStorageError, fixture_layout
+
+    real = tmp_path / "real"
+    root = real / "AETHER-Phase2-Fixture-ancestor"
+    _make_layout(root)
+    link = tmp_path / "linkdir"
+    _symlink_dir(link, real)
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout(_layout_env(link / "AETHER-Phase2-Fixture-ancestor"))
+
+
+def test_project_junction_redirect_is_refused_without_elevation(tmp_path) -> None:
+    """Native Windows junction coverage (no privilege required).
+
+    Junctions need no Developer Mode or elevation, so this runs on
+    Windows where the symlink variants may have to skip. Skips off
+    Windows via the helper; a skip is not evidence of a pass.
+    """
+    from fs_support import make_junction
+
+    from aether.channel.app_storage import AcceptanceStorageError, fixture_layout
+
+    root = tmp_path / "AETHER-Phase2-Fixture-junction"
+    _make_layout(root)
+    (root / "project").rmdir()
+    make_junction(root / "project", root / "outside")
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout(_layout_env(root))
+
+
+def test_storage_redirect_is_refused_before_resolution(tmp_path) -> None:
+    from aether.channel.app_storage import AcceptanceStorageError, fixture_layout
+
+    root = tmp_path / "AETHER-Phase2-Fixture-storage-dir-redirect"
+    _make_layout(root)
+    (root / "storage").rmdir()
+    _symlink_dir(root / "storage", root / "outside")
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout(_layout_env(root))

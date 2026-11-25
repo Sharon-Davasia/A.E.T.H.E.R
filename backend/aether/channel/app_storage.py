@@ -54,11 +54,14 @@ def _is_fixture_path(candidate: Path) -> bool:
 
 
 def fixture_root_for(candidate: Path) -> Path | None:
-    """The ``AETHER-Phase2-Fixture-*`` ancestor of a fixture path, if any.
+    """Locate the designated fixture root of a fixture path, if any.
 
-    This ancestor is the controlled-activation boundary: designated
-    synthetic project directories live under it, and the composition
-    refuses registration or mutation outside it during acceptance.
+    Provenance discipline: the ``AETHER-Phase2-Fixture-*`` name only
+    *locates* the root the operator designated for this launch; a name
+    prefix is never evidence of ownership or safety. Safety comes
+    solely from the canonical validation in :func:`fixture_layout`
+    (exact designated subtrees, reparse rejection before and after
+    resolution, canonical containment).
     """
 
     for parent in (candidate, *candidate.parents):
@@ -88,12 +91,23 @@ def fixture_layout(env: dict[str, str]) -> FixtureLayout:
     """Derive and validate the canonical fixture layout, or refuse.
 
     Runs before storage is opened and before Activation B is enabled:
-    a misconfigured layout refuses the launch, never falls back. The
-    designated project directory must already exist (fixture setup
-    creates it); storage may be created by the store. Canonical
-    containment is decided on reparse-checked resolved paths, and the
-    directory names locate the designated subtrees — a name alone is
-    never the safety evidence.
+    a misconfigured layout refuses the launch, never falls back.
+
+    Validation order matters and is deliberate:
+
+    1. reparse components are rejected on the *original lexical*
+       root, project, storage and database paths before anything is
+       resolved — a junction/symlink redirect (e.g. ``project``
+       pointing at a sibling inside the fixture) must not be concealed
+       by resolution;
+    2. after resolution, the canonical results are re-checked and the
+       canonical project must be *exactly* the designated
+       ``<canonical-root>/project`` directory, with project/storage
+       separation preserved.
+
+    The fixture name locates the designated root (see
+    :func:`fixture_root_for`); it does not prove ownership. These
+    canonical checks are the safety evidence.
     """
 
     if env.get("AETHER_REVIEW_DB"):
@@ -117,25 +131,51 @@ def fixture_layout(env: dict[str, str]) -> FixtureLayout:
             "fixture storage must live in the designated storage directory (<root>/storage)"
         )
     project_dir = root / "project"
+    # 1. Reparse rejection on the original lexical paths, BEFORE any
+    #    resolution can conceal a redirect.
+    try:
+        reject_reparse_components(candidate)
+        reject_reparse_components(root)
+        reject_reparse_components(project_dir)
+        reject_reparse_components(storage_dir)
+    except (OSError, PathSafetyError) as exc:
+        raise AcceptanceStorageError(
+            "fixture layout contains a reparse point in its original paths"
+        ) from exc
     if not project_dir.is_dir():
         raise AcceptanceStorageError(
             "the designated fixture project directory (<root>/project) does not exist"
         )
+    # 2. Post-resolution validation: re-check the canonical results and
+    #    require exact designated subtrees.
     try:
         canonical_root = root.resolve(strict=True)
         reject_reparse_components(canonical_root)
         canonical_project = project_dir.resolve(strict=True)
         reject_reparse_components(canonical_project)
+        canonical_storage = (
+            storage_dir.resolve(strict=True) if storage_dir.exists() else storage_dir
+        )
         if storage_dir.exists():
-            reject_reparse_components(storage_dir.resolve(strict=True))
+            reject_reparse_components(canonical_storage)
     except (OSError, PathSafetyError) as exc:
         raise AcceptanceStorageError("fixture layout could not be validated") from exc
-    if canonical_project == canonical_root or not canonical_project.is_relative_to(canonical_root):
-        raise AcceptanceStorageError("the designated fixture project directory is invalid")
+    if canonical_project != canonical_root / "project":
+        raise AcceptanceStorageError(
+            "the canonical project directory is not exactly the designated <root>/project"
+        )
+    if storage_dir.exists() and canonical_storage != canonical_root / "storage":
+        raise AcceptanceStorageError(
+            "the canonical storage directory is not exactly the designated <root>/storage"
+        )
+    if canonical_project == canonical_storage or canonical_project.is_relative_to(
+        canonical_storage
+    ):
+        raise AcceptanceStorageError("fixture project and storage must remain separate")
     return FixtureLayout(
         fixture_root=canonical_root,
         project_dir=canonical_project,
-        storage_dir=storage_dir,
+        storage_dir=canonical_storage,
     )
 
 
