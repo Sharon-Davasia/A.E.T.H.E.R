@@ -40,8 +40,9 @@ def _sha(data: bytes) -> str:
 
 def _world(tmp_path, monkeypatch, *, activation: bool):
     """One production-shaped world; ``activation`` toggles the scope only."""
+    (tmp_path / "project").mkdir(exist_ok=True)
     store = stage4_store(tmp_path, monkeypatch)
-    scope = ActivationScope(fixture_root=tmp_path) if activation else None
+    scope = ActivationScope(project_root=tmp_path / "project") if activation else None
     composition = TrustedComposition.build(
         store=store, gesture_key=GESTURE_KEY, clock=lambda: NOW, activation_scope=scope
     )
@@ -209,7 +210,7 @@ def test_receipt_survives_restart_and_approved_undo_restores_original(
         store=store2,
         gesture_key=GESTURE_KEY,
         clock=lambda: NOW,
-        activation_scope=ActivationScope(fixture_root=tmp_path),
+        activation_scope=ActivationScope(project_root=tmp_path / "project"),
     )
     bridge2 = LiveBridge(composition2)
     try:
@@ -292,35 +293,45 @@ def test_ordinary_launch_remains_issuance_disabled(tmp_path, monkeypatch) -> Non
 
 
 def test_registration_outside_the_activation_boundary_is_refused(tmp_path, monkeypatch) -> None:
-    boundary = tmp_path / "fixture"
-    boundary.mkdir(mode=0o700)
-    outside = tmp_path / "outside-project"
-    outside.mkdir()
+    """The exact acceptance layout: only <root>/project may register.
+
+    The fixture root itself, the private storage directory and the
+    unauthorized outside directory all refuse with the boundary reason;
+    the designated project directory registers successfully.
+    """
+    root = tmp_path / "AETHER-Phase2-Fixture-demo"
+    project = root / "project"
+    storage = root / "storage"
+    outside = root / "outside"
+    for directory in (project, storage, outside):
+        directory.mkdir(parents=True, mode=0o700)
+    (project / "sample.txt").write_bytes(ORIGINAL)
     (outside / "sample.txt").write_bytes(ORIGINAL)
-    store = stage4_store(boundary, monkeypatch)
+    root.chmod(0o700)
+    store = stage4_store(root, monkeypatch)
     composition = TrustedComposition.build(
         store=store,
         gesture_key=GESTURE_KEY,
         clock=lambda: NOW,
-        activation_scope=ActivationScope(fixture_root=boundary),
+        activation_scope=ActivationScope(project_root=project),
     )
     bridge = LiveBridge(composition)
     try:
-        refused = bridge.register_project({"alias": "escape", "path": str(outside)})
-        assert "reason" in refused or "rootId" not in refused, refused
-        assert refused.get("reason") is not None
-        # Inside the boundary registers fine (containment is canonical,
-        # so a sibling sharing a name prefix is still outside).
-        inside = boundary / "project"
-        inside.mkdir()
-        (inside / "sample.txt").write_bytes(ORIGINAL)
-        accepted = bridge.register_project({"alias": "ok", "path": str(inside)})
+        for alias, path in (
+            ("root-itself", root),
+            ("storage", storage),
+            ("outside", outside),
+        ):
+            refused = bridge.register_project({"alias": alias, "path": str(path)})
+            assert refused.get("reason") == "root_outside_activation_boundary", (alias, refused)
+        accepted = bridge.register_project({"alias": "ok", "path": str(project)})
         assert "rootId" in accepted, accepted
-        sibling = tmp_path / "fixture-evil"
+        # A sibling merely sharing a name prefix is still outside.
+        sibling = tmp_path / "AETHER-Phase2-Fixture-demo-evil"
         sibling.mkdir()
         (sibling / "sample.txt").write_bytes(ORIGINAL)
         refused2 = bridge.register_project({"alias": "evil", "path": str(sibling)})
-        assert refused2.get("reason") is not None, refused2
+        assert refused2.get("reason") == "root_outside_activation_boundary", refused2
     finally:
         composition.close()
         store.close()
@@ -402,12 +413,13 @@ def test_expired_and_revoked_grants_are_refused_at_execution(tmp_path, monkeypat
     from datetime import timedelta
 
     clock_cell = {"now": NOW}
+    (tmp_path / "project").mkdir(exist_ok=True)
     store = stage4_store(tmp_path, monkeypatch)
     composition = TrustedComposition.build(
         store=store,
         gesture_key=GESTURE_KEY,
         clock=lambda: clock_cell["now"],
-        activation_scope=ActivationScope(fixture_root=tmp_path),
+        activation_scope=ActivationScope(project_root=tmp_path / "project"),
     )
     bridge = LiveBridge(composition)
     try:
@@ -441,3 +453,73 @@ def test_expired_and_revoked_grants_are_refused_at_execution(tmp_path, monkeypat
     finally:
         composition.close()
         store.close()
+
+
+# ----------------------------------------------------------------------
+# Fixture layout + ordinary-launch execution-disable guarantee
+# ----------------------------------------------------------------------
+
+
+def test_fixture_layout_validation(tmp_path) -> None:
+    """The exact acceptance layout is derived and validated up front."""
+    from aether.channel.app_storage import AcceptanceStorageError, fixture_layout
+
+    root = tmp_path / "AETHER-Phase2-Fixture-7"
+    (root / "project").mkdir(parents=True)
+    env = {"AETHER_FIXTURE_DB": str(root / "storage" / "tasks.sqlite3")}
+    layout = fixture_layout(env)
+    assert layout.project_dir == (root / "project").resolve()
+    assert layout.fixture_root == root.resolve()
+    # Storage outside the designated storage directory refuses.
+    misplaced = {"AETHER_FIXTURE_DB": str(root / "tasks.sqlite3")}
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout(misplaced)
+    # A missing designated project directory refuses before any storage
+    # is opened or issuance enabled.
+    empty_root = tmp_path / "AETHER-Phase2-Fixture-8"
+    empty_root.mkdir()
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout({"AETHER_FIXTURE_DB": str(empty_root / "storage" / "tasks.sqlite3")})
+    # A review seed redirect refuses.
+    with pytest.raises(AcceptanceStorageError):
+        fixture_layout({**env, "AETHER_REVIEW_DB": str(root / "seed.sqlite3")})
+
+
+def test_ordinary_launch_cannot_execute_a_persisted_activation_grant(tmp_path, monkeypatch) -> None:
+    """Execution-disable is a tier guarantee, not just issuance denial.
+
+    A grant issued (and left unconsumed) under Activation B persists in
+    the fixture database. An ordinary launch reopening that database —
+    no scope, no injected ledger — must refuse execution with
+    ``mutation_not_enabled`` and leave the grant unconsumed and the
+    file untouched.
+    """
+    store, composition, bridge = _world(tmp_path, monkeypatch, activation=True)
+    project = _make_project(tmp_path)
+    _, resource_id = _register_and_resolve(bridge, project)
+    task_id = _plan_edit(bridge, resource_id)
+    begun = bridge.begin_gesture({"taskId": task_id})
+    submitted = bridge.submit_gesture(_wire(composition, begun))
+    assert "approvalId" in submitted, submitted
+    approval_id = UUID(str(submitted["approvalId"]))
+    composition.close()
+    store.close()
+
+    store2 = stage4_store(tmp_path, monkeypatch)
+    composition2 = TrustedComposition.build(
+        store=store2, gesture_key=GESTURE_KEY, clock=lambda: NOW
+    )
+    bridge2 = LiveBridge(composition2)
+    try:
+        assert composition2.mutation_enabled is False
+        refused = bridge2.execute_edit({"taskId": task_id})
+        assert refused.get("status") == "unavailable", refused
+        assert refused.get("reason") == "mutation_not_enabled", refused
+        assert (project / "sample.txt").read_bytes() == ORIGINAL
+        # The persisted grant is still there and still unconsumed: the
+        # refusal came from the disabled tier, not from missing state.
+        assert composition2.ledger is not None
+        assert composition2.ledger.load(approval_id).uses_remaining == 1
+    finally:
+        composition2.close()
+        store2.close()

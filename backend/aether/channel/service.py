@@ -57,9 +57,8 @@ from typing import Any
 from aether.channel import protocol
 from aether.channel.app_storage import (
     ACCEPTANCE_MODE_ENV,
-    FIXTURE_DB_ENV,
     AcceptanceStorageError,
-    fixture_root_for,
+    fixture_layout,
     open_application_store,
     open_fixture_store,
 )
@@ -171,8 +170,13 @@ def main() -> int:
     # falling back to the real application database, and a development
     # review seed cannot redirect the launch.
     app_store: SQLiteTaskStore | None
+    fixture_project_root: Path | None = None
     if env.get(ACCEPTANCE_MODE_ENV) == "fixture":
         try:
+            # Canonical fixture layout is validated BEFORE storage is
+            # opened or Activation B is enabled; an invalid layout
+            # refuses startup outright.
+            fixture_project_root = fixture_layout(env).project_dir
             app_store = open_fixture_store(env)
         except AcceptanceStorageError:
             return 3
@@ -200,10 +204,8 @@ def main() -> int:
             # issuance bounded to the fixture root). Ordinary launches
             # pass no scope and remain issuance-disabled.
             activation_scope = None
-            if env.get(ACCEPTANCE_MODE_ENV) == "fixture":
-                fixture_root = fixture_root_for(Path(env[FIXTURE_DB_ENV]))
-                if fixture_root is not None:
-                    activation_scope = ActivationScope(fixture_root=fixture_root)
+            if fixture_project_root is not None:
+                activation_scope = ActivationScope(project_root=fixture_project_root)
             composition = TrustedComposition.build(
                 store=composition_store,
                 gesture_key=gesture_key,

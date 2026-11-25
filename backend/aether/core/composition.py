@@ -103,19 +103,21 @@ class ActivationScope:
     """Validated controlled-activation scope (Activation B).
 
     Constructed only by the channel service for a validated
-    acceptance-fixture launch. ``fixture_root`` is the
-    ``AETHER-Phase2-Fixture-*`` directory: the composition enables
-    production-trusted issuance only under this scope and restricts
-    project registration to canonical paths inside it. Ordinary
-    application launches never carry a scope and remain
-    issuance-disabled. Neither a caller-provided object outside the
+    acceptance-fixture launch. ``project_root`` is the designated
+    synthetic project directory (``<fixture-root>/project``): the
+    composition enables production-trusted issuance only under this
+    scope and restricts registration and mutation to that subtree —
+    the fixture root itself, its storage directory and outside
+    directories are refused. Ordinary application launches never
+    carry a scope: issuance stays disabled and the mutation tier is
+    not executable. Neither a caller-provided object outside the
     composition's own construction sites, a module name, an
     environment variable nor a renderer request constitutes this
     authorization — the service derives it solely from the validated
-    fixture storage configuration.
+    fixture layout.
     """
 
-    fixture_root: Path
+    project_root: Path
 
 
 class CompositionUnavailable(RuntimeError):
@@ -169,6 +171,7 @@ class TrustedComposition:
         vault: UndoVault | None,
         schema_version: int,
         clock: Callable[[], datetime] | None = None,
+        mutation_enabled: bool = False,
         startup_reconciliation: ReconciliationReport | None = None,
         unresolved_task_ids: frozenset[UUID] = frozenset(),
         reconciliation_failed: bool = False,
@@ -191,6 +194,13 @@ class TrustedComposition:
         self.journal = journal
         self.vault = vault
         self.schema_version = schema_version
+        # Execution-tier enablement (Activation B boundary correction):
+        # True only under a controlled-activation scope or an explicitly
+        # injected (test-scoped) ledger. Issuance denial alone is not an
+        # execution-disable guarantee, so ordinary launches — which may
+        # reopen a database holding previously issued grants — must
+        # refuse execution here too.
+        self.mutation_enabled = mutation_enabled
         # FI-05 startup reconciliation results (None on schema v1, where
         # there is no mutation tier to reconcile).
         self.startup_reconciliation = startup_reconciliation
@@ -222,8 +232,9 @@ class TrustedComposition:
         state live beside the database under deterministic sibling names.
         ``activation_scope`` (Activation B) is set only for validated
         acceptance-fixture launches: it enables production-trusted
-        issuance and bounds registration to the fixture root. Ordinary
-        launches pass None and remain issuance-disabled.
+        issuance and the executable mutation tier, bounded to the
+        designated fixture project subtree. Ordinary launches pass
+        None: issuance stays disabled and execution refuses.
 
         Two distinct startup mechanisms run before mutations enable: the
         store's ``recover_on_startup`` (on open) pauses in-flight tasks and
@@ -236,14 +247,15 @@ class TrustedComposition:
         clock = clock or (lambda: datetime.now(UTC))
         database_path = store.database_path
         consumption: ConsumptionLedger | None = None
+        ledger_injected = ledger is not None
         # Activation B: validate the controlled-activation boundary
         # before composing anything. Canonical containment is decided
         # on reparse-checked resolved paths, never name prefixes.
         activation_boundary: Path | None = None
         if activation_scope is not None:
             try:
-                reject_reparse_components(Path(activation_scope.fixture_root))
-                activation_boundary = Path(activation_scope.fixture_root).resolve(strict=True)
+                reject_reparse_components(Path(activation_scope.project_root))
+                activation_boundary = Path(activation_scope.project_root).resolve(strict=True)
                 if not activation_boundary.is_dir():
                     raise CompositionUnavailable(
                         "activation_boundary_invalid",
@@ -252,7 +264,7 @@ class TrustedComposition:
             except (OSError, PathSafetyError) as exc:
                 raise CompositionUnavailable(
                     "activation_boundary_invalid",
-                    "the controlled-activation fixture root could not be validated",
+                    "the designated fixture project directory could not be validated",
                 ) from exc
         try:
             schema_version = int(store._connection.execute("PRAGMA user_version").fetchone()[0])
@@ -397,6 +409,7 @@ class TrustedComposition:
                     startup_reconciliation = None
 
             composition = cls(
+                mutation_enabled=activation_scope is not None or ledger_injected,
                 store=store,
                 registry=registry,
                 narratives=narratives,
@@ -462,16 +475,31 @@ class TrustedComposition:
     # Capability registration (deterministic; absence always has a reason)
     # ------------------------------------------------------------------
     def capabilities(self) -> tuple[CapabilityState, ...]:
-        mutation_reason = None if self.ledger is not None else "schema_activation_pending"
+        if self.ledger is None:
+            mutation_reason: str | None = "schema_activation_pending"
+        elif not self.mutation_enabled:
+            mutation_reason = "mutation_not_enabled"
+        else:
+            mutation_reason = None
         return (
             CapabilityState("project_registration", True),
             CapabilityState("read_search_open", True),
             CapabilityState("task_planning", True),
             CapabilityState("exact_preview", True),
             CapabilityState("trusted_gesture", True),
-            CapabilityState("grant_issuance", self.issuer is not None, mutation_reason),
-            CapabilityState("edit_execution", self.executor is not None, mutation_reason),
-            CapabilityState("undo", self.executor is not None, mutation_reason),
+            CapabilityState(
+                "grant_issuance",
+                self.issuer is not None and self.mutation_enabled,
+                mutation_reason,
+            ),
+            CapabilityState(
+                "edit_execution",
+                self.executor is not None and self.mutation_enabled,
+                mutation_reason,
+            ),
+            CapabilityState(
+                "undo", self.executor is not None and self.mutation_enabled, mutation_reason
+            ),
         )
 
     # ------------------------------------------------------------------

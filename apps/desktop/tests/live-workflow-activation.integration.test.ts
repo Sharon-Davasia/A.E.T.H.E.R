@@ -140,7 +140,17 @@ test(
       const workflow = new LiveWorkflow(client);
       await workflow.registerProject(project);
 
-      // Registration outside the fixture boundary is refused.
+      // The authorized boundary is the designated project subtree
+      // only: the fixture root itself, the private storage directory
+      // and the unauthorized outside directory all refuse registration
+      // (distinct aliases so the refusal is the boundary, not an
+      // alias collision).
+      mkdirSync(join(fixture, 'outside'));
+      writeFileSync(join(fixture, 'outside', 'sample.txt'), 'do not touch\n', 'utf8');
+      await assert.rejects(() => workflow.registerProject(fixture, 'fixture-root'));
+      await assert.rejects(() => workflow.registerProject(join(fixture, 'storage'), 'fixture-storage'));
+      await assert.rejects(() => workflow.registerProject(join(fixture, 'outside'), 'fixture-outside'));
+      // Registration outside the fixture entirely is refused too.
       const outside = mkdtempSync(join(tmpdir(), 'aether-outside-project-'));
       try {
         await assert.rejects(() => workflow.registerProject(outside));

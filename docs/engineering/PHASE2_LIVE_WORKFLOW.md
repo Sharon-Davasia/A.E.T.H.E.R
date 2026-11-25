@@ -137,10 +137,16 @@ acceptance stage requires: the composition passes
 ``production_trusted=True`` only when the channel service derived an
 ``ActivationScope`` from a validated acceptance-fixture launch
 (``AETHER_ACCEPTANCE_MODE=fixture`` + fixture database under an
-``AETHER-Phase2-Fixture-*`` root), and the registry refuses project
-registration outside that canonical fixture boundary. Ordinary
-application launches carry no scope, keep default-deny ledger
-construction, and remain issuance-disabled. Test-simulation permits
+``AETHER-Phase2-Fixture-*`` root), after validating the canonical
+fixture layout (``<root>/project`` designated synthetic project,
+``<root>/storage`` private persistence, everything else
+unauthorized). The registry boundary is the designated project
+subtree only: the fixture root, storage and outside directories
+refuse registration. Ordinary application launches carry no scope,
+keep default-deny ledger construction, remain issuance-disabled,
+and — as an execution-tier guarantee, not merely an issuance denial
+— refuse execution (``mutation_not_enabled``) even over a database
+holding previously issued Activation B grants. Test-simulation permits
 are refused by the production-trusted policy; neither a
 caller-provided object, module name, environment variable nor
 renderer request constitutes authorization. The original proposal

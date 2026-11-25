@@ -383,6 +383,12 @@ class LiveBridge:
             composition = self._composition
             if composition.executor is None:
                 raise _Refused("schema_activation_pending")
+            if not composition.mutation_enabled:
+                # Execution-disable guarantee: an ordinary launch refuses
+                # execution even over a database holding previously
+                # issued (unconsumed) Activation B grants. Issuance
+                # denial alone was never this guarantee.
+                raise _Refused("mutation_not_enabled")
             if composition.reconciliation_failed or task_id in composition.unresolved_task_ids:
                 raise _Refused("startup_reconciliation_required")
             store = composition.store

@@ -492,3 +492,13 @@ Outstanding: the native Windows execution campaign on the target
 machine (actual approved edit, receipt inspection, restart, Undo,
 and the remaining mandatory acceptance scenarios). Formal Phase 2
 acceptance remains **NOT COMPLETE**.
+
+**Boundary correction (following candidate):** review found the
+registration boundary was the whole fixture root. It is now the
+designated project subtree only, with the canonical layout validated
+before storage opens; the fixture root, storage and outside
+directories refuse registration in Python and genuine TS coverage.
+Ordinary launches additionally refuse execution
+(`mutation_not_enabled`) over databases holding previously issued
+Activation B grants, with the persisted grant left unconsumed —
+an execution-disable guarantee, not just issuance denial.
