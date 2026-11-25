@@ -251,6 +251,17 @@ function unavailable<T>(value: unknown): WorkflowStep<T> | null {
       reason: typeof value.reason === 'string' ? value.reason : 'unavailable',
     };
   }
+  // The channel's live.error kind carries exactly {reason}: recognize
+  // that shape too, so backend refusal reasons survive to the caller
+  // instead of degrading into a generic malformed-response failure.
+  if (
+    isRecord(value)
+    && Object.keys(value).length === 1
+    && typeof value.reason === 'string'
+    && WIRE_REASON.test(value.reason)
+  ) {
+    return { status: 'unavailable', reason: value.reason };
+  }
   return null;
 }
 
@@ -268,18 +279,37 @@ export function parseCreatedTask(value: unknown): string {
   return taskId;
 }
 
+const RESOURCE_ID = /^(file|directory):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/**
+ * Authoritative backend resource identifier: `<kind>:<uuid>`
+ * (`file:...` / `directory:...`, minted by the resource registry).
+ * Raw filesystem paths, bare UUIDs and kind/prefix mismatches are all
+ * malformed — an identifier is never a path.
+ */
+export function parseResourceId(value: unknown): { kind: 'file' | 'directory'; resourceId: string } {
+  if (typeof value !== 'string' || !RESOURCE_ID.test(value)) {
+    throw new Error('resource identifier is malformed');
+  }
+  const kind = value.startsWith('file:') ? 'file' : 'directory';
+  return { kind, resourceId: value };
+}
+
 export function parseResolvedFile(value: unknown): WorkflowStep<ResolvedFile> {
   const refused = unavailable<ResolvedFile>(value);
   if (refused) return refused;
   const record = requireRecord(value, 'resource resolution');
-  const resourceId = requireString(record, 'resourceId', 'resource resolution');
-  if (!UUID.test(resourceId)) throw new Error('resource resolution resourceId is malformed');
+  const { kind, resourceId } = parseResourceId(record.resourceId);
+  const declaredKind = requireString(record, 'kind', 'resource resolution');
+  if (declaredKind !== kind) {
+    throw new Error('resource resolution kind does not match its identifier prefix');
+  }
   return {
     status: 'ready',
     value: {
       resourceId,
       version: requireString(record, 'version', 'resource resolution'),
-      kind: requireString(record, 'kind', 'resource resolution'),
+      kind,
     },
   };
 }
@@ -327,7 +357,7 @@ export function parseEditReceipt(value: unknown): LiveReceiptState {
       taskId: requireString(record, 'taskId', 'edit receipt'),
       status: requireString(record, 'status', 'edit receipt'),
       capabilityId: requireString(record, 'capabilityId', 'edit receipt'),
-      resourceId: requireString(record, 'resourceId', 'edit receipt'),
+      resourceId: parseResourceId(record.resourceId).resourceId,
       preSha256: nullableString(record, 'preSha256', 'edit receipt'),
       postSha256: nullableString(record, 'postSha256', 'edit receipt'),
       snapshotId,

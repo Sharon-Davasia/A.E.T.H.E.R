@@ -1,4 +1,10 @@
 import { createHash } from 'node:crypto';
+
+/** Bounded, sanitized stage reason for a failed workflow step. */
+function stageFailure<T>(stage: string, error: unknown): WorkflowStep<T> {
+  const malformed = error instanceof Error && error.message.includes('malformed');
+  return { status: 'unavailable', reason: malformed ? 'response_malformed' : stage };
+}
 import {
   buildProposedContents,
   parseCreatedTask,
@@ -111,11 +117,21 @@ export class LiveWorkflow {
 
   public async openFile(relativePath: string): Promise<WorkflowStep<ResolvedFile>> {
     if (!this.project) throw new Error('register a project before opening a file');
-    const resolved = parseResolvedFile(
-      await this.backend.liveResolveResource(this.project.rootId, relativePath),
-    );
+    let resolved: WorkflowStep<ResolvedFile>;
+    try {
+      resolved = parseResolvedFile(
+        await this.backend.liveResolveResource(this.project.rootId, relativePath),
+      );
+    } catch (error) {
+      return stageFailure('resolve_failed', error);
+    }
     if (resolved.status !== 'ready') return resolved;
-    const read = await this.readCurrent(resolved.value.resourceId);
+    let read: WorkflowStep<FileContents>;
+    try {
+      read = await this.readCurrent(resolved.value.resourceId);
+    } catch (error) {
+      return stageFailure('read_failed', error);
+    }
     if (read.status !== 'ready') return read;
     this.file = resolved.value;
     this.contents = read.value;
@@ -125,30 +141,38 @@ export class LiveWorkflow {
 
   public async searchProject(query: string): Promise<WorkflowStep<SearchOutcome>> {
     if (!this.project) throw new Error('register a project before searching');
-    const root = parseResolvedFile(
-      await this.backend.liveResolveResource(this.project.rootId, ''),
-    );
-    if (root.status !== 'ready') return root;
-    const taskId = parseCreatedTask(await this.backend.liveCreateTask('Search the project'));
-    const planned = parsePlannedPreview(
-      await this.backend.livePlanSearch(taskId, root.value.resourceId, query),
-    );
-    if (planned.status !== 'ready') return planned;
-    return parseSearchOutcome(await this.backend.liveExecuteRead(taskId));
+    try {
+      const root = parseResolvedFile(
+        await this.backend.liveResolveResource(this.project.rootId, ''),
+      );
+      if (root.status !== 'ready') return root;
+      const taskId = parseCreatedTask(await this.backend.liveCreateTask('Search the project'));
+      const planned = parsePlannedPreview(
+        await this.backend.livePlanSearch(taskId, root.value.resourceId, query),
+      );
+      if (planned.status !== 'ready') return planned;
+      return parseSearchOutcome(await this.backend.liveExecuteRead(taskId));
+    } catch (error) {
+      return stageFailure('search_failed', error);
+    }
   }
 
   public async openProjectFolder(): Promise<WorkflowStep<OpenOutcome>> {
     if (!this.project) throw new Error('register a project before opening it');
-    const root = parseResolvedFile(
-      await this.backend.liveResolveResource(this.project.rootId, ''),
-    );
-    if (root.status !== 'ready') return root;
-    const taskId = parseCreatedTask(await this.backend.liveCreateTask('Open the project folder'));
-    const planned = parsePlannedPreview(
-      await this.backend.livePlanOpen(taskId, root.value.resourceId),
-    );
-    if (planned.status !== 'ready') return planned;
-    return parseOpenOutcome(await this.backend.liveExecuteRead(taskId));
+    try {
+      const root = parseResolvedFile(
+        await this.backend.liveResolveResource(this.project.rootId, ''),
+      );
+      if (root.status !== 'ready') return root;
+      const taskId = parseCreatedTask(await this.backend.liveCreateTask('Open the project folder'));
+      const planned = parsePlannedPreview(
+        await this.backend.livePlanOpen(taskId, root.value.resourceId),
+      );
+      if (planned.status !== 'ready') return planned;
+      return parseOpenOutcome(await this.backend.liveExecuteRead(taskId));
+    } catch (error) {
+      return stageFailure('open_failed', error);
+    }
   }
 
   public async prepareEdit(find: string, replace: string): Promise<WorkflowStep<ExactPreview>> {

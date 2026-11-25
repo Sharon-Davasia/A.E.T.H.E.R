@@ -12,9 +12,11 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const preview = parseExactPreview(
   JSON.parse(readFileSync(path.join(root, 'tests', 'fixtures', 'stage2-exact-preview.golden.json'), 'utf8')).preview,
 );
-const ROOT_ID = '11111111-1111-4111-8111-111111111111';
+const ROOT_ID = '11111111-1111-4111-8111-111111111111'; // root ids are bare UUIDs
 const TASK_ID = '22222222-2222-4222-8222-222222222222';
-const FILE_ID = '33333333-3333-4333-8333-333333333333';
+// Authoritative backend resource identifiers are kind-prefixed.
+const DIR_ID = 'directory:44444444-4444-4444-8444-444444444444';
+const FILE_ID = 'file:33333333-3333-4333-8333-333333333333';
 const TEXT = 'hello world\n';
 const TEXT_SHA256 = createHash('sha256').update(Buffer.from(TEXT, 'utf8')).digest('hex');
 
@@ -48,7 +50,7 @@ function stub(overrides: StubOverrides = {}) {
     async liveResolveResource(_rootId: string, relativePath: string): Promise<unknown> {
       calls.push('resolve');
       return {
-        resourceId: relativePath === '' ? ROOT_ID : FILE_ID,
+        resourceId: relativePath === '' ? DIR_ID : FILE_ID,
         version: 'v1',
         kind: relativePath === '' ? 'directory' : 'file',
       };
@@ -98,7 +100,7 @@ test('FI-02B: search plans and executes over the existing channel kinds', async 
   backend.liveExecuteRead = async (): Promise<unknown> => ({
     succeeded: true,
     data: {
-      resource_id: ROOT_ID,
+      resource_id: DIR_ID,
       query: 'hello',
       matches: ['sample.txt:1: hello world'],
       files_scanned: 3,
@@ -123,7 +125,7 @@ test('FI-02B: open-folder plans the existing open capability, nothing generic', 
   backend.liveExecuteRead = async (): Promise<unknown> => ({
     succeeded: true,
     data: {
-      resource_id: ROOT_ID,
+      resource_id: DIR_ID,
       display_name: 'project',
       target_kind: 'directory',
       status: 'SUCCEEDED',
@@ -240,4 +242,35 @@ test('FI-06A qualification: a read whose reported hash does not match its bytes 
   await workflow.registerProject('/fixture/project');
   const opened = await workflow.openFile('sample.txt');
   assert.deepEqual(opened, { status: 'unavailable', reason: 'source_hash_mismatch' });
+});
+
+test('resource identifiers follow the authoritative kind-prefixed contract', async () => {
+  const { parseResolvedFile } = await import('../shared/live');
+  // A raw filesystem path is never a resource identifier.
+  assert.throws(
+    () => parseResolvedFile({ resourceId: '/fixture/project/sample.txt', version: 'v1', kind: 'file' }),
+    /malformed/,
+  );
+  // A bare UUID is not a resource identifier either.
+  assert.throws(
+    () => parseResolvedFile({ resourceId: FILE_ID.slice('file:'.length), version: 'v1', kind: 'file' }),
+    /malformed/,
+  );
+  // Kind and identifier prefix must agree.
+  assert.throws(
+    () => parseResolvedFile({ resourceId: DIR_ID, version: 'v1', kind: 'file' }),
+    /does not match/,
+  );
+  const parsed = parseResolvedFile({ resourceId: FILE_ID, version: 'v1', kind: 'file' });
+  assert.equal(parsed.status, 'ready');
+});
+
+test('live.error refusal payloads keep their bounded backend reason', async () => {
+  const { parseResolvedFile, parseSearchOutcome } = await import('../shared/live');
+  assert.deepEqual(parseResolvedFile({ reason: 'resource_not_found' }), {
+    status: 'unavailable', reason: 'resource_not_found',
+  });
+  assert.deepEqual(parseSearchOutcome({ reason: 'plan_arguments_invalid' }), {
+    status: 'unavailable', reason: 'plan_arguments_invalid',
+  });
 });
