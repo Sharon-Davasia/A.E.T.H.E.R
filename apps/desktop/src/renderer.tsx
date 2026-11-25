@@ -238,7 +238,7 @@ function App(): React.JSX.Element {
       onShowReceipt={(id) => void showReceipt(id)}
       onPrepareUndo={(id) => void prepareUndo(id)}
     />
-    <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires the trusted approval window (complete exact preview with explicit review acknowledgement), schema version 2 activation, and separately approved production grant issuance; production issuance is currently disabled, so an approved gesture is refused at issuance and nothing executes.</p>
+    <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires the trusted approval window (complete exact preview with explicit review acknowledgement) and production grant issuance. Issuance is enabled only for the controlled acceptance fixture — validated fixture storage and its designated project directory. In ordinary application launches, issuance and execution remain disabled: an approved gesture is refused and nothing executes.</p>
   </main>;
 }
 
