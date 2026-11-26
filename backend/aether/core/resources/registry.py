@@ -154,6 +154,10 @@ class ResourceRegistry:
         self._aliases[normalized_alias] = root.root_id
         return root
 
+    def known_roots(self) -> tuple[RegisteredRoot, ...]:
+        """Read-only enumeration of registered roots (CP6 detection)."""
+        return tuple(self._roots.values())
+
     def known_resources(self) -> tuple[ResolvedResource, ...]:
         """Return every resource this registry has issued, in issuance order.
 
