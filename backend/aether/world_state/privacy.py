@@ -68,7 +68,7 @@ def classify_context(
     app_identity: str | None,
     *,
     adapter_classification: ContextClassification = ContextClassification.UNKNOWN,
-    elevated: bool = False,
+    elevated: bool | None = None,
 ) -> ContextClassification:
     """Combine adapter classification with supplemental exclusions.
 
@@ -76,12 +76,12 @@ def classify_context(
     adapter claims; an adapter's positive classification is required
     for anything to be treated as permitted.
     """
-    if elevated or supplemental_sensitive_marker(app_identity):
+    if elevated is True or supplemental_sensitive_marker(app_identity):
         return ContextClassification.PROHIBITED_SENSITIVE
     return adapter_classification
 
 
-def is_sensitive_context(app_identity: str | None, *, elevated: bool = False) -> bool:
+def is_sensitive_context(app_identity: str | None, *, elevated: bool | None = None) -> bool:
     """Back-compatible helper: True only for *prohibited* contexts."""
     return classify_context(app_identity, elevated=elevated) is (
         ContextClassification.PROHIBITED_SENSITIVE
@@ -106,7 +106,7 @@ def collect_permitted(
     *,
     app_identity: str | None,
     classification: ContextClassification = ContextClassification.UNKNOWN,
-    elevated: bool = False,
+    elevated: bool | None = None,
     is_foreground: bool = False,
 ) -> bool:
     """Decide, *before collection*, whether metadata may be collected.

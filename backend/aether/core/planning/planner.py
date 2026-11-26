@@ -58,6 +58,7 @@ class PlanGoal(StrEnum):
     OPEN_FOLDER = "open_folder"
     APPLY_EDIT = "apply_edit"
     UNDO_EDIT = "undo_edit"
+    LAUNCH_APPLICATION = "launch_application"
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,6 +101,7 @@ _GOAL_CAPABILITY: dict[PlanGoal, str] = {
     PlanGoal.OPEN_FOLDER: "fs.open_folder",
     PlanGoal.APPLY_EDIT: "fs.apply_approved_edit",
     PlanGoal.UNDO_EDIT: "fs.undo_edit",
+    PlanGoal.LAUNCH_APPLICATION: "app.launch",
 }
 
 
@@ -112,9 +114,11 @@ class Planner:
         capabilities: CapabilityRegistry,
         resources: ResourceRegistry,
         clock: Callable[[], datetime] | None = None,
+        app_authority: object | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._resources = resources
+        self._app_authority = app_authority
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def plan(self, task_id: UUID, intent: PlanIntent, *, revision: int = 1) -> PlannedRevision:
@@ -148,6 +152,8 @@ class Planner:
             raise PlannerError(
                 "PLAN_ARGUMENTS_INVALID", "the intent's arguments are not valid for the capability"
             ) from exc
+        if intent.goal is PlanGoal.LAUNCH_APPLICATION:
+            return self._plan_launch(task_id, intent, capability_id, definition, revision)
         try:
             resolved = self._resources.resource_by_id(intent.resource_id)
         except ResourceRegistryError as exc:
@@ -241,6 +247,65 @@ class Planner:
         except EditBindingError as exc:
             raise PlannerError(exc.reason_code, str(exc)) from exc
 
+    def _plan_launch(
+        self,
+        task_id: UUID,
+        intent: PlanIntent,
+        capability_id: str,
+        definition: object,
+        revision: int,
+    ) -> PlannedRevision:
+        """Build a launch plan against the app resource authority only."""
+        from aether.core.contracts.resource import ResourceRef
+        from aether.core.policy.capabilities import CapabilityDefinition
+
+        assert isinstance(definition, CapabilityDefinition)
+        if self._app_authority is None:
+            raise PlannerError(
+                "PLAN_APP_AUTHORITY_UNAVAILABLE",
+                "launch planning requires the app/window resource authority",
+            )
+        try:
+            arguments = self._capabilities.validate(capability_id, intent.arguments)
+        except CapabilityRegistryError as exc:
+            raise PlannerError(
+                "PLAN_ARGUMENTS_INVALID", "launch arguments are not valid for the capability"
+            ) from exc
+        ref = ResourceRef(kind="app", resource_id=intent.resource_id)
+        try:
+            self._app_authority.authorize_ref(ref, expected_kind="app")  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise PlannerError(
+                "PLAN_RESOURCE_UNKNOWN", "the app resource was never issued by the authority"
+            ) from exc
+        now = self._clock()
+        step_id = uuid5(_PLAN_NAMESPACE, f"{task_id}:{revision}:{capability_id}:{intent.resource_id}")
+        resource = TaskPlanResource(
+            resource_id=intent.resource_id,
+            expected_version="app-registration-v1",
+            display_name=intent.resource_id,
+        )
+        arguments_dump = arguments.model_dump(mode="json")
+        expected_effect = {"kind": "launch_application", "resource_id": intent.resource_id}
+        step = PlanStep(
+            step_id=step_id,
+            capability_id=capability_id,
+            arguments=arguments_dump,
+            resources=(resource,),
+            resource_locks=(f"app:{intent.resource_id}",),
+            expected_state={"resource_id": intent.resource_id},
+            expected_effect=expected_effect,
+            risk_tier=definition.risk_tier,
+            timeout_seconds=30,
+            idempotency_key=uuid5(_PLAN_NAMESPACE, f"{task_id}:{revision}:{step_id}:idempotency"),
+            postconditions=({"verify": "intended_process_or_window_observed", "check": "postcondition_distinct_outcome"},),
+            recovery_class="IRREVERSIBLE",
+        )
+        plan = TaskPlan(task_id=task_id, revision=revision, summary=intent.summary[:512], steps=(step,), created_at=now)
+        plan_hash = hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
+        narrative = _narrative_for(intent, intent.resource_id, expected_effect, approved_edit=None)
+        return PlannedRevision(plan=plan, plan_hash=plan_hash, narrative=narrative, step_id=step_id)
+
     def revision_for_change(
         self,
         *,
@@ -312,6 +377,8 @@ def _expected_effect(
             }
         case PlanGoal.UNDO_EDIT:
             return {"effect": "file_restored", "resource": display_name}
+        case PlanGoal.LAUNCH_APPLICATION:
+            return {"effect": "application_launch_requested", "resource": display_name}
 
 
 def _freshly_planned_binding(planned: PlannedRevision) -> ApprovedEdit | None:
@@ -358,6 +425,8 @@ def _postcondition(goal: PlanGoal) -> dict[str, Any]:
             return {"verify": "pre_image_hash_restored", "check": "sha256_matches_receipt"}
         case PlanGoal.OPEN_FOLDER:
             return {"verify": "shell_accepted_request", "check": "process_attribution_unavailable"}
+        case PlanGoal.LAUNCH_APPLICATION:
+            return {"verify": "intended_process_or_window_observed", "check": "postcondition_distinct_outcome"}
         case _:
             return {"verify": "result_reported", "check": "no_error"}
 
@@ -368,6 +437,8 @@ RecoveryClassLiteral = Literal["REVERSIBLE", "SNAPSHOT_RESTORABLE", "COMPENSATAB
 def _recovery_for(goal: PlanGoal) -> RecoveryClassLiteral:
     if goal in {PlanGoal.APPLY_EDIT, PlanGoal.UNDO_EDIT}:
         return "SNAPSHOT_RESTORABLE"
+    if goal is PlanGoal.LAUNCH_APPLICATION:
+        return "IRREVERSIBLE"
     return "REVERSIBLE"
 
 
@@ -425,6 +496,19 @@ def _narrative_for(
                 unified_diff=_render_preview_diff(approved_edit),
             ),
         )
+    elif intent.goal is PlanGoal.LAUNCH_APPLICATION:
+        intent_text = f"Launch {display_name}"
+        explanation = (
+            "This launches exactly the registry-issued application bound to the "
+            "confirmed plan, after authority, integrity and confirmation "
+            "revalidation. It may start a process; it changes no file bytes."
+        )
+        external = ("A new application process may start; no file mutation is requested.",)
+        risks = ("A launched application is an external process whose later behaviour is outside this plan.",)
+        verification = ("Success requires the intended new process or window to be observed; an accepted request alone is not success.",)
+        preconditions = (f"{display_name} is an approved registry-issued application in scope.",)
+        proposed = f"launch_application result for {display_name}"
+        diffs = ()
     else:
         verb = {
             PlanGoal.INSPECT_FILE: "Inspect metadata for",

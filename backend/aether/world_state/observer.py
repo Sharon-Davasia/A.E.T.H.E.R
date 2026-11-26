@@ -26,6 +26,7 @@ guards and is never started by this module or by ordinary launches.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import queue
 import threading
 from collections.abc import Callable
@@ -67,12 +68,15 @@ class WindowEvent:
     process_creation_time: str | None = None
     app_identity: str | None = None
     title: str | None = None  # only ever retained after privacy gating
-    elevated: bool = False
+    elevated: bool | None = None  # None = unknown, never assumed non-elevated
     # Adapter-supplied context classification (F04 three-valued).
     classification: ContextClassification = ContextClassification.UNKNOWN
     # Evidence provenance: "fake" for test sources, platform name for
     # native sources. Fake evidence is never labelled native.
     source: str = "fake"
+    # Authoritative collection generation, stamped by the observer at
+    # collection time and validated by WorldState at commit.
+    generation: int = 0
 
 
 class WindowEventSource(Protocol):
@@ -117,6 +121,34 @@ class FakeWindowEventSource:
         self._emit(event)
 
 
+def _bump_early(value: int) -> int:
+    return min(value + 1, (1 << 62) - 1)
+
+
+class GenerationClock:
+    """One authoritative collection generation shared end-to-end.
+
+    The observer stamps each event at collection; the stamp travels
+    through the queue and callback; WorldState validates it at the
+    retained-state commit boundary. Invalidation from either side
+    advances the same clock, so in-flight stale callbacks can never
+    repopulate state after pause/privacy/overflow invalidation.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value = 0
+
+    def current(self) -> int:
+        with self._lock:
+            return self._value
+
+    def advance(self) -> int:
+        with self._lock:
+            self._value = _bump_early(self._value)
+            return self._value
+
+
 @dataclass(slots=True)
 class ObserverStats:
     received: int = 0
@@ -138,6 +170,7 @@ class ObserverService:
     source: WindowEventSource
     on_event: Callable[[WindowEvent], None]
     on_invalidate: Callable[[], None] | None = None
+    generation_clock: GenerationClock | None = None
     queue_capacity: int = DEFAULT_QUEUE_CAPACITY
     reconcile_interval: float = 0.0  # seconds; 0 disables periodic reconciliation
     _queue: queue.Queue[tuple[int, WindowEvent]] = field(init=False)
@@ -147,7 +180,6 @@ class ObserverService:
     _invalidate_signal: threading.Event = field(default_factory=threading.Event, init=False)
     _lifecycle: threading.Lock = field(default_factory=threading.Lock, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
-    _generation: int = field(default=0, init=False)
     _source_generation: int = field(default=0, init=False)
     stats: ObserverStats = field(default_factory=ObserverStats, init=False)
     running: bool = field(default=False, init=False)
@@ -156,12 +188,18 @@ class ObserverService:
     def __post_init__(self) -> None:
         if self.queue_capacity < 1:
             raise ValueError("queue_capacity must be >= 1")
+        if self.generation_clock is None:
+            self.generation_clock = GenerationClock()
         self._queue = queue.Queue(maxsize=self.queue_capacity)
 
     @property
     def generation(self) -> int:
-        with self._lock:
-            return self._generation
+        assert self.generation_clock is not None
+        return self.generation_clock.current()
+
+    def _advance_generation(self) -> int:
+        assert self.generation_clock is not None
+        return self.generation_clock.advance()
 
     @property
     def invalidation_pending(self) -> bool:
@@ -183,7 +221,7 @@ class ObserverService:
             self._drain_queue()
             with self._lock:
                 self._source_generation = _bump(self._source_generation)
-                self._generation = _bump(self._generation)
+                self._advance_generation()
                 source_generation = self._source_generation
             try:
                 self.source.start(lambda event: self._enqueue(event, source_generation))
@@ -240,7 +278,7 @@ class ObserverService:
             self.source.stop()
         with self._lock:
             self._source_generation = _bump(self._source_generation)
-            self._generation = _bump(self._generation)
+        self._advance_generation()
         self._notify_invalidate()
 
     # -- intake -----------------------------------------------------------
@@ -249,7 +287,8 @@ class ObserverService:
             if source_generation != self._source_generation or self._stop.is_set():
                 return  # obsolete source generation callback
             self.stats.received = _bump(self.stats.received)
-            generation = self._generation
+            generation = self.generation
+        event = dataclasses.replace(event, generation=generation)
         try:
             self._queue.put_nowait((generation, event))
         except queue.Full:
@@ -266,7 +305,7 @@ class ObserverService:
             self.stats.dropped_overflow = _bump(self.stats.dropped_overflow)
             self.stats.generation_dropped = _bump(self.stats.generation_dropped)
             self.stats.uncertain = True
-            self._generation = _bump(self._generation)
+        self._advance_generation()
         # Out-of-band signal: cannot be lost to a full queue (F03).
         self._invalidate_signal.set()
         self._notify_invalidate()
@@ -288,7 +327,7 @@ class ObserverService:
         for _attempt in range(_MAX_RECONCILE_ATTEMPTS):
             self._drain_queue()  # reconciliation supersedes stale queued events
             with self._lock:
-                self._generation = _bump(self._generation)
+                self._advance_generation()
                 self.stats.generation_dropped = 0
             self._notify_invalidate()
             try:
@@ -313,8 +352,9 @@ class ObserverService:
 
     def _reconcile_loop(self) -> None:
         while not self._stop.wait(self.reconcile_interval):
-            if self._invalidate_signal.is_set() or self.stats.uncertain:
-                self.reconcile()
+            # Periodic reconciliation runs even when apparently healthy:
+            # events can be missed without an explicit overflow.
+            self.reconcile()
 
     # -- consumption ---------------------------------------------------------
     def _consume(self) -> None:
@@ -324,7 +364,7 @@ class ObserverService:
             except queue.Empty:
                 continue
             with self._lock:
-                stale = generation != self._generation
+                stale = generation != self.generation
             if stale:
                 continue  # pre-invalidation event can never restore state
             try:
@@ -355,7 +395,7 @@ class ObserverService:
             except queue.Empty:
                 return
             with self._lock:
-                stale = generation != self._generation
+                stale = generation != self.generation
             if stale:
                 continue
             self.on_event(event)

@@ -618,8 +618,9 @@ def test_production_issuance_is_still_disabled() -> None:
     )
 
     # Proposal A activated the schema; issuance remains disabled.
+    # Phase 3 schema v3 is prepared-only (pending, never active here).
     assert ACTIVE_SCHEMA_VERSION == 2
-    assert frozenset() == PENDING_MIGRATION_VERSIONS
+    assert frozenset({3}) == PENDING_MIGRATION_VERSIONS
     source = (
         Path(__file__).resolve().parents[1] / "aether" / "core" / "grants" / "ledger.py"
     ).read_text(encoding="utf-8")

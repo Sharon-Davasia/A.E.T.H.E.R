@@ -8,6 +8,7 @@ into the running application.
 
 from aether.world_state.observer import (
     FakeWindowEventSource,
+    GenerationClock,
     ObserverService,
     ObserverUnavailable,
     WindowEvent,
@@ -24,6 +25,7 @@ from aether.world_state.service import InMemoryWorldState
 __all__ = [
     "ContextClassification",
     "FakeWindowEventSource",
+    "GenerationClock",
     "InMemoryWorldState",
     "ObservationPolicy",
     "ObserverService",

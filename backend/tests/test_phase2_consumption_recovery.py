@@ -681,5 +681,6 @@ def test_gates_are_unchanged(tmp_path) -> None:
     )
 
     # Proposal A activated the schema; issuance remains disabled.
+    # Phase 3 schema v3 is prepared-only (pending, never active here).
     assert ACTIVE_SCHEMA_VERSION == 2
-    assert frozenset() == PENDING_MIGRATION_VERSIONS
+    assert frozenset({3}) == PENDING_MIGRATION_VERSIONS

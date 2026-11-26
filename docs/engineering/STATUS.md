@@ -23,14 +23,23 @@ demonstrations are recorded in §8 of that document; their artifacts
 remain owner-held and are not archived in this repository. Nothing in
 Phase 3 development changes that verdict.
 
-**Phase 3 foundation (CP0-CP2) is in development** on
+**Phase 3 foundation (CP0-CP2) plus the foundation-closeout + CP3
+batch is in development** on
 `integration/phase3-windows-state-app-control` under a bounded
-parallel-development authorization (Phase 2 acceptance is not waived):
-typed app/window contracts, privacy-gated in-memory WorldState with a
-fake event source, guarded-but-inert native source, and an in-memory
-application registry with real RapidFuzz alias resolution. No native
-observation, application launching, or UI interaction is enabled; no
-schema v3 migration exists. See `docs/engineering/PHASE3_PLAN.md`.
+parallel-development authorization (Phase 2 acceptance is not
+waived): typed app/window contracts with one generation/epoch and
+real session-ephemeral `window:<uuid>` resource authority,
+privacy-gated in-memory WorldState, a thread-owned native observer
+(source written, fake-verified, activation disabled), an in-memory
+application registry with real RapidFuzz alias resolution and trusted
+discovery normalization, trusted launch-authority/confirmation
+separation, and a bounded `app.launch` capability exercised only
+through fake adapters with durable navigation evidence on a
+*prepared-but-inactive* schema v3 (`ACTIVE_SCHEMA_VERSION = 2`). No
+native observation is enabled, no real application has been
+launched, and no UI interaction exists. See
+`docs/engineering/PHASE3_PLAN.md` and
+`docs/engineering/PHASE3_R1_DESIGN.md`.
 
 Everything below this section that describes PR #14 or earlier stage
 branches as open/pending is **historical** and superseded by this section.

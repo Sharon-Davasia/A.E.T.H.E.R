@@ -131,14 +131,45 @@ class StdlibWindowsDiscoveryProviders:
         return candidates, SourceStatus("uninstall_registry", "ok")
 
     def apps_folder_entries(self) -> tuple[list[DiscoveredAppCandidate], SourceStatus]:
-        # AppsFolder/packaged-app enumeration requires Shell COM
-        # (IShellFolder over shell:AppsFolder). pywin32 is deferred to
-        # the UIA checkpoint, so this source truthfully reports
-        # unavailable rather than pretending to succeed empty.
-        _ = self
-        return [], SourceStatus(
-            "apps_folder", "unavailable", "shell_com_provider_deferred_to_uia_checkpoint"
-        )
+        """Enumerate AppsFolder/packaged apps via Shell COM (pywin32).
+
+        Read-only metadata: display name and AppUserModelId / parsing
+        path identity. Nothing is activated or executed.
+        """
+        if sys.platform != "win32":  # pragma: no cover - platform guard
+            return [], SourceStatus("apps_folder", "unavailable", "requires_windows")
+        try:  # pragma: no cover - Windows only
+            import pythoncom  # type: ignore[import-untyped]
+            from win32com.shell import shell  # type: ignore[import-untyped]
+
+            pythoncom.CoInitialize()
+            try:
+                desktop = shell.SHGetDesktopFolder()
+                pidl, _eaten, _attrs = desktop.ParseDisplayName(0, None, "shell:AppsFolder", 0)
+                folder = desktop.BindToObject(pidl, None, shell.IID_IShellFolder)
+                candidates: list[DiscoveredAppCandidate] = []
+                enumerator = folder.EnumObjects(0, 0x1 | 0x2 | 0x20)
+                if enumerator is not None:
+                    while len(candidates) < MAX_RECORDS_PER_SOURCE:
+                        items = enumerator.Next(1)
+                        if not items:
+                            break
+                        item_pidl = items[0]
+                        display = folder.GetDisplayNameOf(item_pidl, 0x8000 | 0x1)
+                        identity = folder.GetDisplayNameOf(item_pidl, 0x8000 | 0x2)
+                        candidates.append(
+                            DiscoveredAppCandidate(
+                                display_name=_bound(display),
+                                executable_identity=_bound(identity) or None,
+                                publisher=None,
+                                source="apps_folder",
+                            )
+                        )
+                return candidates, SourceStatus("apps_folder", "ok")
+            finally:
+                pythoncom.CoUninitialize()
+        except Exception:
+            return [], SourceStatus("apps_folder", "unavailable", "shell_com_unavailable")
 
 
 def _subdirs(root: str) -> list[str]:  # pragma: no cover - Windows path helper

@@ -1,10 +1,14 @@
 # AETHER OS — Phase 3 Plan: Windows State, Application Discovery and Generic Application Control
 
-**Status:** CP0–CP2 foundation implemented on
-`integration/phase3-windows-state-app-control` (from merged baseline
-`14614dcf99c79477dec36e1c25e10e17397cf763`). **Phase 3 is not
-complete. No native observation, application launching or UI
-interaction is enabled. CP3+ require separate authorization.**
+**Status:** CP0–CP2 foundation plus the foundation-closeout + CP3
+batch implemented on `integration/phase3-windows-state-app-control`
+(from merged baseline `14614dcf99c79477dec36e1c25e10e17397cf763`).
+**Phase 3 is not complete. No native observation, application
+launching or UI interaction is enabled. Schema v3 is prepared but
+NOT activated (`ACTIVE_SCHEMA_VERSION = 2`). CP4+ and native
+activation require separate authorization.** CP3 source is
+fake-backed integration only: the native launcher is disabled and
+no real application has been launched.
 Formal Phase 2 acceptance remains **NOT COMPLETE**
 (`PHASE2_WINDOWS_ACCEPTANCE.md` §10 outstanding); this plan does not
 waive it. Parallel CP0–CP2 development was explicitly authorized as
@@ -25,11 +29,16 @@ the merged repository layout governs; the spec's behaviour governs.
 | Native behaviour verified | Requires future native Windows runs — **not achieved** |
 | Formal acceptance | Requires the future acceptance campaign — **not achieved** |
 
-After the F01–F08 correction batch: contracts and platform-independent
-behaviour are implemented; the native observer (SetWinEventHook +
-message pump) and bounded stdlib discovery sources are *written* and
-fake-verified; AppsFolder COM enumeration remains truthfully
-`unavailable` until the pywin32 checkpoint. Native activation is
+After the F01–F08 correction batch and the foundation-closeout + CP3
+batch: contracts and platform-independent behaviour are implemented;
+the native observer (dedicated hook-owning thread, SetWinEventHook +
+message pump, full ctypes metadata providers) and bounded discovery
+sources are *written* and fake-verified with a thread-affine Win32
+fake; AppsFolder enumeration uses Shell COM via pywin32 (Windows-only
+marker) and is fake-verified only. The CP3 `app.launch` capability,
+launch authority, trusted confirmation, durable navigation evidence
+(prepared schema v3, inactive) and distinct postcondition verifier
+are implemented against fake adapters. Native activation remains
 disabled and nothing native is verified.
 
 ## 1. Traceability

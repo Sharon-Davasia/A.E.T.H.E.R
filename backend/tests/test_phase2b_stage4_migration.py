@@ -50,6 +50,7 @@ BACKEND_ROOT = Path(__file__).parents[1]
 MIGRATIONS = BACKEND_ROOT / "aether/core/persistence/migrations"
 MIGRATION_V1 = MIGRATIONS / "0001_phase2b_core.sql"
 MIGRATION_V2 = MIGRATIONS / "0002_phase2b_stage4_grants.sql"
+MIGRATION_V3 = MIGRATIONS / "0003_phase3_navigation.sql"
 
 # Independently recomputed by replaying the packaged SQL through SQLite and
 # hashing the normalized ``sqlite_master`` descriptor exactly as
@@ -126,7 +127,7 @@ CRLF_BYTES = b"\r\n"
 
 def _scratch_migrations(destination: Path, *names: str) -> Path:
     destination.mkdir(parents=True)
-    for name in names or (MIGRATION_V1.name, MIGRATION_V2.name):
+    for name in names or (MIGRATION_V1.name, MIGRATION_V2.name, MIGRATION_V3.name):
         shutil.copyfile(MIGRATIONS / name, destination / name)
     return destination
 
@@ -261,7 +262,7 @@ def test_shipped_configuration_activates_version_two_after_proposal_a() -> None:
     """Proposal A: the delivered build creates and accepts v2 databases."""
 
     assert ACTIVE_SCHEMA_VERSION == 2
-    assert frozenset() == PENDING_MIGRATION_VERSIONS
+    assert frozenset({3}) == PENDING_MIGRATION_VERSIONS  # v3 prepared-only (Phase 3)
 
 
 def test_clean_install_records_version_two_after_proposal_a(tmp_path: Path) -> None:

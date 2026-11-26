@@ -35,10 +35,16 @@ class PolicyBroker:
         resources: ResourceRegistry | None = None,
         grant_authority: GrantAuthority | None = None,
         executors: frozenset[str] = frozenset(),
+        app_authority: object | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._resources = resources
         self._grant_authority = grant_authority
+        # Phase 3 app/window authority (AppWindowResourceAuthority).
+        # Dispatch is by the *registered capability's* declared kind,
+        # never by caller claims; filesystem kinds keep the existing
+        # ResourceRegistry path unchanged.
+        self._app_authority = app_authority
         # Capability ids for which a real, bounded execution adapter is wired in
         # *this process*. Declaring one is an explicit integration act: the
         # default is empty, so a broker built without this argument authorizes
@@ -90,6 +96,35 @@ class PolicyBroker:
                     "Typed resource argument must match the registry-issued resource reference.",
                     definition.risk_tier >= RiskTier.MODIFY,
                 )
+            if definition.resource_kind in ("app", "window"):
+                # App/window dispatch via the Phase 3 authority only.
+                from aether.core.resources.app_window_authority import (
+                    AppWindowAuthorityError,
+                )
+
+                if self._app_authority is None:
+                    return self._deny(
+                        definition.risk_tier,
+                        "APP_RESOURCE_AUTHORITY_NOT_CONFIGURED",
+                        "No app/window resource authority is configured.",
+                        definition.risk_tier >= RiskTier.MODIFY,
+                    )
+                try:
+                    self._app_authority.authorize_ref(  # type: ignore[attr-defined]
+                        resource_ref, expected_kind=definition.resource_kind
+                    )
+                except AppWindowAuthorityError as exc:
+                    return self._deny(
+                        definition.risk_tier,
+                        exc.reason_code.upper(),
+                        "App/window resource is forged, stale or out of scope.",
+                        definition.risk_tier >= RiskTier.MODIFY,
+                    )
+                # Skip the filesystem registry check entirely.
+                authorized_via_app_authority = True
+                return self._after_resource_check(
+                    definition, request, grant, now, authorized_via_app_authority
+                )
             try:
                 self._resources.authorize_ref(
                     resource_ref,
@@ -112,6 +147,20 @@ class PolicyBroker:
                 definition.risk_tier >= RiskTier.MODIFY,
             )
 
+        return self._after_resource_check(definition, request, grant, now, False)
+
+    def _after_resource_check(
+        self,
+        definition: object,
+        request: ToolRequest,
+        grant: GrantRequest | None,
+        now: datetime | None,
+        _via_app_authority: bool,
+    ) -> PolicyDecision:
+        """Post-resource-check policy tail (shared fs/app dispatch)."""
+        from aether.core.policy.capabilities import CapabilityDefinition
+
+        assert isinstance(definition, CapabilityDefinition)
         if definition.risk_tier == RiskTier.CRITICAL:
             return self._deny(
                 RiskTier.CRITICAL,
@@ -140,9 +189,6 @@ class PolicyBroker:
                     "T2 mutation remains denied: the exact grant failed closed validation.",
                     True,
                 )
-            # Exact scope verified, but no execution adapter exists in this
-            # phase. This is not authorization to run anything, and it never
-            # becomes one without a separately approved Phase 2C executor.
             return PolicyDecision(
                 allowed=False,
                 risk_tier=RiskTier.MODIFY,
@@ -162,17 +208,13 @@ class PolicyBroker:
                 "The capability contract is registered but no execution adapter is enabled.",
                 False,
             )
-        # A typed T0/T1 observation adapter is wired and the resource scope was
-        # verified above. This authorizes the caller to *invoke that adapter* --
-        # nothing more. The adapter still performs its own bounded, canonical
-        # re-verification before touching the filesystem.
         return PolicyDecision(
             allowed=True,
             risk_tier=definition.risk_tier,
             reason_code="CAPABILITY_AUTHORIZED",
             reason=(
-                "A bounded read-tier execution adapter is enabled for this capability "
-                "and the resource scope was verified against the registry."
+                "A bounded read/navigation-tier execution adapter is enabled for "
+                "this capability and the resource scope was verified."
             ),
             requires_approval=False,
             approval_id=None,

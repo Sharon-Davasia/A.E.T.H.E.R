@@ -24,7 +24,7 @@ from datetime import datetime, timedelta
 
 from aether.core.contracts.resource import DataClass, Provenance
 from aether.core.contracts.world_state import WorldStateObservation
-from aether.world_state.observer import WindowEvent, WindowEventKind
+from aether.world_state.observer import GenerationClock, WindowEvent, WindowEventKind
 from aether.world_state.privacy import (
     ContextClassification,
     ObservationPolicy,
@@ -53,11 +53,23 @@ class InMemoryWorldState:
     policy: ObservationPolicy
     ttl: timedelta = DEFAULT_OBSERVATION_TTL
     max_windows: int = DEFAULT_MAX_WINDOWS
+    generation_clock: GenerationClock | None = None
+    authority: object | None = None  # AppWindowResourceAuthority (avoid cycle)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _windows: dict[int, _WindowEntry] = field(default_factory=dict, init=False)
     _foreground_hwnd: int | None = field(default=None, init=False)
     _sequence: int = field(default=0, init=False)
     _generation: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        if self.generation_clock is not None:
+            self._generation = self.generation_clock.current()
+
+    def _advance_generation(self) -> None:
+        if self.generation_clock is not None:
+            self._generation = self.generation_clock.advance()
+        else:
+            self._generation += 1
     paused: bool = field(default=False, init=False)
     over_capacity_drops: int = field(default=0, init=False)
 
@@ -71,21 +83,21 @@ class InMemoryWorldState:
         """Atomically apply a policy and invalidate retained state."""
         with self._lock:
             self.policy = policy
-            self._generation += 1
+            self._advance_generation()
             self._windows.clear()
             self._foreground_hwnd = None
 
     def invalidate_all(self) -> None:
         """Out-of-band invalidation (overflow/reconciliation, F03)."""
         with self._lock:
-            self._generation += 1
+            self._advance_generation()
             self._windows.clear()
             self._foreground_hwnd = None
 
     def pause(self) -> None:
         with self._lock:
             self.paused = True
-            self._generation += 1
+            self._advance_generation()
             self._windows.clear()
             self._foreground_hwnd = None
 
@@ -93,7 +105,7 @@ class InMemoryWorldState:
         """Resume requires fresh observation: retained state stays empty."""
         with self._lock:
             self.paused = False
-            self._generation += 1
+            self._advance_generation()
             self._windows.clear()
             self._foreground_hwnd = None
 
@@ -103,6 +115,14 @@ class InMemoryWorldState:
     ) -> None:
         # Generation + policy + insertion are one locked operation.
         with self._lock:
+            if self.generation_clock is not None:
+                self._generation = self.generation_clock.current()
+            # Commit-boundary generation validation: explicit caller
+            # generation wins; otherwise the collection stamp carried
+            # on the event is authoritative.
+            effective_generation = generation if generation is not None else event.generation
+            if effective_generation and effective_generation != self._generation:
+                return  # stale event from before invalidation/pause
             if generation is not None and generation != self._generation:
                 return  # obsolete privacy/observation generation
             if self.paused:
@@ -124,7 +144,7 @@ class InMemoryWorldState:
                     self._foreground_hwnd = None
                 return
             if event.kind is WindowEventKind.RECONCILIATION_REQUIRED:
-                self._generation += 1
+                self._advance_generation()
                 self._windows.clear()
                 self._foreground_hwnd = None
                 return
@@ -171,7 +191,7 @@ class InMemoryWorldState:
                 evidence_strength=0.9 if (event.source != "fake" and identity_known) else 0.4,
                 version_token=process_token,
                 availability="available" if identity_known else "stale",
-                resource_id=f"window-obs-{event.hwnd}",
+                resource_id=self._window_resource_id(event, process_token),
             )
             self._windows[event.hwnd] = _WindowEntry(
                 observation=observation,
@@ -182,6 +202,34 @@ class InMemoryWorldState:
             )
             if is_foreground:
                 self._foreground_hwnd = event.hwnd
+
+    def apply_snapshot(self, events: list[WindowEvent], *, now: datetime) -> None:
+        """Atomically replace retained state with a complete snapshot.
+
+        Partial snapshots are never published: the caller must only
+        invoke this with a complete enumeration for one generation.
+        """
+        with self._lock:
+            self._windows.clear()
+            self._foreground_hwnd = None
+            generation = self._generation
+        for event in events:
+            self.handle_event(event, now=now, generation=generation)
+
+    def _window_resource_id(self, event: WindowEvent, process_token: str) -> str | None:
+        if self.authority is None:
+            return None
+        from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+
+        assert isinstance(self.authority, AppWindowResourceAuthority)
+        generation = getattr(event, "_instance_generation", 0)
+        ref = self.authority.register_window(
+            hwnd=event.hwnd,
+            process_token=process_token,
+            instance_generation=int(generation or 0),
+            version_token=process_token,
+        )
+        return ref.resource_id
 
     # -- expiry / queries ----------------------------------------------------
     def cleanup_expired(self, *, now: datetime) -> int:

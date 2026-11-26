@@ -40,6 +40,19 @@ class AppResolveArguments(CapabilityArguments):
     query: str = Field(min_length=1, max_length=256)
 
 
+class AppLaunchArguments(CapabilityArguments):
+    """Launch arguments: registry-issued app id + evidence references.
+
+    The nested ``launch_evidence`` mapping carries only the
+    confirmation / authority-grant references (opaque ids, never
+    secrets or credentials). No executable path, command string or
+    arbitrary arguments can be expressed by this schema.
+    """
+
+    resource_id: str = Field(pattern=_APP_RESOURCE_ID)
+    launch_evidence: dict[str, str]
+
+
 class ReadFileArguments(ResourceArguments):
     max_bytes: int = Field(default=131_072, ge=1, le=1_048_576)
 
@@ -176,6 +189,21 @@ class CapabilityRegistry:
             ),
         ):
             registry.register(definition)
+        return registry
+
+    @classmethod
+    def phase3_with_launch(cls) -> CapabilityRegistry:
+        """Foundation + the bounded CP3 ``app.launch`` capability (T1).
+
+        Registration is a contract only: no executor is enabled by
+        this factory, and ordinary composition never builds it.
+        """
+        registry = cls.phase3_foundation()
+        registry.register(
+            CapabilityDefinition(
+                "app.launch", RiskTier.NAVIGATE, AppLaunchArguments, "app"
+            )
+        )
         return registry
 
 

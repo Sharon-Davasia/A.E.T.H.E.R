@@ -438,4 +438,10 @@ def copy_migrations(destination: Path, *, include_proposed: bool = False) -> Pat
     )
     if include_proposed:
         shutil.copyfile(MIGRATION_0002, destination / "0002_phase2b_stage4_grants.sql")
+    # The packaged migration set always includes the prepared-only v3
+    # file (registered + hash-verified, never active in shipped builds).
+    shutil.copyfile(
+        PERSISTENCE_DIR / "migrations/0003_phase3_navigation.sql",
+        destination / "0003_phase3_navigation.sql",
+    )
     return destination

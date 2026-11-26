@@ -300,8 +300,14 @@ _EXPECTED_MIGRATIONS: dict[int, tuple[str, str]] = {
         # documentation (see docs/engineering/PHASE2B_STAGE4_MIGRATION.md).
         "d2a02f54bc2f0eaee19fe1fd29c58294efbb136565145866d3c4853b8d64571c",
     ),
+    # Phase 3 navigation evidence: PREPARED ONLY. Activation requires a
+    # separate owner decision; see docs/engineering/PHASE3_R1_DESIGN.md.
+    3: ("0003_phase3_navigation.sql", "b67b07c256119d46d8b5b6441f344959ac7f16f1560ab0abb06e541cac1a694c"),
 }
 _EXPECTED_SCHEMA_SHA256: dict[int, str] = {
+    # v3 fingerprint computed from a synthetic isolated database after
+    # applying 0001-0003; v3 remains PENDING (never the active target).
+    3: "17d654a0377855fe60c72d33f61e0ef181d8b7da3ae6ccedef8e58d21682d6ff",
     1: "02f3cac7e905dfb4d1f161621c789bd5c437530002dec36202e9b2dfaa5d2e30",
     2: "dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788",
 }
@@ -336,7 +342,7 @@ _EXPECTED_SCHEMA_SHA256: dict[int, str] = {
 # an isolated fixture directory), and migrating any pre-existing real
 # database still requires separate authorization and a verified backup.
 ACTIVE_SCHEMA_VERSION = 2
-PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset()
+PENDING_MIGRATION_VERSIONS: frozenset[int] = frozenset({3})
 
 
 def _activation_error(version: int) -> str:
@@ -387,9 +393,25 @@ _CRITICAL_TABLES_V2 = _CRITICAL_TABLES_V1 | {
     "exact_approval_grant_consumptions",
 }
 
+_CRITICAL_TABLES_V3 = _CRITICAL_TABLES_V2 | {
+    "navigation_confirmations",
+    "navigation_attempts",
+    "navigation_verifications",
+    "navigation_receipts",
+}
+_CRITICAL_TRIGGER_NAMES_V3 = _CRITICAL_TRIGGER_NAMES_V2 | {
+    "navigation_confirmations_no_delete",
+    "navigation_attempts_no_update",
+    "navigation_attempts_no_delete",
+    "navigation_verifications_no_update",
+    "navigation_verifications_no_delete",
+    "navigation_receipts_no_update",
+    "navigation_receipts_no_delete",
+}
 _SCHEMA_REQUIREMENTS: dict[int, tuple[frozenset[str], frozenset[str]]] = {
     1: (_CRITICAL_TABLES_V1, _CRITICAL_TRIGGER_NAMES_V1),
     2: (_CRITICAL_TABLES_V2, _CRITICAL_TRIGGER_NAMES_V2),
+    3: (_CRITICAL_TABLES_V3, _CRITICAL_TRIGGER_NAMES_V3),
 }
 
 # Backwards-compatible alias: the highest version's trigger inventory.

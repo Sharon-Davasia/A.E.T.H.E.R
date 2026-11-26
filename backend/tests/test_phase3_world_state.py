@@ -145,13 +145,17 @@ def test_expiry_capacity_and_defensive_copies() -> None:
 
 
 def test_overflow_invalidates_out_of_band_and_reconcile_rebuilds() -> None:
-    state = InMemoryWorldState(policy=_policy())
+    from aether.world_state.observer import GenerationClock
+
+    clock = GenerationClock()
+    state = InMemoryWorldState(policy=_policy(), generation_clock=clock)
     source = FakeWindowEventSource()
     service = ObserverService(
         source=source,
         on_event=lambda event: state.handle_event(event, now=NOW),
         on_invalidate=state.invalidate_all,
         queue_capacity=2,
+        generation_clock=clock,
     )
     service.push_for_test(_event(WindowEventKind.WINDOW_CREATED, hwnd=1, process_creation_time="t"))
     service.drain_for_test()
@@ -211,3 +215,37 @@ def test_lifecycle_start_failure_rolls_back_and_stop_reports() -> None:
     service.push_for_test(_event(WindowEventKind.WINDOW_CREATED))
     service.start()
     service.stop()
+
+
+def test_window_resource_ids_are_session_ephemeral_uuids() -> None:
+    from aether.core.contracts.resource import ResourceRef
+    from aether.core.resources.app_window_authority import (
+        AppWindowAuthorityError,
+        AppWindowResourceAuthority,
+    )
+
+    authority = AppWindowResourceAuthority()
+    state = InMemoryWorldState(policy=_policy(), authority=authority)
+    state.handle_event(_event(WindowEventKind.WINDOW_CREATED, hwnd=987654321, process_creation_time="t1"), now=NOW)
+    first = state.current(now=NOW)[0]
+    assert first.resource_id is not None and first.resource_id.startswith("window:")
+    assert "987654321" not in first.resource_id  # HWND never exposed in the id
+    # Same HWND recreated (new process instance) invalidates the old ref.
+    state.handle_event(_event(WindowEventKind.WINDOW_CREATED, hwnd=987654321, process_creation_time="t2"), now=NOW)
+    second = state.current(now=NOW)[0]
+    assert second.resource_id != first.resource_id
+    with pytest.raises(AppWindowAuthorityError):
+        authority.authorize_ref(
+            ResourceRef(kind="window", resource_id=first.resource_id or "", observed_version="x"),
+            expected_kind="window",
+        )
+    # Forged window ref and kind confusion both fail closed.
+    with pytest.raises(AppWindowAuthorityError):
+        authority.authorize_ref(
+            ResourceRef(kind="window", resource_id="window:123e4567-e89b-12d3-a456-426614174000"),
+            expected_kind="window",
+        )
+    with pytest.raises(AppWindowAuthorityError):
+        authority.authorize_ref(
+            ResourceRef(kind="app", resource_id=second.resource_id or ""), expected_kind="window"
+        )

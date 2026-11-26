@@ -19,6 +19,10 @@ dependencies = [
     "cryptography>=43,<47",
     # Phase 3 CP2: deterministic fuzzy alias ranking (platform-independent).
     "rapidfuzz>=3.14,<4.0",
+    # Phase 3 discovery (AppsFolder/shortcut metadata only): Windows-only.
+    # Deferred until this checkpoint genuinely required it; pywinauto
+    # remains deferred to the UIA checkpoint.
+    "pywin32>=312,<313; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
