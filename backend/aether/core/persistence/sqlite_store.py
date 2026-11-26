@@ -924,6 +924,48 @@ class SQLiteTaskStore:
             if cursor.rowcount != 1:
                 raise IllegalPersistentTransition("confirmation is not revocable")
 
+    def _begin_attempt_unlocked(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: UUID,
+        step_id: UUID,
+        confirmation_id: str,
+        timestamp: str,
+    ) -> str:
+        confirmation = self._check_navigation_binding(
+            connection, task_id=task_id, step_id=step_id, confirmation_id=confirmation_id
+        )
+        if confirmation["revoked_at"] is not None:
+            raise IllegalPersistentTransition("navigation confirmation is revoked")
+        if confirmation["consumed_at"] is not None:
+            raise IllegalPersistentTransition("navigation confirmation was already consumed")
+        if str(confirmation["expires_at"]) <= timestamp:
+            raise IllegalPersistentTransition("navigation confirmation has expired")
+        cursor = connection.execute(
+            "UPDATE navigation_confirmations SET consumed_at = ?"
+            " WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+            (timestamp, confirmation_id),
+        )
+        if cursor.rowcount != 1:
+            raise IllegalPersistentTransition("navigation confirmation consumption raced")
+        attempt_id = str(uuid4())
+        connection.execute(
+            "INSERT INTO navigation_attempts(id, confirmation_id, task_id, step_id,"
+            " capability_id, app_resource_id, attempt_number, recorded_at)"
+            " VALUES (?,?,?,?,?,?,1,?)",
+            (
+                attempt_id,
+                confirmation_id,
+                str(task_id),
+                str(step_id),
+                confirmation["capability_id"],
+                confirmation["app_resource_id"],
+                timestamp,
+            ),
+        )
+        return attempt_id
+
     def begin_navigation_attempt(
         self, *, task_id: UUID, step_id: UUID, confirmation_id: str, now: datetime
     ) -> str:
@@ -936,36 +978,60 @@ class SQLiteTaskStore:
         timestamp = _timestamp(now)
         with self._transaction() as connection:
             self._require_navigation_schema(connection)
-            confirmation = self._check_navigation_binding(
-                connection, task_id=task_id, step_id=step_id, confirmation_id=confirmation_id
+            return self._begin_attempt_unlocked(
+                connection,
+                task_id=task_id,
+                step_id=step_id,
+                confirmation_id=confirmation_id,
+                timestamp=timestamp,
             )
-            if confirmation["revoked_at"] is not None:
-                raise IllegalPersistentTransition("navigation confirmation is revoked")
-            if confirmation["consumed_at"] is not None:
-                raise IllegalPersistentTransition("navigation confirmation was already consumed")
-            if str(confirmation["expires_at"]) <= timestamp:
-                raise IllegalPersistentTransition("navigation confirmation has expired")
-            cursor = connection.execute(
-                "UPDATE navigation_confirmations SET consumed_at = ?"
-                " WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
-                (timestamp, confirmation_id),
+
+    def commit_navigation_attempt(
+        self, *, task_id: UUID, step_id: UUID, confirmation_id: str, now: datetime
+    ) -> str:
+        """Execution commitment boundary (CP3-R01/R02), one transaction.
+
+        Consumes the confirmation, records the durable attempt and
+        transitions PRECHECK -> EXECUTING atomically. A crash before
+        this commit leaves the task in PRECHECK with an unconsumed
+        confirmation (distinguishable, cancellable); a crash after it
+        leaves an EXECUTING task with a committed attempt that
+        reconciliation resolves truthfully. No external effect may be
+        attempted before this method returns.
+        """
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            row = connection.execute(
+                "SELECT state FROM tasks WHERE id = ?", (str(task_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown task id")
+            current = PersistentTaskState(row["state"])
+            if current is not PersistentTaskState.PRECHECK:
+                raise IllegalPersistentTransition(
+                    "execution commitment requires the task to be in PRECHECK"
+                )
+            attempt_id = self._begin_attempt_unlocked(
+                connection,
+                task_id=task_id,
+                step_id=step_id,
+                confirmation_id=confirmation_id,
+                timestamp=timestamp,
             )
-            if cursor.rowcount != 1:
-                raise IllegalPersistentTransition("navigation confirmation consumption raced")
-            attempt_id = str(uuid4())
-            connection.execute(
-                "INSERT INTO navigation_attempts(id, confirmation_id, task_id, step_id,"
-                " capability_id, app_resource_id, attempt_number, recorded_at)"
-                " VALUES (?,?,?,?,?,?,1,?)",
-                (
-                    attempt_id,
-                    confirmation_id,
-                    str(task_id),
-                    str(step_id),
-                    confirmation["capability_id"],
-                    confirmation["app_resource_id"],
-                    timestamp,
-                ),
+            self._commit_transition_unlocked(
+                connection,
+                task_id,
+                current,
+                PersistentTaskState.EXECUTING,
+                event_type="TASK_EXECUTING",
+                metadata_values={
+                    "confirmation_id": confirmation_id,
+                    "attempt_id": attempt_id,
+                    "authority": "BACKEND_NAVIGATION_EVIDENCE",
+                },
+                now=timestamp,
+                error_code=None,
             )
         return attempt_id
 
@@ -1169,12 +1235,26 @@ class SQLiteTaskStore:
                 " JOIN navigation_attempts a ON a.task_id = t.id"
                 " LEFT JOIN navigation_verifications v ON v.attempt_id = a.id"
                 " LEFT JOIN navigation_receipts r ON r.attempt_id = a.id"
-                " WHERE t.state IN ('EXECUTING', 'POSTCHECK', 'RECOVERING')"
+                " WHERE t.state IN ('PRECHECK', 'EXECUTING', 'POSTCHECK', 'RECOVERING')"
             ).fetchall()
         for row in rows:
             task_id = UUID(row["task_id"])
             step_id = UUID(row["step_id"])
             try:
+                if row["state"] == "PRECHECK":
+                    # Attempt committed but EXECUTING never reached:
+                    # within this architecture the adapter is gated on
+                    # EXECUTING, so no external effect occurred. The
+                    # consumed confirmation is never replayed.
+                    self.advance_navigation_state(
+                        task_id,
+                        PersistentTaskState.FAILED,
+                        step_id=step_id,
+                        confirmation_id=row["confirmation_id"],
+                        now=now,
+                    )
+                    outcomes.append((task_id, PersistentTaskState.FAILED.value))
+                    continue
                 if row["verification_id"] is not None and row["receipt_id"] is None:
                     self.record_navigation_receipt(
                         attempt_id=row["attempt_id"],

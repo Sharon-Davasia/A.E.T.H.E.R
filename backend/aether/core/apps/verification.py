@@ -57,6 +57,10 @@ class ObservedWindow:
 class PlatformObservation:
     processes: tuple[ObservedProcess, ...]
     windows: tuple[ObservedWindow, ...]
+    # An incomplete baseline cannot establish that a process is new:
+    # absence from a partial enumeration proves nothing (CP3-R04).
+    complete: bool = True
+    generation: int = 0
 
 
 class ObservationProvider(Protocol):
@@ -71,6 +75,14 @@ class VerificationExpectation:
     integrity_sha256: str
     postcondition: PostconditionKind
     pre_existing_process_tokens: frozenset[str]
+    # Attempt correlation (CP3-R04): when the launch call returned a
+    # process identity, only that exact instance can verify a new
+    # launch; an unrelated process the user started must not satisfy
+    # the task. Without a returned identity, a *complete* pre-attempt
+    # baseline is required before any process counts as new.
+    attempt_id: str = ""
+    returned_process_token: str | None = None
+    baseline_complete: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,9 +141,22 @@ class LaunchVerifier:
             and process.integrity_sha256 is not None
             and process.integrity_sha256 == expectation.integrity_sha256
         ]
-        new_instances = [
-            p for p in matching if p.process_token not in expectation.pre_existing_process_tokens
-        ]
+        if expectation.returned_process_token is not None:
+            new_instances = [
+                p
+                for p in matching
+                if p.process_token == expectation.returned_process_token
+                and p.process_token not in expectation.pre_existing_process_tokens
+            ]
+        elif expectation.baseline_complete:
+            new_instances = [
+                p
+                for p in matching
+                if p.process_token not in expectation.pre_existing_process_tokens
+                and p.started_after_attempt
+            ]
+        else:
+            new_instances = []
         for process in new_instances:
             if expectation.postcondition is PostconditionKind.BACKGROUND_NO_WINDOW:
                 return VerificationResult(

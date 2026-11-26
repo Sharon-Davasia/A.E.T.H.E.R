@@ -56,6 +56,7 @@ class IntegrityEvidence:
     package_identity: str | None
     verified_at: datetime
     file_identity: str | None = None
+    package_version: str | None = None
 
 
 class IntegrityVerifier(Protocol):
@@ -82,6 +83,7 @@ def integrity_digest_of(evidence: IntegrityEvidence) -> str:
             evidence.signer_identity or "",
             evidence.package_identity or "",
             evidence.file_identity or "",
+            evidence.package_version or "",
         ]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()

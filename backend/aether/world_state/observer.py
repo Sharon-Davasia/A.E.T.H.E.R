@@ -170,6 +170,11 @@ class ObserverService:
     source: WindowEventSource
     on_event: Callable[[WindowEvent], None]
     on_invalidate: Callable[[], None] | None = None
+    # Atomic snapshot publication pathway (CP3-R05): when wired,
+    # reconciliation hands the complete generation-stamped snapshot
+    # to the handler (WorldState.apply_snapshot) instead of enqueueing
+    # entries individually. Uncertainty clears only on publication.
+    snapshot_handler: Callable[[list[WindowEvent]], bool] | None = None
     generation_clock: GenerationClock | None = None
     queue_capacity: int = DEFAULT_QUEUE_CAPACITY
     reconcile_interval: float = 0.0  # seconds; 0 disables periodic reconciliation
@@ -357,6 +362,20 @@ class ObserverService:
                 return False
             with self._lock:
                 source_generation = self._source_generation
+            if self.snapshot_handler is not None:
+                stamped = [
+                    dataclasses.replace(event, generation=self.generation) for event in events
+                ]
+                if self.snapshot_handler(stamped):
+                    with self._lock:
+                        self.stats.reconciliations = _bump(self.stats.reconciliations)
+                        if self.stats.generation_dropped == 0:
+                            self.stats.uncertain = False
+                            self._invalidate_signal.clear()
+                            return True
+                with self._lock:
+                    self.stats.uncertain = True
+                return False
             for event in events:
                 self._enqueue(event, source_generation)
             with self._lock:

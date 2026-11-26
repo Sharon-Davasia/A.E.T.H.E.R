@@ -89,6 +89,9 @@ class InMemoryWorldState:
         """Remove entries and invalidate their window authority refs."""
         for hwnd in hwnds:
             self._invalidate_ref(self._windows.pop(hwnd, None))
+            # Forget the last instance token so a same-process HWND
+            # recreation is a new instance generation (R05).
+            self._last_token_by_hwnd.pop(hwnd, None)
             if self._foreground_hwnd == hwnd:
                 self._foreground_hwnd = None
 
@@ -97,6 +100,8 @@ class InMemoryWorldState:
             self._invalidate_ref(entry)
         self._windows.clear()
         self._foreground_hwnd = None
+
+    _MAX_GENERATION_BOOKKEEPING = 4096
 
     def _next_instance_generation(self, hwnd: int, process_token: str) -> int:
         """Actual per-HWND instance generation (CP3-B06).
@@ -108,26 +113,55 @@ class InMemoryWorldState:
         if self._last_token_by_hwnd.get(hwnd) != process_token:
             self._instance_generations[hwnd] = self._instance_generations.get(hwnd, 0) + 1
             self._last_token_by_hwnd[hwnd] = process_token
+        if len(self._instance_generations) > self._MAX_GENERATION_BOOKKEEPING:
+            # Bounded bookkeeping: forget generations of windows that
+            # are neither retained nor the latest instance for an HWND.
+            for stale in list(self._instance_generations):
+                if stale not in self._windows and stale != hwnd:
+                    self._instance_generations.pop(stale, None)
+                    self._last_token_by_hwnd.pop(stale, None)
         return self._instance_generations[hwnd]
 
-    def _publish_entry(self, entry: _WindowEntry, event: WindowEvent) -> _WindowEntry:
-        """Register the entry's authority ref at publication time only."""
+    def _publish_entry(
+        self, entry: _WindowEntry, event: WindowEvent, existing: _WindowEntry | None = None
+    ) -> _WindowEntry:
+        """Register the entry's authority ref at publication time only.
+
+        An unchanged live window keeps its stable reference and
+        instance version; only an actual instance replacement mints a
+        new reference (and invalidates the previous one).
+        """
+        if existing is not None and existing.process_token == entry.process_token:
+            entry.resource_id = existing.resource_id
+            entry.instance_generation = existing.instance_generation
+            entry.observation = entry.observation.model_copy(
+                update={
+                    "resource_id": existing.resource_id,
+                    "version_token": existing.observation.version_token,
+                }
+            )
+            return entry
         if self.authority is None:
             return entry
         from aether.core.resources.app_window_authority import AppWindowResourceAuthority
 
         assert isinstance(self.authority, AppWindowResourceAuthority)
         instance_generation = self._next_instance_generation(entry.hwnd, entry.process_token)
+        # The version token represents the actual window instance,
+        # not merely its process: process token + instance generation.
+        version_token = f"{entry.process_token}#{instance_generation}"
         ref = self.authority.register_window(
             hwnd=event.hwnd,
             process_token=entry.process_token,
             instance_generation=instance_generation,
-            version_token=entry.process_token,
+            version_token=version_token,
             expires_at=entry.observation.expires_at,
         )
         entry.resource_id = ref.resource_id
         entry.instance_generation = instance_generation
-        entry.observation = entry.observation.model_copy(update={"resource_id": ref.resource_id})
+        entry.observation = entry.observation.model_copy(
+            update={"resource_id": ref.resource_id, "version_token": version_token}
+        )
         return entry
 
     paused: bool = field(default=False, init=False)
@@ -269,7 +303,9 @@ class InMemoryWorldState:
                 event, now=now, sequence=self._sequence, generation=self._generation
             )
             assert entry is not None
-            self._windows[event.hwnd] = self._publish_entry(entry, event)
+            self._windows[event.hwnd] = self._publish_entry(
+                entry, event, existing=self._windows.get(event.hwnd)
+            )
             if is_foreground:
                 self._foreground_hwnd = event.hwnd
 
@@ -287,6 +323,8 @@ class InMemoryWorldState:
         snapshot: queries take the same lock as the swap.
         """
         with self._lock:
+            if self.generation_clock is not None:
+                self._generation = self.generation_clock.current()
             if self.paused:
                 return False
             staged_generation = self._generation
@@ -338,7 +376,9 @@ class InMemoryWorldState:
             published: dict[int, _WindowEntry] = {}
             for hwnd, entry in staged.items():
                 event = next(e for e in events if e.hwnd == hwnd)
-                published[hwnd] = self._publish_entry(entry, event)
+                published[hwnd] = self._publish_entry(
+                    entry, event, existing=self._windows.get(hwnd)
+                )
             self._windows = published
             self._foreground_hwnd = staged_foreground if staged_foreground in published else None
             self._sequence = max(self._sequence, sequence)

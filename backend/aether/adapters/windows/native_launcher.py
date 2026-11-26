@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -64,17 +65,28 @@ class Win32LaunchApi(Protocol):
 class NativeIntegrityProvider:
     """Native integrity-evidence source for approved launch identity.
 
-    Establishes executable content identity by streaming the canonical
-    file's bytes (bounded) and its OS file identity. Signer evidence
-    is supplied by the platform API hook when available; an unknown
-    signer is reported as unknown, never invented. For AppsFolder
-    activation the package/AppUserModel identity is the evidence.
-    Reading is limited to the canonical identity already present in
-    the trusted registry record; no discovery or execution occurs.
+    For executable targets, content identity is established by
+    streaming bytes from the *same opened file handle* whose OS file
+    identity is recorded, and the identity is re-validated after
+    inspection: replacement or mutation during inspection yields no
+    evidence. Approved targets are restricted to canonical local
+    executable identities: UNC/network paths, drive-relative paths,
+    reparse points (symlinks), non-regular files and unsupported
+    extensions are rejected conservatively. For packaged (AppsFolder)
+    applications, installed package identity and version come from
+    the platform package query — a repeated registry string is not
+    treated as independently verified package integrity, and without
+    a package-query result there is no evidence. Signer evidence is
+    supplied by the platform hook when available and otherwise
+    remains explicitly unavailable. The documented residual
+    verify-to-create race (CP3 sec.5) is unchanged.
     """
 
-    def __init__(self, *, signer_of: Any = None) -> None:
+    def __init__(self, *, signer_of: Any = None, package_query: Any = None) -> None:
         self._signer_of = signer_of  # Callable[[str], str | None] | None
+        # Callable[[str], tuple[str, str] | None]: AUMID -> (package
+        # full identity, package version) from the platform.
+        self._package_query = package_query
 
     def verify(self, record: ApplicationRecord) -> IntegrityEvidence | None:
         from datetime import UTC, datetime
@@ -85,27 +97,53 @@ class NativeIntegrityProvider:
         if location_identity_digest(identity) != record.location_digest:
             return None
         if record.launch_method is LaunchMethod.APPS_FOLDER_ACTIVATION:
+            if self._package_query is None:
+                return None
+            try:
+                queried = self._package_query(identity)
+            except Exception:
+                return None
+            if queried is None:
+                return None
+            package_identity, package_version = queried
+            if not package_identity or not package_version:
+                return None
             return IntegrityEvidence(
                 location_digest=record.location_digest,
                 content_sha256=None,
                 signer_identity=None,
-                package_identity=identity,
+                package_identity=package_identity,
                 verified_at=datetime.now(UTC),
+                package_version=package_version,
             )
         if record.launch_method is not LaunchMethod.APPROVED_EXECUTABLE:
+            return None
+        if not _is_supported_local_executable(identity):
             return None
         digest = hashlib.sha256()
         total = 0
         try:
-            info = os.stat(identity)
-            with open(identity, "rb") as handle:
+            descriptor = os.open(identity, os.O_RDONLY)
+        except OSError:
+            return None
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                return None
+            file_identity = _file_identity(before)
+            with os.fdopen(os.dup(descriptor), "rb") as handle:
                 while chunk := handle.read(1 << 20):
                     total += len(chunk)
                     if total > MAX_INTEGRITY_FILE_BYTES:
                         return None
                     digest.update(chunk)
+            after = os.fstat(descriptor)
         except OSError:
             return None
+        finally:
+            os.close(descriptor)
+        if _file_identity(after) != file_identity:
+            return None  # identity changed during inspection: no evidence
         signer = None
         if self._signer_of is not None:
             try:
@@ -118,8 +156,32 @@ class NativeIntegrityProvider:
             signer_identity=signer,
             package_identity=None,
             verified_at=datetime.now(UTC),
-            file_identity=f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}",
+            file_identity=file_identity,
         )
+
+
+def _file_identity(info: os.stat_result) -> str:
+    return f"{info.st_dev}:{info.st_ino}:{info.st_size}:{info.st_mtime_ns}"
+
+
+def _is_supported_local_executable(identity: str) -> bool:
+    """Canonical, supported local executable identities only."""
+    if identity.startswith(("\\\\", "//")):
+        return False  # UNC / network path
+    windows_style = len(identity) >= 2 and identity[1] == ":"
+    if windows_style:
+        if len(identity) < 4 or identity[2] not in ("\\", "/"):
+            return False  # drive-relative or malformed
+        if not identity.casefold().endswith(".exe"):
+            return False  # unsupported executable identity
+    elif not os.path.isabs(identity):
+        return False  # relative identity is never canonical
+    try:
+        if os.path.islink(identity):
+            return False  # reparse point / symlink: conservative deny
+    except OSError:
+        return False
+    return True
 
 
 @dataclass(slots=True)
@@ -150,6 +212,11 @@ class NativeWindowsLaunchAdapter:
         """Exercise the real launch logic against an injected fake API."""
         return self._launch(method=method, canonical_target=canonical_target)
 
+    def _process_token(self, pid: int) -> str | None:
+        """Returned process identity for verifier correlation (R04)."""
+        creation = self.api.get_process_creation_time(pid)
+        return f"{pid}:{creation}" if creation else None
+
     def _launch(self, *, method: LaunchMethod, canonical_target: str) -> LaunchCallResult:
         if not canonical_target or "\x00" in canonical_target:
             raise LaunchDenied("canonical_target_invalid")
@@ -158,7 +225,7 @@ class NativeWindowsLaunchAdapter:
             try:
                 if pid <= 0:
                     return LaunchCallResult(accepted=False, error_code="create_process_no_pid")
-                return LaunchCallResult(accepted=True)
+                return LaunchCallResult(accepted=True, process_token=self._process_token(pid))
             finally:
                 self.api.close_handle(thread_handle)
                 self.api.close_handle(process_handle)
@@ -166,7 +233,7 @@ class NativeWindowsLaunchAdapter:
             pid = self.api.activate_application(canonical_target)
             if pid <= 0:
                 return LaunchCallResult(accepted=False, error_code="activation_no_pid")
-            return LaunchCallResult(accepted=True)
+            return LaunchCallResult(accepted=True, process_token=self._process_token(pid))
         # No unsafe fallback for unapproved categories.
         raise LaunchDenied("launch_method_not_approved")
 
@@ -266,7 +333,13 @@ class _CtypesWin32LaunchApi:  # pragma: no cover - Windows only source
                 )
 
         ole32 = ctypes.windll.ole32
-        ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+        # COINIT_APARTMENTTHREADED. RPC_E_CHANGED_MODE means the
+        # apartment was already initialized differently: proceed
+        # without owning initialization (and without uninitializing).
+        init_hr = ole32.CoInitializeEx(None, 0x2)
+        owns_apartment = init_hr in (0, 1)  # S_OK / S_FALSE
+        if init_hr not in (0, 1, -2147417850):  # RPC_E_CHANGED_MODE
+            raise LaunchDenied("com_apartment_initialization_failed")
         manager = ctypes.c_void_p()
         try:
             hr = ole32.CoCreateInstance(
@@ -297,7 +370,8 @@ class _CtypesWin32LaunchApi:  # pragma: no cover - Windows only source
                 vtable = ctypes.cast(manager, ctypes.POINTER(ctypes.c_void_p))
                 release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
                 release(manager)
-            ole32.CoUninitialize()
+            if owns_apartment:
+                ole32.CoUninitialize()
 
     def close_handle(self, handle: object) -> None:
         if handle:

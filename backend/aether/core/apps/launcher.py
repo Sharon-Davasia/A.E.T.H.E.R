@@ -26,6 +26,7 @@ a fake observation platform. A fake success is never a native launch.
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -65,10 +66,16 @@ from aether.core.policy.capabilities import CapabilityRegistry
 
 @dataclass(frozen=True, slots=True)
 class LaunchCallResult:
-    """What the platform reported about the launch *call* (not success)."""
+    """What the platform reported about the launch *call* (not success).
+
+    ``process_token`` is the returned process identity (pid + creation
+    identity) where the platform provides one; it is evidence for the
+    verifier to correlate, never a success claim by itself.
+    """
 
     accepted: bool
     error_code: str | None = None
+    process_token: str | None = None
 
 
 class LaunchAdapter(Protocol):
@@ -130,6 +137,10 @@ class TrustedLaunchCoordinator:
         self._session_id = session_id
         self._scope = activation_scope
         self._clock = clock
+        # Serializes execution commitment against cancellation (R02).
+        # This is an in-process coordinator lock only; it does not
+        # make any Windows operation atomic.
+        self._execution_lock = threading.RLock()
 
     # -- authoritative loading -------------------------------------------
 
@@ -213,6 +224,18 @@ class TrustedLaunchCoordinator:
     def execute(
         self, task_id: UUID, step_id: UUID, *, confirmation_id: str, authorization_id: str
     ) -> LaunchOutcome:
+        # The execution lock spans commitment through the terminal
+        # state advance, so cancellation is fully serialized with the
+        # effect: before commitment it prevents the adapter call;
+        # after it, it reports the verified/uncertain terminal truth.
+        with self._execution_lock:
+            return self._execute_locked(
+                task_id, step_id, confirmation_id=confirmation_id, authorization_id=authorization_id
+            )
+
+    def _execute_locked(
+        self, task_id: UUID, step_id: UUID, *, confirmation_id: str, authorization_id: str
+    ) -> LaunchOutcome:
         _task, plan, step, arguments_dump, resource = self._load_step(task_id, step_id)
         app_id = resource.resource_id
         now = self._clock()
@@ -277,34 +300,37 @@ class TrustedLaunchCoordinator:
             capability_id=step.capability_id, app_id=app_id, now=self._clock()
         ):
             raise LaunchDenied("phase3_enablement_inactive")
-        # Durable attempt BEFORE any external effect; failure = no launch.
-        attempt_id = self._store.begin_navigation_attempt(
-            task_id=task_id, step_id=step_id, confirmation_id=confirmation_id, now=self._clock()
-        )
-        self._store.advance_navigation_state(
-            task_id,
-            PersistentTaskState.EXECUTING,
-            step_id=step_id,
-            confirmation_id=confirmation_id,
-            attempt_id=attempt_id,
-            now=self._clock(),
-        )
-        pre_existing = frozenset(
-            process.process_token
-            for process in self._verifier_processes()
-            if process.app_id == app_id
-        )
-        call: LaunchCallResult | None
-        call_error: Exception | None = None
-        try:
-            call = self._adapter.launch(
-                app_id=app_id,
-                method=record.launch_method,
-                canonical_target=authorization.canonical_target,
+        # Execution commitment boundary (R01/R02): confirmation
+        # consumption + durable attempt + EXECUTING commit in ONE
+        # transaction, serialized against cancellation. No external
+        # effect may be attempted before this returns, and a
+        # cancellation confirmed before it prevents the adapter call.
+        with self._execution_lock:
+            attempt_id = self._store.commit_navigation_attempt(
+                task_id=task_id, step_id=step_id, confirmation_id=confirmation_id, now=self._clock()
             )
-        except Exception as exc:  # effect unknown once the call was attempted
-            call = None
-            call_error = exc
+            # Latest practical pre-effect recheck of enablement and
+            # scope: a stale in-flight coordinator must not continue
+            # merely because it was authorized earlier.
+            if not self._enablement.is_active(
+                capability_id=step.capability_id, app_id=app_id, now=self._clock()
+            ):
+                raise LaunchDenied("phase3_enablement_inactive")
+            baseline = self._verifier.observe_snapshot()
+            pre_existing = frozenset(
+                process.process_token for process in baseline.processes if process.app_id == app_id
+            )
+            call: LaunchCallResult | None
+            call_error: Exception | None = None
+            try:
+                call = self._adapter.launch(
+                    app_id=app_id,
+                    method=record.launch_method,
+                    canonical_target=authorization.canonical_target,
+                )
+            except Exception as exc:  # effect unknown once the call was attempted
+                call = None
+                call_error = exc
         self._store.advance_navigation_state(
             task_id,
             PersistentTaskState.POSTCHECK,
@@ -328,6 +354,9 @@ class TrustedLaunchCoordinator:
                         str(arguments_dump.get("postcondition", "window_required"))
                     ),
                     pre_existing_process_tokens=pre_existing,
+                    attempt_id=attempt_id,
+                    returned_process_token=call.process_token if call is not None else None,
+                    baseline_complete=baseline.complete,
                 ),
                 call_accepted=True,
             )
@@ -364,8 +393,29 @@ class TrustedLaunchCoordinator:
         return self._verifier.observe_snapshot().processes
 
     def cancel(self, task_id: UUID, step_id: UUID, *, confirmation_id: str) -> PersistentTaskState:
-        """Cancel truthfully: never hide an effect that may have occurred."""
+        """Cancel truthfully: never hide an effect that may have occurred.
+
+        Serialized with execution commitment: cancellation confirmed
+        before the commitment prevents the adapter call; once an
+        attempt is committed the outcome is UNVERIFIED (or the
+        verified terminal state), never a false CANCELLED.
+        """
+        with self._execution_lock:
+            return self._cancel_locked(task_id, step_id, confirmation_id=confirmation_id)
+
+    def _cancel_locked(
+        self, task_id: UUID, step_id: UUID, *, confirmation_id: str
+    ) -> PersistentTaskState:
         task = self._store.get_task(task_id)
+        if task.state in (
+            PersistentTaskState.COMPLETED,
+            PersistentTaskState.FAILED,
+            PersistentTaskState.CANCELLED,
+            PersistentTaskState.UNVERIFIED,
+            PersistentTaskState.DENIED,
+            PersistentTaskState.PARTIALLY_COMPLETED,
+        ):
+            return task.state  # terminal truth: nothing to cancel
         attempts = self._store.navigation_attempts_for_task(task_id)
         if task.state in (PersistentTaskState.EXECUTING, PersistentTaskState.POSTCHECK):
             attempt_id = str(attempts[0]["attempt_id"]) if attempts else None
@@ -410,6 +460,7 @@ class FakeWindowsPlatform:
     """Simulated platform state, observed separately from launch calls."""
 
     integrity_by_app: dict[str, str] = field(default_factory=dict)
+    complete: bool = True
     processes: list[ObservedProcess] = field(default_factory=list)
     windows: list[ObservedWindow] = field(default_factory=list)
     _counter: int = 0
@@ -464,7 +515,9 @@ class FakeWindowsPlatform:
         ]
 
     def observe(self) -> PlatformObservation:
-        return PlatformObservation(processes=tuple(self.processes), windows=tuple(self.windows))
+        return PlatformObservation(
+            processes=tuple(self.processes), windows=tuple(self.windows), complete=self.complete
+        )
 
 
 @dataclass(slots=True)
@@ -479,21 +532,22 @@ class ScriptedFakeLaunchAdapter:
         self, *, app_id: str, method: LaunchMethod, canonical_target: str
     ) -> LaunchCallResult:
         self.calls += 1
+        spawned: str | None = None
         if self.behavior == "fail_before_effect":
             return LaunchCallResult(accepted=False, error_code="fake_create_failed")
         if self.behavior == "raise_after_accept":
             self.platform.spawn(app_id)
             raise RuntimeError("fake platform failure after acceptance")
         if self.behavior == "new_instance":
-            self.platform.spawn(app_id)
+            spawned = self.platform.spawn(app_id)
         elif self.behavior == "existing_activation":
             self.platform.activate_existing(app_id)
         elif self.behavior == "background":
-            self.platform.spawn(app_id, windowed=False)
+            spawned = self.platform.spawn(app_id, windowed=False)
         elif self.behavior == "wrong_process":
             self.platform.spawn("app:123e4567-e89b-12d3-a456-426614174001")
         elif self.behavior == "wrong_window":
-            token = self.platform.spawn(app_id, windowed=False)
+            spawned = self.platform.spawn(app_id, windowed=False)
             self.platform.windows.append(
                 ObservedWindow(
                     window_token="window:wrong",
@@ -501,12 +555,11 @@ class ScriptedFakeLaunchAdapter:
                     app_id=app_id,
                 )
             )
-            _ = token
         elif self.behavior == "accepted_no_effect":
             pass
         else:  # pragma: no cover - test authoring guard
             raise AssertionError(f"unknown fake behavior {self.behavior}")
-        return LaunchCallResult(accepted=True)
+        return LaunchCallResult(accepted=True, process_token=spawned)
 
 
 class FakeLaunchAdapter(ScriptedFakeLaunchAdapter):
