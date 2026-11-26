@@ -215,3 +215,48 @@ activation proposal is `docs/security/PHASE3_ACTIVATION_PROPOSAL.md`
 (not approved). Implementation-present ≠ platform-verified ≠
 native-verified ≠ formally accepted: everything above is
 implementation-present with fake/Linux evidence only.
+
+## Integration and activation-readiness gate (G01–G06)
+
+On top of the final consolidated batch, the readiness gate added:
+
+- **G01** `core/apps/composition.py`: one controlled composition
+  factory (disabled / simulated / native-prepared-never-startable)
+  wiring observer policy, registry+resolver, app/window authority,
+  integrity, launch authority, confirmer, PolicyBroker, planner,
+  TrustedLaunchCoordinator, WindowActivationService, UIA supervisor
+  + snapshot service, FocusCoordinator, fixture executor,
+  ProjectDetector, dialog guard, takeover source, RecoveryService
+  and Phase3Bridge over shared authorities, with revoke/shutdown
+  lifecycle and initialization-failure cleanup. The native worker
+  now requires a parent-owned first-line bootstrap on its private
+  stdin pipe (no env/CLI/importable-token enablement).
+- **G02** Complete desktop workflow (apps discovery + ambiguous
+  selection, observed windows with human identities, persisted
+  launch/activation/fixture preparation, trusted approval binding
+  app+window+operation+verified precondition+postcondition, durable
+  receipts, pause/cancel/resume) over narrow `phase3.*` kinds.
+  Ordinary startup still constructs the disabled surface.
+- **G03** Scoped schema selection: dedicated marker-bound synthetic
+  acceptance storage opens v3 only with an owner authorization
+  object; ordinary storage stays v2; real-user storage is rejected.
+- **G04** Takeover mapping relative to the active operation; native
+  activity source resolves foreground HWND→authorized window id and
+  owns its hook thread/pump/cleanup; dialog stops dispatch and is
+  never dismissed; integrated (not isolated) tests.
+- **G05** Native fixture contract (automation-id control contract,
+  strict counter, script launches rejected) plus a reproducibly
+  built `AETHERFixture.exe` (in-box `csc.exe`, delay as an on-window
+  toggle, no arbitrary arguments).
+- **G06** Authoritative privacy authority in composition (worker
+  enforces collection mode before name access; `read_value` removed
+  from the worker contract; bounded request values; explicit worker
+  completeness; privacy-change-in-flight rejection), project
+  detection without unregistered probing and with root-resource
+  binding, and window-activation confirmation binding validation.
+
+Evidence at the gate head: backend + desktop gates (see STATUS).
+Simulated/Linux evidence only — not native evidence, not formal
+acceptance. The runnable campaign is
+`docs/engineering/PHASE3_NATIVE_ACCEPTANCE.md`; the decision package
+is `docs/security/PHASE3_ACTIVATION_PROPOSAL.md` (not approved).

@@ -23,6 +23,20 @@ demonstrations are recorded in §8 of that document; their artifacts
 remain owner-held and are not archived in this repository. Nothing in
 Phase 3 development changes that verdict.
 
+**Phase 3 integration/activation-readiness gate (G01–G06) is
+implemented** on top of the final batch: a controlled composition
+factory with trusted lifecycle and parent-owned worker bootstrap,
+the complete G02 desktop workflow (no typed internal ids), scoped
+schema-v3 acceptance storage (ordinary storage stays v2), integrated
+takeover/dialog handling, the native fixture contract with a
+reproducibly built executable, and authoritative privacy/project/
+activation hardening. Automated evidence is simulated/Linux only
+(including a genuine authenticated cross-process simulated workflow
+to a durable receipt). The runnable P3-01…P3-25 campaign and the
+activation decision package are prepared for independent review;
+native activation remains disabled in ordinary operation and no
+owner-side run is requested yet.
+
 **Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
 fake-backed** on top of CP4–CP5: authoritative persisted UI-operation
 bindings enforced end-to-end, PolicyBroker/enablement integration,
