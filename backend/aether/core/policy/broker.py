@@ -45,10 +45,18 @@ class PolicyBroker:
         grant_authority: GrantAuthority | None = None,
         executors: frozenset[str] = frozenset(),
         app_authority: object | None = None,
+        ui_authorizer: object | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._resources = resources
         self._grant_authority = grant_authority
+        # F10: explicit capability-specific UI authorization check.
+        # For window-kind MODIFY capabilities the trusted approval is
+        # the exact UI-operation binding (a separate evidence class);
+        # the callable returns None when authorized, else a reason
+        # code. Filesystem capabilities never take this path and keep
+        # the exact-grant requirement untouched.
+        self._ui_authorizer = ui_authorizer
         # Phase 3 app/window authority (AppWindowResourceAuthority).
         # Dispatch is by the *registered capability's* declared kind,
         # never by caller claims; filesystem kinds keep the existing
@@ -66,6 +74,7 @@ class PolicyBroker:
         *,
         grant: GrantRequest | None = None,
         now: datetime | None = None,
+        ui_authorizer: object | None = None,
     ) -> PolicyDecision:
         """Return deterministic authorization status, without running a capability."""
         if self._capabilities is None and self._resources is None:
@@ -132,7 +141,7 @@ class PolicyBroker:
                 # Skip the filesystem registry check entirely.
                 authorized_via_app_authority = True
                 return self._after_resource_check(
-                    definition, request, grant, now, authorized_via_app_authority
+                    definition, request, grant, now, authorized_via_app_authority, ui_authorizer
                 )
             try:
                 self._resources.authorize_ref(
@@ -156,7 +165,7 @@ class PolicyBroker:
                 definition.risk_tier >= RiskTier.MODIFY,
             )
 
-        return self._after_resource_check(definition, request, grant, now, False)
+        return self._after_resource_check(definition, request, grant, now, False, ui_authorizer)
 
     def _after_resource_check(
         self,
@@ -165,6 +174,7 @@ class PolicyBroker:
         grant: GrantRequest | None,
         now: datetime | None,
         _via_app_authority: bool,
+        ui_authorizer: object | None = None,
     ) -> PolicyDecision:
         """Post-resource-check policy tail (shared fs/app dispatch)."""
         from aether.core.policy.capabilities import CapabilityDefinition
@@ -178,6 +188,50 @@ class PolicyBroker:
                 True,
             )
         if definition.risk_tier == RiskTier.MODIFY:
+            if definition.resource_kind == "window":
+                # Exact UI-operation authorization path (F10). Only
+                # the specifically approved fixture-interaction
+                # capability may be authorized this way.
+                from aether.core.policy.capabilities import UI_EFFECTFUL_CAPABILITIES
+
+                if definition.capability_id not in UI_EFFECTFUL_CAPABILITIES:
+                    return self._deny(
+                        RiskTier.MODIFY,
+                        "UI_CAPABILITY_NOT_APPROVED",
+                        "This window capability is not approved for UI-operation authorization.",
+                        True,
+                    )
+                authorizer = ui_authorizer if ui_authorizer is not None else self._ui_authorizer
+                if authorizer is None:
+                    return self._deny(
+                        RiskTier.MODIFY,
+                        "TRUSTED_APPROVAL_NOT_AVAILABLE",
+                        "No UI-operation authorizer is configured.",
+                        True,
+                    )
+                reason = authorizer(request)  # type: ignore[operator]
+                if reason is not None:
+                    return self._deny(
+                        RiskTier.MODIFY, str(reason), "UI-operation approval failed.", True
+                    )
+                if definition.capability_id not in self._executors:
+                    return self._deny(
+                        definition.risk_tier,
+                        "CAPABILITY_EXECUTOR_NOT_AVAILABLE",
+                        "The capability contract is registered but no execution adapter is enabled.",
+                        False,
+                    )
+                return PolicyDecision(
+                    allowed=True,
+                    risk_tier=definition.risk_tier,
+                    reason_code="UI_OPERATION_AUTHORIZED",
+                    reason=(
+                        "The exact UI-operation binding was verified by the "
+                        "trusted authorizer for this capability and scope."
+                    ),
+                    requires_approval=False,
+                    approval_id=None,
+                )
             if grant is None or self._grant_authority is None:
                 return self._deny(
                     RiskTier.MODIFY,

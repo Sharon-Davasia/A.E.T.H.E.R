@@ -53,6 +53,8 @@ class UiOperationBinding:
     activation_scope: str
     issued_at: datetime
     expires_at: datetime
+    expected_precondition: str = ""
+    expected_postcondition: str = ""
 
     def digest(self) -> str:
         payload = {
@@ -71,6 +73,8 @@ class UiOperationBinding:
             "element_runtime_id": self.element_runtime_id,
             "pattern": self.pattern,
             "intended_effect": self.intended_effect,
+            "expected_precondition": self.expected_precondition,
+            "expected_postcondition": self.expected_postcondition,
             "session_id": self.session_id,
             "activation_scope": self.activation_scope,
             "issued_at": self.issued_at.isoformat(),
@@ -107,6 +111,8 @@ def issue_binding(
     session_id: str,
     activation_scope: str,
     now: datetime,
+    expected_precondition: str = "",
+    expected_postcondition: str = "",
 ) -> UiOperationBinding:
     return UiOperationBinding(
         binding_id=f"uibind:{uuid4()}",

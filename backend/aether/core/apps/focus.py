@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import threading
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -36,6 +37,9 @@ class LockHandle:
     owner_session: str
     acquired_at: float
     expires_at: float
+    # F13: unique ownership token; release and validity require it, so
+    # a stale or forged handle can never act for the current owner.
+    token: str = ""
 
 
 @dataclass(slots=True)
@@ -98,8 +102,12 @@ class FocusCoordinator:
             slot = (kind, key)
             existing = self._held.get(slot)
             if existing is not None:
-                if existing.handle.owner_task == owner_task:
-                    return existing.handle  # same-owner re-entry
+                # Same-task re-entry must not bypass session ownership.
+                if (
+                    existing.handle.owner_task == owner_task
+                    and existing.handle.owner_session == owner_session
+                ):
+                    return existing.handle
                 return None  # contention: fail, never queue-steal focus
             now = self.monotonic()
             handle = LockHandle(
@@ -141,16 +149,31 @@ class FocusCoordinator:
         with self._lock:
             slot = (handle.kind, handle.key)
             existing = self._held.get(slot)
-            if existing is None or existing.handle is not handle:
-                if existing is not None and (
-                    existing.handle.owner_task != handle.owner_task
-                    or existing.handle.acquired_at != handle.acquired_at
-                ):
-                    return False  # another owner's lock: not ours to release
-                if existing is None:
-                    return False
+            if existing is None:
+                return False
+            current = existing.handle
+            if (
+                current.token != handle.token
+                or current.owner_task != handle.owner_task
+                or current.owner_session != handle.owner_session
+            ):
+                return False  # another owner's lock: not ours to release
             self._held.pop(slot, None)
             return True
+
+    def is_valid(self, handle: LockHandle) -> bool:
+        """True while this exact ownership token is held and unexpired.
+
+        Expiry never silently transfers ownership while a worker may
+        still be executing: callers must re-check validity at every
+        dispatch boundary and treat a lapsed lock after possible
+        effect as uncertain, not as permission to proceed.
+        """
+        with self._lock:
+            existing = self._held.get((handle.kind, handle.key))
+            if existing is None or existing.handle.token != handle.token:
+                return False
+            return existing.handle.expires_at > self.monotonic()
 
     def release_task(self, owner_task: str) -> int:
         with self._lock:

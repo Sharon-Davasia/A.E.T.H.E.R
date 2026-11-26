@@ -17,6 +17,10 @@ from aether.adapters.windows.native_uia import NativeUiaDisabled, build_native_u
 from aether.core.apps.uia_snapshot import SnapshotResult, UiaSnapshotService
 from aether.core.contracts.uia import UiaLimits
 from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+from aether.core.workers.subprocess_supervisor import (
+    SubprocessWorkerSupervisor,
+    default_worker_command,
+)
 
 __all__ = ["NativeUiaAdapter", "NativeUiaDisabled"]
 

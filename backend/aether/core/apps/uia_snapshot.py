@@ -74,10 +74,39 @@ class UiaSnapshotService:
     authority: AppWindowResourceAuthority
     backend_factory: Callable[[], UiaBackend]
     session_id: str
+    # F11: when a supervised worker is configured, native collection
+    # routes through the subprocess supervisor; the direct backend
+    # factory remains only for injected test doubles.
+    worker: object | None = None  # SubprocessWorkerSupervisor
     clock: Callable[[], datetime] | None = None
     content_inspection_permitted: Callable[[str], bool] | None = None
     monotonic: Callable[[], float] = time.monotonic
     _snapshots: OrderedDict[str, UiaSnapshot] = field(default_factory=OrderedDict)
+    # Privacy/observation generation: any privacy-mode change, sensor
+    # pause or session change bumps this and purges retained snapshots.
+    privacy_generation: int = 0
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def note_privacy_change(self) -> None:
+        """Privacy mode/opt-in changed: retained snapshots are void."""
+        self.privacy_generation += 1
+        self._snapshots.clear()
+
+    def on_sensor_pause(self) -> None:
+        self.note_privacy_change()
+
+    def on_session_end(self) -> None:
+        self.note_privacy_change()
+
+    def on_takeover(self, window_resource_id: str) -> None:
+        for key in [
+            k for k, v in self._snapshots.items() if v.window_resource_id == window_resource_id
+        ]:
+            self._snapshots.pop(key, None)
+
+    def on_dialog(self, window_resource_id: str) -> None:
+        self.on_takeover(window_resource_id)
 
     def _now(self) -> datetime:
         return self.clock() if self.clock else datetime.now(UTC)
@@ -119,20 +148,26 @@ class UiaSnapshotService:
         )
         if classification is not ContextClassification.PERMITTED_METADATA:
             return SnapshotResult(UiaOutcome.PRIVACY_DENIED, detail=classification.value)
-        if (
-            require_content
-            and self.content_inspection_permitted is not None
-            and not self.content_inspection_permitted(binding.app_resource_id or "")
+        # F12: missing content-authorization authority denies content
+        # inspection outright; metadata-only collection never reads
+        # unrestricted accessible text.
+        if require_content and (
+            self.content_inspection_permitted is None
+            or not self.content_inspection_permitted(binding.app_resource_id or "")
         ):
             return SnapshotResult(UiaOutcome.PRIVACY_DENIED, detail="content inspection")
 
+        if self.worker is not None:
+            return self._inspect_via_worker(binding, window_resource_id, limits, require_content)
         backend = self.backend_factory()
         started = self.monotonic()
         try:
             root = backend.find_root(hwnd=binding.hwnd)
             if root is None:
                 return SnapshotResult(UiaOutcome.PROVIDER_UNAVAILABLE, detail="no_uia_root")
-            collected, truncated_reason = self._walk(backend, root, limits, started)
+            collected, truncated_reason = self._walk(
+                backend, root, limits, started, include_text=require_content
+            )
         except TimeoutError:
             return SnapshotResult(UiaOutcome.TIMED_OUT)
         except UiaElementStale:
@@ -153,6 +188,7 @@ class UiaSnapshotService:
             observed_at=now,
             expires_at=now + timedelta(seconds=SNAPSHOT_TTL_SECONDS),
             generation=binding.instance_generation,
+            privacy_generation=self.privacy_generation,
             privacy_classification=SnapshotPrivacy.CONTENT
             if require_content
             else SnapshotPrivacy.METADATA,
@@ -168,12 +204,91 @@ class UiaSnapshotService:
             UiaOutcome.TRUNCATED if truncated_reason else UiaOutcome.OK, snapshot=snapshot
         )
 
+    def _inspect_via_worker(
+        self, binding, window_resource_id, limits, require_content
+    ) -> SnapshotResult:  # type: ignore[no-untyped-def]
+        from aether.core.workers.uia_worker import WorkerOutcome
+
+        now = self._now()
+        result = self.worker.execute(  # type: ignore[attr-defined]
+            "inspect",
+            {
+                "hwnd": binding.hwnd,
+                "max_depth": limits.max_depth,
+                "max_elements": limits.max_elements,
+                "max_total_text_chars": limits.max_total_text_chars,
+            },
+            timeout=limits.budget_seconds + 2.0,
+        )
+        if result.outcome is WorkerOutcome.TIMED_OUT:
+            return SnapshotResult(UiaOutcome.TIMED_OUT)
+        if result.outcome is not WorkerOutcome.OK or result.response is None:
+            return SnapshotResult(UiaOutcome.PROVIDER_UNAVAILABLE, detail=result.detail)
+        raw_elements = result.response.get("elements")
+        if not isinstance(raw_elements, list):
+            return SnapshotResult(UiaOutcome.PROVIDER_UNAVAILABLE, detail="malformed_worker_result")
+        elements: list[UiaElement] = []
+        ref_by_key: dict[str, str] = {}
+        for raw in raw_elements[: limits.max_elements]:
+            if not isinstance(raw, dict):
+                continue
+            ref = f"el:{len(elements) + 1}"
+            ref_by_key[str(raw.get("key"))] = ref
+            is_password = bool(raw.get("is_password"))
+            name = raw.get("name") if (require_content and not is_password) else None
+            elements.append(
+                UiaElement(
+                    element_ref=ref,
+                    runtime_id=str(raw.get("key")),
+                    control_type=str(raw.get("control_type", "unknown")),
+                    automation_id=raw.get("automation_id") or None,
+                    name=name if isinstance(name, str) else None,
+                    patterns=frozenset(
+                        p for p in raw.get("patterns", []) if p in SUPPORTED_PATTERNS
+                    ),
+                    is_enabled=bool(raw.get("is_enabled", False)),
+                    is_offscreen=bool(raw.get("is_offscreen", False)),
+                    is_password=is_password,
+                    depth=int(raw.get("depth", 0)),
+                    child_count=int(raw.get("child_count", 0)),
+                    value_present=False,
+                )
+            )
+        truncated = len(raw_elements) >= limits.max_elements
+        snapshot = UiaSnapshot(
+            snapshot_id=f"snap:{uuid4()}",
+            session_id=self.session_id,
+            app_resource_id=binding.app_resource_id or "",
+            window_resource_id=window_resource_id,
+            window_version_token=binding.version_token,
+            process_token=binding.process_token,
+            observed_at=now,
+            expires_at=now + timedelta(seconds=SNAPSHOT_TTL_SECONDS),
+            generation=binding.instance_generation,
+            privacy_generation=self.privacy_generation,
+            privacy_classification=(
+                SnapshotPrivacy.CONTENT if require_content else SnapshotPrivacy.METADATA
+            ),
+            completeness="truncated" if truncated else "complete",
+            truncated=truncated,
+            truncated_reason="element_limit" if truncated else None,
+            elements=tuple(elements),
+            retained_text_chars=sum(len(e.name or "") for e in elements),
+            root_element_ref=elements[0].element_ref if elements else None,
+        )
+        self._retain(snapshot)
+        return SnapshotResult(
+            UiaOutcome.TRUNCATED if truncated else UiaOutcome.OK, snapshot=snapshot
+        )
+
     def _walk(
         self,
         backend: UiaBackend,
         root: RawElement,
         limits: UiaLimits,
         started: float,
+        *,
+        include_text: bool = False,
     ) -> tuple[list[UiaElement], str | None]:
         elements: list[UiaElement] = []
         ref_by_key: dict[str, str] = {}
@@ -181,7 +296,14 @@ class UiaSnapshotService:
         text_budget = limits.max_total_text_chars
         truncated: str | None = None
         queue: deque[tuple[RawElement, str | None, int]] = deque([(root, None, 0)])
+        # Bound actual traversal work and provider calls, not just the
+        # retained element count (F12).
+        work_bound = limits.max_elements * 8 + 64
+        visited = 0
         while queue:
+            visited += 1
+            if visited > work_bound:
+                return elements, "work_limit"
             raw, parent_ref, depth = queue.popleft()
             if self.monotonic() - started > limits.budget_seconds:
                 return elements, "time_budget"
@@ -200,7 +322,7 @@ class UiaSnapshotService:
             if parent_ref:
                 ancestors_by_key[raw.key] = ancestors
             name = None
-            if raw.name:
+            if raw.name and include_text:
                 if len(raw.name) <= text_budget:
                     name = raw.name
                     text_budget -= len(raw.name)
@@ -248,6 +370,16 @@ class UiaSnapshotService:
         snapshot = self._snapshots.get(snapshot_id)
         if snapshot is None or snapshot.expires_at <= self._now():
             return SnapshotResult(UiaOutcome.SNAPSHOT_EXPIRED)
+        if snapshot.session_id != self.session_id:
+            return SnapshotResult(UiaOutcome.SNAPSHOT_EXPIRED, detail="session_changed")
+        if snapshot.privacy_generation != self.privacy_generation:
+            return SnapshotResult(UiaOutcome.SNAPSHOT_EXPIRED, detail="privacy_changed")
+        if (
+            snapshot.privacy_classification == "content"
+            and self.content_inspection_permitted is not None
+            and not self.content_inspection_permitted(snapshot.app_resource_id)
+        ):
+            return SnapshotResult(UiaOutcome.PRIVACY_DENIED, detail="content permission revoked")
         # Revalidate the bound window instance: a replaced window
         # invalidates every snapshot taken against the old instance.
         try:

@@ -88,6 +88,7 @@ class UiaSnapshot(BaseModel):
     observed_at: datetime
     expires_at: datetime
     generation: int = Field(ge=0)
+    privacy_generation: int = Field(default=0, ge=0)
     provenance: Provenance = Provenance.SYSTEM_OBSERVED
     data_class: DataClass = DataClass.PRIVATE
     privacy_classification: SnapshotPrivacy = SnapshotPrivacy.METADATA
@@ -111,3 +112,6 @@ class UiaSnapshot(BaseModel):
 
     def find(self, element_ref: str) -> UiaElement | None:
         return next((e for e in self.elements if e.element_ref == element_ref), None)
+
+    def find_by_runtime(self, runtime_id: str) -> UiaElement | None:
+        return next((e for e in self.elements if e.runtime_id == runtime_id), None)

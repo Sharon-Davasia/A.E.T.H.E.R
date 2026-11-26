@@ -8,9 +8,10 @@ from pathlib import Path
 import pytest
 
 import aether.core.persistence.sqlite_store as sqlite_store
+from aether.core.apps.enablement import OwnerEnablementConfig, Phase3Enablement
 from aether.core.apps.fixture import FIXTURE_HWND, FixtureApp
 from aether.core.apps.focus import ActivitySignal, FocusCoordinator
-from aether.core.apps.ui_executor import UiDenied, UiOperationExecutor, WindowActivator
+from aether.core.apps.ui_executor import UiDenied, UiOperationExecutor
 from aether.core.apps.uia_snapshot import UiaSnapshotService
 from aether.core.persistence.models import PersistentTaskState
 from aether.core.persistence.sqlite_store import IllegalPersistentTransition, SQLiteTaskStore
@@ -40,13 +41,35 @@ class _World:
         self.clock = clock
         self.fixture = FixtureApp()
         self.authority = AppWindowResourceAuthority(session_id="session-1")
+        from aether.core.contracts.app_window import (
+            ApplicationRecord,
+            DiscoverySource,
+            LaunchMethod,
+            location_identity_digest,
+            registration_app_id,
+        )
+
+        exe = "C:\\Fake\\AETHERFixture.exe"
+        self.fixture_record = ApplicationRecord(
+            app_id=registration_app_id(
+                display_name="AETHER Fixture", executable_identity=exe,
+                launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+            ),
+            display_name="AETHER Fixture",
+            launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+            executable_identity=exe,
+            location_digest=location_identity_digest(exe),
+            discovery_source=DiscoverySource.FAKE_FIXTURE,
+            discovered_at=NOW, fresh_until=NOW + timedelta(hours=2),
+        )
+        self.authority.register_app(self.fixture_record, version_token="fixture-identity-v1")
         ref = self.authority.register_window(
             hwnd=FIXTURE_HWND,
             process_token="pid:7:ct",
             instance_generation=1,
             version_token="pid:7:ct#1",
             expires_at=NOW + timedelta(hours=1),
-            app_resource_id="app:fixture",
+            app_resource_id=self.fixture_record.app_id,
             classification=ContextClassification.PERMITTED_METADATA,
         )
         self.window_id = ref.resource_id
@@ -55,10 +78,29 @@ class _World:
             backend_factory=self.fixture.backend,
             session_id="session-1",
             clock=clock,
+            content_inspection_permitted=lambda app_id: True,
         )
         self.focus = FocusCoordinator()
         self.capabilities = CapabilityRegistry.phase3_with_uia()
         self.store = _v3_store(tmp_path)
+        from aether.core.policy.broker import PolicyBroker
+
+        broker = PolicyBroker(
+            capabilities=self.capabilities,
+            resources=ResourceRegistry(windows_semantics=False),
+            app_authority=self.authority,
+            executors=frozenset({"uia.invoke_fixture"}),
+        )
+        enablement = Phase3Enablement.from_owner_config(
+            OwnerEnablementConfig(
+                enabled=True,
+                capability_allowlist=frozenset({"uia.invoke_fixture"}),
+                app_allowlist=frozenset({self.fixture_record.app_id}),
+                session_lifetime=timedelta(hours=1),
+                scope_name="test-scope",
+            ),
+            now=NOW,
+        )
         self.executor = UiOperationExecutor(
             store=self.store,
             snapshots=self.snapshots,
@@ -68,10 +110,14 @@ class _World:
             session_id="session-1",
             activation_scope="test-scope",
             clock=clock,
+            broker=broker,
+            enablement=enablement,
+            approved_fixture_app_id=self.fixture_record.app_id,
+            approved_fixture_identity_token="fixture-identity-v1",
         )
 
     def snapshot(self):  # type: ignore[no-untyped-def]
-        result = self.snapshots.inspect(self.window_id)
+        result = self.snapshots.inspect(self.window_id, require_content=True)
         assert result.snapshot is not None, result
         return result.snapshot
 
@@ -284,25 +330,3 @@ def test_window_replacement_while_locked_revalidates() -> None:
     assert activator_world is not None
     focus.on_takeover("w1")
     assert focus.holder_of_window("w1") is None  # takeover released ownership safely
-
-
-def test_window_activation_t1_verified(tmp_path: Path) -> None:
-    world = _World(tmp_path)
-    state = {"foreground": None}
-
-    def activate(hwnd: int) -> bool:
-        state["foreground"] = hwnd
-        return True
-
-    activator = WindowActivator(
-        focus=world.focus,
-        snapshots=world.snapshots,
-        activate=activate,
-        foreground_hwnd=lambda: state["foreground"],
-        session_id="session-1",
-    )
-    from uuid import uuid4
-
-    outcome = activator.activate_window(uuid4(), world.window_id)
-    assert outcome.status == "SUCCEEDED"
-    world.close()

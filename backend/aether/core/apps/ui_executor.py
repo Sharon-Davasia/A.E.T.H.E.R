@@ -60,6 +60,22 @@ class UiOperationExecutor:
     session_id: str
     activation_scope: str
     clock: Callable[[], datetime] | None = None
+    # F10: the authoritative policy + enablement boundary. Execution
+    # without them is denied; there is no second broker.
+    broker: object | None = None  # PolicyBroker
+    enablement: object | None = None  # Phase3Enablement
+    # Trusted fixture identity: approved app resource + its trusted
+    # identity token (from launch/process/integrity evidence, never a
+    # title, name prefix or status string).
+    approved_fixture_app_id: str | None = None
+    approved_fixture_identity_token: str | None = None
+    # Optional supervised worker route (F11): when configured, the
+    # effectful operation is dispatched through the subprocess worker;
+    # direct backend use remains only for injected test doubles.
+    worker: object | None = None  # SubprocessWorkerSupervisor
+    # CP6 dialog guard seam: returns a redacted reason code when a
+    # relevant unexpected dialog is present.
+    dialog_present: Callable[[str], str | None] | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def _now(self) -> datetime:
@@ -189,6 +205,16 @@ class UiOperationExecutor:
             raise UiDenied("binding_revoked")
         if str(binding["expires_at"]) <= self._now().isoformat():
             raise UiDenied("binding_expired")
+        # F10 step 3-4: controlled enablement + permitted fixture scope.
+        if self.enablement is None or not self.enablement.is_active(
+            capability_id=step.capability_id,
+            app_id=str(binding["app_resource_id"]),
+            now=self._now(),
+        ):
+            raise UiDenied("phase3_enablement_inactive")
+        self._verify_fixture_identity(binding)
+        # F10 step 6: existing PolicyBroker preliminary eligibility.
+        self._evaluate_policy(task_id, step, arguments, binding, binding_id=binding_id)
 
         # Fresh precheck: snapshot + exact element identity current.
         snap_result = self.snapshots.get(snapshot_id)
@@ -207,6 +233,8 @@ class UiOperationExecutor:
             or snapshot.window_version_token != str(binding["window_version_token"])
         ):
             raise UiDenied("binding_element_mismatch")
+        if not element.is_enabled:
+            raise UiDenied("element_disabled")
         status_element = next(
             (e for e in snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None
         )
@@ -216,6 +244,9 @@ class UiOperationExecutor:
             raise UiDenied("manual_takeover")
         if self.focus.snapshot_invalidated(snapshot_id):
             raise UiDenied("snapshot_invalidated_by_takeover")
+        if self.dialog_present is not None and self.dialog_present(window_id):
+            self.snapshots.on_dialog(window_id)
+            raise UiDenied("unexpected_dialog")
 
         # PRECHECK -> commitment (combined durable transaction).
         if self.store.get_task(task_id).state is PersistentTaskState.AWAITING_APPROVAL:
@@ -225,9 +256,16 @@ class UiOperationExecutor:
                 step_id=step_id,
                 binding_id=binding_id,
                 now=self._now(),
+                expected_session_id=self.session_id,
+                expected_activation_scope=self.activation_scope,
             )
         attempt_id = self.store.commit_ui_attempt(
-            task_id=task_id, step_id=step_id, binding_id=binding_id, now=self._now()
+            task_id=task_id,
+            step_id=step_id,
+            binding_id=binding_id,
+            now=self._now(),
+            expected_session_id=self.session_id,
+            expected_activation_scope=self.activation_scope,
         )
 
         locks = self.focus.acquire_operation(
@@ -236,35 +274,59 @@ class UiOperationExecutor:
         if locks is None:
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
         try:
-            if self.focus.takeover_detected(window_id):
-                return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
-            backend = self.backend_factory()
-            try:
-                root = backend.find_root(hwnd=_hwnd_of(self, window_id))
-                if root is None:
-                    return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
-                target = _find_runtime(backend, root, element.runtime_id)
-                if target is None:
-                    return self._finish(
-                        task_id, step_id, binding_id, attempt_id, "stale_target", None
-                    )
-                if element.runtime_id != target.key:
-                    return self._finish(
-                        task_id, step_id, binding_id, attempt_id, "stale_target", None
-                    )
-                try:
-                    backend.invoke(target)
-                except TimeoutError:
-                    return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
-                except (UiaElementStale, UiaBackendError):
-                    return self._finish(
-                        task_id, step_id, binding_id, attempt_id, "stale_target", None
-                    )
-            finally:
-                backend.close()
+            return self._execute_under_locks(
+                task_id,
+                step_id,
+                binding_id,
+                attempt_id,
+                window_id=window_id,
+                element=element,
+                locks=locks,
+                binding=binding,
+            )
         finally:
+            # Ownership releases only after verification + receipt are
+            # persisted inside _finish (F13).
             for handle in reversed(locks):
                 self.focus.release(handle)
+
+    def _execute_under_locks(
+        self, task_id, step_id, binding_id, attempt_id, *, window_id, element, locks, binding
+    ) -> UiOutcome:  # type: ignore[no-untyped-def]
+        if self.focus.takeover_detected(window_id):
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        if not all(self.focus.is_valid(handle) for handle in locks):
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        # Pre-effect status obtained while operation ownership is held.
+        pre = self.snapshots.inspect(window_id, require_content=True)
+        if pre.snapshot is None:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        pre_status = next(
+            (e for e in pre.snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None
+        )
+        if pre_status is None or pre_status.name is None:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        expected = _expected_status(pre_status.name)
+        if expected is None:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        target_element = (
+            pre.snapshot.find_by_runtime(element.runtime_id)
+            if hasattr(pre.snapshot, "find_by_runtime")
+            else None
+        )
+        if target_element is None or not target_element.is_enabled:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "stale_target", None)
+        if not all(self.focus.is_valid(handle) for handle in locks):
+            # Ownership lapsed before dispatch: confirmed no effect.
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+
+        effect_outcome = self._dispatch_invoke(window_id, element.runtime_id)
+        if effect_outcome == "stale_target":
+            return self._finish(task_id, step_id, binding_id, attempt_id, "stale_target", None)
+        if effect_outcome == "failed":
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        if effect_outcome == "uncertain":
+            return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
 
         self.store.advance_ui_state(
             task_id,
@@ -273,20 +335,136 @@ class UiOperationExecutor:
             binding_id=binding_id,
             attempt_id=attempt_id,
             now=self._now(),
+            expected_session_id=self.session_id,
+            expected_activation_scope=self.activation_scope,
         )
-        # Independent verification: fresh snapshot, exact postcondition.
-        expected = _expected_status(status_element.name)
-        fresh = self.snapshots.inspect(window_id)
-        observed_token: str | None = None
-        outcome = "no_effect"
-        if fresh.snapshot is not None and expected is not None:
-            fresh_status = next(
-                (e for e in fresh.snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None
+        # F13: takeover or dialog during execution/verification makes
+        # the outcome uncertain, never a clean success or no-effect.
+        if self.focus.takeover_detected(window_id) or (
+            self.dialog_present is not None and self.dialog_present(window_id)
+        ):
+            self.snapshots.on_dialog(window_id)
+            return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
+        # Independent verification from a fresh snapshot. A missing,
+        # truncated, stale or ambiguous observation cannot establish
+        # success OR no-effect: it is uncertain.
+        fresh = self.snapshots.inspect(window_id, require_content=True)
+        if (
+            fresh.snapshot is None
+            or fresh.snapshot.truncated
+            or fresh.snapshot.window_version_token != str(binding["window_version_token"])
+        ):
+            return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
+        fresh_status = next(
+            (e for e in fresh.snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None
+        )
+        if fresh_status is None or fresh_status.name is None:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
+        if fresh_status.name == expected:
+            return self._finish(
+                task_id,
+                step_id,
+                binding_id,
+                attempt_id,
+                "verified_effect",
+                postcondition_token(fresh_status.name),
             )
-            if fresh_status is not None and fresh_status.name == expected:
-                outcome = "verified_effect"
-                observed_token = postcondition_token(fresh_status.name)
-        return self._finish(task_id, step_id, binding_id, attempt_id, outcome, observed_token)
+        if fresh_status.name == pre_status.name:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "no_effect", None)
+        return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
+
+    def _dispatch_invoke(self, window_id: str, runtime_id: str) -> str:
+        """One bounded effect dispatch; returns an outcome token."""
+        if self.worker is not None:
+            from aether.core.workers.uia_worker import WorkerOutcome
+
+            binding = self.snapshots.authority.resolve_window(window_id)
+            result = self.worker.execute(
+                "invoke", {"hwnd": binding.hwnd, "element_key": runtime_id}
+            )
+            if result.outcome is WorkerOutcome.OK:
+                return "ok"
+            if result.outcome is WorkerOutcome.UNCERTAIN:
+                return "uncertain"
+            return "failed"
+        backend = self.backend_factory()
+        try:
+            binding = self.snapshots.authority.resolve_window(window_id)
+            root = backend.find_root(hwnd=binding.hwnd)
+            if root is None:
+                return "failed"
+            target = _find_runtime(backend, root, runtime_id)
+            if target is None:
+                return "stale_target"
+            try:
+                backend.invoke(target)
+            except TimeoutError:
+                return "uncertain"
+            except (UiaElementStale, UiaBackendError):
+                return "stale_target"
+            return "ok"
+        finally:
+            backend.close()
+
+    def _verify_fixture_identity(self, binding: dict[str, object]) -> None:
+        """Trusted fixture identity (F10): approved app resource whose
+        authority-held identity token matches the trusted token. Titles,
+        name prefixes and status strings are never consulted."""
+        if self.approved_fixture_app_id is None or self.approved_fixture_identity_token is None:
+            raise UiDenied("fixture_identity_not_configured")
+        if str(binding["app_resource_id"]) != self.approved_fixture_app_id:
+            raise UiDenied("fixture_identity_mismatch")
+        token = self.snapshots.authority.app_version_token(self.approved_fixture_app_id)
+        if token != self.approved_fixture_identity_token:
+            raise UiDenied("fixture_identity_mismatch")
+
+    def _evaluate_policy(self, task_id, step, arguments, binding, *, binding_id: str) -> None:  # type: ignore[no-untyped-def]
+        if self.broker is None:
+            raise UiDenied("policy_broker_not_configured")
+        from aether.core.contracts.tool import ToolRequest
+        from aether.core.contracts.resource import ResourceRef
+
+        def _ui_authorizer(request: object) -> str | None:
+            # Trusted exact-operation approval check, evaluated inside
+            # the broker: the recorded binding for this task/step, in
+            # this session and scope, unconsumed, unrevoked, unexpired.
+            try:
+                current = self.store.get_ui_binding(binding_id)
+            except KeyError:
+                return "UI_BINDING_NOT_RECORDED"
+            if current["task_id"] != str(task_id) or current["step_id"] != str(step.step_id):
+                return "UI_BINDING_TASK_MISMATCH"
+            if current["session_id"] != self.session_id:
+                return "UI_BINDING_SESSION_MISMATCH"
+            if current["activation_scope"] != self.activation_scope:
+                return "UI_BINDING_SCOPE_MISMATCH"
+            if current["consumed_at"] is not None:
+                return "UI_BINDING_CONSUMED"
+            if current["revoked_at"] is not None:
+                return "UI_BINDING_REVOKED"
+            if str(current["expires_at"]) <= self._now().isoformat():
+                return "UI_BINDING_EXPIRED"
+            return None
+
+        decision = self.broker.evaluate(
+            ToolRequest(
+                request_id=str(step.step_id),
+                task_id=str(task_id),
+                capability_id=step.capability_id,
+                arguments=arguments,
+                resources=[
+                    ResourceRef(
+                        kind="window",
+                        resource_id=str(arguments["resource_id"]),
+                        observed_version=str(binding["window_version_token"]),
+                    )
+                ],
+            ),
+            now=self._now(),
+            ui_authorizer=_ui_authorizer,
+        )
+        if not decision.allowed:
+            raise UiDenied(decision.reason_code)
 
     def _finish(self, task_id, step_id, binding_id, attempt_id, outcome, token) -> UiOutcome:  # type: ignore[no-untyped-def]
         if self.store.get_task(task_id).state is PersistentTaskState.EXECUTING:
@@ -360,47 +538,3 @@ def _expected_status(before: str) -> str | None:
         return f"Count: {int(before.split(':', 1)[1].strip()) + 1}"
     except ValueError:
         return None
-
-
-@dataclass(frozen=True, slots=True)
-class ActivationOutcome:
-    status: str  # SUCCEEDED | FAILED | UNVERIFIED
-    detail: str | None = None
-
-
-@dataclass(slots=True)
-class WindowActivator:
-    """Bounded window activation (T1) under the foreground lock.
-
-    Activation is navigation-tier only when the target window is the
-    authorized current instance and the independent foreground check
-    confirms it. No repeated focus stealing: one attempt, verified
-    once, lock released either way.
-    """
-
-    focus: FocusCoordinator
-    snapshots: UiaSnapshotService
-    activate: Callable[[int], bool]  # platform seam (fake in tests; native gated)
-    foreground_hwnd: Callable[[], int | None]
-    session_id: str
-
-    def activate_window(self, task_id: UUID, window_id: str) -> ActivationOutcome:
-        binding = self.snapshots.authority.resolve_window(window_id)
-        locks = self.focus.acquire_operation(
-            window_id=window_id, owner_task=str(task_id), owner_session=self.session_id
-        )
-        if locks is None:
-            return ActivationOutcome("FAILED", "focus_lock_contended")
-        try:
-            # Revalidate identity + focus at the operation boundary.
-            current = self.snapshots.authority.resolve_window(window_id)
-            if current.version_token != binding.version_token:
-                return ActivationOutcome("FAILED", "window_instance_replaced")
-            if not self.activate(binding.hwnd):
-                return ActivationOutcome("FAILED", "activation_rejected")
-            if self.foreground_hwnd() != binding.hwnd:
-                return ActivationOutcome("UNVERIFIED", "foreground_not_confirmed")
-            return ActivationOutcome("SUCCEEDED")
-        finally:
-            for handle in reversed(locks):
-                self.focus.release(handle)

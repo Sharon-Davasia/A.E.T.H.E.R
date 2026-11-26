@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from aether.core.contracts.policy import RiskTier
 from aether.core.contracts.resource import DataClass
 
+# F09/F10: the only capability approved for the T2 exact
+# UI-operation evidence class. Read-only UIA inspection capabilities
+# never enter the effectful execution path.
+UI_EFFECTFUL_CAPABILITIES: frozenset[str] = frozenset({"uia.invoke_fixture"})
+
 _RESOURCE_ID = r"^(?:file|directory):[0-9a-fA-F-]{36}$"
 _APP_RESOURCE_ID = r"^app:[0-9a-fA-F-]{36}$"
 _WINDOW_RESOURCE_ID = r"^window:[0-9a-fA-F-]{36}$"

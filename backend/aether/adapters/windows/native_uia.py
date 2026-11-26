@@ -61,15 +61,18 @@ class PywinautoUiaBackend:
             children = tuple(self._key(c.element_info) for c in element.children())
         except Exception:
             children = ()
+        # F12: sensitive classification precedes any content-bearing
+        # read. A password control's name/value are never queried.
+        is_password = bool(getattr(info, "is_password", False))
         raw = RawElement(
             key=runtime_id,
             control_type=str(info.control_type or "unknown"),
-            name=(info.name or None),
+            name=None if is_password else (info.name or None),
             automation_id=(info.automation_id or None),
             patterns=_pattern_names(element),
             is_enabled=bool(info.enabled),
             is_offscreen=bool(getattr(info, "is_offscreen", False)),
-            is_password=bool(getattr(info, "is_password", False)),
+            is_password=is_password,
             bounding_rect=_rect(info.rectangle),
             value_present=False,
             children_keys=children,

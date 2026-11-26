@@ -143,3 +143,52 @@ def serve(
                 break
     finally:
         backend.close()
+
+
+def _simulated_backend_factory() -> UiaBackend:
+    """Deterministic simulated provider for platform-independent tests.
+
+    This is the child-process provider used by the subprocess
+    reliability tests; it is never native evidence and is selected
+    only by the trusted parent's explicit ``--simulated`` flag.
+    """
+    from aether.core.apps.fixture import FixtureApp
+
+    return FixtureApp().backend()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Worker entry point. Disabled unless the trusted parent starts it
+    with a provider it owns; ordinary application startup never does.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--simulated" in args:
+        serve(_simulated_backend_factory)
+        return 0
+    if sys.platform != "win32":
+        print("uia worker: native provider unavailable on this platform", file=sys.stderr)
+        return 2
+    # Windows: explicit COM apartment initialization/cleanup around the
+    # serving loop. Construction of the native backend requires the
+    # trusted activation the parent supplies out-of-band; without it
+    # the worker refuses to start (no env-var or importable-token
+    # enablement).
+    import comtypes  # type: ignore[import-not-found]
+
+    comtypes.CoInitialize()
+    try:
+        from aether.adapters.windows.native_uia import NativeUiaDisabled, build_native_uia_backend
+
+        try:
+            backend = build_native_uia_backend(activation=None)
+        except NativeUiaDisabled:
+            print("uia worker: native UIA activation is disabled", file=sys.stderr)
+            return 2
+        serve(lambda: backend)
+        return 0
+    finally:
+        comtypes.CoUninitialize()
+
+
+if __name__ == "__main__":  # pragma: no cover - process entry
+    raise SystemExit(main())

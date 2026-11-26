@@ -343,13 +343,13 @@ _EXPECTED_MIGRATIONS: dict[int, tuple[str, str]] = {
     # separate owner decision; see docs/engineering/PHASE3_R1_DESIGN.md.
     3: (
         "0003_phase3_navigation.sql",
-        "36c93e8348cd6d58aba77af4f07572988b2d570815f253cb631f2c7c70c23e7a",
+        "6d165d8a3f56634619b1340ca310aa7d0057c9b6438d461919f34d1a64dcd4dc",
     ),
 }
 _EXPECTED_SCHEMA_SHA256: dict[int, str] = {
     # v3 fingerprint computed from a synthetic isolated database after
     # applying 0001-0003; v3 remains PENDING (never the active target).
-    3: "5e69f75d1eee2857fd96edb9183aa8e5b2480ee18c95a6ee6035a24b6c19ac24",
+    3: "880a6a58b8ac1639f86b3a06dc21294a32608b9688c9b845183809732a762904",
     1: "02f3cac7e905dfb4d1f161621c789bd5c437530002dec36202e9b2dfaa5d2e30",
     2: "dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788",
 }
@@ -785,7 +785,7 @@ class SQLiteTaskStore:
         from aether.core.contracts.policy import RiskTier
         from aether.core.policy.capabilities import CapabilityRegistry
 
-        registry = CapabilityRegistry.phase3_with_launch()
+        registry = CapabilityRegistry.phase3_with_uia()
         return frozenset(
             definition.capability_id
             for definition in registry.definitions()
@@ -1305,16 +1305,15 @@ class SQLiteTaskStore:
     # filesystem edits. Only bound identities/digests/outcome tokens are
     # stored — never UIA content, names or values.
 
-    @staticmethod
-    def _ui_capability_ids() -> frozenset[str]:
-        from aether.core.policy.capabilities import CapabilityRegistry
+    # F09: explicit capability-specific execution-evidence
+    # classification. Only the specifically approved fixture
+    # interaction may use the T2 UI-operation evidence class;
+    # read-only UIA inspection capabilities never enter it.
+    _UI_EFFECTFUL_CAPABILITY_IDS: frozenset[str] = frozenset({"uia.invoke_fixture"})
 
-        registry = CapabilityRegistry.phase3_with_uia()
-        return frozenset(
-            definition.capability_id
-            for definition in registry.definitions()
-            if definition.capability_id.startswith("uia.")
-        )
+    @classmethod
+    def _ui_capability_ids(cls) -> frozenset[str]:
+        return cls._UI_EFFECTFUL_CAPABILITY_IDS
 
     def _check_ui_binding(
         self,
@@ -1323,7 +1322,15 @@ class SQLiteTaskStore:
         task_id: UUID,
         step_id: UUID,
         binding_id: str,
+        expected_session_id: str | None = None,
+        expected_activation_scope: str | None = None,
     ) -> sqlite3.Row:
+        """F09: exact authoritative comparison of every binding field.
+
+        All values are derived from the authoritative persisted plan
+        (task row, plan revision/hash, persisted step arguments and
+        digests) — caller-provided binding fields are never trusted.
+        """
         row = connection.execute(
             "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?", (str(task_id),)
         ).fetchone()
@@ -1337,19 +1344,58 @@ class SQLiteTaskStore:
         capability = self._persisted_step_capability(
             connection, task_id, step_id, int(row["plan_revision"])
         )
-        if capability not in self._ui_capability_ids():
+        if capability not in self._UI_EFFECTFUL_CAPABILITY_IDS:
             raise IllegalPersistentTransition(
-                "persisted capability is not a UI-operation capability"
+                "persisted capability is not approved for the UI-operation evidence class"
             )
+        step_row = connection.execute(
+            "SELECT args_json, expected_state_json FROM task_steps"
+            " WHERE task_id = ? AND plan_revision = ? AND id = ?",
+            (str(task_id), int(row["plan_revision"]), str(step_id)),
+        ).fetchone()
+        if step_row is None:
+            raise IllegalPersistentTransition("ui binding names no persisted plan step")
+        import json as _json
+
+        from aether.core.apps.ui_binding import arguments_digest
+
+        persisted_arguments = _json.loads(step_row["args_json"])
+        persisted_state = _json.loads(step_row["expected_state_json"])
+        mismatches: list[str] = []
+        if binding["task_id"] != str(task_id):
+            mismatches.append("task")
+        if binding["step_id"] != str(step_id):
+            mismatches.append("step")
+        if int(binding["plan_revision"]) != int(row["plan_revision"]):
+            mismatches.append("plan_revision")
+        if binding["plan_hash"] != row["plan_hash"]:
+            mismatches.append("plan_hash")
+        if binding["capability_id"] != capability:
+            mismatches.append("capability")
+        if binding["arguments_sha256"] != arguments_digest(persisted_arguments):
+            mismatches.append("arguments")
+        if binding["window_resource_id"] != persisted_arguments.get("resource_id"):
+            mismatches.append("window_resource")
+        if binding["snapshot_id"] != persisted_arguments.get("snapshot_id"):
+            mismatches.append("snapshot")
+        if binding["element_ref"] != persisted_arguments.get("element_ref"):
+            mismatches.append("element")
+        expected_effect = persisted_state.get("intended_effect")
+        if expected_effect is not None and binding["intended_effect"] != expected_effect:
+            mismatches.append("intended_effect")
         if (
-            binding["task_id"] != str(task_id)
-            or binding["step_id"] != str(step_id)
-            or int(binding["plan_revision"]) != int(row["plan_revision"])
-            or binding["plan_hash"] != row["plan_hash"]
-            or binding["capability_id"] != capability
+            expected_session_id is not None
+            and binding["session_id"] != expected_session_id
         ):
+            mismatches.append("session")
+        if (
+            expected_activation_scope is not None
+            and binding["activation_scope"] != expected_activation_scope
+        ):
+            mismatches.append("activation_scope")
+        if mismatches:
             raise IllegalPersistentTransition(
-                "ui operation binding does not bind the task's current plan and step"
+                "ui operation binding mismatch: " + ",".join(mismatches)
             )
         return cast(sqlite3.Row, binding)
 
@@ -1371,6 +1417,8 @@ class SQLiteTaskStore:
         element_runtime_id: str,
         pattern: str,
         intended_effect: str,
+        expected_precondition: str = "",
+        expected_postcondition: str = "",
         session_id: str,
         activation_scope: str,
         issued_at: datetime,
@@ -1396,8 +1444,9 @@ class SQLiteTaskStore:
                     " plan_hash, capability_id, arguments_sha256, binding_sha256,"
                     " app_resource_id, window_resource_id, window_version_token, snapshot_id,"
                     " snapshot_generation, element_ref, element_runtime_id, pattern,"
-                    " intended_effect, session_id, activation_scope, issued_at, expires_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    " intended_effect, expected_precondition, expected_postcondition,"
+                    " session_id, activation_scope, issued_at, expires_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         binding_id,
                         str(task_id),
@@ -1416,6 +1465,8 @@ class SQLiteTaskStore:
                         element_runtime_id,
                         pattern,
                         intended_effect,
+                        expected_precondition,
+                        expected_postcondition,
                         session_id,
                         activation_scope,
                         _timestamp(issued_at),
@@ -1439,7 +1490,14 @@ class SQLiteTaskStore:
                 raise IllegalPersistentTransition("ui binding is not revocable")
 
     def commit_ui_attempt(
-        self, *, task_id: UUID, step_id: UUID, binding_id: str, now: datetime
+        self,
+        *,
+        task_id: UUID,
+        step_id: UUID,
+        binding_id: str,
+        now: datetime,
+        expected_session_id: str | None = None,
+        expected_activation_scope: str | None = None,
     ) -> str:
         """Execution commitment for one exact UI operation (one transaction)."""
         timestamp = _timestamp(now)
@@ -1455,7 +1513,12 @@ class SQLiteTaskStore:
                     "ui execution commitment requires the task to be in PRECHECK"
                 )
             binding = self._check_ui_binding(
-                connection, task_id=task_id, step_id=step_id, binding_id=binding_id
+                connection,
+                task_id=task_id,
+                step_id=step_id,
+                binding_id=binding_id,
+                expected_session_id=expected_session_id,
+                expected_activation_scope=expected_activation_scope,
             )
             if binding["revoked_at"] is not None:
                 raise IllegalPersistentTransition("ui operation binding is revoked")
@@ -1510,13 +1573,20 @@ class SQLiteTaskStore:
         binding_id: str,
         attempt_id: str | None = None,
         now: datetime | None = None,
+        expected_session_id: str | None = None,
+        expected_activation_scope: str | None = None,
     ) -> StoredTask:
         """Advance a UI-operation task on durable UI evidence only."""
         timestamp = _timestamp(now)
         with self._transaction() as connection:
             self._require_navigation_schema(connection)
             binding = self._check_ui_binding(
-                connection, task_id=task_id, step_id=step_id, binding_id=binding_id
+                connection,
+                task_id=task_id,
+                step_id=step_id,
+                binding_id=binding_id,
+                expected_session_id=expected_session_id,
+                expected_activation_scope=expected_activation_scope,
             )
             row = connection.execute(
                 "SELECT state FROM tasks WHERE id = ?", (str(task_id),)

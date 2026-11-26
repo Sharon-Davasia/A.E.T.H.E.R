@@ -30,6 +30,23 @@ PROTOCOL_VERSION = "aether-uia-worker/1"
 
 OPERATIONS = frozenset({"inspect", "invoke", "read_value", "health", "shutdown"})
 
+# F11: strict allowlisted, operation-specific payload schemas replace
+# any forbidden-field blacklisting. Unknown keys are rejected.
+_PAYLOAD_SCHEMAS: dict[str, dict[str, type]] = {
+    "health": {},
+    "shutdown": {},
+    "inspect": {"hwnd": int, "max_depth": int, "max_elements": int, "max_total_text_chars": int},
+    # Internal worker operations: dispatchable only by the trusted
+    # parent for an authorized typed capability/target; never exposed
+    # to the renderer or model.
+    "invoke": {"hwnd": int, "element_key": str},
+    "read_value": {"hwnd": int, "element_key": str},
+}
+
+# Side-effect classification derives from the operation contract,
+# never from a caller-provided flag.
+SIDE_EFFECT_OPERATIONS = frozenset({"invoke"})
+
 
 def encode_request(request: dict[str, Any]) -> bytes:
     body = json.dumps(request, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -51,16 +68,23 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     """Reject anything that is not a bounded typed operation."""
     if request.get("protocol") != PROTOCOL_VERSION:
         raise ValueError("unknown worker protocol")
-    if request.get("operation") not in OPERATIONS:
+    operation = request.get("operation")
+    if operation not in OPERATIONS:
         raise ValueError("unsupported worker operation")
     if not isinstance(request.get("request_id"), str) or not request["request_id"]:
         raise ValueError("request identity is required")
     payload = request.get("payload")
     if not isinstance(payload, dict):
         raise ValueError("request payload must be an object")
-    for forbidden in ("python", "code", "shell", "pattern_name", "keys", "mouse", "script"):
-        if forbidden in payload:
-            raise ValueError(f"request payload field is forbidden: {forbidden}")
+    schema = _PAYLOAD_SCHEMAS[str(operation)]
+    unknown = set(payload) - set(schema)
+    if unknown:
+        raise ValueError(f"payload fields are not allowlisted: {sorted(unknown)}")
+    for key, expected in schema.items():
+        if key in payload and (
+            not isinstance(payload[key], expected) or isinstance(payload[key], bool)
+        ):
+            raise ValueError(f"payload field {key} has the wrong type")
     return request
 
 
@@ -105,7 +129,7 @@ class WorkerSupervisor:
             return f"req:{self._counter}"
 
     def health(self, *, timeout: float = 2.0) -> bool:
-        result = self.execute("health", {}, side_effect=False, timeout=timeout)
+        result = self.execute("health", {}, timeout=timeout)
         return result.outcome is WorkerOutcome.OK
 
     def execute(
@@ -113,9 +137,9 @@ class WorkerSupervisor:
         operation: str,
         payload: dict[str, Any],
         *,
-        side_effect: bool,
         timeout: float = 5.0,
     ) -> WorkerResult:
+        side_effect = operation in SIDE_EFFECT_OPERATIONS
         request_id = self._next_id()
         request = {
             "protocol": PROTOCOL_VERSION,

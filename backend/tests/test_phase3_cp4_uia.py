@@ -200,8 +200,8 @@ def _supervisor(send) -> WorkerSupervisor:
 
 def test_worker_malformed_and_stale_responses_rejected() -> None:
     timed = _supervisor(lambda body, timeout: (_ for _ in ()).throw(TimeoutError()))
-    assert timed.execute("inspect", {}, side_effect=False).outcome is WorkerOutcome.TIMED_OUT
-    assert timed.execute("inspect", {}, side_effect=True).outcome is WorkerOutcome.UNCERTAIN
+    assert timed.execute("inspect", {}).outcome is WorkerOutcome.TIMED_OUT
+    assert timed.execute("invoke", {"hwnd": 1, "element_key": "x"}).outcome is WorkerOutcome.UNCERTAIN
 
     def wrong_id(body: bytes, timeout: float) -> bytes:
         import json
@@ -212,7 +212,7 @@ def test_worker_malformed_and_stale_responses_rejected() -> None:
         ).encode()
 
     assert (
-        _supervisor(wrong_id).execute("health", {}, side_effect=False).outcome
+        _supervisor(wrong_id).execute("health", {}).outcome
         is WorkerOutcome.STALE_RESPONSE
     )
 
@@ -220,7 +220,7 @@ def test_worker_malformed_and_stale_responses_rejected() -> None:
         return b"not-json"
 
     assert (
-        _supervisor(garbage).execute("health", {}, side_effect=False).outcome
+        _supervisor(garbage).execute("health", {}).outcome
         is WorkerOutcome.MALFORMED
     )
 
@@ -228,11 +228,11 @@ def test_worker_malformed_and_stale_responses_rejected() -> None:
         raise ConnectionError("worker died")
 
     assert (
-        _supervisor(crash).execute("inspect", {}, side_effect=False).outcome
+        _supervisor(crash).execute("inspect", {}).outcome
         is WorkerOutcome.CRASHED
     )
     assert (
-        _supervisor(crash).execute("invoke", {}, side_effect=True).outcome
+        _supervisor(crash).execute("invoke", {"hwnd": 1, "element_key": "x"}).outcome
         is WorkerOutcome.UNCERTAIN
     )
 
@@ -270,7 +270,7 @@ def test_worker_roundtrip_through_handler() -> None:
         request = json.loads(body)
         return json.dumps(handle_request(request, backend=backend)).encode()
 
-    result = _supervisor(send).execute("inspect", {"hwnd": HWND}, side_effect=False)
+    result = _supervisor(send).execute("inspect", {"hwnd": HWND})
     assert result.outcome is WorkerOutcome.OK
     assert result.response is not None and len(result.response["elements"]) == 4
     password = next(e for e in result.response["elements"] if e["key"] == "pw")

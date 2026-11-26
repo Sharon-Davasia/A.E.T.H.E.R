@@ -141,6 +141,8 @@ CREATE TABLE ui_operation_bindings (
     element_runtime_id TEXT NOT NULL,
     pattern TEXT NOT NULL CHECK (pattern IN ('invoke','value','selectionitem','toggle','expandcollapse')),
     intended_effect TEXT NOT NULL,
+    expected_precondition TEXT NOT NULL DEFAULT '',
+    expected_postcondition TEXT NOT NULL DEFAULT '', 
     session_id TEXT NOT NULL,
     activation_scope TEXT NOT NULL,
     issued_at TEXT NOT NULL,
@@ -206,6 +208,8 @@ WHEN NEW.id != OLD.id OR NEW.task_id != OLD.task_id OR NEW.step_id != OLD.step_i
   OR NEW.element_ref != OLD.element_ref
   OR NEW.element_runtime_id != OLD.element_runtime_id
   OR NEW.pattern != OLD.pattern OR NEW.intended_effect != OLD.intended_effect
+  OR NEW.expected_precondition != OLD.expected_precondition
+  OR NEW.expected_postcondition != OLD.expected_postcondition
   OR NEW.session_id != OLD.session_id OR NEW.activation_scope != OLD.activation_scope
   OR NEW.issued_at != OLD.issued_at OR NEW.expires_at != OLD.expires_at
 BEGIN SELECT RAISE(ABORT, 'ui operation binding is immutable'); END;
