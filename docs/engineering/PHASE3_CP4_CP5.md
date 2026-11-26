@@ -151,3 +151,67 @@ owner native-verification pass. CP7: enumerated additional verified
 interactions beyond the fixture (each with its own exact binding,
 intended-effect classification and independent verification), still
 no generic UI automation.
+
+## Final consolidated batch (F09–F14, CP6, CP7)
+
+Owner-authorized final implementation batch on this branch. Native
+activation remains disabled; schema v3 remains prepared-but-inactive;
+no native evidence was produced (Linux, Python 3.11.2, fake providers
+and real subprocess workers only).
+
+- **F09** The persisted UI-operation binding is now fully
+  authoritative: migration 0003 adds precondition/postcondition digest
+  columns protected by the immutability trigger; execution re-derives
+  and compares every field against the persisted plan and trusted
+  observations; read-only observation capabilities never enter the T2
+  path and failed binding checks consume nothing. Focus ownership
+  tokens are task+session-bound UUIDs with deterministic lock order;
+  outcome classes are truthful — a missing post-Invoke snapshot is
+  `uncertain`, never `no_effect`.
+- **F10** `UiOperationExecutor` integrates the existing `PolicyBroker`
+  (new `ui_authorizer` limited to `uia.invoke_fixture`; no second
+  broker, no widened filesystem grants) and `Phase3Enablement`;
+  fixture identity comes only from trusted launch/process/executable
+  evidence; `window.activate` ships as a T1 service; observation stays
+  under privacy/access policy.
+- **F11** Production UIA inspection routes through the real
+  `SubprocessWorkerSupervisor`: parent-owned startup, allowlisted
+  bounded schemas, worker-session identity, parent deadlines,
+  termination/cleanup, no replay of uncertain effects. Real-child
+  tests cover success, startup failure, hang/timeout, oversized/
+  malformed frames, crash, stale responses and cancellation cleanup.
+- **F12** Privacy governs collection: password controls are
+  classified before any content read and their names suppressed in
+  the native walk; metadata-only mode collects no unrestricted text;
+  snapshots are lifecycle-bound (session/window/process/privacy
+  generation/permission/expiry) and purge on privacy change, pause,
+  replacement, takeover, dialog and worker restart; traversal work is
+  budget-bounded.
+- **F13/F14** `tools/windows-fixture/aether_fixture.py` provides the
+  native Win32 fixture source (stable control ids, `Count: N`,
+  disabled/password/modal/replacement/delayed modes, deterministic
+  reset). It is source only — never executed here; fake ids
+  (`fixture-increment`/`fixture-status`) are contract ids, not native
+  runtime ids.
+- **CP6** Current-project detection inside registered roots only
+  (registered/Explorer/recent-focus evidence, deterministic ranking,
+  ambiguity clarification, no permission expansion);
+  unexpected-dialog handling that halts dispatch and never
+  auto-dismisses; manual-takeover signals scoped to active operations;
+  pause/resume only through the persistent task authority with fresh
+  revalidation; restart reconciliation without activating v3.
+- **CP7** Electron Phase 3 verification surface over the existing
+  authenticated channel (`phase3.*` kinds): observer state, privacy
+  modes, registry search, bounded snapshot inspection, fixture
+  preview + trusted approval (native dialog visibly binds
+  app/window/operation/effect; main signs; backend verifies;
+  exactly-once), task state and pause. Ordinary launches construct
+  the disabled surface and report `phase3_native_disabled`
+  truthfully. No generic execute/invoke/click/python IPC exists.
+
+Native acceptance campaign P3-01–P3-25 is prepared in
+`docs/engineering/PHASE3_NATIVE_ACCEPTANCE.md` (not run); the
+activation proposal is `docs/security/PHASE3_ACTIVATION_PROPOSAL.md`
+(not approved). Implementation-present ≠ platform-verified ≠
+native-verified ≠ formally accepted: everything above is
+implementation-present with fake/Linux evidence only.

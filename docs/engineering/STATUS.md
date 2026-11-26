@@ -23,13 +23,23 @@ demonstrations are recorded in §8 of that document; their artifacts
 remain owner-held and are not archived in this repository. Nothing in
 Phase 3 development changes that verdict.
 
-**Phase 3 CP4–CP5 is implemented fake-backed** (bounded privacy-aware
-UIA snapshots with a real but disabled native pywinauto backend and a
-typed reliability worker; focus locks, manual-takeover invalidation,
-exact UI-operation bindings and one independently verified fixture
-interaction; CP3 prerequisites R01–R05 closed). See
-`PHASE3_CP4_CP5.md`. No native Windows evidence exists yet; native
-activation remains disabled and schema v3 remains inactive.
+**Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
+fake-backed** on top of CP4–CP5: authoritative persisted UI-operation
+bindings enforced end-to-end, PolicyBroker/enablement integration,
+production UIA inspection through the real supervised subprocess
+worker, privacy-governed collection with lifecycle-bound snapshots,
+truthful outcome classes, the native Win32 fixture source
+(`tools/windows-fixture/`, never executed here), current-project
+detection/dialog handling/pause-resume/restart reconciliation (CP6),
+and the Electron Phase 3 verification surface over the authenticated
+channel (CP7). The native acceptance campaign P3-01–P3-25 is prepared
+(`PHASE3_NATIVE_ACCEPTANCE.md`, not run) and the activation proposal
+awaits separate owner approval
+(`docs/security/PHASE3_ACTIVATION_PROPOSAL.md`). No native Windows
+evidence exists; native activation remains disabled
+(`phase3_native_disabled` in ordinary launches) and schema v3 remains
+inactive. Implementation-present only — not platform-verified, not
+native-verified, not formally accepted.
 
 **Phase 3 foundation (CP0-CP2) plus the CP3 completion batch
 (CP3-B01..B06) is in development** on
