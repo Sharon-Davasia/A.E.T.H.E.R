@@ -795,7 +795,7 @@ def test_schema_v3_prepared_but_not_active(tmp_path) -> None:  # type: ignore[no
     assert frozenset({3}) == sqlite_store.PENDING_MIGRATION_VERSIONS
     assert (
         sqlite_store._EXPECTED_MIGRATIONS[3][1]
-        == "f797cae2115326a5e9dfe23be6a554ae139b76d44fbc3ccbdd106742d775d478"
+        == "36c93e8348cd6d58aba77af4f07572988b2d570815f253cb631f2c7c70c23e7a"
     )
     store = _v3_store(tmp_path)
     version = store._connection.execute("PRAGMA user_version").fetchone()[0]

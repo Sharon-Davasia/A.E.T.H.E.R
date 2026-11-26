@@ -59,6 +59,10 @@ class PlanGoal(StrEnum):
     APPLY_EDIT = "apply_edit"
     UNDO_EDIT = "undo_edit"
     LAUNCH_APPLICATION = "launch_application"
+    ACTIVATE_WINDOW = "activate_window"
+    INSPECT_WINDOW_UIA = "inspect_window_uia"
+    INSPECT_UIA_ELEMENT = "inspect_uia_element"
+    INVOKE_FIXTURE_ELEMENT = "invoke_fixture_element"
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,7 +106,20 @@ _GOAL_CAPABILITY: dict[PlanGoal, str] = {
     PlanGoal.APPLY_EDIT: "fs.apply_approved_edit",
     PlanGoal.UNDO_EDIT: "fs.undo_edit",
     PlanGoal.LAUNCH_APPLICATION: "app.launch",
+    PlanGoal.ACTIVATE_WINDOW: "window.activate",
+    PlanGoal.INSPECT_WINDOW_UIA: "uia.inspect_snapshot",
+    PlanGoal.INSPECT_UIA_ELEMENT: "uia.inspect_element",
+    PlanGoal.INVOKE_FIXTURE_ELEMENT: "uia.invoke_fixture",
 }
+
+_WINDOW_GOALS: frozenset[PlanGoal] = frozenset(
+    {
+        PlanGoal.ACTIVATE_WINDOW,
+        PlanGoal.INSPECT_WINDOW_UIA,
+        PlanGoal.INSPECT_UIA_ELEMENT,
+        PlanGoal.INVOKE_FIXTURE_ELEMENT,
+    }
+)
 
 
 class Planner:
@@ -158,6 +175,8 @@ class Planner:
             ) from exc
         if intent.goal is PlanGoal.LAUNCH_APPLICATION:
             return self._plan_launch(task_id, intent, capability_id, definition, revision)
+        if intent.goal in _WINDOW_GOALS:
+            return self._plan_window_op(task_id, intent, capability_id, definition, revision)
         try:
             resolved = self._resources.resource_by_id(intent.resource_id)
         except ResourceRegistryError as exc:
@@ -363,6 +382,91 @@ class Planner:
         plan_hash = hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
         narrative = _narrative_for(intent, record.display_name, expected_effect, approved_edit=None)
         _ = LaunchAuthorityError  # imported for symmetry; errors mapped above
+        return PlannedRevision(plan=plan, plan_hash=plan_hash, narrative=narrative, step_id=step_id)
+
+    def _plan_window_op(
+        self,
+        task_id: UUID,
+        intent: PlanIntent,
+        capability_id: str,
+        definition: object,
+        revision: int,
+    ) -> PlannedRevision:
+        """Plan a bounded window/UIA operation against the window authority.
+
+        The plan binds the window resource and its actual instance
+        version token. Snapshot/element arguments are transient
+        identities validated again at approval/execution time; a name
+        or index can never identify an element in a plan.
+        """
+        from aether.core.contracts.resource import ResourceRef
+        from aether.core.policy.capabilities import CapabilityDefinition
+
+        assert isinstance(definition, CapabilityDefinition)
+        if self._app_authority is None:
+            raise PlannerError(
+                "PLAN_APP_AUTHORITY_UNAVAILABLE",
+                "window planning requires the app/window resource authority",
+            )
+        try:
+            arguments = self._capabilities.validate(capability_id, intent.arguments)
+        except CapabilityRegistryError as exc:
+            raise PlannerError(
+                "PLAN_ARGUMENTS_INVALID", "window arguments are not valid for the capability"
+            ) from exc
+        arguments_dump = arguments.model_dump(mode="json")
+        window_id = str(arguments_dump["resource_id"])
+        ref = ResourceRef(kind="window", resource_id=window_id)
+        try:
+            self._app_authority.authorize_ref(ref, expected_kind="window")  # type: ignore[attr-defined]
+            binding = self._app_authority.resolve_window(window_id)  # type: ignore[attr-defined]
+        except Exception as exc:
+            raise PlannerError(
+                "PLAN_RESOURCE_UNKNOWN", "the window resource was never issued by the authority"
+            ) from exc
+        now = self._clock()
+        step_id = uuid5(_PLAN_NAMESPACE, f"{task_id}:{revision}:{capability_id}:{window_id}")
+        resource = TaskPlanResource(
+            resource_id=window_id,
+            expected_version=binding.version_token,
+            display_name="authorized window",
+        )
+        locks = [f"window:{window_id}"]
+        if intent.goal in (PlanGoal.ACTIVATE_WINDOW, PlanGoal.INVOKE_FIXTURE_ELEMENT):
+            locks.append("foreground:shared")
+        expected_state: dict[str, Any] = {
+            "resource_id": window_id,
+            "expected_version": binding.version_token,
+        }
+        for key in ("snapshot_id", "element_ref"):
+            if key in arguments_dump:
+                expected_state[key] = arguments_dump[key]
+        expected_effect = {"kind": capability_id, "resource_id": window_id}
+        step = PlanStep(
+            step_id=step_id,
+            capability_id=capability_id,
+            arguments=arguments_dump,
+            resources=(resource,),
+            resource_locks=tuple(locks),
+            expected_state=expected_state,
+            expected_effect=expected_effect,
+            risk_tier=definition.risk_tier,
+            timeout_seconds=30,
+            idempotency_key=uuid5(_PLAN_NAMESPACE, f"{task_id}:{revision}:{step_id}:idempotency"),
+            postconditions=(
+                {
+                    "verify": "independent_postcondition_observed",
+                    "check": "postcondition_distinct_outcome",
+                },
+            ),
+            recovery_class="IRREVERSIBLE",
+        )
+        plan = TaskPlan(
+            task_id=task_id, revision=revision, summary=intent.summary[:512],
+            steps=(step,), created_at=now,
+        )
+        plan_hash = hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
+        narrative = _narrative_for(intent, "authorized window", expected_effect, approved_edit=None)
         return PlannedRevision(plan=plan, plan_hash=plan_hash, narrative=narrative, step_id=step_id)
 
     def revision_for_change(
@@ -574,6 +678,34 @@ def _narrative_for(
         )
         preconditions = (f"{display_name} is an approved registry-issued application in scope.",)
         proposed = f"launch_application result for {display_name}"
+        diffs = ()
+    elif intent.goal in _WINDOW_GOALS:
+        verb = {
+            PlanGoal.ACTIVATE_WINDOW: "Activate",
+            PlanGoal.INSPECT_WINDOW_UIA: "Inspect the accessibility tree of",
+            PlanGoal.INSPECT_UIA_ELEMENT: "Inspect one element of",
+            PlanGoal.INVOKE_FIXTURE_ELEMENT: "Invoke the bound fixture control in",
+        }[intent.goal]
+        intent_text = f"{verb} {display_name}"
+        explanation = (
+            "This is a bounded window/UIA operation against exactly the "
+            "authorized window instance bound to the plan. It cannot "
+            "address any other window, element or application."
+        )
+        external = (
+            "The fixture interaction has one declared bounded effect, "
+            "verified independently afterwards.",
+        )
+        risks = (
+            "UI text is untrusted data and is never treated as instructions.",
+            "A replaced window or element invalidates the operation.",
+        )
+        verification = (
+            "Success requires the declared postcondition to be observed "
+            "in a fresh inspection; an adapter claim alone is not success.",
+        )
+        preconditions = (f"{display_name} remains the authorized current window instance.",)
+        proposed = f"{intent.goal.value} result for {display_name}"
         diffs = ()
     else:
         verb = {

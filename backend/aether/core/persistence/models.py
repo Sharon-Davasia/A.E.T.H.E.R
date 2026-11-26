@@ -406,6 +406,9 @@ class EventMetadata(BaseModel):
                 # Phase 3 CP3: marks a transition driven by re-read
                 # durable navigation evidence; the rows did the work.
                 "BACKEND_NAVIGATION_EVIDENCE",
+                # Phase 3 CP5: marks a transition driven by re-read
+                # durable exact UI-operation evidence (separate class).
+                "BACKEND_UI_OPERATION_EVIDENCE",
             }:
                 raise ValueError("event authority metadata is invalid")
             if key == "requires_fresh_plan_and_consent" and not isinstance(item, bool):
