@@ -11,6 +11,7 @@ CREATE TABLE navigation_confirmations (
     plan_hash TEXT NOT NULL CHECK (length(plan_hash) = 64),
     capability_id TEXT NOT NULL,
     arguments_sha256 TEXT NOT NULL CHECK (length(arguments_sha256) = 64),
+    binding_sha256 TEXT NOT NULL CHECK (length(binding_sha256) = 64),
     app_resource_id TEXT NOT NULL CHECK (app_resource_id LIKE 'app:%'),
     expected_app_version TEXT NOT NULL,
     integrity_evidence_sha256 TEXT NOT NULL CHECK (length(integrity_evidence_sha256) = 64),
@@ -41,13 +42,24 @@ CREATE TABLE navigation_verifications (
     attempt_id TEXT NOT NULL REFERENCES navigation_attempts(id) ON DELETE RESTRICT,
     outcome TEXT NOT NULL CHECK (outcome IN (
         'verified_new_instance', 'verified_existing_instance',
-        'verified_background', 'timeout_before_effect',
-        'timeout_after_effect', 'unverified', 'failed'
+        'verified_background_no_window', 'accepted_unverified',
+        'timeout_before_effect', 'timeout_after_effect',
+        'unverified', 'failed'
     )),
     process_instance_token TEXT,
     window_version_token TEXT,
     verified_at TEXT NOT NULL,
-    UNIQUE (attempt_id)
+    UNIQUE (attempt_id),
+    -- Outcome-specific evidence requirements: a verified outcome must
+    -- name the independently observed identity that supports it.
+    CHECK (outcome NOT IN (
+        'verified_new_instance', 'verified_existing_instance',
+        'verified_background_no_window'
+    ) OR process_instance_token IS NOT NULL),
+    CHECK (outcome NOT IN (
+        'verified_new_instance', 'verified_existing_instance'
+    ) OR window_version_token IS NOT NULL),
+    CHECK (outcome != 'verified_background_no_window' OR window_version_token IS NULL)
 );
 
 CREATE TABLE navigation_receipts (
@@ -66,6 +78,33 @@ CREATE INDEX idx_navigation_confirmations_task ON navigation_confirmations(task_
 
 CREATE TRIGGER navigation_confirmations_no_delete BEFORE DELETE ON navigation_confirmations
 BEGIN SELECT RAISE(ABORT, 'navigation confirmations are append-only'); END;
+-- Binding fields are immutable after issuance; only the guarded
+-- consumption/revocation state columns may ever change.
+CREATE TRIGGER navigation_confirmations_binding_no_update
+BEFORE UPDATE ON navigation_confirmations
+WHEN NEW.id != OLD.id OR NEW.task_id != OLD.task_id OR NEW.step_id != OLD.step_id
+  OR NEW.plan_revision != OLD.plan_revision OR NEW.plan_hash != OLD.plan_hash
+  OR NEW.capability_id != OLD.capability_id
+  OR NEW.arguments_sha256 != OLD.arguments_sha256
+  OR NEW.binding_sha256 != OLD.binding_sha256
+  OR NEW.app_resource_id != OLD.app_resource_id
+  OR NEW.expected_app_version != OLD.expected_app_version
+  OR NEW.integrity_evidence_sha256 != OLD.integrity_evidence_sha256
+  OR NEW.session_id != OLD.session_id OR NEW.activation_scope != OLD.activation_scope
+  OR NEW.issued_at != OLD.issued_at OR NEW.expires_at != OLD.expires_at
+BEGIN SELECT RAISE(ABORT, 'navigation confirmation binding is immutable'); END;
+-- A SUCCEEDED receipt requires an affirmative verified verification.
+CREATE TRIGGER navigation_receipts_success_requires_verification
+BEFORE INSERT ON navigation_receipts
+WHEN NEW.status = 'SUCCEEDED' AND NOT EXISTS (
+    SELECT 1 FROM navigation_verifications
+    WHERE id = NEW.verification_id AND attempt_id = NEW.attempt_id
+      AND outcome IN (
+        'verified_new_instance', 'verified_existing_instance',
+        'verified_background_no_window'
+      )
+)
+BEGIN SELECT RAISE(ABORT, 'receipt success requires verified verification'); END;
 CREATE TRIGGER navigation_attempts_no_update BEFORE UPDATE ON navigation_attempts
 BEGIN SELECT RAISE(ABORT, 'navigation attempts are append-only'); END;
 CREATE TRIGGER navigation_attempts_no_delete BEFORE DELETE ON navigation_attempts

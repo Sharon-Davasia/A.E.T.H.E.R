@@ -83,7 +83,7 @@ class WindowEventSource(Protocol):
     """A source of normalized window events (fake or native)."""
 
     def start(self, emit: Callable[[WindowEvent], None]) -> None: ...
-    def stop(self) -> None: ...
+    def stop(self) -> bool | None: ...
     def reconcile(self) -> list[WindowEvent]: ...
 
 
@@ -184,6 +184,7 @@ class ObserverService:
     stats: ObserverStats = field(default_factory=ObserverStats, init=False)
     running: bool = field(default=False, init=False)
     _health: str = field(default="stopped", init=False)
+    _paused: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if self.queue_capacity < 1:
@@ -216,6 +217,8 @@ class ObserverService:
                 if self.running:
                     return
             self._stop.clear()
+            with self._lock:
+                self._paused = False
             # Drop any pre-shutdown queued events; bump generations so
             # callbacks from an obsolete source generation are ignored.
             self._drain_queue()
@@ -251,8 +254,14 @@ class ObserverService:
         """Bounded shutdown. Returns False if the consumer stays alive."""
         with self._lifecycle:
             self._stop.set()
-            with contextlib.suppress(Exception):
-                self.source.stop()
+            # Source shutdown failure is propagated truthfully: a
+            # raising or False-returning source stop is not success.
+            source_stopped = True
+            try:
+                if self.source.stop() is False:
+                    source_stopped = False
+            except Exception:
+                source_stopped = False
             with self._lock:
                 self._source_generation = _bump(self._source_generation)
                 thread, reconcile_thread = self._thread, self._reconcile_thread
@@ -262,7 +271,7 @@ class ObserverService:
                     worker.join(timeout=timeout)
                     alive = alive or worker.is_alive()
             with self._lock:
-                if alive:
+                if alive or not source_stopped:
                     self._health = "degraded"  # never claim clean shutdown
                     return False
                 self.running = False
@@ -272,8 +281,15 @@ class ObserverService:
             self._drain_queue()
             return True
 
+    @property
+    def collection_paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
     def pause_collection(self) -> None:
         """Pause at the source boundary (F04), not merely in retention."""
+        with self._lock:
+            self._paused = True
         with contextlib.suppress(Exception):
             self.source.stop()
         with self._lock:
@@ -324,6 +340,9 @@ class ObserverService:
         enumeration retains uncertainty (it is not proof windows
         disappeared). Bounded attempts; no infinite retry.
         """
+        with self._lock:
+            if self._paused:
+                return False  # paused observation cannot collect
         for _attempt in range(_MAX_RECONCILE_ATTEMPTS):
             self._drain_queue()  # reconciliation supersedes stale queued events
             with self._lock:
@@ -353,7 +372,12 @@ class ObserverService:
     def _reconcile_loop(self) -> None:
         while not self._stop.wait(self.reconcile_interval):
             # Periodic reconciliation runs even when apparently healthy:
-            # events can be missed without an explicit overflow.
+            # events can be missed without an explicit overflow. It must
+            # never collect while observation is paused or stopped.
+            with self._lock:
+                paused = self._paused
+            if paused:
+                continue
             self.reconcile()
 
     # -- consumption ---------------------------------------------------------

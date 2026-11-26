@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from datetime import datetime
 from uuid import uuid4
 
 from aether.core.contracts.app_window import ApplicationRecord
@@ -31,29 +32,47 @@ class WindowBinding:
     process_token: str
     instance_generation: int
     version_token: str
+    expires_at: datetime | None = None
 
 
 class AppWindowResourceAuthority:
     """Broker-side authority for app/window resources (not a sandbox)."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, session_id: str | None = None) -> None:
         self._lock = threading.Lock()
         self._apps: dict[str, ApplicationRecord] = {}
+        self._app_versions: dict[str, str] = {}
         self._windows: dict[str, WindowBinding] = {}
         self._by_hwnd: dict[int, str] = {}
+        self.session_id = session_id
 
-    def register_app(self, record: ApplicationRecord) -> ResourceRef:
+    def register_app(
+        self, record: ApplicationRecord, *, version_token: str | None = None
+    ) -> ResourceRef:
+        """Register an app, optionally with its trusted version token."""
         with self._lock:
             self._apps[record.app_id] = record
+            if version_token is not None:
+                self._app_versions[record.app_id] = version_token
         return ResourceRef(
             kind="app",
             resource_id=record.app_id,
-            observed_version=record.location_digest,
+            observed_version=version_token or record.location_digest,
             data_class=DataClass.INTERNAL,
         )
 
+    def app_version_token(self, app_id: str) -> str | None:
+        with self._lock:
+            return self._app_versions.get(app_id)
+
     def register_window(
-        self, *, hwnd: int, process_token: str, instance_generation: int, version_token: str
+        self,
+        *,
+        hwnd: int,
+        process_token: str,
+        instance_generation: int,
+        version_token: str,
+        expires_at: datetime | None = None,
     ) -> ResourceRef:
         """Issue a fresh window ref, invalidating any previous HWND binding."""
         with self._lock:
@@ -67,6 +86,7 @@ class AppWindowResourceAuthority:
                 process_token=process_token,
                 instance_generation=instance_generation,
                 version_token=version_token,
+                expires_at=expires_at,
             )
             self._by_hwnd[hwnd] = window_id
         return ResourceRef(kind="window", resource_id=window_id, observed_version=version_token)
@@ -84,14 +104,33 @@ class AppWindowResourceAuthority:
             if binding is not None and self._by_hwnd.get(binding.hwnd) == window_id:
                 self._by_hwnd.pop(binding.hwnd, None)
 
-    def authorize_ref(self, ref: ResourceRef, *, expected_kind: str) -> None:
-        """Fail closed unless the ref was issued here for this kind."""
+    def authorize_ref(
+        self, ref: ResourceRef, *, expected_kind: str, now: datetime | None = None
+    ) -> None:
+        """Fail closed unless the ref was issued here, is current, fresh
+        and available for this kind.
+
+        An app ref carrying an exact expected version (``observed_version``)
+        requires the authority to hold matching trusted version evidence;
+        missing version evidence denies, never passes.
+        """
         if ref.kind != expected_kind:
             raise AppWindowAuthorityError("resource_kind_mismatch")
         with self._lock:
             if expected_kind == "app":
-                if ref.resource_id not in self._apps:
+                record = self._apps.get(ref.resource_id)
+                if record is None:
                     raise AppWindowAuthorityError("app_resource_not_registered")
+                if not record.available:
+                    raise AppWindowAuthorityError("app_resource_unavailable")
+                if now is not None and record.fresh_until <= now:
+                    raise AppWindowAuthorityError("app_resource_stale")
+                if ref.observed_version is not None:
+                    current = self._app_versions.get(ref.resource_id)
+                    if current is None:
+                        raise AppWindowAuthorityError("app_resource_version_unavailable")
+                    if current != ref.observed_version:
+                        raise AppWindowAuthorityError("app_resource_version_mismatch")
             elif expected_kind == "window":
                 binding = self._windows.get(ref.resource_id)
                 if binding is None:
@@ -101,5 +140,7 @@ class AppWindowResourceAuthority:
                     and ref.observed_version != binding.version_token
                 ):
                     raise AppWindowAuthorityError("window_resource_stale")
+                if now is not None and binding.expires_at is not None and binding.expires_at <= now:
+                    raise AppWindowAuthorityError("window_resource_expired")
             else:
                 raise AppWindowAuthorityError("resource_kind_mismatch")

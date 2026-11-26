@@ -1,6 +1,6 @@
 # Phase 3 R1 Design — Execution-State and Evidence Architecture
 
-**Status: REVISED for the foundation-closeout + CP3 batch.** Prepared
+**Status: REVISED for the CP3 completion batch (CP3-B01..B06).** The navigation evidence path is now integrated into the authoritative `SQLiteTaskStore` (`advance_navigation_state`, `begin_navigation_attempt`, `record_navigation_verification/receipt`, `reconcile_navigation_tasks`); execution is driven by `TrustedLaunchCoordinator`, which loads the persisted task/plan itself; verification is independent of the adapter (`LaunchVerifier` over a separate observation provider) with the closed `NavigationOutcome` vocabulary shared by code and SQL. Prepared
 schema v3 exists but is **not activated** (`ACTIVE_SCHEMA_VERSION`
 remains 2; v3 is `PENDING_MIGRATION_VERSIONS`, exercised only against
 explicit isolated synthetic databases). CP3 source and fake-backed
@@ -100,8 +100,7 @@ provide; the native launcher remains disabled in this batch.
 
 ## 6. Persistence / migration
 
-Schema v3 (`0003_phase3_navigation.sql`) is prepared and hash-pinned
-(migration SHA-256 and schema fingerprint), listed as pending, and
+Schema v3 (`0003_phase3_navigation.sql`, revised in this batch: binding digest column, immutable-binding trigger, outcome-specific verification CHECKs, receipt-success trigger) is prepared and hash-pinned (migration SHA-256 `f797cae2115326a5e9dfe23be6a554ae139b76d44fbc3ccbdd106742d775d478`, schema fingerprint `e7f51c1b6b2012f94d42d02bb8a6897ae398f6f93d6b5b2d034b5130f724cce0`), listed as pending, and
 refused by ordinary startup. It is exercised only on explicit
 isolated synthetic databases; no real-user database is migrated.
 Backup/migration recovery behaviour is unchanged from the established

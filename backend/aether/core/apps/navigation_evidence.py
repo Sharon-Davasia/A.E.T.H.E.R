@@ -1,4 +1,9 @@
-"""Durable navigation evidence store — PREPARED schema v3 only.
+"""Standalone synthetic navigation evidence store — PREPARED schema v3 only.
+
+Retained for isolated synthetic-schema tests. The authoritative
+integrated evidence path is ``SQLiteTaskStore``'s navigation methods
+(CP3-B03), which bind evidence to the persisted task and plan; this
+helper never opens or migrates a real-user database.
 
 Operates on an explicit SQLite connection whose schema was created
 from the prepared 0003 migration on an *isolated synthetic* database
@@ -42,6 +47,7 @@ class ConfirmationBinding:
     activation_scope: str
     issued_at: str
     expires_at: str
+    binding_sha256: str = "0" * 64
 
 
 class NavigationEvidenceStore:
@@ -72,16 +78,25 @@ class NavigationEvidenceStore:
         try:
             self._db.execute(
                 "INSERT INTO navigation_confirmations(id, task_id, step_id, plan_revision,"
-                " plan_hash, capability_id, arguments_sha256, app_resource_id,"
+                " plan_hash, capability_id, arguments_sha256, binding_sha256, app_resource_id,"
                 " expected_app_version, integrity_evidence_sha256, session_id,"
-                " activation_scope, issued_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " activation_scope, issued_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    binding.confirmation_id, binding.task_id, binding.step_id,
-                    binding.plan_revision, binding.plan_hash, binding.capability_id,
-                    binding.arguments_sha256, binding.app_resource_id,
-                    binding.expected_app_version, binding.integrity_sha256,
-                    binding.session_id, binding.activation_scope,
-                    binding.issued_at, binding.expires_at,
+                    binding.confirmation_id,
+                    binding.task_id,
+                    binding.step_id,
+                    binding.plan_revision,
+                    binding.plan_hash,
+                    binding.capability_id,
+                    binding.arguments_sha256,
+                    binding.binding_sha256,
+                    binding.app_resource_id,
+                    binding.expected_app_version,
+                    binding.integrity_sha256,
+                    binding.session_id,
+                    binding.activation_scope,
+                    binding.issued_at,
+                    binding.expires_at,
                 ),
             )
             self._db.commit()
@@ -89,8 +104,14 @@ class NavigationEvidenceStore:
             raise NavigationEvidenceError("confirmation_record_rejected") from exc
 
     def record_attempt(
-        self, *, confirmation_id: str, task_id: str, step_id: str,
-        capability_id: str, app_resource_id: str, recorded_at: str,
+        self,
+        *,
+        confirmation_id: str,
+        task_id: str,
+        step_id: str,
+        capability_id: str,
+        app_resource_id: str,
+        recorded_at: str,
     ) -> str:
         row = self._db.execute(
             "SELECT task_id, step_id, capability_id, app_resource_id"
@@ -100,8 +121,10 @@ class NavigationEvidenceStore:
         if row is None:
             raise NavigationEvidenceError("attempt_without_confirmation")
         if (
-            row["task_id"] != task_id or row["step_id"] != step_id
-            or row["capability_id"] != capability_id or row["app_resource_id"] != app_resource_id
+            row["task_id"] != task_id
+            or row["step_id"] != step_id
+            or row["capability_id"] != capability_id
+            or row["app_resource_id"] != app_resource_id
         ):
             raise NavigationEvidenceError("attempt_binding_mismatch")
         attempt_id = str(uuid4())
@@ -110,7 +133,15 @@ class NavigationEvidenceStore:
                 "INSERT INTO navigation_attempts(id, confirmation_id, task_id, step_id,"
                 " capability_id, app_resource_id, attempt_number, recorded_at)"
                 " VALUES (?,?,?,?,?,?,1,?)",
-                (attempt_id, confirmation_id, task_id, step_id, capability_id, app_resource_id, recorded_at),
+                (
+                    attempt_id,
+                    confirmation_id,
+                    task_id,
+                    step_id,
+                    capability_id,
+                    app_resource_id,
+                    recorded_at,
+                ),
             )
             self._db.commit()
         except sqlite3.IntegrityError as exc:
@@ -118,12 +149,20 @@ class NavigationEvidenceStore:
         return attempt_id
 
     def record_verification(
-        self, *, attempt_id: str, outcome: str, process_token: str | None,
-        window_token: str | None, verified_at: str,
+        self,
+        *,
+        attempt_id: str,
+        outcome: str,
+        process_token: str | None,
+        window_token: str | None,
+        verified_at: str,
     ) -> str:
-        if self._db.execute(
-            "SELECT id FROM navigation_attempts WHERE id = ?", (attempt_id,)
-        ).fetchone() is None:
+        if (
+            self._db.execute(
+                "SELECT id FROM navigation_attempts WHERE id = ?", (attempt_id,)
+            ).fetchone()
+            is None
+        ):
             raise NavigationEvidenceError("verification_without_attempt")
         verification_id = str(uuid4())
         try:
@@ -147,10 +186,12 @@ class NavigationEvidenceStore:
         if row is None or row["attempt_id"] != attempt_id:
             raise NavigationEvidenceError("receipt_verification_mismatch")
         if status == "SUCCEEDED":
+            from aether.core.apps.navigation_outcomes import VERIFIED_OUTCOMES, NavigationOutcome
+
             outcome = self._db.execute(
                 "SELECT outcome FROM navigation_verifications WHERE id = ?", (verification_id,)
             ).fetchone()["outcome"]
-            if not str(outcome).startswith("verified_"):
+            if NavigationOutcome(str(outcome)) not in VERIFIED_OUTCOMES:
                 raise NavigationEvidenceError("receipt_success_without_verification")
         receipt_id = str(uuid4())
         try:

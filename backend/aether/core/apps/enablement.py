@@ -46,9 +46,7 @@ class Phase3Enablement:
         )
 
     @classmethod
-    def from_owner_config(
-        cls, config: OwnerEnablementConfig, *, now: datetime
-    ) -> Phase3Enablement:
+    def from_owner_config(cls, config: OwnerEnablementConfig, *, now: datetime) -> Phase3Enablement:
         return cls(config=config, initialized_at=now)
 
     def is_active(self, *, capability_id: str, app_id: str, now: datetime) -> bool:
@@ -56,7 +54,10 @@ class Phase3Enablement:
             return False
         if now < self.initialized_at or now >= self.initialized_at + self.config.session_lifetime:
             return False
-        return capability_id in self.config.capability_allowlist and app_id in self.config.app_allowlist
+        return (
+            capability_id in self.config.capability_allowlist
+            and app_id in self.config.app_allowlist
+        )
 
     def revoke(self) -> None:
         self.revoked = True

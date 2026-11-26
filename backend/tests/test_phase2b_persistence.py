@@ -137,7 +137,11 @@ def _copy_migration_directory(destination: Path, *names: str) -> Path:
 
     destination.mkdir()
     migrations = Path(__file__).parents[1] / "aether/core/persistence/migrations"
-    for name in names or ("0001_phase2b_core.sql", "0002_phase2b_stage4_grants.sql", "0003_phase3_navigation.sql"):
+    for name in names or (
+        "0001_phase2b_core.sql",
+        "0002_phase2b_stage4_grants.sql",
+        "0003_phase3_navigation.sql",
+    ):
         shutil.copyfile(migrations / name, destination / name)
     return destination
 

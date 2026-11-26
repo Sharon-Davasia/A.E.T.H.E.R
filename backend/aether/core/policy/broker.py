@@ -26,6 +26,15 @@ class PolicyBroker:
     broker. A valid Stage 4 exact grant is *scope-verified* by the optional
     ``grant_authority`` — it is never execution authorization, and grant
     consumption happens only at execution time (which does not exist yet).
+
+    For Phase 3 navigation the broker's ``allowed`` decision is
+    *preliminary eligibility only*: it establishes that the registered
+    capability, typed arguments and authority-issued resource scope
+    are coherent. Actual authorization to execute additionally
+    requires the trusted execution coordinator to validate and
+    consume the authoritative confirmation and launch authorization
+    and to commit the durable attempt before any external effect.
+    There is no alternate launch path around those checks.
     """
 
     def __init__(
@@ -111,7 +120,7 @@ class PolicyBroker:
                     )
                 try:
                     self._app_authority.authorize_ref(  # type: ignore[attr-defined]
-                        resource_ref, expected_kind=definition.resource_kind
+                        resource_ref, expected_kind=definition.resource_kind, now=now
                     )
                 except AppWindowAuthorityError as exc:
                     return self._deny(

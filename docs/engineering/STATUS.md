@@ -23,8 +23,8 @@ demonstrations are recorded in §8 of that document; their artifacts
 remain owner-held and are not archived in this repository. Nothing in
 Phase 3 development changes that verdict.
 
-**Phase 3 foundation (CP0-CP2) plus the foundation-closeout + CP3
-batch is in development** on
+**Phase 3 foundation (CP0-CP2) plus the CP3 completion batch
+(CP3-B01..B06) is in development** on
 `integration/phase3-windows-state-app-control` under a bounded
 parallel-development authorization (Phase 2 acceptance is not
 waived): typed app/window contracts with one generation/epoch and
@@ -33,9 +33,12 @@ privacy-gated in-memory WorldState, a thread-owned native observer
 (source written, fake-verified, activation disabled), an in-memory
 application registry with real RapidFuzz alias resolution and trusted
 discovery normalization, trusted launch-authority/confirmation
-separation, and a bounded `app.launch` capability exercised only
-through fake adapters with durable navigation evidence on a
-*prepared-but-inactive* schema v3 (`ACTIVE_SCHEMA_VERSION = 2`). No
+separation, and a bounded `app.launch` capability executed only by the
+trusted coordinator against the authoritative persisted plan,
+independently verified over separate fake-platform observations,
+with durable navigation evidence integrated into `SQLiteTaskStore`
+on a *prepared-but-inactive* schema v3 (`ACTIVE_SCHEMA_VERSION = 2`).
+Native launcher/integrity source is written but activation-disabled. No
 native observation is enabled, no real application has been
 launched, and no UI interaction exists. See
 `docs/engineering/PHASE3_PLAN.md` and

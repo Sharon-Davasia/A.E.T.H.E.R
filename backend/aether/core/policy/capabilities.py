@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -41,16 +42,17 @@ class AppResolveArguments(CapabilityArguments):
 
 
 class AppLaunchArguments(CapabilityArguments):
-    """Launch arguments: registry-issued app id + evidence references.
+    """Immutable launch *intent*: registry-issued app id + postcondition.
 
-    The nested ``launch_evidence`` mapping carries only the
-    confirmation / authority-grant references (opaque ids, never
-    secrets or credentials). No executable path, command string or
-    arbitrary arguments can be expressed by this schema.
+    Execution credentials (confirmation / authorization references)
+    are deliberately NOT plan arguments: they are issued after the
+    immutable plan exists and must never become part of the plan-hash
+    dependency. No executable path, command string or arbitrary
+    arguments can be expressed by this schema.
     """
 
     resource_id: str = Field(pattern=_APP_RESOURCE_ID)
-    launch_evidence: dict[str, str]
+    postcondition: Literal["window_required", "background_no_window"] = "window_required"
 
 
 class ReadFileArguments(ResourceArguments):
@@ -119,6 +121,9 @@ class CapabilityRegistry:
         if definition.capability_id in self._definitions:
             raise CapabilityRegistryError("CAPABILITY_ALREADY_REGISTERED")
         self._definitions[definition.capability_id] = definition
+
+    def definitions(self) -> tuple[CapabilityDefinition, ...]:
+        return tuple(self._definitions.values())
 
     def get(self, capability_id: str) -> CapabilityDefinition:
         try:
@@ -200,9 +205,7 @@ class CapabilityRegistry:
         """
         registry = cls.phase3_foundation()
         registry.register(
-            CapabilityDefinition(
-                "app.launch", RiskTier.NAVIGATE, AppLaunchArguments, "app"
-            )
+            CapabilityDefinition("app.launch", RiskTier.NAVIGATE, AppLaunchArguments, "app")
         )
         return registry
 

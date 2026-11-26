@@ -226,12 +226,16 @@ def test_window_resource_ids_are_session_ephemeral_uuids() -> None:
 
     authority = AppWindowResourceAuthority()
     state = InMemoryWorldState(policy=_policy(), authority=authority)
-    state.handle_event(_event(WindowEventKind.WINDOW_CREATED, hwnd=987654321, process_creation_time="t1"), now=NOW)
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=987654321, process_creation_time="t1"), now=NOW
+    )
     first = state.current(now=NOW)[0]
     assert first.resource_id is not None and first.resource_id.startswith("window:")
     assert "987654321" not in first.resource_id  # HWND never exposed in the id
     # Same HWND recreated (new process instance) invalidates the old ref.
-    state.handle_event(_event(WindowEventKind.WINDOW_CREATED, hwnd=987654321, process_creation_time="t2"), now=NOW)
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=987654321, process_creation_time="t2"), now=NOW
+    )
     second = state.current(now=NOW)[0]
     assert second.resource_id != first.resource_id
     with pytest.raises(AppWindowAuthorityError):
@@ -249,3 +253,143 @@ def test_window_resource_ids_are_session_ephemeral_uuids() -> None:
         authority.authorize_ref(
             ResourceRef(kind="app", resource_id=second.resource_id or ""), expected_kind="window"
         )
+
+
+# -- CP3-B06: snapshot atomicity + authority lifecycle -------------------------
+
+
+def _authority_world():  # type: ignore[no-untyped-def]
+    from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+
+    authority = AppWindowResourceAuthority()
+    return InMemoryWorldState(policy=_policy(), authority=authority), authority
+
+
+def test_snapshot_publication_is_atomic_and_drops_refs() -> None:
+    from aether.core.contracts.resource import ResourceRef
+    from aether.core.resources.app_window_authority import AppWindowAuthorityError
+
+    state, authority = _authority_world()
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=1, process_creation_time="t1"), now=NOW
+    )
+    kept = state.current(now=NOW)[0].resource_id
+    assert kept is not None
+    # A published snapshot replaces state wholesale; the dropped
+    # window's authority ref is invalidated with its observation.
+    assert state.apply_snapshot(
+        [_event(WindowEventKind.WINDOW_CREATED, hwnd=2, pid=11, process_creation_time="t1")],
+        now=NOW,
+    )
+    current = state.current(now=NOW)
+    assert [o.resource_id for o in current] != [kept]
+    with pytest.raises(AppWindowAuthorityError):
+        authority.authorize_ref(
+            ResourceRef(kind="window", resource_id=kept), expected_kind="window"
+        )
+
+
+def test_privacy_change_during_snapshot_invalidates_it() -> None:
+    class PolicyChangingState(InMemoryWorldState):
+        arm = False
+
+        def _stage_entry(self, event, *, now, sequence, generation):  # type: ignore[no-untyped-def]
+            if self.arm:
+                self.arm = False
+                self.set_policy(_policy())  # policy changes mid-construction
+            return super()._stage_entry(event, now=now, sequence=sequence, generation=generation)
+
+    from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+
+    state = PolicyChangingState(policy=_policy(), authority=AppWindowResourceAuthority())
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=1, process_creation_time="t1"), now=NOW
+    )
+    state.arm = True
+    published = state.apply_snapshot(
+        [_event(WindowEventKind.WINDOW_CREATED, hwnd=2, pid=11, process_creation_time="t1")],
+        now=NOW,
+    )
+    assert published is False
+    # The snapshot was not published on top of the retained state.
+    assert [o.summary for o in state.current(now=NOW)] == []
+
+
+def test_destroyed_and_expired_window_refs_are_rejected() -> None:
+    from aether.core.contracts.resource import ResourceRef
+    from aether.core.resources.app_window_authority import AppWindowAuthorityError
+
+    state, authority = _authority_world()
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=5, process_creation_time="t1"), now=NOW
+    )
+    ref = state.current(now=NOW)[0].resource_id
+    assert ref is not None
+    state.handle_event(_event(WindowEventKind.WINDOW_DESTROYED, hwnd=5), now=NOW)
+    with pytest.raises(AppWindowAuthorityError):
+        authority.authorize_ref(ResourceRef(kind="window", resource_id=ref), expected_kind="window")
+    # Expiry also invalidates.
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=6, process_creation_time="t1"), now=NOW
+    )
+    ref2 = state.current(now=NOW)[0].resource_id
+    later = NOW + timedelta(seconds=3600)
+    assert state.current(now=later) == []
+    with pytest.raises(AppWindowAuthorityError):
+        authority.authorize_ref(
+            ResourceRef(kind="window", resource_id=ref2), expected_kind="window", now=later
+        )
+
+
+def test_same_hwnd_recreation_invalidates_previous_ref() -> None:
+    from aether.core.contracts.resource import ResourceRef
+    from aether.core.resources.app_window_authority import AppWindowAuthorityError
+
+    state, authority = _authority_world()
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=9, process_creation_time="t1"), now=NOW
+    )
+    first = state.current(now=NOW)[0]
+    state.handle_event(
+        _event(WindowEventKind.WINDOW_CREATED, hwnd=9, process_creation_time="t2"), now=NOW
+    )
+    second = state.current(now=NOW)[0]
+    assert first.resource_id != second.resource_id
+    binding = authority.resolve_window(second.resource_id or "")
+    assert binding.instance_generation > 1  # actual instance generation advances
+    with pytest.raises(AppWindowAuthorityError):
+        authority.authorize_ref(
+            ResourceRef(kind="window", resource_id=first.resource_id or ""), expected_kind="window"
+        )
+
+
+def test_paused_observation_cannot_reconcile() -> None:
+    source = FakeWindowEventSource()
+    calls = []
+    original = source.reconcile
+
+    def _counting():  # type: ignore[no-untyped-def]
+        calls.append(1)
+        return original()
+
+    source.reconcile = _counting  # type: ignore[method-assign]
+    service = ObserverService(source=source, on_event=lambda event: None, reconcile_interval=0.01)
+    service.start()
+    service.pause_collection()
+    try:
+        assert service.collection_paused
+        assert service.reconcile() is False  # direct call also refused
+    finally:
+        service.stop()
+    assert calls == []
+
+
+def test_native_source_shutdown_failure_is_not_success() -> None:
+    class FailingStopSource(FakeWindowEventSource):
+        def stop(self) -> bool:
+            return False
+
+    service = ObserverService(source=FailingStopSource(), on_event=lambda event: None)
+    service.start()
+    assert service.stop() is False
+    assert service.health() == "degraded"

@@ -2,18 +2,29 @@
 
 An explicit trusted confirmation for a T1 launch, bound to task,
 step, plan revision/hash, capability, exact normalized arguments,
-canonical app resource, expected app version, integrity evidence,
-session and activation scope. Single-use with expiry. It is *not* a
-filesystem edit grant and cannot satisfy mutation evidence gates. A
-renderer-supplied boolean is never this object: confirmations are
-minted only by the trusted confirmer held on the trusted side of the
-channel (production wiring is a later, separately reviewed step).
+canonical app resource, expected app version, trusted integrity
+evidence, session and activation scope. Single-use with expiry. It
+is *not* a filesystem edit grant and cannot satisfy mutation evidence
+gates. A renderer-supplied boolean is never a confirmation:
+confirmations are minted only by the trusted confirmer held on the
+trusted side of the channel (production wiring is a later, separately
+reviewed step).
+
+Issued confirmations are immutable snapshots: callers receive a
+frozen object and cannot modify consumption, expiry or revocation
+state. The confirmer's authoritative mutable state is private and
+consumption is serialized under a lock, so concurrent double
+consumption succeeds exactly once. The durable record of this
+confirmation (with its actual issuance/expiry and binding digest) is
+persisted by the task store; durable consumption there is guarded
+atomically as well.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
@@ -53,9 +64,25 @@ def confirmation_binding_digest(request: NavigationConfirmationRequest) -> str:
     ).hexdigest()
 
 
-@dataclass(slots=True)
+def arguments_digest(arguments: dict[str, object]) -> str:
+    """Canonical digest of authoritative normalized arguments."""
+    return hashlib.sha256(
+        json.dumps(arguments, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class NavigationConfirmation:
+    """Immutable snapshot handed to callers; state lives in the confirmer."""
+
     confirmation_id: str
+    binding_digest: str
+    issued_at: datetime
+    expires_at: datetime
+
+
+@dataclass(slots=True)
+class _ConfirmationState:
     binding_digest: str
     issued_at: datetime
     expires_at: datetime
@@ -74,36 +101,52 @@ class TrustedNavigationConfirmer:
 
     def __init__(self, *, lifetime: timedelta = timedelta(minutes=5)) -> None:
         self._lifetime = lifetime
-        self._confirmations: dict[str, NavigationConfirmation] = {}
+        self._lock = threading.Lock()
+        self._confirmations: dict[str, _ConfirmationState] = {}
 
-    def issue(self, request: NavigationConfirmationRequest, *, now: datetime) -> NavigationConfirmation:
+    def issue(
+        self, request: NavigationConfirmationRequest, *, now: datetime
+    ) -> NavigationConfirmation:
         confirmation = NavigationConfirmation(
             confirmation_id=str(uuid4()),
             binding_digest=confirmation_binding_digest(request),
             issued_at=now,
             expires_at=now + self._lifetime,
         )
-        self._confirmations[confirmation.confirmation_id] = confirmation
+        with self._lock:
+            self._confirmations[confirmation.confirmation_id] = _ConfirmationState(
+                binding_digest=confirmation.binding_digest,
+                issued_at=confirmation.issued_at,
+                expires_at=confirmation.expires_at,
+            )
         return confirmation
 
     def consume(
         self, confirmation_id: str, request: NavigationConfirmationRequest, *, now: datetime
     ) -> NavigationConfirmation:
-        confirmation = self._confirmations.get(confirmation_id)
-        if confirmation is None:
-            raise ConfirmationError("confirmation_unknown")
-        if confirmation.revoked:
-            raise ConfirmationError("confirmation_revoked")
-        if confirmation.consumed:
-            raise ConfirmationError("confirmation_replayed")
-        if now >= confirmation.expires_at or now < confirmation.issued_at:
-            raise ConfirmationError("confirmation_expired")
-        if confirmation.binding_digest != confirmation_binding_digest(request):
-            raise ConfirmationError("confirmation_binding_mismatch")
-        confirmation.consumed = True
-        return confirmation
+        """Atomically consume; concurrent double consumption fails once."""
+        with self._lock:
+            state = self._confirmations.get(confirmation_id)
+            if state is None:
+                raise ConfirmationError("confirmation_unknown")
+            if state.revoked:
+                raise ConfirmationError("confirmation_revoked")
+            if state.consumed:
+                raise ConfirmationError("confirmation_replayed")
+            if now >= state.expires_at or now < state.issued_at:
+                raise ConfirmationError("confirmation_expired")
+            if state.binding_digest != confirmation_binding_digest(request):
+                raise ConfirmationError("confirmation_binding_mismatch")
+            state.consumed = True
+            return NavigationConfirmation(
+                confirmation_id=confirmation_id,
+                binding_digest=state.binding_digest,
+                issued_at=state.issued_at,
+                expires_at=state.expires_at,
+            )
 
     def revoke(self, confirmation_id: str) -> None:
-        confirmation = self._confirmations.get(confirmation_id)
-        if confirmation is not None:
-            confirmation.revoked = True
+        with self._lock:
+            state = self._confirmations.get(confirmation_id)
+            if state is not None:
+                state.revoked = True

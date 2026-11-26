@@ -115,10 +115,14 @@ class Planner:
         resources: ResourceRegistry,
         clock: Callable[[], datetime] | None = None,
         app_authority: object | None = None,
+        app_registry: object | None = None,
+        integrity_verifier: object | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._resources = resources
         self._app_authority = app_authority
+        self._app_registry = app_registry
+        self._integrity_verifier = integrity_verifier
         self._clock = clock or (lambda: datetime.now(UTC))
 
     def plan(self, task_id: UUID, intent: PlanIntent, *, revision: int = 1) -> PlannedRevision:
@@ -255,7 +259,21 @@ class Planner:
         definition: object,
         revision: int,
     ) -> PlannedRevision:
-        """Build a launch plan against the app resource authority only."""
+        """Build a launch plan against the app resource authority only.
+
+        The step's expected application version is the *actual*
+        version token derived from trusted integrity evidence for the
+        registered application at plan time — never a placeholder and
+        never location alone. Confirmation/authorization references
+        are execution credentials issued after the plan; they are not
+        plan arguments and cannot create a circular plan-hash
+        dependency.
+        """
+        from aether.core.apps.launch_authority import (
+            LaunchAuthorityError,
+            app_version_token,
+            evidence_satisfies_method,
+        )
         from aether.core.contracts.resource import ResourceRef
         from aether.core.policy.capabilities import CapabilityDefinition
 
@@ -265,45 +283,86 @@ class Planner:
                 "PLAN_APP_AUTHORITY_UNAVAILABLE",
                 "launch planning requires the app/window resource authority",
             )
+        if self._app_registry is None or self._integrity_verifier is None:
+            raise PlannerError(
+                "PLAN_INTEGRITY_UNAVAILABLE",
+                "launch planning requires trusted application integrity evidence",
+            )
         try:
             arguments = self._capabilities.validate(capability_id, intent.arguments)
         except CapabilityRegistryError as exc:
             raise PlannerError(
                 "PLAN_ARGUMENTS_INVALID", "launch arguments are not valid for the capability"
             ) from exc
-        ref = ResourceRef(kind="app", resource_id=intent.resource_id)
+        arguments_dump = arguments.model_dump(mode="json")
+        app_id = str(arguments_dump["resource_id"])
+        postcondition = str(arguments_dump.get("postcondition", "window_required"))
+        ref = ResourceRef(kind="app", resource_id=app_id)
         try:
             self._app_authority.authorize_ref(ref, expected_kind="app")  # type: ignore[attr-defined]
+            record = self._app_registry.get(app_id)  # type: ignore[attr-defined]
+            evidence = self._integrity_verifier.verify(record)  # type: ignore[attr-defined]
         except Exception as exc:
             raise PlannerError(
                 "PLAN_RESOURCE_UNKNOWN", "the app resource was never issued by the authority"
             ) from exc
+        if evidence is None or evidence.location_digest != record.location_digest:
+            raise PlannerError(
+                "PLAN_INTEGRITY_UNAVAILABLE",
+                "no trusted integrity evidence exists for the registered application",
+            )
+        if not evidence_satisfies_method(evidence, record.launch_method):
+            raise PlannerError(
+                "PLAN_INTEGRITY_UNAVAILABLE",
+                "integrity evidence is insufficient for the approved launch method",
+            )
+        version_token = app_version_token(evidence)
         now = self._clock()
-        step_id = uuid5(_PLAN_NAMESPACE, f"{task_id}:{revision}:{capability_id}:{intent.resource_id}")
+        step_id = uuid5(_PLAN_NAMESPACE, f"{task_id}:{revision}:{capability_id}:{app_id}")
         resource = TaskPlanResource(
-            resource_id=intent.resource_id,
-            expected_version="app-registration-v1",
-            display_name=intent.resource_id,
+            resource_id=app_id,
+            expected_version=version_token,
+            display_name=record.display_name[:256],
         )
-        arguments_dump = arguments.model_dump(mode="json")
-        expected_effect = {"kind": "launch_application", "resource_id": intent.resource_id}
+        expected_effect = {
+            "kind": "launch_application",
+            "resource_id": app_id,
+            "postcondition": postcondition,
+        }
         step = PlanStep(
             step_id=step_id,
             capability_id=capability_id,
             arguments=arguments_dump,
             resources=(resource,),
-            resource_locks=(f"app:{intent.resource_id}",),
-            expected_state={"resource_id": intent.resource_id},
+            resource_locks=(f"app:{app_id}",),
+            expected_state={
+                "resource_id": app_id,
+                "expected_version": version_token,
+                "postcondition": postcondition,
+            },
             expected_effect=expected_effect,
             risk_tier=definition.risk_tier,
             timeout_seconds=30,
             idempotency_key=uuid5(_PLAN_NAMESPACE, f"{task_id}:{revision}:{step_id}:idempotency"),
-            postconditions=({"verify": "intended_process_or_window_observed", "check": "postcondition_distinct_outcome"},),
+            postconditions=(
+                {
+                    "verify": "intended_process_or_window_observed",
+                    "check": "postcondition_distinct_outcome",
+                    "postcondition": postcondition,
+                },
+            ),
             recovery_class="IRREVERSIBLE",
         )
-        plan = TaskPlan(task_id=task_id, revision=revision, summary=intent.summary[:512], steps=(step,), created_at=now)
+        plan = TaskPlan(
+            task_id=task_id,
+            revision=revision,
+            summary=intent.summary[:512],
+            steps=(step,),
+            created_at=now,
+        )
         plan_hash = hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
-        narrative = _narrative_for(intent, intent.resource_id, expected_effect, approved_edit=None)
+        narrative = _narrative_for(intent, record.display_name, expected_effect, approved_edit=None)
+        _ = LaunchAuthorityError  # imported for symmetry; errors mapped above
         return PlannedRevision(plan=plan, plan_hash=plan_hash, narrative=narrative, step_id=step_id)
 
     def revision_for_change(
@@ -426,7 +485,10 @@ def _postcondition(goal: PlanGoal) -> dict[str, Any]:
         case PlanGoal.OPEN_FOLDER:
             return {"verify": "shell_accepted_request", "check": "process_attribution_unavailable"}
         case PlanGoal.LAUNCH_APPLICATION:
-            return {"verify": "intended_process_or_window_observed", "check": "postcondition_distinct_outcome"}
+            return {
+                "verify": "intended_process_or_window_observed",
+                "check": "postcondition_distinct_outcome",
+            }
         case _:
             return {"verify": "result_reported", "check": "no_error"}
 
@@ -504,8 +566,12 @@ def _narrative_for(
             "revalidation. It may start a process; it changes no file bytes."
         )
         external = ("A new application process may start; no file mutation is requested.",)
-        risks = ("A launched application is an external process whose later behaviour is outside this plan.",)
-        verification = ("Success requires the intended new process or window to be observed; an accepted request alone is not success.",)
+        risks = (
+            "A launched application is an external process whose later behaviour is outside this plan.",
+        )
+        verification = (
+            "Success requires the intended new process or window to be observed; an accepted request alone is not success.",
+        )
         preconditions = (f"{display_name} is an approved registry-issued application in scope.",)
         proposed = f"launch_application result for {display_name}"
         diffs = ()

@@ -97,7 +97,9 @@ def native_observer_available() -> tuple[bool, str]:
 class NativeWindowsEventSource:
     """WinEvent source whose dedicated thread owns all native state."""
 
-    def __init__(self, *, api: Win32ObserverApi, activation: ActivationContext | None = None) -> None:
+    def __init__(
+        self, *, api: Win32ObserverApi, activation: ActivationContext | None = None
+    ) -> None:
         self._api = api
         self._activation = activation
         self._thread: threading.Thread | None = None
@@ -191,7 +193,9 @@ class NativeWindowsEventSource:
             foreground = self._api.get_foreground_window()
         events: list[WindowEvent] = []
         for hwnd, pid in windows:
-            event_type = EVENT_SYSTEM_FOREGROUND if hwnd == foreground and hwnd else EVENT_OBJECT_SHOW
+            event_type = (
+                EVENT_SYSTEM_FOREGROUND if hwnd == foreground and hwnd else EVENT_OBJECT_SHOW
+            )
             events.append(self._normalize(event_type, hwnd, pid))
         return events
 
@@ -262,8 +266,13 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
         user32 = self._user32
         user32.SetWinEventHook.restype = ctypes.c_void_p
         user32.SetWinEventHook.argtypes = [
-            ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.c_uint, ctypes.c_uint, ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_uint,
+            ctypes.c_uint,
         ]
         user32.UnhookWinEvent.restype = ctypes.c_bool
         user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
@@ -284,7 +293,13 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
         c_callback = self._callback_type(_hook)
         self._callbacks.append(c_callback)
         handle = self._user32.SetWinEventHook(
-            event_type, event_type, None, c_callback, 0, 0, 0  # WINEVENT_OUTOFCONTEXT
+            event_type,
+            event_type,
+            None,
+            c_callback,
+            0,
+            0,
+            0,  # WINEVENT_OUTOFCONTEXT
         )
         return int(handle or 0)
 
@@ -327,8 +342,11 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
             kernel = ctypes.c_ulonglong(0)
             user = ctypes.c_ulonglong(0)
             ok = self._kernel32.GetProcessTimes(
-                handle, ctypes.byref(creation), ctypes.byref(exit_time),
-                ctypes.byref(kernel), ctypes.byref(user),
+                handle,
+                ctypes.byref(creation),
+                ctypes.byref(exit_time),
+                ctypes.byref(kernel),
+                ctypes.byref(user),
             )
             if not ok:
                 return None
@@ -369,13 +387,19 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
             return None  # unknown, never "confirmed non-elevated"
         try:
             token = ctypes.c_void_p(0)
-            if not self._ctypes.windll.advapi32.OpenProcessToken(handle, 0x0008, ctypes.byref(token)):
+            if not self._ctypes.windll.advapi32.OpenProcessToken(
+                handle, 0x0008, ctypes.byref(token)
+            ):
                 return None
             try:
                 elevation = ctypes.c_uint(0)
                 returned = ctypes.c_uint(0)
                 ok = self._ctypes.windll.advapi32.GetTokenInformation(
-                    token, 20, ctypes.byref(elevation), ctypes.sizeof(elevation), ctypes.byref(returned)
+                    token,
+                    20,
+                    ctypes.byref(elevation),
+                    ctypes.sizeof(elevation),
+                    ctypes.byref(returned),
                 )
                 if not ok:
                     return None

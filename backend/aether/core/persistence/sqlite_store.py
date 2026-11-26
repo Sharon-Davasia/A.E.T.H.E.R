@@ -21,7 +21,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path, PureWindowsPath
-from typing import BinaryIO
+from typing import BinaryIO, cast
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -256,6 +256,45 @@ _EXECUTION_TRANSITIONS: dict[PersistentTaskState, dict[PersistentTaskState, str]
     },
 }
 
+
+# Narrow navigation (T1) execution transitions (CP3-B03). Reachable only
+# through ``advance_navigation_state``, which re-reads the durable
+# schema-v3 navigation evidence named by each edge's minimum class:
+# ``"confirmation"`` (recorded confirmation bound to the current plan),
+# ``"attempt"`` (confirmation consumed + durable attempt recorded),
+# ``"verification"`` (independently loaded verification), and
+# ``"receipt"`` (durable receipt; SUCCEEDED required for COMPLETED).
+_NAVIGATION_TRANSITIONS: dict[PersistentTaskState, dict[PersistentTaskState, str]] = {
+    PersistentTaskState.AWAITING_APPROVAL: {
+        PersistentTaskState.PRECHECK: "confirmation",
+    },
+    PersistentTaskState.PRECHECK: {
+        PersistentTaskState.EXECUTING: "attempt",
+        PersistentTaskState.CANCELLED: "confirmation",
+        PersistentTaskState.FAILED: "confirmation",
+        PersistentTaskState.RECOVERING: "confirmation",
+    },
+    PersistentTaskState.EXECUTING: {
+        PersistentTaskState.POSTCHECK: "attempt",
+        PersistentTaskState.RECOVERING: "attempt",
+        PersistentTaskState.UNVERIFIED: "attempt",
+    },
+    PersistentTaskState.POSTCHECK: {
+        PersistentTaskState.COMPLETED: "receipt",
+        PersistentTaskState.UNVERIFIED: "verification",
+        PersistentTaskState.FAILED: "verification",
+        PersistentTaskState.RECOVERING: "attempt",
+    },
+    PersistentTaskState.RECOVERING: {
+        PersistentTaskState.COMPLETED: "receipt",
+        # UNVERIFIED from recovery is the truthful outcome both when a
+        # verification exists and when the attempt was interrupted
+        # before verification; the recorded attempt is the minimum.
+        PersistentTaskState.UNVERIFIED: "attempt",
+        PersistentTaskState.FAILED: "confirmation",
+    },
+}
+
 _PHASE1_TO_PERSISTENT: dict[TaskState, PersistentTaskState] = {
     TaskState.CREATED: PersistentTaskState.RECEIVED,
     TaskState.PLANNING: PersistentTaskState.PLANNING,
@@ -302,12 +341,15 @@ _EXPECTED_MIGRATIONS: dict[int, tuple[str, str]] = {
     ),
     # Phase 3 navigation evidence: PREPARED ONLY. Activation requires a
     # separate owner decision; see docs/engineering/PHASE3_R1_DESIGN.md.
-    3: ("0003_phase3_navigation.sql", "b67b07c256119d46d8b5b6441f344959ac7f16f1560ab0abb06e541cac1a694c"),
+    3: (
+        "0003_phase3_navigation.sql",
+        "f797cae2115326a5e9dfe23be6a554ae139b76d44fbc3ccbdd106742d775d478",
+    ),
 }
 _EXPECTED_SCHEMA_SHA256: dict[int, str] = {
     # v3 fingerprint computed from a synthetic isolated database after
     # applying 0001-0003; v3 remains PENDING (never the active target).
-    3: "17d654a0377855fe60c72d33f61e0ef181d8b7da3ae6ccedef8e58d21682d6ff",
+    3: "e7f51c1b6b2012f94d42d02bb8a6897ae398f6f93d6b5b2d034b5130f724cce0",
     1: "02f3cac7e905dfb4d1f161621c789bd5c437530002dec36202e9b2dfaa5d2e30",
     2: "dec68c2c1ecdd6d7222b5dcff54b877c9895e5cee6329930148c5db97355b788",
 }
@@ -401,6 +443,8 @@ _CRITICAL_TABLES_V3 = _CRITICAL_TABLES_V2 | {
 }
 _CRITICAL_TRIGGER_NAMES_V3 = _CRITICAL_TRIGGER_NAMES_V2 | {
     "navigation_confirmations_no_delete",
+    "navigation_confirmations_binding_no_update",
+    "navigation_receipts_success_requires_verification",
     "navigation_attempts_no_update",
     "navigation_attempts_no_delete",
     "navigation_verifications_no_update",
@@ -723,6 +767,472 @@ class SQLiteTaskStore:
                 error_code=None,
             )
         return self.get_task(task_id)
+
+    # -- Phase 3 navigation evidence integration (CP3-B03) -----------------
+    # One authoritative task-state machine: navigation (T1) execution
+    # states are entered only through ``advance_navigation_state``,
+    # which derives the evidence class from the *persisted* plan step's
+    # registered capability and re-reads the durable navigation
+    # evidence (schema v3, prepared-only) inside the transition
+    # transaction. T1 navigation evidence can never satisfy the T2
+    # grant/consumption/receipt edges in ``advance_execution_state``,
+    # and this path refuses tasks whose persisted capability is not a
+    # trusted navigation capability. On a pre-v3 database every method
+    # here fails closed.
+
+    @staticmethod
+    def _navigation_capability_ids() -> frozenset[str]:
+        from aether.core.contracts.policy import RiskTier
+        from aether.core.policy.capabilities import CapabilityRegistry
+
+        registry = CapabilityRegistry.phase3_with_launch()
+        return frozenset(
+            definition.capability_id
+            for definition in registry.definitions()
+            if definition.risk_tier == RiskTier.NAVIGATE
+        )
+
+    def _require_navigation_schema(self, connection: sqlite3.Connection) -> None:
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if version < 3:
+            raise IllegalPersistentTransition(
+                "navigation evidence requires the prepared schema v3 (not activated)"
+            )
+
+    def _persisted_step_capability(
+        self, connection: sqlite3.Connection, task_id: UUID, step_id: UUID, plan_revision: int
+    ) -> str:
+        row = connection.execute(
+            "SELECT capability_id FROM task_steps WHERE task_id = ? AND plan_revision = ? AND id = ?",
+            (str(task_id), plan_revision, str(step_id)),
+        ).fetchone()
+        if row is None:
+            raise IllegalPersistentTransition("navigation evidence names no persisted plan step")
+        return str(row["capability_id"])
+
+    def _check_navigation_binding(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        task_id: UUID,
+        step_id: UUID,
+        confirmation_id: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            "SELECT state, plan_revision, plan_hash FROM tasks WHERE id = ?", (str(task_id),)
+        ).fetchone()
+        if row is None:
+            raise KeyError("unknown task id")
+        confirmation = connection.execute(
+            "SELECT * FROM navigation_confirmations WHERE id = ?", (confirmation_id,)
+        ).fetchone()
+        if confirmation is None:
+            raise IllegalPersistentTransition("navigation confirmation is not recorded")
+        capability = self._persisted_step_capability(
+            connection, task_id, step_id, int(row["plan_revision"])
+        )
+        if capability not in self._navigation_capability_ids():
+            raise IllegalPersistentTransition(
+                "persisted capability is not a navigation capability; "
+                "navigation evidence cannot drive this task"
+            )
+        if (
+            confirmation["task_id"] != str(task_id)
+            or confirmation["step_id"] != str(step_id)
+            or int(confirmation["plan_revision"]) != int(row["plan_revision"])
+            or confirmation["plan_hash"] != row["plan_hash"]
+            or confirmation["capability_id"] != capability
+        ):
+            raise IllegalPersistentTransition(
+                "navigation confirmation does not bind the task's current plan and step"
+            )
+        return cast(sqlite3.Row, confirmation)
+
+    def record_navigation_confirmation(
+        self,
+        *,
+        confirmation_id: str,
+        task_id: UUID,
+        step_id: UUID,
+        capability_id: str,
+        arguments_sha256: str,
+        binding_sha256: str,
+        app_resource_id: str,
+        expected_app_version: str,
+        integrity_evidence_sha256: str,
+        session_id: str,
+        activation_scope: str,
+        issued_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        """Persist a trusted confirmation bound to the current plan.
+
+        Actual issuance/expiry from the trusted confirmer are stored;
+        nothing is manufactured at execution time.
+        """
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            row = connection.execute(
+                "SELECT plan_revision, plan_hash FROM tasks WHERE id = ?", (str(task_id),)
+            ).fetchone()
+            if row is None:
+                raise KeyError("unknown task id")
+            capability = self._persisted_step_capability(
+                connection, task_id, step_id, int(row["plan_revision"])
+            )
+            if capability != capability_id or capability not in self._navigation_capability_ids():
+                raise IllegalPersistentTransition(
+                    "confirmation capability does not match the persisted navigation step"
+                )
+            try:
+                connection.execute(
+                    "INSERT INTO navigation_confirmations(id, task_id, step_id, plan_revision,"
+                    " plan_hash, capability_id, arguments_sha256, binding_sha256, app_resource_id,"
+                    " expected_app_version, integrity_evidence_sha256, session_id,"
+                    " activation_scope, issued_at, expires_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        confirmation_id,
+                        str(task_id),
+                        str(step_id),
+                        int(row["plan_revision"]),
+                        row["plan_hash"],
+                        capability_id,
+                        arguments_sha256,
+                        binding_sha256,
+                        app_resource_id,
+                        expected_app_version,
+                        integrity_evidence_sha256,
+                        session_id,
+                        activation_scope,
+                        _timestamp(issued_at),
+                        _timestamp(expires_at),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise IllegalPersistentTransition(
+                    "navigation confirmation could not be recorded for this plan"
+                ) from exc
+
+    def revoke_navigation_confirmation(self, confirmation_id: str, *, now: datetime) -> None:
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            cursor = connection.execute(
+                "UPDATE navigation_confirmations SET revoked_at = ?"
+                " WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                (_timestamp(now), confirmation_id),
+            )
+            if cursor.rowcount != 1:
+                raise IllegalPersistentTransition("confirmation is not revocable")
+
+    def begin_navigation_attempt(
+        self, *, task_id: UUID, step_id: UUID, confirmation_id: str, now: datetime
+    ) -> str:
+        """Atomically consume the confirmation and record the attempt.
+
+        This durable commit happens *before* any external effect; if
+        it fails, no launch may occur. Consumption is a guarded
+        update: concurrent or replayed consumption matches no row.
+        """
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            confirmation = self._check_navigation_binding(
+                connection, task_id=task_id, step_id=step_id, confirmation_id=confirmation_id
+            )
+            if confirmation["revoked_at"] is not None:
+                raise IllegalPersistentTransition("navigation confirmation is revoked")
+            if confirmation["consumed_at"] is not None:
+                raise IllegalPersistentTransition("navigation confirmation was already consumed")
+            if str(confirmation["expires_at"]) <= timestamp:
+                raise IllegalPersistentTransition("navigation confirmation has expired")
+            cursor = connection.execute(
+                "UPDATE navigation_confirmations SET consumed_at = ?"
+                " WHERE id = ? AND consumed_at IS NULL AND revoked_at IS NULL",
+                (timestamp, confirmation_id),
+            )
+            if cursor.rowcount != 1:
+                raise IllegalPersistentTransition("navigation confirmation consumption raced")
+            attempt_id = str(uuid4())
+            connection.execute(
+                "INSERT INTO navigation_attempts(id, confirmation_id, task_id, step_id,"
+                " capability_id, app_resource_id, attempt_number, recorded_at)"
+                " VALUES (?,?,?,?,?,?,1,?)",
+                (
+                    attempt_id,
+                    confirmation_id,
+                    str(task_id),
+                    str(step_id),
+                    confirmation["capability_id"],
+                    confirmation["app_resource_id"],
+                    timestamp,
+                ),
+            )
+        return attempt_id
+
+    def record_navigation_verification(
+        self,
+        *,
+        attempt_id: str,
+        outcome: str,
+        process_token: str | None,
+        window_token: str | None,
+        now: datetime,
+    ) -> str:
+        from aether.core.apps.navigation_outcomes import VERIFIED_OUTCOMES, NavigationOutcome
+
+        parsed = NavigationOutcome(outcome)
+        if parsed in VERIFIED_OUTCOMES and process_token is None:
+            raise IllegalPersistentTransition(
+                "a verified outcome requires observed process identity"
+            )
+        if (
+            parsed
+            in (
+                NavigationOutcome.VERIFIED_NEW_INSTANCE,
+                NavigationOutcome.VERIFIED_EXISTING_INSTANCE,
+            )
+            and window_token is None
+        ):
+            raise IllegalPersistentTransition(
+                "this verified outcome requires observed window identity"
+            )
+        verification_id = str(uuid4())
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            if (
+                connection.execute(
+                    "SELECT 1 FROM navigation_attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                is None
+            ):
+                raise IllegalPersistentTransition("verification names no recorded attempt")
+            try:
+                connection.execute(
+                    "INSERT INTO navigation_verifications(id, attempt_id, outcome,"
+                    " process_instance_token, window_version_token, verified_at)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (
+                        verification_id,
+                        attempt_id,
+                        parsed.value,
+                        process_token,
+                        window_token,
+                        _timestamp(now),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise IllegalPersistentTransition("navigation verification was rejected") from exc
+        return verification_id
+
+    def record_navigation_receipt(
+        self, *, attempt_id: str, verification_id: str, now: datetime
+    ) -> str:
+        """Record the receipt whose status derives from the verification."""
+        from aether.core.apps.navigation_outcomes import NavigationOutcome, receipt_status_for
+
+        receipt_id = str(uuid4())
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            row = connection.execute(
+                "SELECT attempt_id, outcome FROM navigation_verifications WHERE id = ?",
+                (verification_id,),
+            ).fetchone()
+            if row is None or row["attempt_id"] != attempt_id:
+                raise IllegalPersistentTransition("receipt does not match its verification")
+            status = receipt_status_for(NavigationOutcome(row["outcome"]))
+            try:
+                connection.execute(
+                    "INSERT INTO navigation_receipts(id, attempt_id, verification_id, status,"
+                    " recovery_class, created_at) VALUES (?,?,?,?,?,?)",
+                    (
+                        receipt_id,
+                        attempt_id,
+                        verification_id,
+                        status,
+                        "IRREVERSIBLE",
+                        _timestamp(now),
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise IllegalPersistentTransition("navigation receipt was rejected") from exc
+        return receipt_id
+
+    def advance_navigation_state(
+        self,
+        task_id: UUID,
+        to_state: PersistentTaskState,
+        *,
+        step_id: UUID,
+        confirmation_id: str,
+        attempt_id: str | None = None,
+        now: datetime | None = None,
+    ) -> StoredTask:
+        """Advance a navigation task on durable navigation evidence only.
+
+        The evidence class is derived from the persisted plan step's
+        capability; there is no caller-controlled override. A task
+        whose persisted capability is a T2 mutation capability can
+        never be advanced here.
+        """
+        timestamp = _timestamp(now)
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            confirmation = self._check_navigation_binding(
+                connection, task_id=task_id, step_id=step_id, confirmation_id=confirmation_id
+            )
+            row = connection.execute(
+                "SELECT state FROM tasks WHERE id = ?", (str(task_id),)
+            ).fetchone()
+            current = PersistentTaskState(row["state"])
+            required = _NAVIGATION_TRANSITIONS.get(current, {}).get(to_state)
+            if required is None:
+                raise IllegalPersistentTransition(
+                    f"illegal navigation transition: {current} -> {to_state}"
+                )
+            attempt_row = None
+            if attempt_id is not None:
+                attempt_row = connection.execute(
+                    "SELECT * FROM navigation_attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+            if required in ("attempt", "verification", "receipt"):
+                if attempt_row is None or attempt_row["confirmation_id"] != confirmation_id:
+                    raise IllegalPersistentTransition(
+                        "navigation transition requires the recorded attempt for this confirmation"
+                    )
+                if confirmation["consumed_at"] is None:
+                    raise IllegalPersistentTransition(
+                        "navigation attempt exists without confirmation consumption"
+                    )
+            verification_row = None
+            if required in ("verification", "receipt"):
+                verification_row = connection.execute(
+                    "SELECT * FROM navigation_verifications WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if verification_row is None:
+                    raise IllegalPersistentTransition(
+                        "navigation transition requires recorded verification evidence"
+                    )
+            if required == "receipt":
+                receipt_row = connection.execute(
+                    "SELECT * FROM navigation_receipts WHERE attempt_id = ?", (attempt_id,)
+                ).fetchone()
+                if receipt_row is None:
+                    raise IllegalPersistentTransition(
+                        "navigation completion requires the durable receipt"
+                    )
+                if (
+                    to_state is PersistentTaskState.COMPLETED
+                    and receipt_row["status"] != "SUCCEEDED"
+                ):
+                    raise IllegalPersistentTransition(
+                        "only a SUCCEEDED navigation receipt can complete a task"
+                    )
+            values: dict[str, str | int | float | bool | None] = {
+                "confirmation_id": confirmation_id,
+                "authority": "BACKEND_NAVIGATION_EVIDENCE",
+            }
+            if attempt_id is not None:
+                values["attempt_id"] = attempt_id
+            self._commit_transition_unlocked(
+                connection,
+                task_id,
+                current,
+                to_state,
+                event_type=f"TASK_{to_state.value}",
+                metadata_values=values,
+                now=timestamp,
+                error_code=None,
+            )
+        return self.get_task(task_id)
+
+    def reconcile_navigation_tasks(self, *, now: datetime | None = None) -> list[tuple[UUID, str]]:
+        """Durably reconcile interrupted navigation attempts; never replay.
+
+        Crash after attempt (no verification) -> UNVERIFIED. Crash
+        after verification (no receipt) -> the receipt is derived from
+        the recorded verification, then COMPLETED only when the
+        verification is affirmative, else UNVERIFIED. Crash after
+        receipt -> COMPLETED/UNVERIFIED per the receipt. No launch is
+        ever re-attempted here.
+        """
+        timestamp = _timestamp(now)
+        outcomes: list[tuple[UUID, str]] = []
+        with self._transaction() as connection:
+            self._require_navigation_schema(connection)
+            rows = connection.execute(
+                "SELECT t.id AS task_id, t.state AS state, a.id AS attempt_id,"
+                " a.step_id AS step_id, a.confirmation_id AS confirmation_id,"
+                " v.id AS verification_id, v.outcome AS outcome,"
+                " r.id AS receipt_id, r.status AS receipt_status"
+                " FROM tasks t"
+                " JOIN navigation_attempts a ON a.task_id = t.id"
+                " LEFT JOIN navigation_verifications v ON v.attempt_id = a.id"
+                " LEFT JOIN navigation_receipts r ON r.attempt_id = a.id"
+                " WHERE t.state IN ('EXECUTING', 'POSTCHECK', 'RECOVERING')"
+            ).fetchall()
+        for row in rows:
+            task_id = UUID(row["task_id"])
+            step_id = UUID(row["step_id"])
+            try:
+                if row["verification_id"] is not None and row["receipt_id"] is None:
+                    self.record_navigation_receipt(
+                        attempt_id=row["attempt_id"],
+                        verification_id=row["verification_id"],
+                        now=now or datetime.now(UTC),
+                    )
+                if row["verification_id"] is None:
+                    target = PersistentTaskState.UNVERIFIED
+                else:
+                    from aether.core.apps.navigation_outcomes import (
+                        VERIFIED_OUTCOMES,
+                        NavigationOutcome,
+                    )
+
+                    target = (
+                        PersistentTaskState.COMPLETED
+                        if NavigationOutcome(row["outcome"]) in VERIFIED_OUTCOMES
+                        else PersistentTaskState.UNVERIFIED
+                    )
+                # Drive through RECOVERING when the task was mid-flight.
+                state = PersistentTaskState(row["state"])
+                if state is not PersistentTaskState.RECOVERING:
+                    self.advance_navigation_state(
+                        task_id,
+                        PersistentTaskState.RECOVERING,
+                        step_id=step_id,
+                        confirmation_id=row["confirmation_id"],
+                        attempt_id=row["attempt_id"],
+                        now=now,
+                    )
+                self.advance_navigation_state(
+                    task_id,
+                    target,
+                    step_id=step_id,
+                    confirmation_id=row["confirmation_id"],
+                    attempt_id=row["attempt_id"],
+                    now=now,
+                )
+                outcomes.append((task_id, target.value))
+            except IllegalPersistentTransition:
+                continue
+        _ = timestamp
+        return outcomes
+
+    def navigation_attempts_for_task(self, task_id: UUID) -> list[dict[str, object]]:
+        """Read durable navigation evidence for one task (audit/tests)."""
+        with self._lock:
+            self._verify_database_location()
+            rows = self._connection.execute(
+                "SELECT a.id AS attempt_id, a.confirmation_id AS confirmation_id,"
+                " v.outcome AS outcome, r.status AS receipt_status"
+                " FROM navigation_attempts a"
+                " LEFT JOIN navigation_verifications v ON v.attempt_id = a.id"
+                " LEFT JOIN navigation_receipts r ON r.attempt_id = a.id"
+                " WHERE a.task_id = ?",
+                (str(task_id),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def _verify_receipt_evidence(
         self,
