@@ -7,9 +7,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
+from test_phase3_cp5_interaction import NOW, _World
 
 from aether.core.apps.activation import WindowActivationService
 from aether.core.apps.confirmation import TrustedNavigationConfirmer
@@ -20,9 +20,6 @@ from aether.core.persistence.sqlite_store import IllegalPersistentTransition
 from aether.core.planning.planner import PlanGoal, PlanIntent, Planner
 from aether.core.policy.broker import PolicyBroker
 from aether.core.resources.registry import ResourceRegistry
-
-from test_phase3_cp5_interaction import NOW, _World
-
 
 # -- F09: authoritative binding comparison ---------------------------------------
 

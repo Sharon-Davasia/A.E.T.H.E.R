@@ -51,7 +51,12 @@ ID_MODAL = 105
 ID_REPLACE = 106
 ID_RESET = 107
 
-_state = {"count": 0, "delayed": "--delayed" in sys.argv, "hwnd": None, "increment": None}
+_state = {
+    "count": 0,
+    "delayed": "--delayed" in sys.argv,
+    "hwnd": None,
+    "increment": None,
+}
 
 
 def _text(hwnd: int, text: str) -> None:
@@ -98,7 +103,9 @@ def _wndproc(hwnd, msg, wparam, lparam):  # type: ignore[no-untyped-def]
             _refresh()
             return 0
         if control == ID_MODAL:
-            user32.MessageBoxW(hwnd, "AETHER fixture modal dialog", "AETHER Fixture", 0x40)
+            user32.MessageBoxW(
+                hwnd, "AETHER fixture modal dialog", "AETHER Fixture", 0x40
+            )
             return 0
         if control == ID_REPLACE:
             # Controlled element replacement: the old control (and its
@@ -220,8 +227,19 @@ def main() -> int:
         enabled=False,
     )
     control("EDIT", "", ES_PASSWORD | WS_TABSTOP | 0x0080, 20, 95, 200, 25, ID_PASSWORD)
-    control("BUTTON", "Open dialog", BS_PUSHBUTTON | WS_TABSTOP, 20, 135, 120, 30, ID_MODAL)
-    control("BUTTON", "Replace control", BS_PUSHBUTTON | WS_TABSTOP, 160, 135, 140, 30, ID_REPLACE)
+    control(
+        "BUTTON", "Open dialog", BS_PUSHBUTTON | WS_TABSTOP, 20, 135, 120, 30, ID_MODAL
+    )
+    control(
+        "BUTTON",
+        "Replace control",
+        BS_PUSHBUTTON | WS_TABSTOP,
+        160,
+        135,
+        140,
+        30,
+        ID_REPLACE,
+    )
     control("BUTTON", "Reset", BS_PUSHBUTTON | WS_TABSTOP, 20, 180, 120, 30, ID_RESET)
 
     user32.ShowWindow(hwnd, SW_SHOWNORMAL)

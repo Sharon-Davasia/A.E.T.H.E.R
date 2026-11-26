@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import sys
 
-import pytest
-
 from aether.core.contracts.uia import MAX_RESPONSE_BYTES
 from aether.core.workers.subprocess_supervisor import (
     SubprocessWorkerSupervisor,

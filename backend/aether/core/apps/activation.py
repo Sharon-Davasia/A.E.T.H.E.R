@@ -23,13 +23,15 @@ from aether.core.apps.confirmation import (
     TrustedNavigationConfirmer,
     confirmation_binding_digest,
 )
+from aether.core.apps.enablement import Phase3Enablement
 from aether.core.apps.focus import FocusCoordinator
 from aether.core.apps.navigation_outcomes import NavigationOutcome
 from aether.core.contracts.resource import ResourceRef
 from aether.core.contracts.tool import ToolRequest
 from aether.core.persistence.models import PersistentTaskState
 from aether.core.persistence.sqlite_store import SQLiteTaskStore
-from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+from aether.core.policy.broker import PolicyBroker
+from aether.core.resources.app_window_authority import AppWindowResourceAuthority, WindowBinding
 
 
 class ActivationDenied(Exception):
@@ -50,8 +52,8 @@ class WindowActivationService:
     store: SQLiteTaskStore
     authority: AppWindowResourceAuthority
     confirmer: TrustedNavigationConfirmer
-    broker: object  # PolicyBroker
-    enablement: object  # Phase3Enablement
+    broker: PolicyBroker
+    enablement: Phase3Enablement
     focus: FocusCoordinator
     activate: Callable[[int], bool]  # platform seam (native route disabled)
     foreground_hwnd: Callable[[], int | None]
@@ -226,8 +228,14 @@ class WindowActivationService:
                 self.focus.release(handle)
 
     def _finish(
-        self, task_id, step_id, confirmation_id, attempt_id, outcome, binding
-    ) -> ActivationOutcome:  # type: ignore[no-untyped-def]
+        self,
+        task_id: UUID,
+        step_id: UUID,
+        confirmation_id: str,
+        attempt_id: str,
+        outcome: NavigationOutcome,
+        binding: WindowBinding | None,
+    ) -> ActivationOutcome:
         if self.store.get_task(task_id).state is PersistentTaskState.EXECUTING:
             self.store.advance_navigation_state(
                 task_id,

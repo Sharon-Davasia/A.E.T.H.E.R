@@ -14,6 +14,7 @@ import type {
 } from '../shared/live';
 import type { ExactPreview } from '../shared/review';
 import type { WorkflowState } from './workflow';
+import type { Phase3Outcome, Phase3Snapshot, Phase3State, Phase3AppResult } from '../shared/phase3';
 
 const desktopApi = Object.freeze({
   getBackendStatus: (): Promise<{ state: string; message: string }> => ipcRenderer.invoke('desktop:backend-status'),
@@ -42,6 +43,19 @@ const desktopApi = Object.freeze({
   openProjectFolder: (): Promise<WorkflowStep<OpenOutcome>> =>
     ipcRenderer.invoke('desktop:workflow-open-folder'),
   getWorkflowState: (): Promise<WorkflowState> => ipcRenderer.invoke('desktop:workflow-state'),
+  // CP7 Phase 3 verification surface: bounded summaries only. The
+  // approval request carries only a task identity; the trusted flow
+  // (preview -> native confirmation -> main-signed gesture) is owned
+  // entirely by the main process.
+  phase3GetState: (): Promise<Phase3State> => ipcRenderer.invoke('desktop:phase3-state'),
+  phase3SetPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }): Promise<Phase3State> =>
+    ipcRenderer.invoke('desktop:phase3-set-privacy', privacy),
+  phase3SearchApps: (query: string): Promise<Phase3AppResult[]> => ipcRenderer.invoke('desktop:phase3-search-apps', query),
+  phase3InspectWindow: (windowId: string): Promise<Phase3Snapshot> => ipcRenderer.invoke('desktop:phase3-inspect-window', windowId),
+  phase3ApproveInteraction: (taskId: string): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-approve-interaction', taskId),
+  phase3GetTask: (taskId: string): Promise<{ status: string; taskState?: string; attempts?: unknown[] }> =>
+    ipcRenderer.invoke('desktop:phase3-task', taskId),
+  phase3PauseTask: (taskId: string): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-pause-task', taskId),
 });
 
 contextBridge.exposeInMainWorld('aetherDesktop', desktopApi);

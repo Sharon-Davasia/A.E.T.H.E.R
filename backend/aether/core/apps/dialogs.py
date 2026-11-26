@@ -108,7 +108,9 @@ class DialogGuard:
     detector: DialogDetector
     on_dialog: Callable[[str, DialogAssessment], None] | None = None
 
-    def check(self, window_resource_id: str, *, process_token: str, effectful: bool) -> DialogDecision:
+    def check(
+        self, window_resource_id: str, *, process_token: str, effectful: bool
+    ) -> DialogDecision:
         assessment = self.detector.assess(window_resource_id, process_token=process_token)
         if assessment.present:
             if self.on_dialog is not None:

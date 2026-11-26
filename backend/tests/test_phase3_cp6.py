@@ -6,8 +6,14 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from test_phase3_cp5_interaction import NOW
+from test_phase3_cp5_interaction import _World as _UiWorld
 
-from aether.adapters.windows.native_activity import FakeActivitySource, NativeActivityDisabled, NativeActivitySource
+from aether.adapters.windows.native_activity import (
+    FakeActivitySource,
+    NativeActivityDisabled,
+    NativeActivitySource,
+)
 from aether.core.apps.dialogs import (
     DialogDetector,
     DialogGuard,
@@ -20,10 +26,10 @@ from aether.core.context.project_detection import ProjectDetector
 from aether.core.persistence.models import PersistentTaskState
 from aether.core.resources.registry import ResourceRegistry
 
-from test_phase3_cp5_interaction import NOW, _World as _UiWorld
 
-
-def _registry_with_root(tmp_path: Path, alias: str = "proj", *, manifest: bool = True) -> tuple[ResourceRegistry, Path]:
+def _registry_with_root(
+    tmp_path: Path, alias: str = "proj", *, manifest: bool = True
+) -> tuple[ResourceRegistry, Path]:
     root = tmp_path / alias
     root.mkdir()
     if manifest:
@@ -65,7 +71,9 @@ def test_explorer_context_and_unregistered_discovery(tmp_path: Path) -> None:
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     (elsewhere / ".git").mkdir()
-    detector2 = ProjectDetector(registry=registry, explorer_folder=lambda: elsewhere, clock=lambda: NOW)
+    detector2 = ProjectDetector(
+        registry=registry, explorer_folder=lambda: elsewhere, clock=lambda: NOW
+    )
     discovered = [c for c in detector2.detect() if c.evidence_source == "explorer_discovered"]
     assert discovered and not discovered[0].available
     assert discovered[0].resource_id is None  # no permission is created
@@ -76,7 +84,7 @@ def test_stale_project_evidence_and_reference_expiry(tmp_path: Path) -> None:
     registry, _ = _registry_with_root(tmp_path)
     detector = ProjectDetector(registry=registry, clock=lambda: NOW)
     later = NOW + timedelta(minutes=10)
-    resolution = detector.resolve_reference("this project", now=later)
+    detector.resolve_reference("this project", now=later)
     # Candidates are re-observed fresh at resolve time in this
     # implementation, so expiry manifests for held candidate objects:
     candidate = detector.detect()[0]
@@ -86,8 +94,10 @@ def test_stale_project_evidence_and_reference_expiry(tmp_path: Path) -> None:
 def test_dialog_detection_and_guard() -> None:
     evidence = (
         ModalWindowEvidence(
-            window_resource_id="window:x", owner_process_token="pid:7:ct",
-            is_modal=True, title_hint="Unsaved changes — confirm",
+            window_resource_id="window:x",
+            owner_process_token="pid:7:ct",
+            is_modal=True,
+            title_hint="Unsaved changes — confirm",
         ),
     )
     detector = DialogDetector(modal_evidence=lambda wid: evidence)
@@ -125,9 +135,13 @@ def test_pause_resume_recovery_cycle(tmp_path: Path) -> None:
     assert world.store.get_task(task_id).state is PersistentTaskState.PAUSED
     # Resume requires fresh precheck + valid approval; goes to PLANNING,
     # never straight back to EXECUTING.
-    denied = recovery.resume(task_id, fresh_precheck=lambda tid: False, approval_valid=lambda tid: True, now=NOW)
+    denied = recovery.resume(
+        task_id, fresh_precheck=lambda tid: False, approval_valid=lambda tid: True, now=NOW
+    )
     assert denied.classification is RecoveryClass.REQUIRES_USER_INTERVENTION
-    resumed = recovery.resume(task_id, fresh_precheck=lambda tid: True, approval_valid=lambda tid: True, now=NOW)
+    resumed = recovery.resume(
+        task_id, fresh_precheck=lambda tid: True, approval_valid=lambda tid: True, now=NOW
+    )
     assert resumed.redacted_reason == "resumed_to_planning"
     assert world.store.get_task(task_id).state is PersistentTaskState.PLANNING
     world.close()

@@ -77,6 +77,17 @@ _GET_OUTCOME_KIND = "review.get_outcome"
 # composition when it could be built; otherwise each answers a bounded
 # `live.error` with reason `composition_unavailable`. There is no generic
 # privileged operation: unknown kinds still terminate the session.
+_PHASE3_KINDS = {
+    "phase3.get_state": ("get_state", "phase3.state"),
+    "phase3.set_privacy": ("set_privacy", "phase3.state"),
+    "phase3.search_apps": ("search_apps", "phase3.apps"),
+    "phase3.inspect_window": ("inspect_window", "phase3.snapshot"),
+    "phase3.preview_interaction": ("preview_fixture_interaction", "phase3.preview"),
+    "phase3.approve_interaction": ("approve_fixture_interaction", "phase3.outcome"),
+    "phase3.get_task": ("get_task_state", "phase3.task"),
+    "phase3.pause_task": ("pause_task", "phase3.task"),
+}
+
 _LIVE_KINDS = {
     "project.register": ("register_project", "project.registered"),
     "project.resolve": ("resolve_resource", "project.resolved"),
@@ -192,6 +203,12 @@ def main() -> int:
         app_store = None if bridge is not None else open_application_store(env)
     composition = None
     live_bridge = None
+    # CP7: the Phase 3 surface is constructed disabled in ordinary
+    # operation (no native providers are wired here); a reviewed
+    # activation decision supplies a wired surface separately.
+    from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
+
+    phase3_bridge = Phase3Bridge(Phase3Surface.disabled())
     # Hello is emitted only after storage resolution: an acceptance
     # launch with invalid fixture storage exits above without ever
     # becoming ready.
@@ -279,6 +296,15 @@ def main() -> int:
                     else:
                         response_kind = "review.error"
                         response_payload = _error_payload(reason or "review_unavailable")
+            elif kind in _PHASE3_KINDS:
+                method_name, success_kind = _PHASE3_KINDS[kind]
+                result = getattr(phase3_bridge, method_name)(payload)
+                if result.get("status") == "unavailable":
+                    response_kind = "phase3.error"
+                    response_payload = _error_payload(str(result.get("reason")))
+                else:
+                    response_kind = success_kind
+                    response_payload = result
             elif kind in _LIVE_KINDS:
                 method_name, success_kind = _LIVE_KINDS[kind]
                 if live_bridge is None:

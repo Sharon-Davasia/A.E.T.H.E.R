@@ -28,21 +28,28 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
-from aether.core.approval_review import (  # noqa: E402
+from aether.core.approval_review import (
     PreviewDiff,
     PreviewNarrative,
     build_preview,
 )
-from aether.core.review_contract import electron_preview_payload  # noqa: E402
-from aether.core.contracts.policy import RiskTier  # noqa: E402
-from aether.core.persistence.models import (  # noqa: E402
+from aether.core.contracts.policy import RiskTier
+from aether.core.persistence.models import (
     PlanStep,
     TaskPlan,
     TaskPlanResource,
 )
+from aether.core.review_contract import electron_preview_payload
 
 GOLDEN_CANARY = "SYNTHETIC-CANONICAL-CANARY-2b9e31"
-FIXTURE_PATH = REPO_ROOT / "apps" / "desktop" / "tests" / "fixtures" / "stage2-exact-preview.golden.json"
+FIXTURE_PATH = (
+    REPO_ROOT
+    / "apps"
+    / "desktop"
+    / "tests"
+    / "fixtures"
+    / "stage2-exact-preview.golden.json"
+)
 
 
 def build_fixture() -> dict[str, object]:
@@ -57,7 +64,10 @@ def build_fixture() -> dict[str, object]:
             PlanStep(
                 step_id=step_id,
                 capability_id="fs.preview_edit",
-                arguments={"resource_id": "file:golden-synthetic-1", "operation": "replace-line"},
+                arguments={
+                    "resource_id": "file:golden-synthetic-1",
+                    "operation": "replace-line",
+                },
                 resources=(
                     TaskPlanResource(
                         resource_id="file:golden-synthetic-1",
@@ -71,7 +81,9 @@ def build_fixture() -> dict[str, object]:
                 risk_tier=RiskTier.MODIFY,
                 approval_status="REQUIRED",
                 idempotency_key=idempotency_key,
-                postconditions=({"condition": "synthetic content hash matches expected value"},),
+                postconditions=(
+                    {"condition": "synthetic content hash matches expected value"},
+                ),
                 recovery_class="REVERSIBLE",
             ),
         ),
@@ -80,10 +92,14 @@ def build_fixture() -> dict[str, object]:
     narrative = PreviewNarrative(
         action_intent="Preview one synthetic golden example edit",
         explanation="This changes exactly one synthetic example file used as the cross-language golden fixture.",
-        preconditions=("The synthetic example file remains at the golden previewed version",),
+        preconditions=(
+            "The synthetic example file remains at the golden previewed version",
+        ),
         external_effects=("No external service or operating-system action",),
         risks=("The displayed diff could fail deterministic post-check verification",),
-        verification_strategy=("Recompute the synthetic content hash and compare it with the expected hash",),
+        verification_strategy=(
+            "Recompute the synthetic content hash and compare it with the expected hash",
+        ),
         proposed_effect="Replace the synthetic golden example line with the displayed replacement.",
         full_diff=(
             PreviewDiff(
@@ -114,14 +130,21 @@ def build_fixture() -> dict[str, object]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="fail if the fixture is not up to date")
+    parser.add_argument(
+        "--check", action="store_true", help="fail if the fixture is not up to date"
+    )
     args = parser.parse_args()
     fixture = build_fixture()
     rendered = json.dumps(fixture, indent=2, ensure_ascii=False) + "\n"
     if args.check:
-        current = FIXTURE_PATH.read_text(encoding="utf-8") if FIXTURE_PATH.exists() else ""
+        current = (
+            FIXTURE_PATH.read_text(encoding="utf-8") if FIXTURE_PATH.exists() else ""
+        )
         if current != rendered:
-            print(f"stale golden fixture: {FIXTURE_PATH}; re-run scripts/generate_stage2_golden.py", file=sys.stderr)
+            print(
+                f"stale golden fixture: {FIXTURE_PATH}; re-run scripts/generate_stage2_golden.py",
+                file=sys.stderr,
+            )
             return 1
         print(f"golden fixture is up to date: {FIXTURE_PATH}")
         return 0

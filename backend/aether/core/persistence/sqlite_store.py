@@ -1383,10 +1383,7 @@ class SQLiteTaskStore:
         expected_effect = persisted_state.get("intended_effect")
         if expected_effect is not None and binding["intended_effect"] != expected_effect:
             mismatches.append("intended_effect")
-        if (
-            expected_session_id is not None
-            and binding["session_id"] != expected_session_id
-        ):
+        if expected_session_id is not None and binding["session_id"] != expected_session_id:
             mismatches.append("session")
         if (
             expected_activation_scope is not None

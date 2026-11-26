@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import threading
 import time
-import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta

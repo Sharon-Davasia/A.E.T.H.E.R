@@ -52,7 +52,8 @@ class _World:
         exe = "C:\\Fake\\AETHERFixture.exe"
         self.fixture_record = ApplicationRecord(
             app_id=registration_app_id(
-                display_name="AETHER Fixture", executable_identity=exe,
+                display_name="AETHER Fixture",
+                executable_identity=exe,
                 launch_method=LaunchMethod.APPROVED_EXECUTABLE,
             ),
             display_name="AETHER Fixture",
@@ -60,7 +61,8 @@ class _World:
             executable_identity=exe,
             location_digest=location_identity_digest(exe),
             discovery_source=DiscoverySource.FAKE_FIXTURE,
-            discovered_at=NOW, fresh_until=NOW + timedelta(hours=2),
+            discovered_at=NOW,
+            fresh_until=NOW + timedelta(hours=2),
         )
         self.authority.register_app(self.fixture_record, version_token="fixture-identity-v1")
         ref = self.authority.register_window(

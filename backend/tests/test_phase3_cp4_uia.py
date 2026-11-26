@@ -201,7 +201,9 @@ def _supervisor(send) -> WorkerSupervisor:
 def test_worker_malformed_and_stale_responses_rejected() -> None:
     timed = _supervisor(lambda body, timeout: (_ for _ in ()).throw(TimeoutError()))
     assert timed.execute("inspect", {}).outcome is WorkerOutcome.TIMED_OUT
-    assert timed.execute("invoke", {"hwnd": 1, "element_key": "x"}).outcome is WorkerOutcome.UNCERTAIN
+    assert (
+        timed.execute("invoke", {"hwnd": 1, "element_key": "x"}).outcome is WorkerOutcome.UNCERTAIN
+    )
 
     def wrong_id(body: bytes, timeout: float) -> bytes:
         import json
@@ -211,26 +213,17 @@ def test_worker_malformed_and_stale_responses_rejected() -> None:
             {"protocol": req["protocol"], "request_id": "req:other", "status": "ok", "result": {}}
         ).encode()
 
-    assert (
-        _supervisor(wrong_id).execute("health", {}).outcome
-        is WorkerOutcome.STALE_RESPONSE
-    )
+    assert _supervisor(wrong_id).execute("health", {}).outcome is WorkerOutcome.STALE_RESPONSE
 
     def garbage(body: bytes, timeout: float) -> bytes:
         return b"not-json"
 
-    assert (
-        _supervisor(garbage).execute("health", {}).outcome
-        is WorkerOutcome.MALFORMED
-    )
+    assert _supervisor(garbage).execute("health", {}).outcome is WorkerOutcome.MALFORMED
 
     def crash(body: bytes, timeout: float) -> bytes:
         raise ConnectionError("worker died")
 
-    assert (
-        _supervisor(crash).execute("inspect", {}).outcome
-        is WorkerOutcome.CRASHED
-    )
+    assert _supervisor(crash).execute("inspect", {}).outcome is WorkerOutcome.CRASHED
     assert (
         _supervisor(crash).execute("invoke", {"hwnd": 1, "element_key": "x"}).outcome
         is WorkerOutcome.UNCERTAIN

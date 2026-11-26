@@ -501,6 +501,56 @@ export class BackendClient {
     return this.request(session, 'edit.receipt', { receiptId }, ['edit.receipt', 'live.error']);
   }
 
+  // -- Phase 3 verification surface (CP7) -------------------------------
+  // Bounded summaries only. The fixture-interaction approval is signed
+  // by main (signGesture) after the trusted native confirmation; the
+  // renderer never sees a nonce, binding or signature.
+
+  async phase3GetState(): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.get_state', {}, ['phase3.state', 'phase3.error']);
+  }
+
+  async phase3SetPrivacy(privacy: { optedIn: boolean; mode: string; paused: boolean }): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.set_privacy', privacy, ['phase3.state', 'phase3.error']);
+  }
+
+  async phase3SearchApps(query: string): Promise<unknown> {
+    if (typeof query !== 'string' || query.length > 256) throw backendError('malformed app query');
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.search_apps', { query }, ['phase3.apps', 'phase3.error']);
+  }
+
+  async phase3InspectWindow(windowId: string): Promise<unknown> {
+    if (typeof windowId !== 'string' || windowId.length > 128) throw backendError('malformed window identity');
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.inspect_window', { windowId }, ['phase3.snapshot', 'phase3.error']);
+  }
+
+  async phase3PreviewInteraction(taskId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.preview_interaction', { taskId }, ['phase3.preview', 'phase3.error']);
+  }
+
+  async phase3ApproveInteraction(payload: {
+    taskId: string; nonce: string; assertedAt: string; userIntent: string; signature: string;
+    binding: { taskId: string; planRevision: number; planHash: string; previewId: string; previewDigest: string; scopeDigest: string };
+  }): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.approve_interaction', payload, ['phase3.outcome', 'phase3.error']);
+  }
+
+  async phase3GetTask(taskId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.get_task', { taskId }, ['phase3.task', 'phase3.error']);
+  }
+
+  async phase3PauseTask(taskId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.pause_task', { taskId }, ['phase3.task', 'phase3.error']);
+  }
+
   /** Execute the approved edit for one task whose grant was just issued. */
   async liveExecuteEdit(taskId: string): Promise<unknown> {
     if (typeof taskId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(taskId)) {

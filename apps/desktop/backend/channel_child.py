@@ -20,9 +20,9 @@ HELLO_REQUEST_ID = "00000000-0000-4000-8000-000000000000"
 
 
 def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
-        "utf-8"
-    )
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
 
 
 def read_exact(stream: object, size: int) -> bytes:
@@ -60,7 +60,13 @@ def signed(unsigned: dict[str, object], key: bytes) -> dict[str, object]:
 
 
 def validate(
-    raw: bytes, *, key: bytes, session: str, seq: int, direction: str, seen_nonces: set[str]
+    raw: bytes,
+    *,
+    key: bytes,
+    session: str,
+    seq: int,
+    direction: str,
+    seen_nonces: set[str],
 ) -> dict[str, object]:
     source = raw.decode("utf-8")
     parsed = json.loads(source)
@@ -101,11 +107,15 @@ def validate(
     if nonce in seen_nonces:
         raise ValueError("replayed nonce")
     timestamp = parsed["timestamp"]
-    if type(timestamp) is not int or abs(int(time.time() * 1000) - timestamp) > MAX_SKEW_MS:
+    if (
+        type(timestamp) is not int
+        or abs(int(time.time() * 1000) - timestamp) > MAX_SKEW_MS
+    ):
         raise ValueError("stale timestamp")
     request_id = parsed["requestId"]
     if not isinstance(request_id, str) or not re.fullmatch(
-        r"[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}", request_id
+        r"[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}",
+        request_id,
     ):
         raise ValueError("malformed request identifier")
     kind = parsed["kind"]
@@ -179,7 +189,9 @@ def main() -> int:
         seen_requests.add(request_id)
         if len(seen_requests) > 4096:
             raise ValueError("session request capacity exceeded")
-        if request["kind"] != "demo.ping" or request["payload"] != {"text": "synthetic-only"}:
+        if request["kind"] != "demo.ping" or request["payload"] != {
+            "text": "synthetic-only"
+        }:
             raise ValueError("unsupported synthetic channel message")
         nonce = secrets.token_hex(16)
         response = {

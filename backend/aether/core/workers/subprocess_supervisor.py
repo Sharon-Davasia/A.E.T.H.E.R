@@ -86,15 +86,16 @@ class SubprocessWorkerSupervisor:
             raise TimeoutError("worker deadline exceeded")
         if "error" in result:
             raise ConnectionError(str(result["error"]))
-        return bytes(result["line"])  # type: ignore[arg-type]
+        line = result["line"]
+        assert isinstance(line, (bytes, bytearray))
+        return bytes(line)
 
     def execute(
         self, operation: str, payload: dict[str, object], *, timeout: float = 5.0
     ) -> WorkerResult:
         with self._lock:
-            if self._process is None or self._process.poll() is not None:
-                if not self.start():
-                    return WorkerResult(WorkerOutcome.UNAVAILABLE, detail="worker_start_failed")
+            if (self._process is None or self._process.poll() is not None) and not self.start():
+                return WorkerResult(WorkerOutcome.UNAVAILABLE, detail="worker_start_failed")
             assert self._supervisor is not None
             result = self._supervisor.execute(operation, payload, timeout=timeout)
             if result.outcome in (

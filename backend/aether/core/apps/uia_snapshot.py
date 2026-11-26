@@ -41,6 +41,7 @@ from aether.core.contracts.uia import (
 from aether.core.resources.app_window_authority import (
     AppWindowAuthorityError,
     AppWindowResourceAuthority,
+    WindowBinding,
 )
 from aether.world_state.privacy import ContextClassification, classify_context
 
@@ -205,8 +206,12 @@ class UiaSnapshotService:
         )
 
     def _inspect_via_worker(
-        self, binding, window_resource_id, limits, require_content
-    ) -> SnapshotResult:  # type: ignore[no-untyped-def]
+        self,
+        binding: WindowBinding,
+        window_resource_id: str,
+        limits: UiaLimits,
+        require_content: bool,
+    ) -> SnapshotResult:
         from aether.core.workers.uia_worker import WorkerOutcome
 
         now = self._now()

@@ -145,10 +145,16 @@ class ProjectDetector:
             )
         )
 
-    def resolve_reference(self, reference: str, *, now: datetime | None = None) -> ReferenceResolution:
+    def resolve_reference(
+        self, reference: str, *, now: datetime | None = None
+    ) -> ReferenceResolution:
         """Resolve "this project" against fresh evidence only."""
         moment = now or self._now()
-        if reference.strip().casefold() not in ("this project", "current project", "this workspace"):
+        if reference.strip().casefold() not in (
+            "this project",
+            "current project",
+            "this workspace",
+        ):
             return ReferenceResolution(None, True, "unsupported_reference")
         fresh = [c for c in self.detect() if c.fresh(moment) and c.available]
         if not fresh:

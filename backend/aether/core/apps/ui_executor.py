@@ -22,11 +22,15 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 from aether.adapters.windows.uia_backend import UiaBackend, UiaBackendError, UiaElementStale
-from aether.core.apps.focus import FocusCoordinator
+from aether.core.apps.enablement import Phase3Enablement
+from aether.core.apps.focus import FocusCoordinator, LockHandle
 from aether.core.apps.uia_snapshot import UiaSnapshotService
+from aether.core.contracts.uia import UiaElement
 from aether.core.persistence.models import PersistentTaskState
 from aether.core.persistence.sqlite_store import SQLiteTaskStore
+from aether.core.policy.broker import PolicyBroker
 from aether.core.policy.capabilities import CapabilityRegistry
+from aether.core.workers.subprocess_supervisor import SubprocessWorkerSupervisor
 
 KNOWN_INTENDED_EFFECTS = frozenset({"increment_fixture_count"})
 EFFECT_PATTERN = {"increment_fixture_count": "invoke"}
@@ -62,8 +66,8 @@ class UiOperationExecutor:
     clock: Callable[[], datetime] | None = None
     # F10: the authoritative policy + enablement boundary. Execution
     # without them is denied; there is no second broker.
-    broker: object | None = None  # PolicyBroker
-    enablement: object | None = None  # Phase3Enablement
+    broker: PolicyBroker | None = None
+    enablement: Phase3Enablement | None = None
     # Trusted fixture identity: approved app resource + its trusted
     # identity token (from launch/process/integrity evidence, never a
     # title, name prefix or status string).
@@ -72,7 +76,7 @@ class UiOperationExecutor:
     # Optional supervised worker route (F11): when configured, the
     # effectful operation is dispatched through the subprocess worker;
     # direct backend use remains only for injected test doubles.
-    worker: object | None = None  # SubprocessWorkerSupervisor
+    worker: SubprocessWorkerSupervisor | None = None
     # CP6 dialog guard seam: returns a redacted reason code when a
     # relevant unexpected dialog is present.
     dialog_present: Callable[[str], str | None] | None = None
@@ -291,8 +295,17 @@ class UiOperationExecutor:
                 self.focus.release(handle)
 
     def _execute_under_locks(
-        self, task_id, step_id, binding_id, attempt_id, *, window_id, element, locks, binding
-    ) -> UiOutcome:  # type: ignore[no-untyped-def]
+        self,
+        task_id: UUID,
+        step_id: UUID,
+        binding_id: str,
+        attempt_id: str,
+        *,
+        window_id: str,
+        element: UiaElement,
+        locks: tuple[LockHandle, LockHandle],
+        binding: dict[str, object],
+    ) -> UiOutcome:
         if self.focus.takeover_detected(window_id):
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
         if not all(self.focus.is_valid(handle) for handle in locks):
@@ -421,8 +434,8 @@ class UiOperationExecutor:
     def _evaluate_policy(self, task_id, step, arguments, binding, *, binding_id: str) -> None:  # type: ignore[no-untyped-def]
         if self.broker is None:
             raise UiDenied("policy_broker_not_configured")
-        from aether.core.contracts.tool import ToolRequest
         from aether.core.contracts.resource import ResourceRef
+        from aether.core.contracts.tool import ToolRequest
 
         def _ui_authorizer(request: object) -> str | None:
             # Trusted exact-operation approval check, evaluated inside

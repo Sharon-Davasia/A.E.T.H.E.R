@@ -5,6 +5,7 @@ import { BackendClient, type BackendLaunchSpec } from './backend-client';
 import { isTrustedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
 import { createLiveApprovalProvider } from './live-approval-provider';
+import { createPhase3Provider, type Phase3InteractionSummary } from './phase3-provider';
 import { createApprovalWindowConfirmer } from './approval-window';
 import { workflowFailureReason } from './workflow';
 import { LiveWorkflow } from './workflow';
@@ -57,6 +58,30 @@ const liveApprovalProvider = createLiveApprovalProvider({
   confirm: (summary) => approvalConfirmer.confirmApproval(summary),
   approvalGeneration: () => navigationEpoch,
 });
+const phase3Provider = createPhase3Provider({
+  backend,
+  confirm: async (summary: Phase3InteractionSummary) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    const detail = [
+      `Capability: ${summary.capabilityId}`,
+      `Window: ${summary.windowId}`,
+      `Element: ${summary.elementRef}`,
+      `Intended effect: ${summary.intendedEffect}`,
+      `Expected result: ${summary.expectedPostcondition}`,
+    ].join('\n');
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Approve exact action'],
+      defaultId: 0,
+      cancelId: 0,
+      title: 'AETHER — confirm fixture interaction',
+      message: 'Approve this exact UI operation?',
+      detail,
+    });
+    return result.response === 1;
+  },
+});
+
 let mainWindow: BrowserWindow | undefined;
 let shuttingDown = false;
 
@@ -193,6 +218,51 @@ function registerIpc(): void {
   ipcMain.handle('desktop:live-approve', async (event) => {
     validateInvoke(event);
     return liveApprovalProvider.approveAndExecute();
+  });
+  // CP7 Phase 3 verification surface. The renderer receives bounded
+  // summaries and may only *request* the trusted approval flow with a
+  // task identity; bindings, nonces and signatures never cross IPC.
+  const phase3TaskId = (raw: unknown): string => {
+    if (typeof raw !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(raw)) {
+      throw new Error('malformed phase3 task identity');
+    }
+    return raw;
+  };
+  ipcMain.handle('desktop:phase3-state', async (event) => {
+    validateInvoke(event);
+    return phase3Provider.getState();
+  });
+  ipcMain.handle('desktop:phase3-set-privacy', async (event, raw: unknown) => {
+    validateInvoke(event);
+    const item = raw as { optedIn?: unknown; mode?: unknown; paused?: unknown } | null;
+    if (!item || typeof item !== 'object'
+      || typeof item.optedIn !== 'boolean' || typeof item.paused !== 'boolean'
+      || typeof item.mode !== 'string' || !['off', 'metadata_only', 'active_app_only', 'workspace_context', 'content_on_demand'].includes(item.mode)) {
+      throw new Error('malformed phase3 privacy request');
+    }
+    return phase3Provider.setPrivacy({ optedIn: item.optedIn, mode: item.mode, paused: item.paused });
+  });
+  ipcMain.handle('desktop:phase3-search-apps', async (event, raw: unknown) => {
+    validateInvoke(event);
+    if (typeof raw !== 'string' || raw.length > 256) throw new Error('malformed phase3 query');
+    return phase3Provider.searchApps(raw);
+  });
+  ipcMain.handle('desktop:phase3-inspect-window', async (event, raw: unknown) => {
+    validateInvoke(event);
+    if (typeof raw !== 'string' || raw.length > 128) throw new Error('malformed phase3 window identity');
+    return phase3Provider.inspectWindow(raw);
+  });
+  ipcMain.handle('desktop:phase3-approve-interaction', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.approveFixtureInteraction(phase3TaskId(raw));
+  });
+  ipcMain.handle('desktop:phase3-task', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.getTaskState(phase3TaskId(raw));
+  });
+  ipcMain.handle('desktop:phase3-pause-task', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.pauseTask(phase3TaskId(raw));
   });
   // FI-02 workflow steps. The renderer requests operations; main owns
   // every identity. Project registration additionally requires a native

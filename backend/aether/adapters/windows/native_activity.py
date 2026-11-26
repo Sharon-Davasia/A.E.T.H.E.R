@@ -37,45 +37,71 @@ class FakeActivitySource:
             self.emit_to(signal)
 
     def foreground_changed(self, window_id: str | None) -> None:
-        self.emit(ActivitySignal(kind="foreground_changed", window_id=window_id, at=datetime.now(UTC)))
+        self.emit(
+            ActivitySignal(kind="foreground_changed", window_id=window_id, at=datetime.now(UTC))
+        )
 
     def manual_activity(self, window_id: str) -> None:
         self.emit(
-            ActivitySignal(kind="manual_activity_in_window", window_id=window_id, at=datetime.now(UTC))
+            ActivitySignal(
+                kind="manual_activity_in_window", window_id=window_id, at=datetime.now(UTC)
+            )
         )
 
 
 class NativeActivitySource:
     """WinEvent-hook activity source (Windows, activation-gated)."""
 
-    def __init__(self, *, activation: ActivationContext | None, emit_to: Callable[[ActivitySignal], None]) -> None:
+    def __init__(
+        self, *, activation: ActivationContext | None, emit_to: Callable[[ActivitySignal], None]
+    ) -> None:
         if sys.platform != "win32" or activation is None:
             raise NativeActivityDisabled(
                 "native activity monitoring requires Windows + trusted activation; disabled"
             )
-        self._emit_to = emit_to
-        self._hook = None
+        self._emit_to: Callable[[ActivitySignal], None] = emit_to
+        self._hook: int | None = None
+        self._callback: object = None
 
     def start(self) -> None:  # pragma: no cover - Windows-only
         import ctypes
 
-        user32 = ctypes.windll.user32
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
         EVENT_SYSTEM_FOREGROUND = 0x0003
         WINEVENT_OUTOFCONTEXT = 0x0000
-        callback_type = ctypes.WINFUNCTYPE(
-            None, ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p,
-            ctypes.c_long, ctypes.c_long, ctypes.c_uint, ctypes.c_uint,
+        callback_type = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+            None,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_void_p,
+            ctypes.c_long,
+            ctypes.c_long,
+            ctypes.c_uint,
+            ctypes.c_uint,
         )
         emit = self._emit_to
 
-        def _callback(hook, event, hwnd, id_object, id_child, thread, time_ms):  # type: ignore[no-untyped-def]
+        def _callback(
+            hook: object,
+            event: object,
+            hwnd: object,
+            id_object: object,
+            id_child: object,
+            thread: object,
+            time_ms: object,
+        ) -> None:
             # Content-free signal: only that foreground changed.
             emit(ActivitySignal(kind="foreground_changed", window_id=None, at=datetime.now(UTC)))
 
         self._callback = callback_type(_callback)
         self._hook = user32.SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None,
-            self._callback, 0, 0, WINEVENT_OUTOFCONTEXT,
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            self._callback,
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT,
         )
         if not self._hook:
             raise NativeActivityDisabled("activity hook could not be installed")
@@ -84,5 +110,5 @@ class NativeActivitySource:
         if self._hook:
             import ctypes
 
-            ctypes.windll.user32.UnhookWinEvent(self._hook)
+            ctypes.windll.user32.UnhookWinEvent(self._hook)  # type: ignore[attr-defined]
             self._hook = None
