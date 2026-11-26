@@ -15,6 +15,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from aether.adapters.windows.native_observer import ActivationContext
 from aether.core.apps.focus import ActivitySignal
@@ -100,13 +101,14 @@ class NativeActivitySource:
         def _run() -> None:
             import ctypes
 
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
-            kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+            windll: Any = getattr(ctypes, "windll", None)
+            user32 = windll.user32
+            kernel32 = windll.kernel32
             self._thread_id = int(kernel32.GetCurrentThreadId())
             EVENT_SYSTEM_FOREGROUND = 0x0003
             EVENT_OBJECT_FOCUS = 0x8005
             WINEVENT_OUTOFCONTEXT = 0x0000
-            callback_type = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+            callback_type = ctypes.__dict__["WINFUNCTYPE"](
                 None,
                 ctypes.c_void_p,
                 ctypes.c_uint,
@@ -167,7 +169,7 @@ class NativeActivitySource:
             # Low-level mouse/keyboard hooks emit one content-free
             # signal per event while installed; the event data itself
             # (key code, coordinates) is never read or retained.
-            ll_callback_type = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+            ll_callback_type = ctypes.__dict__["WINFUNCTYPE"](
                 ctypes.c_longlong,
                 ctypes.c_int,
                 ctypes.c_void_p,
@@ -273,7 +275,8 @@ class NativeActivitySource:
             return
         if self._thread_id is not None:
             WM_QUIT = 0x0012
-            ctypes.windll.user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)  # type: ignore[attr-defined]
+            user32: Any = getattr(getattr(ctypes, "windll", None), "user32", None)
+            user32.PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
         thread.join(timeout=5.0)  # type: ignore[attr-defined]
         self._thread = None
         self._thread_id = None

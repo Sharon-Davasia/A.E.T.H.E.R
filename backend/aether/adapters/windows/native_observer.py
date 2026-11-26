@@ -205,6 +205,12 @@ class NativeWindowsEventSource:
                             raise ObserverUnavailable("SetWinEventHook registration failed")
                         hooks.append(handle)
                 except BaseException as exc:  # initialization failure
+                    # Partial initialization must not leak hooks:
+                    # unhook whatever was installed, on this (the
+                    # owning) thread, before reporting the failure.
+                    for handle in hooks:
+                        with contextlib.suppress(Exception):
+                            self._api.unhook_win_event(handle)
                     failure.append(exc)
                     started.set()
                     return
@@ -742,7 +748,8 @@ class NativeForegroundProvider:  # pragma: no cover - Windows only
         if user32 is None:
             import ctypes
 
-            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+            windll: Any = getattr(ctypes, "windll", None)
+            user32 = windll.user32
         self._user32: Any = user32
 
     def activate(self, hwnd: int) -> bool:

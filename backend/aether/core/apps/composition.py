@@ -1127,8 +1127,10 @@ def _native_explorer_folder() -> object:  # pragma: no cover - Windows COM
 
         shell = win32com.client.Dispatch("Shell.Application")
         import ctypes
+        from typing import Any as _Any
 
-        foreground = ctypes.windll.user32.GetForegroundWindow()  # type: ignore[attr-defined]
+        _windll: _Any = getattr(ctypes, "windll", None)
+        foreground = _windll.user32.GetForegroundWindow()
         for window in shell.Windows():
             try:
                 if int(window.HWND) == int(foreground):

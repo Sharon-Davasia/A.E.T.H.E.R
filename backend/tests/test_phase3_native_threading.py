@@ -23,13 +23,15 @@ from aether.world_state.observer import ObserverUnavailable, WindowEventKind
 class ThreadAffineFakeApi:
     """Fake Win32 API that enforces single-thread (observer) affinity."""
 
-    def __init__(self, *, fail_hook: bool = False) -> None:
+    def __init__(self, *, fail_hook: bool = False, fail_after: int | None = None) -> None:
         self.owner_thread: int | None = None
         self.violations: list[str] = []
         self.hooks: dict[int, Callable] = {}  # type: ignore[type-arg]
         self.unhooked: list[int] = []
         self.pump_thread: int | None = None
         self.fail_hook = fail_hook
+        self.fail_after = fail_after
+        self._hook_calls = 0
         self.enumerate_error: Exception | None = None
         self.elevated: bool | None = None
 
@@ -42,11 +44,17 @@ class ThreadAffineFakeApi:
             raise AssertionError(f"{what} called on wrong thread")
 
     def initialize_message_queue(self) -> None:
-        self._affine("init")
+        # A new observer lifecycle begins on a new dedicated thread:
+        # that thread claims ownership for this lifecycle. Distinct
+        # lifecycles therefore have distinct owners, while every
+        # hook/pump/unhook within one lifecycle must stay on its
+        # owning thread (enforced by _affine everywhere else).
+        self.owner_thread = threading.get_ident()
 
     def set_win_event_hook(self, event_type, callback):  # type: ignore[no-untyped-def]
         self._affine("hook")
-        if self.fail_hook:
+        self._hook_calls += 1
+        if self.fail_hook or (self.fail_after is not None and self._hook_calls > self.fail_after):
             return 0
         self.hooks[event_type] = callback
         return 1000 + event_type
@@ -115,6 +123,24 @@ def test_failed_hook_startup_reports_and_cleans_up() -> None:
     api.fail_hook = False
     source.start(lambda event: None)
     assert source.stop() is True
+    assert api.violations == []
+
+
+def test_partial_hook_failure_unhooks_installed_hooks_on_owning_thread() -> None:
+    """Failure after at least one hook was installed: every installed
+    hook is unhooked during startup cleanup, on the owning thread,
+    and a later lifecycle on a new thread is unaffected."""
+    api = ThreadAffineFakeApi(fail_after=2)
+    source = NativeWindowsEventSource.for_testing(api)
+    with pytest.raises(ObserverUnavailable):
+        source.start(lambda event: None)
+    installed = sorted(1000 + event_type for event_type in list(api.hooks)[:2])
+    assert sorted(api.unhooked) == installed  # partial hooks cleaned up
+    assert api.violations == []  # cleanup happened on the owning thread
+    api.fail_after = None
+    source.start(lambda event: None)
+    assert source.stop() is True
+    assert api.violations == []
 
 
 def test_unknown_elevation_and_failed_enumeration_are_truthful() -> None:

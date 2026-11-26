@@ -106,19 +106,58 @@ def test_controlled_service_cross_process_workflow(tmp_path: Path) -> None:
     key = secrets.token_bytes(32)
     challenge = secrets.token_bytes(32)
     gesture_key = secrets.token_bytes(32)
-    env = {
-        "PATH": os.environ.get("PATH", ""),
-        "AETHER_PHASE3_AUTHORIZATION": str(artifact_path),
-        "AETHER_PHASE3_PLATFORM": "fake-windows",
-    }
+    env: dict[str, str] = {"PATH": os.environ.get("PATH", "")}
+    if os.name == "nt":
+        # Minimal Windows runtime environment the child Python and
+        # its worker subprocess need (DLL search, home/profile and
+        # program-files resolution); a fixed allowlist only, so the
+        # child's environment stays isolated.
+        for name in (
+            "SYSTEMROOT",
+            "WINDIR",
+            "COMSPEC",
+            "PATHEXT",
+            "USERPROFILE",
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "LOCALAPPDATA",
+            "APPDATA",
+            "PROGRAMFILES",
+            "PROGRAMFILES(X86)",
+            "TEMP",
+            "TMP",
+        ):
+            if name in os.environ:
+                env[name] = os.environ[name]
+    env.update(
+        {
+            "AETHER_PHASE3_AUTHORIZATION": str(artifact_path),
+            "AETHER_PHASE3_PLATFORM": "fake-windows",
+        }
+    )
     process = subprocess.Popen(
         [sys.executable, "-m", "aether.channel.controlled_service"],
         cwd=BACKEND_ROOT,
         env=env,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
+
+    def _diagnostics(exit_code: int | None) -> str:
+        """Bounded, redacted child diagnostics for a failed startup."""
+        raw = b""
+        if process.stderr is not None:
+            try:
+                raw = process.stderr.read() or b""
+            except Exception:
+                raw = b""
+        text = raw.decode("utf-8", errors="replace")[-2000:]
+        text = text.replace(str(tmp_path), "<tmp>").replace(str(REPO_ROOT), "<repo>")
+        for secret in (session, key, challenge, gesture_key):
+            text = text.replace(secret.hex(), "<redacted>")
+        return f"child_exit={exit_code} child_stderr={text!r}"
+
     seq = 0
 
     def call(kind: str, payload: dict) -> dict:  # type: ignore[type-arg]
@@ -174,11 +213,15 @@ def test_controlled_service_cross_process_workflow(tmp_path: Path) -> None:
             "binding": binding,
         }
 
+    workflow_error: BaseException | None = None
     try:
         assert process.stdin is not None and process.stdout is not None
         process.stdin.write(MAGIC + session + key + challenge + gesture_key)
         process.stdin.flush()
-        hello = _read_frame(process.stdout)
+        try:
+            hello = _read_frame(process.stdout)
+        except AssertionError as exc:
+            raise AssertionError(f"controlled child emitted no hello frame: {exc}") from exc
         assert hello.get("kind") == "channel.hello"
 
         state = call("phase3.get_state", {})
@@ -272,6 +315,9 @@ def test_controlled_service_cross_process_workflow(tmp_path: Path) -> None:
         # Exactly one effect: a fresh preparation now sees Count: 1.
         again = call("phase3.prepare_fixture", {"windowId": window_id})
         assert again["payload"]["preview"]["verifiedPrecondition"] == "Count: 1", again
+    except BaseException as exc:  # capture diagnostics before re-raising
+        workflow_error = exc
+        raise
     finally:
         if process.stdin is not None:
             process.stdin.close()
@@ -279,7 +325,11 @@ def test_controlled_service_cross_process_workflow(tmp_path: Path) -> None:
             exit_code = process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             process.kill()
-            raise
+            exit_code = process.wait(timeout=15)
+        if workflow_error is not None:
+            raise AssertionError(
+                f"controlled cross-process workflow failed: {_diagnostics(exit_code)}"
+            ) from workflow_error
         if process.stdout is not None:
             process.stdout.close()
-    assert exit_code == 0
+    assert exit_code == 0, _diagnostics(exit_code)

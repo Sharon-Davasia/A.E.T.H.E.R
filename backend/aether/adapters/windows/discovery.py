@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 MAX_RECORDS_PER_SOURCE = 512
 MAX_FIELD_CHARS = 512
@@ -190,7 +190,9 @@ def _read_value(key: object, name: str) -> str | None:  # pragma: no cover - Win
     try:
         import winreg
 
-        value, _kind = winreg.QueryValueEx(key, name)  # type: ignore[attr-defined]
+        handle: Any = key
+        query_value_ex: Any = winreg.__dict__.get("QueryValueEx")
+        value, _kind = query_value_ex(handle, name)
         return str(value) if value else None
     except OSError:
         return None

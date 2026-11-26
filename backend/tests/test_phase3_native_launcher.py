@@ -83,7 +83,7 @@ def test_apps_folder_activation_and_unapproved_method() -> None:
 
 
 def test_integrity_provider_hashes_real_file(tmp_path: Path) -> None:
-    target = tmp_path / "fake-app.bin"
+    target = tmp_path / "fake-app.exe"
     target.write_bytes(b"synthetic-bytes")
     identity = str(target)
     record = ApplicationRecord(
@@ -103,6 +103,25 @@ def test_integrity_provider_hashes_real_file(tmp_path: Path) -> None:
     provider = NativeIntegrityProvider()
     evidence = provider.verify(record)
     assert evidence is not None and evidence.content_sha256 is not None
+    # Unsupported extensions stay rejected: a Windows-style .bin
+    # identity is refused by the supported-executable check before
+    # any file access, on every platform.
+    bin_identity = "C:\\Fake\\fake-app.bin"
+    bin_record = ApplicationRecord(
+        app_id=registration_app_id(
+            display_name="FakeAppBin",
+            executable_identity=bin_identity,
+            launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+        ),
+        display_name="FakeAppBin",
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+        executable_identity=bin_identity,
+        location_digest=location_identity_digest(bin_identity),
+        discovery_source=DiscoverySource.FAKE_FIXTURE,
+        discovered_at=NOW,
+        fresh_until=NOW + timedelta(hours=1),
+    )
+    assert provider.verify(bin_record) is None
     assert evidence.file_identity is not None
     # Same-path replacement changes the version token.
     target.write_bytes(b"replaced-bytes!")

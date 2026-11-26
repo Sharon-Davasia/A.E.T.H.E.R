@@ -188,8 +188,22 @@ def test_integrity_provider_rejects_unsafe_targets(tmp_path: Path) -> None:
     provider = NativeIntegrityProvider()
     target = tmp_path / "app.exe"
     target.write_bytes(b"synthetic")
-    link = tmp_path / "link.exe"
-    link.symlink_to(target)
+    # Symlink creation needs a privilege ordinary non-admin Windows
+    # accounts do not have (WinError 5/1314); when the host cannot
+    # create symlinks, only that sub-check is dropped — the
+    # privilege-independent junction coverage below still runs, so
+    # reparse rejection stays covered on ordinary accounts. Any
+    # other creation failure is a real failure.
+    import os as _os
+
+    link: Path | None = tmp_path / "link.exe"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError) as exc:
+        if getattr(exc, "winerror", None) in {5, 1314} or isinstance(exc, NotImplementedError):
+            link = None
+        else:
+            raise
 
     def record_for(identity: str) -> ApplicationRecord:
         return ApplicationRecord(
@@ -208,7 +222,28 @@ def test_integrity_provider_rejects_unsafe_targets(tmp_path: Path) -> None:
         )
 
     assert provider.verify(record_for(str(target))) is not None
-    assert provider.verify(record_for(str(link))) is None  # reparse/symlink
+    if link is not None:
+        assert provider.verify(record_for(str(link))) is None  # reparse/symlink
+        # A reparse ancestor is equivalent: an executable reached
+        # through a linked directory is rejected too.
+        real_dir = tmp_path / "real-target"
+        real_dir.mkdir()
+        (real_dir / "app.exe").write_bytes(b"synthetic")
+        linked_dir = tmp_path / "linked-target"
+        linked_dir.symlink_to(real_dir, target_is_directory=True)
+        assert provider.verify(record_for(str(linked_dir / "app.exe"))) is None
+    if _os.name == "nt":
+        # Directory junctions are reparse points creatable without
+        # any privilege: an executable reached through a junction
+        # must be rejected exactly like a symlink.
+        from tests.fs_support import make_junction
+
+        junction_real = tmp_path / "junction-real"
+        junction_real.mkdir()
+        (junction_real / "app.exe").write_bytes(b"synthetic")
+        junction = tmp_path / "junction-target"
+        make_junction(junction, junction_real)
+        assert provider.verify(record_for(str(junction / "app.exe"))) is None
     assert provider.verify(record_for("\\\\server\\share\\app.exe")) is None  # network
     assert provider.verify(record_for("C:relative\\app.exe")) is None  # drive-relative
     assert provider.verify(record_for("C:\\Fake\\app.txt")) is None  # unsupported type

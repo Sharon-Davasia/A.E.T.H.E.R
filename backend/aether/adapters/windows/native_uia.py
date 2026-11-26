@@ -196,6 +196,8 @@ def build_native_uia_backend(
         return PywinautoUiaBackend(pywinauto_module=pywinauto_module, root_window=None)
     if sys.platform != "win32" or activation is None:
         raise NativeUiaDisabled("native UIA requires Windows + trusted activation; disabled")
-    import pywinauto as real_pywinauto  # type: ignore[import-not-found]  # pragma: no cover
+    import importlib
+
+    real_pywinauto: Any = importlib.import_module("pywinauto")  # pragma: no cover
 
     return PywinautoUiaBackend(pywinauto_module=real_pywinauto, root_window=None)

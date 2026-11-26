@@ -5,8 +5,10 @@ the owner's machine until the activation decision package in
 `docs/security/PHASE3_ACTIVATION_PROPOSAL.md` is independently
 reviewed and explicitly approved. Phase 3 native activation remains
 disabled in ordinary operation; schema v3 is selectable only for
-dedicated isolated acceptance storage (G03); Phase 2 acceptance
-remains NOT COMPLETE and unwaived. The historical combined Phase 2
+dedicated isolated acceptance storage (G03). Phase 2 owner
+acceptance is complete and locally archived (owner record, incl.
+the independently executed native interruption harness); this
+campaign does not reopen Phase 2. The historical combined Phase 2
 verifier must NOT be run.
 
 ## Environment (exact)
@@ -24,6 +26,34 @@ verifier must NOT be run.
   of unverified paths; offline operation expected (observe and record
   any outbound-network behavior; none is required or permitted for
   the fixture).
+
+## Windows verification commands (exact)
+
+Run from non-admin PowerShell 5.1 at `D:\A.E.T.H.E.R`, HEAD equal to
+the approved candidate SHA, clean tree. pytest scratch MUST be a
+new, non-reparse, non-protected directory under the existing owner
+evidence root — synthetic projects under protected AppData paths
+fail resource registration by design, and those protections must
+not be weakened. **Never reuse an existing `--basetemp` path.**
+
+```powershell
+$EvidenceRoot = "D:\AETHER-evidence"          # existing owner evidence root
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$BaseTemp = Join-Path $EvidenceRoot "phase3-pytest-$Stamp"
+if (Test-Path $BaseTemp) { throw "basetemp already exists; choose a new name" }
+New-Item -ItemType Directory -Path $BaseTemp | Out-Null
+if ((Get-Item $BaseTemp).Attributes -match "ReparsePoint") { throw "basetemp must not be a reparse point" }
+python -m pytest backend/tests -q --basetemp $BaseTemp
+python -m ruff check backend tools
+python -m ruff format --check backend tools
+# strict mypy, from backend\
+cd backend; python -m mypy; cd ..
+# desktop gates
+cd apps/desktop; npm.cmd run check; npm.cmd test; cd ../..
+```
+
+Record the exact basetemp used with the campaign evidence; a rerun
+always creates a fresh one.
 
 ## Standard setup (unless a row says otherwise)
 

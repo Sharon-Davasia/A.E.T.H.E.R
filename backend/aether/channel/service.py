@@ -214,14 +214,26 @@ def _trusted_git_executable(
         import sys as _sys
 
         if _sys.platform == "win32":
+            # The backend child may run with a deliberately stripped
+            # environment (no USERPROFILE/HOME): home resolution must
+            # never raise here, and the service-level env mapping is
+            # consulted before the process environment.
+            local_app_data = env.get("LOCALAPPDATA") or _os.environ.get("LOCALAPPDATA") or ""
+            user_profile = env.get("USERPROFILE") or _os.environ.get("USERPROFILE") or ""
             roots = [
-                _os.environ.get("PROGRAMFILES", r"C:\Program Files"),
-                _os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
-                str(_Path.home() / "AppData" / "Local" / "Programs"),
+                env.get("PROGRAMFILES") or _os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                env.get("PROGRAMFILES(X86)")
+                or _os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
             ]
+            if user_profile:
+                roots.append(str(_Path(user_profile) / "AppData" / "Local" / "Programs"))
             candidates = [str(_Path(root) / "Git" / "cmd" / "git.exe") for root in roots] + [
                 str(_Path(root) / "Git" / "bin" / "git.exe") for root in roots
             ]
+            if local_app_data:
+                candidates.append(
+                    str(_Path(local_app_data) / "Programs" / "Git" / "cmd" / "git.exe")
+                )
         else:
             candidates = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"]
     for candidate in candidates:

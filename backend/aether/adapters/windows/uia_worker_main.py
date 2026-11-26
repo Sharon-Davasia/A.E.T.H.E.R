@@ -230,7 +230,9 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, UnicodeDecodeError):
         print("uia worker: parent bootstrap is required", file=sys.stderr)
         return 2
-    import comtypes  # type: ignore[import-not-found]
+    import importlib
+
+    comtypes: Any = importlib.import_module("comtypes")
 
     comtypes.CoInitialize()
     try:

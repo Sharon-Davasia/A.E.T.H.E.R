@@ -179,6 +179,17 @@ def _is_supported_local_executable(identity: str) -> bool:
     try:
         if os.path.islink(identity):
             return False  # reparse point / symlink: conservative deny
+        # A reparse/symlink ancestor (e.g. a directory junction)
+        # defeats the final-component check, so walk the ancestors
+        # with the same conservative deny.
+        parent = os.path.dirname(os.path.abspath(identity))
+        while True:
+            if os.path.islink(parent):
+                return False
+            upper = os.path.dirname(parent)
+            if upper == parent:
+                break
+            parent = upper
     except OSError:
         return False
     return True
