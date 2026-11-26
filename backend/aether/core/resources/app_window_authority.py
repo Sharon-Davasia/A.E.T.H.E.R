@@ -33,6 +33,11 @@ class WindowBinding:
     instance_generation: int
     version_token: str
     expires_at: datetime | None = None
+    # CP4 context: which app this window belongs to and how the
+    # platform classified it (unknown fails closed for inspection).
+    app_resource_id: str | None = None
+    classification: object | None = None  # world_state.privacy.ContextClassification
+    elevated: bool | None = None
 
 
 class AppWindowResourceAuthority:
@@ -73,6 +78,9 @@ class AppWindowResourceAuthority:
         instance_generation: int,
         version_token: str,
         expires_at: datetime | None = None,
+        app_resource_id: str | None = None,
+        classification: object | None = None,
+        elevated: bool | None = None,
     ) -> ResourceRef:
         """Issue a fresh window ref, invalidating any previous HWND binding."""
         with self._lock:
@@ -87,6 +95,9 @@ class AppWindowResourceAuthority:
                 instance_generation=instance_generation,
                 version_token=version_token,
                 expires_at=expires_at,
+                app_resource_id=app_resource_id,
+                classification=classification,
+                elevated=elevated,
             )
             self._by_hwnd[hwnd] = window_id
         return ResourceRef(kind="window", resource_id=window_id, observed_version=version_token)

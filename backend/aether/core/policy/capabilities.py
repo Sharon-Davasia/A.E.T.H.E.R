@@ -41,6 +41,37 @@ class AppResolveArguments(CapabilityArguments):
     query: str = Field(min_length=1, max_length=256)
 
 
+class WindowActivateArguments(CapabilityArguments):
+    """Bounded window activation (T1 navigation): one window ref."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+
+
+class UiaInspectArguments(CapabilityArguments):
+    """Bounded UIA snapshot inspection of one authorized window."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+    require_content: bool = False
+
+
+class UiaElementArguments(CapabilityArguments):
+    """Read-only inspection of one transient element in one snapshot."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    element_ref: str = Field(pattern=r"^el:[0-9]+$")
+
+
+class UiaInvokeFixtureArguments(CapabilityArguments):
+    """The single bounded fixture interaction (CP5): exact transient
+    element identity in one snapshot of one window. No pattern name,
+    no coordinates, no keys, no value payload can be expressed."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    element_ref: str = Field(pattern=r"^el:[0-9]+$")
+
+
 class AppLaunchArguments(CapabilityArguments):
     """Immutable launch *intent*: registry-issued app id + postcondition.
 
@@ -206,6 +237,39 @@ class CapabilityRegistry:
         registry = cls.phase3_foundation()
         registry.register(
             CapabilityDefinition("app.launch", RiskTier.NAVIGATE, AppLaunchArguments, "app")
+        )
+        return registry
+
+    @classmethod
+    def phase3_with_uia(cls) -> CapabilityRegistry:
+        """Launch + CP4/CP5 bounded window/UIA capabilities.
+
+        ``window.activate`` is T1 navigation. ``uia.inspect_snapshot``
+        and ``uia.inspect_element`` are read-only observation.
+        ``uia.invoke_fixture`` is the single exact-operation fixture
+        interaction; it is risk-classified MODIFY (T2) by its intended
+        consequence and is executable only under the exact UI-operation
+        binding (CP5 sec.8). No generic invoke/set-value/keyboard/mouse
+        capability exists. Registration enables no executor by itself.
+        """
+        registry = cls.phase3_with_launch()
+        registry.register(
+            CapabilityDefinition(
+                "window.activate", RiskTier.NAVIGATE, WindowActivateArguments, "window"
+            )
+        )
+        registry.register(
+            CapabilityDefinition(
+                "uia.inspect_snapshot", RiskTier.OBSERVE, UiaInspectArguments, "window"
+            )
+        )
+        registry.register(
+            CapabilityDefinition("uia.inspect_element", RiskTier.OBSERVE, UiaElementArguments, "window")
+        )
+        registry.register(
+            CapabilityDefinition(
+                "uia.invoke_fixture", RiskTier.MODIFY, UiaInvokeFixtureArguments, "window"
+            )
         )
         return registry
 
