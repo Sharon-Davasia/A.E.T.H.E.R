@@ -130,6 +130,42 @@ class WindowActivationService:
             capability_id=step.capability_id, app_id=app_id, now=self._now()
         ):
             raise ActivationDenied("phase3_enablement_inactive")
+        # G06: validate + compare the actual confirmation binding
+        # (plan/step/hash, app+exact window version, arguments, session
+        # and activation scope) before any state commitment. The
+        # durable row's existence alone is never authority; the store
+        # re-validates atomically at consumption as well.
+        recorded = self.store.navigation_confirmation_binding(confirmation_id)
+        _task2, plan, _step2 = self._load_step(task_id, step_id)
+        expected_binding = confirmation_binding_digest(
+            NavigationConfirmationRequest(
+                task_id=task_id,
+                step_id=step_id,
+                plan_revision=plan.revision,
+                plan_hash=hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest(),
+                capability_id=step.capability_id,
+                arguments=dict(step.arguments),
+                app_resource_id=binding.app_resource_id or "",
+                expected_app_version=binding.version_token,
+                integrity_sha256=hashlib.sha256(binding.version_token.encode("utf-8")).hexdigest(),
+                session_id=self.session_id,
+                activation_scope=self.activation_scope,
+            )
+        )
+        if (
+            recorded is None
+            or recorded["task_id"] != str(task_id)
+            or recorded["step_id"] != str(step_id)
+            or recorded["binding_sha256"] != expected_binding
+            or recorded["expected_app_version"] != binding.version_token
+            or recorded["session_id"] != self.session_id
+            or recorded["activation_scope"] != self.activation_scope
+            or recorded["consumed_at"] is not None
+            or recorded["revoked_at"] is not None
+        ):
+            raise ActivationDenied("navigation_confirmation_binding_mismatch")
+        if self.focus.takeover_detected(window_id):
+            raise ActivationDenied("manual_takeover")
         self.store.advance_navigation_state(
             task_id,
             PersistentTaskState.PRECHECK,

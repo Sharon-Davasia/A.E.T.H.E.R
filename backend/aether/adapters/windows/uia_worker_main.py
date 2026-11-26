@@ -43,8 +43,19 @@ def handle_request(request: dict[str, Any], *, backend: UiaBackend) -> dict[str,
                     payload.get("max_total_text_chars", UiaLimits().max_total_text_chars)
                 ),
             )
-            elements = _bounded_walk(backend, root, limits)
-            return {**base, "status": "ok", "result": {"elements": elements}}
+            mode = str(payload.get("collection_mode", "metadata_only"))
+            elements, truncated = _bounded_walk(
+                backend, root, limits, include_names=(mode == "content_on_demand")
+            )
+            return {
+                **base,
+                "status": "ok",
+                "result": {
+                    "elements": elements,
+                    "completeness": "truncated" if truncated else "complete",
+                    "truncated": truncated,
+                },
+            }
         element_key = payload.get("element_key")
         if not isinstance(element_key, str):
             raise ValueError("an element key is required")
@@ -53,8 +64,6 @@ def handle_request(request: dict[str, Any], *, backend: UiaBackend) -> dict[str,
             return {**base, "status": "error", "error": "element_not_found"}
         if operation == "invoke":
             return {**base, "status": "ok", "result": backend.invoke(target)}
-        if operation == "read_value":
-            return {**base, "status": "ok", "result": backend.read_value(target)}
         return {**base, "status": "error", "error": "unsupported_operation"}
     except (ValueError, UiaBackendError) as exc:
         return {**base, "status": "error", "error": str(exc)[:160]}
@@ -75,15 +84,22 @@ def _find(backend: UiaBackend, root: Any, key: str) -> Any | None:
     return None
 
 
-def _bounded_walk(backend: UiaBackend, root: Any, limits: UiaLimits) -> list[dict[str, Any]]:
+def _bounded_walk(
+    backend: UiaBackend, root: Any, limits: UiaLimits, *, include_names: bool = False
+) -> tuple[list[dict[str, Any]], bool]:
     out: list[dict[str, Any]] = []
     stack = [(root, 0)]
     text = 0
+    truncated = False
     while stack and len(out) < limits.max_elements:
         node, depth = stack.pop()
         if depth > limits.max_depth:
+            truncated = True
             continue
-        name = node.name
+        # G06: in metadata-only mode accessible names are never read
+        # from the provider at all (not read-then-filtered). Password
+        # names are never read in any mode.
+        name = node.name if (include_names and not node.is_password) else None
         if name and text + len(name) > limits.max_total_text_chars:
             name = None
         elif name:
@@ -105,8 +121,11 @@ def _bounded_walk(backend: UiaBackend, root: Any, limits: UiaLimits) -> list[dic
             children = backend.children(node)
         except UiaBackendError:
             children = ()
+            truncated = True
         stack.extend((child, depth + 1) for child in reversed(children))
-    return out
+    if stack:
+        truncated = True
+    return out, truncated
 
 
 def serve(

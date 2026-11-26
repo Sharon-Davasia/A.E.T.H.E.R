@@ -23,3 +23,13 @@ acceptance time; the Linux fake identifiers (`fixture-increment`,
 to equal native identities. Fixture identity is established through
 trusted launch/process evidence and the approved executable identity,
 never through the window title.
+
+## Reproducibly built executable (G05)
+
+`AetherFixture.cs` + `build_fixture.cmd` build `AETHERFixture.exe`
+with the in-box .NET Framework `csc.exe` (no downloads or new
+dependencies). The approved launcher launches only that built
+executable identity via `approved_executable` with no arguments;
+the Python fixture source remains a contract reference and is never
+launched as a script. Delayed response is the on-window
+delay-toggle control (108), not a command-line argument.

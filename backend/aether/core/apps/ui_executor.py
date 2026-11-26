@@ -37,6 +37,21 @@ EFFECT_PATTERN = {"increment_fixture_count": "invoke"}
 STATUS_RUNTIME_ID = "fixture-status"
 
 
+def _status_element(snapshot):  # type: ignore[no-untyped-def]
+    """Fixture status by fake runtime id or the native control contract."""
+    direct = next((e for e in snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None)
+    if direct is not None:
+        return direct
+    from aether.core.apps.fixture_contract import STATUS_AUTOMATION_ID
+
+    matches = [
+        e
+        for e in snapshot.elements
+        if e.automation_id == STATUS_AUTOMATION_ID and e.control_type == "Text"
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 class UiDenied(Exception):
     def __init__(self, reason_code: str) -> None:
         self.reason_code = reason_code
@@ -239,9 +254,7 @@ class UiOperationExecutor:
             raise UiDenied("binding_element_mismatch")
         if not element.is_enabled:
             raise UiDenied("element_disabled")
-        status_element = next(
-            (e for e in snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None
-        )
+        status_element = _status_element(snapshot)
         if status_element is None or status_element.name is None:
             raise UiDenied("fixture_status_unavailable")
         if self.focus.takeover_detected(window_id):
@@ -314,9 +327,7 @@ class UiOperationExecutor:
         pre = self.snapshots.inspect(window_id, require_content=True)
         if pre.snapshot is None:
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
-        pre_status = next(
-            (e for e in pre.snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None
-        )
+        pre_status = _status_element(pre.snapshot)
         if pre_status is None or pre_status.name is None:
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
         expected = _expected_status(pre_status.name)
@@ -368,9 +379,7 @@ class UiOperationExecutor:
             or fresh.snapshot.window_version_token != str(binding["window_version_token"])
         ):
             return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
-        fresh_status = next(
-            (e for e in fresh.snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None
-        )
+        fresh_status = _status_element(fresh.snapshot)
         if fresh_status is None or fresh_status.name is None:
             return self._finish(task_id, step_id, binding_id, attempt_id, "uncertain", None)
         if fresh_status.name == expected:

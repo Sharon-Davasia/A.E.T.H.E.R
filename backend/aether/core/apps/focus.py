@@ -66,6 +66,7 @@ class FocusCoordinator:
     _held: dict[tuple[str, str], _HeldLock] = field(default_factory=dict)
     _takeover_windows: set[str] = field(default_factory=set)
     _invalidated_snapshots: set[str] = field(default_factory=set)
+    _active_operation_window: str | None = field(default=None)
 
     # -- acquisition ----------------------------------------------------
 
@@ -133,6 +134,8 @@ class FocusCoordinator:
         )
         if window_lock is None:
             return None
+        with self._lock:
+            self._active_operation_window = window_id
         foreground_lock = self.acquire_foreground(
             owner_task=owner_task, owner_session=owner_session, window_id=window_id
         )
@@ -197,14 +200,27 @@ class FocusCoordinator:
     # -- manual takeover ---------------------------------------------------
 
     def note_activity(self, signal: ActivitySignal) -> None:
-        """Record a takeover-relevant signal (content-free)."""
+        """Record a takeover-relevant signal (content-free).
+
+        G04 mapping: signals are interpreted against the *active
+        controlled operation*, never in isolation. Foreground moving
+        to a different window is a takeover of the active operation;
+        manual activity inside the active window is a takeover of it;
+        manual activity in an unrelated window while nothing is held
+        is only recorded for that window's own future checks. Unknown
+        window identity (``None``) never clears or creates permission:
+        it marks the active operation, conservatively.
+        """
         with self._lock:
-            if signal.window_id is not None and signal.kind in (
-                "manual_activity_in_window",
-                "focus_lost",
-                "foreground_changed",
-            ):
-                self._takeover_windows.add(signal.window_id)
+            active = self._active_operation_window
+            if signal.kind == "foreground_changed":
+                if active is not None and signal.window_id != active:
+                    self._takeover_windows.add(active)
+                elif signal.window_id is None and active is not None:
+                    self._takeover_windows.add(active)
+            elif signal.kind in ("manual_activity_in_window", "focus_lost"):
+                if signal.window_id is not None:
+                    self._takeover_windows.add(signal.window_id)
 
     def takeover_detected(self, window_id: str) -> bool:
         with self._lock:

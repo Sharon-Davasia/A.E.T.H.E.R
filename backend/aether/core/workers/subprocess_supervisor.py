@@ -18,6 +18,7 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
+from aether.core.contracts.uia import MAX_RESPONSE_BYTES
 from aether.core.workers.uia_worker import WorkerOutcome, WorkerResult, WorkerSupervisor
 
 
@@ -70,7 +71,7 @@ class SubprocessWorkerSupervisor:
                 assert process.stdin is not None and process.stdout is not None
                 process.stdin.write(body)
                 process.stdin.flush()
-                line = process.stdout.readline()
+                line = process.stdout.readline(MAX_RESPONSE_BYTES + 2)
                 if not line:
                     raise ConnectionError("worker closed its output")
                 result["line"] = line

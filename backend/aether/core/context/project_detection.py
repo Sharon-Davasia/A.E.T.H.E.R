@@ -92,19 +92,24 @@ class ProjectDetector:
         explorer = self.explorer_folder() if self.explorer_folder else None
         focus_alias = self.recent_focus_root() if self.recent_focus_root else None
         for root in roots:
-            manifests = self._manifests(root.canonical_root)
+            # G06: the root's canonical resource identity is issued by
+            # resolving the registered root itself through the existing
+            # resource/path authorization checks - never an arbitrary
+            # known resource that happens to sit under the root.
+            root_resource = None
+            try:
+                root_resource = self.registry.resolve(root.root_id, "")  # type: ignore[attr-defined]
+            except Exception:
+                root_resource = None
+            manifests = (
+                self._manifests(root_resource.canonical_path) if root_resource is not None else ()
+            )
             source = "registered_project"
             if explorer is not None and _same_path(root.canonical_root, explorer):
                 source = "explorer_registered"
             elif focus_alias is not None and focus_alias == root.alias:
                 source = "recent_task_focus"
-            resource_id: str | None = None
-            try:
-                known = self.registry.known_resources()  # type: ignore[attr-defined]
-                match = next((r for r in known if r.root_id == root.root_id), None)
-                resource_id = match.ref.resource_id if match else None
-            except Exception:
-                resource_id = None
+            resource_id = root_resource.ref.resource_id if root_resource is not None else None
             candidates[str(root.root_id)] = ProjectCandidate(
                 candidate_id=f"project:{root.root_id}",
                 resource_id=resource_id,
@@ -115,8 +120,14 @@ class ProjectDetector:
                 observed_at=now,
                 expires_at=now + CANDIDATE_TTL,
                 evidence_strength=_STRENGTH[source],
-                available=True,
-                limitations=() if manifests else ("no_workspace_manifest",),
+                available=root_resource is not None,
+                limitations=(
+                    ()
+                    if root_resource is not None and manifests
+                    else ("registered_root_unavailable",)
+                    if root_resource is None
+                    else ("no_workspace_manifest",)
+                ),
                 manifests=manifests,
             )
         if explorer is not None and not any(
@@ -136,7 +147,8 @@ class ProjectDetector:
                 evidence_strength=_STRENGTH["explorer_discovered"],
                 available=False,
                 limitations=("unregistered_root", "registration_required_before_use"),
-                manifests=self._manifests(explorer),
+                # G06: no filesystem probing of unregistered locations.
+                manifests=(),
             )
         return tuple(
             sorted(

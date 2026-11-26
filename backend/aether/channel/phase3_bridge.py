@@ -55,6 +55,15 @@ class Phase3Surface:
         default_factory=lambda: {"optedIn": False, "mode": "off", "paused": False}
     )
     native_reason: str = "phase3_native_disabled"
+    # G01/G06: trusted-composition wiring (all optional; absent =
+    # the corresponding workflow is truthfully unavailable).
+    privacy_authority: object | None = None  # ObservationPrivacyAuthority
+    planner: object | None = None  # Planner
+    launch_coordinator: object | None = None  # TrustedLaunchCoordinator
+    launch_authority: object | None = None  # LaunchAuthority
+    launch_registry: object | None = None  # InMemoryApplicationRegistry
+    activation_service: object | None = None  # WindowActivationService
+    dialog_guard: object | None = None  # DialogGuard
 
     @classmethod
     def disabled(cls) -> Phase3Surface:
@@ -111,17 +120,34 @@ class Phase3Bridge:
                     for c in surface.detector.detect()
                 ]
             windows = []
-            if surface.authority is not None and surface.snapshots is not None:
-                windows = [{"status": "observed_via_snapshot_service"}]
+            if surface.authority is not None:
+                app_names = {}
+                if surface.app_records is not None:
+                    app_names = {r.app_id: r.display_name for r in surface.app_records()}
+                windows = [
+                    {
+                        "windowId": w.window_id,
+                        "appId": w.app_resource_id,
+                        "appDisplayName": app_names.get(w.app_resource_id or "", ""),
+                        "version": w.version_token,
+                    }
+                    for w in surface.authority.known_windows()
+                ]
+            privacy_state = (
+                surface.privacy_authority.snapshot_dict()  # type: ignore[attr-defined]
+                if surface.privacy_authority is not None
+                else dict(surface.privacy)
+            )
             return {
                 "status": "ready",
                 "nativeAvailable": surface.executor is not None,
                 "disabledReason": None if surface.executor is not None else surface.native_reason,
-                "privacy": dict(surface.privacy),
+                "privacy": privacy_state,
                 "projects": projects,
                 "windows": windows,
                 "capabilities": {
-                    "window.activate": surface.executor is not None,
+                    "app.launch": surface.launch_coordinator is not None,
+                    "window.activate": surface.activation_service is not None,
                     "uia.inspect_snapshot": surface.snapshots is not None,
                     "uia.inspect_element": surface.snapshots is not None,
                     "uia.invoke_fixture": surface.executor is not None,
@@ -134,7 +160,19 @@ class Phase3Bridge:
         def run() -> dict[str, object]:
             if not isinstance(payload, dict) or not set(payload) <= {"optedIn", "mode", "paused"}:
                 raise _Phase3Refused("invalid_request")
-            self.surface.privacy.update(_privacy_update(payload))
+            update = _privacy_update(payload)
+            if self.surface.privacy_authority is not None:
+                # G06: update the authoritative observation policy;
+                # its listeners purge snapshots and approvals. The
+                # bridge dictionary is never the source of truth.
+                privacy = self.surface.privacy_authority.update(  # type: ignore[attr-defined]
+                    opted_in=bool(update.get("optedIn", False)),
+                    mode=str(update.get("mode", "off")),
+                    paused=bool(update.get("paused", False)),
+                )
+                self.surface.privacy.update(privacy)
+                return {"status": "ready", "privacy": privacy}
+            self.surface.privacy.update(update)
             if self.surface.snapshots is not None:
                 # Any privacy change voids retained snapshots (F12).
                 self.surface.snapshots.note_privacy_change()
@@ -347,6 +385,401 @@ class Phase3Bridge:
                 "detail": outcome.outcome,
                 "attemptId": outcome.attempt_id,
             }
+
+        return self._guarded(run)
+
+    # -- G02 workflow: windows, task preparation, launch/activation ---------
+
+    def list_windows(self, payload: object) -> dict[str, object]:
+        def run() -> dict[str, object]:
+            if self.surface.authority is None:
+                return self._unavailable()
+            app_names = {}
+            if self.surface.app_records is not None:
+                app_names = {r.app_id: r.display_name for r in self.surface.app_records()}
+            return {
+                "status": "ready",
+                "windows": [
+                    {
+                        "windowId": w.window_id,
+                        "appId": w.app_resource_id,
+                        "appDisplayName": app_names.get(w.app_resource_id or "", ""),
+                        "version": w.version_token,
+                    }
+                    for w in self.surface.authority.known_windows()  # type: ignore[attr-defined]
+                ],
+            }
+
+        return self._guarded(run)
+
+    def _now(self) -> datetime:
+        return datetime.now(UTC)
+
+    def _create_planned_task(self, *, goal: object, resource_id: str, arguments: dict[str, object], summary: str) -> tuple[UUID, object]:
+        surface = self.surface
+        if surface.store is None or surface.planner is None:
+            raise _Phase3Refused("phase3_surface_incomplete")
+        from aether.core.planning.planner import PlanIntent
+
+        task = surface.store.create_task(summary, now=self._now())
+        surface.store.transition_task(task.task_id, PersistentTaskState.PLANNING, now=self._now())
+        planned = surface.planner.plan(  # type: ignore[attr-defined]
+            task.task_id,
+            PlanIntent(goal=goal, resource_id=resource_id, arguments=arguments, summary=summary),  # type: ignore[arg-type]
+        )
+        surface.store.save_plan(planned.plan)
+        for state in (
+            PersistentTaskState.VALIDATING,
+            PersistentTaskState.PREVIEW_READY,
+            PersistentTaskState.AWAITING_APPROVAL,
+        ):
+            surface.store.transition_task(task.task_id, state, now=self._now())
+        return task.task_id, planned
+
+    def _app_summary(self, app_id: str) -> dict[str, object]:
+        if self.surface.app_records is not None:
+            for record in self.surface.app_records():
+                if record.app_id == app_id:
+                    return {"appId": record.app_id, "appDisplayName": record.display_name}
+        return {"appId": app_id, "appDisplayName": app_id}
+
+    def prepare_launch(self, payload: object) -> dict[str, object]:
+        def run() -> dict[str, object]:
+            if self.surface.launch_coordinator is None:
+                return self._unavailable()
+            if not isinstance(payload, dict) or not set(payload) <= {"appId", "postcondition"}:
+                raise _Phase3Refused("invalid_request")
+            from aether.core.planning.planner import PlanGoal
+
+            app_id = str(payload["appId"])
+            task_id, planned = self._create_planned_task(
+                goal=PlanGoal.LAUNCH_APPLICATION,
+                resource_id=app_id,
+                arguments={"resource_id": app_id, "postcondition": str(payload.get("postcondition", "window_required"))},
+                summary=f"Launch {self._app_summary(app_id)['appDisplayName']}",
+            )
+            return {
+                "status": "ready",
+                "taskId": str(task_id),
+                "stepId": str(planned.step_id),
+                "preview": {
+                    **self._app_summary(app_id),
+                    "operation": "app.launch",
+                    "intendedEffect": "launch the registered application exactly once",
+                    "expectedPostcondition": str(payload.get("postcondition", "window_required")),
+                },
+            }
+
+        return self._guarded(run)
+
+    def prepare_activation(self, payload: object) -> dict[str, object]:
+        def run() -> dict[str, object]:
+            if self.surface.activation_service is None:
+                return self._unavailable()
+            if not isinstance(payload, dict) or set(payload) != {"windowId"}:
+                raise _Phase3Refused("invalid_request")
+            from aether.core.planning.planner import PlanGoal
+
+            window_id = str(payload["windowId"])
+            window = self._window_summary(window_id)
+            task_id, planned = self._create_planned_task(
+                goal=PlanGoal.ACTIVATE_WINDOW,
+                resource_id=window_id,
+                arguments={"resource_id": window_id},
+                summary=f"Activate {window['appDisplayName']}",
+            )
+            return {
+                "status": "ready",
+                "taskId": str(task_id),
+                "stepId": str(planned.step_id),
+                "preview": {
+                    **window,
+                    "operation": "window.activate",
+                    "intendedEffect": "bring the exact window to the foreground once",
+                    "expectedPostcondition": "the same window instance is foreground",
+                },
+            }
+
+        return self._guarded(run)
+
+    def _window_summary(self, window_id: str) -> dict[str, object]:
+        if self.surface.authority is None:
+            raise _Phase3Refused("window_unknown")
+        binding = self.surface.authority.resolve_window(window_id)  # type: ignore[attr-defined]
+        summary = self._app_summary(binding.app_resource_id or "")
+        return {
+            "windowId": window_id,
+            "appId": binding.app_resource_id,
+            "appDisplayName": summary["appDisplayName"],
+            "windowVersion": binding.version_token,
+        }
+
+    def prepare_fixture_interaction(self, payload: object) -> dict[str, object]:
+        def run() -> dict[str, object]:
+            if self.surface.snapshots is None or self.surface.executor is None:
+                return self._unavailable()
+            if not isinstance(payload, dict) or not set(payload) <= {"windowId", "elementRef"}:
+                raise _Phase3Refused("invalid_request")
+            from aether.core.apps.fixture_contract import resolve_fixture_elements
+            from aether.core.planning.planner import PlanGoal
+
+            window_id = str(payload["windowId"])
+            window = self._window_summary(window_id)
+            # Narrow fixture-counter authorization: content inspection
+            # is permitted only for the approved fixture app (enforced
+            # by the snapshot service seam), and only the contract
+            # status/increment controls are resolved here.
+            result = self.surface.snapshots.inspect(window_id, require_content=True)
+            if result.snapshot is None:
+                return {"status": "unavailable", "reason": result.outcome.value}
+            try:
+                elements = resolve_fixture_elements(result.snapshot)
+            except Exception:
+                # Simulated-provider path only: the fake fixture uses
+                # its documented simulated keys. Native snapshots must
+                # satisfy the automation-id contract above; fake keys
+                # are never accepted as native runtime identity.
+                from aether.core.apps.fixture_contract import (
+                    FixtureContractError,
+                    FixtureElements,
+                    parse_fixture_count,
+                )
+
+                status_el = next(
+                    (e for e in result.snapshot.elements if e.runtime_id == "fixture-status"), None
+                )
+                increment_el = next(
+                    (
+                        e
+                        for e in result.snapshot.elements
+                        if e.runtime_id in ("fixture-increment", "fixture-increment-v2")
+                    ),
+                    None,
+                )
+                if status_el is None or increment_el is None:
+                    raise FixtureContractError("fixture control contract is not satisfied") from None
+                elements = FixtureElements(
+                    status=status_el,
+                    increment=increment_el,
+                    count=parse_fixture_count(status_el.name),
+                )
+            task_id, planned = self._create_planned_task(
+                goal=PlanGoal.INVOKE_FIXTURE_ELEMENT,
+                resource_id=window_id,
+                arguments={
+                    "resource_id": window_id,
+                    "snapshot_id": result.snapshot.snapshot_id,
+                    "element_ref": elements.increment.element_ref,
+                },
+                summary=f"Increment fixture counter in {window['appDisplayName']}",
+            )
+            return {
+                "status": "ready",
+                "taskId": str(task_id),
+                "stepId": str(planned.step_id),
+                "preview": {
+                    **window,
+                    "operation": "uia.invoke_fixture",
+                    "elementRef": elements.increment.element_ref,
+                    "runtimeId": elements.increment.runtime_id,
+                    "verifiedPrecondition": f"Count: {elements.count}",
+                    "intendedEffect": "increment_fixture_count",
+                    "expectedPostcondition": f"Count: {elements.expected_after_increment}",
+                },
+            }
+
+        return self._guarded(run)
+
+    # -- G02: generic trusted-gesture preview/approval for launch/activate --
+
+    def _gesture_binding(self, task_id: UUID, effect: str) -> tuple[object, dict[str, object]]:
+        from aether.core.planning.authorizing_gesture import GestureBinding
+
+        parts = self._preview_parts(task_id)
+        arguments = parts["arguments"]
+        if not isinstance(arguments, dict):
+            raise _Phase3Refused("binding_mismatch")
+        store = self.surface.store
+        if store is None:
+            raise _Phase3Refused("phase3_surface_incomplete")
+        plan = store.get_plan(task_id)
+        plan_hash = hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
+        binding = GestureBinding(
+            task_id=task_id,
+            plan_revision=plan.revision,
+            plan_hash=plan_hash,
+            preview_id=plan.steps[0].step_id,
+            preview_digest=_canonical_digest(parts),
+            scope_digest=_canonical_digest(
+                {"target": arguments.get("resource_id"), "effect": effect, "task": str(task_id)}
+            ),
+        )
+        return binding, parts
+
+    def preview_operation(self, payload: object) -> dict[str, object]:
+        """Preview a launch/activation task for trusted approval."""
+        def run() -> dict[str, object]:
+            if not isinstance(payload, dict) or set(payload) != {"taskId", "effect"}:
+                raise _Phase3Refused("invalid_request")
+            task_id = UUID(str(payload["taskId"]))
+            effect = str(payload["effect"])
+            if effect not in ("app.launch", "window.activate"):
+                raise _Phase3Refused("capability_not_approved_for_interaction")
+            binding, parts = self._gesture_binding(task_id, effect)
+            if self.surface.nonces is None:
+                raise _Phase3Refused("phase3_surface_incomplete")
+            nonce = self.surface.nonces.issue(binding)  # type: ignore[attr-defined]
+            arguments = parts["arguments"]
+            resource_id = str(arguments.get("resource_id")) if isinstance(arguments, dict) else ""
+            summary = (
+                self._app_summary(resource_id)
+                if effect == "app.launch"
+                else self._window_summary(resource_id)
+            )
+            return {
+                "status": "ready",
+                "nonce": nonce,
+                "binding": {
+                    "taskId": str(binding.task_id),  # type: ignore[attr-defined]
+                    "planRevision": binding.plan_revision,  # type: ignore[attr-defined]
+                    "planHash": binding.plan_hash,  # type: ignore[attr-defined]
+                    "previewId": str(binding.preview_id),  # type: ignore[attr-defined]
+                    "previewDigest": binding.preview_digest,  # type: ignore[attr-defined]
+                    "scopeDigest": binding.scope_digest,  # type: ignore[attr-defined]
+                },
+                "preview": {
+                    **parts,
+                    **summary,
+                    "operation": effect,
+                    "intendedEffect": effect,
+                    "expectedPostcondition": "verified by independent observation",
+                },
+            }
+
+        return self._guarded(run)
+
+    def approve_operation(self, payload: object) -> dict[str, object]:
+        """Verify a trusted gesture and execute one launch/activation."""
+        def run() -> dict[str, object]:
+            if not isinstance(payload, dict) or "effect" not in payload:
+                raise _Phase3Refused("invalid_request")
+            effect = str(payload["effect"])
+            gesture_payload = {k: v for k, v in payload.items() if k != "effect"}
+            verified = self._verify_gesture(gesture_payload, effect)
+            task_id = verified["task_id"]
+            plan = verified["plan"]
+            step = plan.steps[0]
+            if effect == "app.launch":
+                coordinator = self.surface.launch_coordinator
+                authority = self.surface.launch_authority
+                registry = self.surface.launch_registry
+                if coordinator is None or authority is None or registry is None:
+                    return self._unavailable()
+                record = registry.get(str(verified["arguments"].get("resource_id")))  # type: ignore[attr-defined]
+                confirmation = coordinator.issue_confirmation(task_id, step.step_id)  # type: ignore[attr-defined]
+                authorization = authority.authorize(  # type: ignore[attr-defined]
+                    record, session_id="session-1", activation_scope="test-scope"
+                )
+                outcome = coordinator.execute(  # type: ignore[attr-defined]
+                    task_id,
+                    step.step_id,
+                    confirmation_id=confirmation.confirmation_id,
+                    authorization_id=authorization.authorization_id,
+                )
+                return {"status": "ready", "outcome": outcome.status, "detail": outcome.outcome.value if hasattr(outcome.outcome, "value") else str(outcome.outcome), "attemptId": outcome.attempt_id}
+            if effect == "window.activate":
+                service = self.surface.activation_service
+                if service is None:
+                    return self._unavailable()
+                confirmation_id = service.issue_confirmation(task_id, step.step_id)
+                outcome = service.execute(task_id, step.step_id, confirmation_id=confirmation_id)
+                return {"status": "ready", "outcome": outcome.status, "detail": outcome.outcome.value if hasattr(outcome.outcome, "value") else str(outcome.outcome), "attemptId": outcome.attempt_id}
+            raise _Phase3Refused("capability_not_approved_for_interaction")
+
+        return self._guarded(run)
+
+    def _verify_gesture(self, payload: dict[str, object], effect: str) -> dict[str, object]:
+        from aether.core.planning.authorizing_gesture import GestureRejected, SignedGesture
+
+        if self.surface.gesture_authority is None or self.surface.store is None:
+            raise _Phase3Refused("phase3_surface_incomplete")
+        task_id = UUID(str(payload["taskId"]))
+        expected, parts = self._gesture_binding(task_id, effect)
+        try:
+            asserted = datetime.fromisoformat(str(payload["assertedAt"]))
+        except ValueError:
+            raise _Phase3Refused("invalid_gesture") from None
+        if asserted.tzinfo is None:
+            asserted = asserted.replace(tzinfo=UTC)
+        gesture = SignedGesture(
+            nonce=str(payload["nonce"]),
+            binding=expected,  # type: ignore[arg-type]
+            asserted_at=asserted,
+            user_intent=str(payload["userIntent"]),
+            signature=str(payload["signature"]),
+        )
+        try:
+            self.surface.gesture_authority.verify(gesture, expected=expected)  # type: ignore[attr-defined]
+        except GestureRejected as exc:
+            raise _Phase3Refused(exc.reason_code) from exc
+        plan = self.surface.store.get_plan(task_id)
+        arguments = parts["arguments"]
+        return {"task_id": task_id, "plan": plan, "arguments": arguments if isinstance(arguments, dict) else {}}
+
+    def get_receipt(self, payload: object) -> dict[str, object]:
+        def run() -> dict[str, object]:
+            if self.surface.store is None:
+                return self._unavailable()
+            if not isinstance(payload, dict) or set(payload) != {"taskId"}:
+                raise _Phase3Refused("invalid_request")
+            task_id = UUID(str(payload["taskId"]))
+            return {
+                "status": "ready",
+                "taskState": PersistentTaskState(self.surface.store.get_task(task_id).state).value,
+                "navigationAttempts": self.surface.store.navigation_attempts_for_task(task_id),
+                "uiAttempts": self.surface.store.ui_attempts_for_task(task_id),
+            }
+
+        return self._guarded(run)
+
+    def cancel_task(self, payload: object) -> dict[str, object]:
+        def run() -> dict[str, object]:
+            if self.surface.store is None:
+                return self._unavailable()
+            if not isinstance(payload, dict) or set(payload) != {"taskId"}:
+                raise _Phase3Refused("invalid_request")
+            task_id = UUID(str(payload["taskId"]))
+            task = self.surface.store.get_task(task_id)
+            if task.state in (PersistentTaskState.PLANNING, PersistentTaskState.AWAITING_APPROVAL, PersistentTaskState.PAUSED):
+                self.surface.store.transition_task(task_id, PersistentTaskState.CANCELLED, now=self._now())
+            return {"status": "ready", "taskState": PersistentTaskState(self.surface.store.get_task(task_id).state).value}
+
+        return self._guarded(run)
+
+    def resume_task(self, payload: object) -> dict[str, object]:
+        def run() -> dict[str, object]:
+            if self.surface.recovery is None:
+                return self._unavailable()
+            if not isinstance(payload, dict) or set(payload) != {"taskId"}:
+                raise _Phase3Refused("invalid_request")
+            task_id = UUID(str(payload["taskId"]))
+            # Fresh precheck is mandatory: a fresh snapshot must be
+            # obtainable and no consumed approval is ever replayed
+            # (approval_valid is therefore always False here; resume
+            # only returns the task to PLANNING for a new cycle).
+            def _no_consumed_authorization(tid: UUID) -> bool:
+                if self.surface.store is None:
+                    return False
+                attempts = self.surface.store.ui_attempts_for_task(tid) + self.surface.store.navigation_attempts_for_task(tid)
+                return not attempts
+
+            assessment = self.surface.recovery.resume(
+                task_id,
+                fresh_precheck=lambda _tid: self.surface.snapshots is not None,
+                approval_valid=_no_consumed_authorization,
+                now=self._now(),
+            )
+            return {"status": "ready", "classification": assessment.classification.value, "reason": assessment.redacted_reason}
 
         return self._guarded(run)
 

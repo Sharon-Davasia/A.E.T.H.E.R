@@ -215,6 +215,7 @@ class UiaSnapshotService:
         from aether.core.workers.uia_worker import WorkerOutcome
 
         now = self._now()
+        generation_before = self.privacy_generation
         result = self.worker.execute(  # type: ignore[attr-defined]
             "inspect",
             {
@@ -222,9 +223,12 @@ class UiaSnapshotService:
                 "max_depth": limits.max_depth,
                 "max_elements": limits.max_elements,
                 "max_total_text_chars": limits.max_total_text_chars,
+                "collection_mode": "content_on_demand" if require_content else "metadata_only",
             },
             timeout=limits.budget_seconds + 2.0,
         )
+        if self.privacy_generation != generation_before:
+            return SnapshotResult(UiaOutcome.PRIVACY_DENIED, detail="privacy_changed_in_flight")
         if result.outcome is WorkerOutcome.TIMED_OUT:
             return SnapshotResult(UiaOutcome.TIMED_OUT)
         if result.outcome is not WorkerOutcome.OK or result.response is None:
@@ -259,7 +263,9 @@ class UiaSnapshotService:
                     value_present=False,
                 )
             )
-        truncated = len(raw_elements) >= limits.max_elements
+        # Completeness is explicit worker evidence; the element-limit
+        # heuristic is only a fallback for older simulated workers.
+        truncated = bool(result.response.get("truncated", len(raw_elements) >= limits.max_elements))
         snapshot = UiaSnapshot(
             snapshot_id=f"snap:{uuid4()}",
             session_id=self.session_id,

@@ -28,19 +28,24 @@ from aether.core.contracts.uia import MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES
 
 PROTOCOL_VERSION = "aether-uia-worker/1"
 
-OPERATIONS = frozenset({"inspect", "invoke", "read_value", "health", "shutdown"})
+OPERATIONS = frozenset({"inspect", "invoke", "health", "shutdown"})
 
 # F11: strict allowlisted, operation-specific payload schemas replace
 # any forbidden-field blacklisting. Unknown keys are rejected.
 _PAYLOAD_SCHEMAS: dict[str, dict[str, type]] = {
     "health": {},
     "shutdown": {},
-    "inspect": {"hwnd": int, "max_depth": int, "max_elements": int, "max_total_text_chars": int},
+    "inspect": {
+        "hwnd": int,
+        "max_depth": int,
+        "max_elements": int,
+        "max_total_text_chars": int,
+        "collection_mode": str,
+    },
     # Internal worker operations: dispatchable only by the trusted
     # parent for an authorized typed capability/target; never exposed
     # to the renderer or model.
     "invoke": {"hwnd": int, "element_key": str},
-    "read_value": {"hwnd": int, "element_key": str},
 }
 
 # Side-effect classification derives from the operation contract,
@@ -85,6 +90,18 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
             not isinstance(payload[key], expected) or isinstance(payload[key], bool)
         ):
             raise ValueError(f"payload field {key} has the wrong type")
+    # G06: bounded numeric/text values, enforced before any provider call.
+    bounds = {"hwnd": (1, 2**31 - 1), "max_depth": (0, 32), "max_elements": (1, 512), "max_total_text_chars": (0, 100_000)}
+    for key, (low, high) in bounds.items():
+        if key in payload and not (low <= int(payload[key]) <= high):
+            raise ValueError(f"payload field {key} is outside its bound")
+    if "element_key" in payload and not (1 <= len(str(payload["element_key"])) <= 128):
+        raise ValueError("element_key is outside its bound")
+    if "collection_mode" in payload and payload["collection_mode"] not in (
+        "metadata_only",
+        "content_on_demand",
+    ):
+        raise ValueError("collection_mode is not permitted")
     return request
 
 

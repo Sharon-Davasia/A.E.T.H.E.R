@@ -86,6 +86,15 @@ _PHASE3_KINDS = {
     "phase3.approve_interaction": ("approve_fixture_interaction", "phase3.outcome"),
     "phase3.get_task": ("get_task_state", "phase3.task"),
     "phase3.pause_task": ("pause_task", "phase3.task"),
+    "phase3.list_windows": ("list_windows", "phase3.windows"),
+    "phase3.prepare_launch": ("prepare_launch", "phase3.prepared"),
+    "phase3.prepare_activation": ("prepare_activation", "phase3.prepared"),
+    "phase3.prepare_fixture": ("prepare_fixture_interaction", "phase3.prepared"),
+    "phase3.preview_operation": ("preview_operation", "phase3.preview"),
+    "phase3.approve_operation": ("approve_operation", "phase3.outcome"),
+    "phase3.get_receipt": ("get_receipt", "phase3.receipt"),
+    "phase3.cancel_task": ("cancel_task", "phase3.task"),
+    "phase3.resume_task": ("resume_task", "phase3.task"),
 }
 
 _LIVE_KINDS = {

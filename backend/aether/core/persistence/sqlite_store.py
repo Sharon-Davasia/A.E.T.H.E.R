@@ -486,7 +486,17 @@ class SQLiteTaskStore:
         database_path: Path | str,
         *,
         migrations_dir: Path | Traversable | None = None,
+        target_schema_version: int | None = None,
+        _acceptance_pending_authorized: bool = False,
     ) -> None:
+        # G03: scoped schema selection. Ordinary construction keeps
+        # ACTIVE_SCHEMA_VERSION (v2). A pending version (v3) may be
+        # targeted only via the dedicated acceptance-storage factory,
+        # which validates location/marker/authorization before passing
+        # the internal flag; the flag alone in ordinary code is not the
+        # owner-side procedure and composition never sets it.
+        self._target_schema_version = target_schema_version
+        self._acceptance_pending_authorized = _acceptance_pending_authorized
         try:
             raw_database_path = os.fspath(database_path)
         except TypeError as exc:
@@ -912,6 +922,20 @@ class SQLiteTaskStore:
                 raise IllegalPersistentTransition(
                     "navigation confirmation could not be recorded for this plan"
                 ) from exc
+
+    def navigation_confirmation_binding(self, confirmation_id: str) -> dict[str, object] | None:
+        """Read-only view of a recorded confirmation binding (G06)."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT task_id, step_id, plan_revision, plan_hash, capability_id,"
+                " arguments_sha256, binding_sha256, app_resource_id, expected_app_version,"
+                " session_id, activation_scope, expires_at, consumed_at, revoked_at"
+                " FROM navigation_confirmations WHERE id = ?",
+                (confirmation_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {key: row[key] for key in row.keys()}
 
     def revoke_navigation_confirmation(self, confirmation_id: str, *, now: datetime) -> None:
         with self._transaction() as connection:
@@ -3068,12 +3092,16 @@ class SQLiteTaskStore:
 
     def _apply_migrations(self) -> None:
         current = int(self._connection.execute("PRAGMA user_version").fetchone()[0])
-        target_version = ACTIVE_SCHEMA_VERSION
+        target_version = (
+            self._target_schema_version
+            if self._target_schema_version is not None
+            else ACTIVE_SCHEMA_VERSION
+        )
         if target_version not in _EXPECTED_MIGRATIONS:
             raise PersistenceIntegrityError("active schema version is not registered")
         # Activation gate (PR #14): a prepared migration must never run before it
         # is explicitly authorized, even if the active version was bumped.
-        if target_version in PENDING_MIGRATION_VERSIONS:
+        if target_version in PENDING_MIGRATION_VERSIONS and not self._acceptance_pending_authorized:
             raise PersistenceIntegrityError(_activation_error(target_version))
         # Compare against the *active* version, not the registry maximum: a build
         # that has only activated version 1 must refuse a version-2 database

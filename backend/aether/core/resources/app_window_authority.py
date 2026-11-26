@@ -102,6 +102,11 @@ class AppWindowResourceAuthority:
             self._by_hwnd[hwnd] = window_id
         return ResourceRef(kind="window", resource_id=window_id, observed_version=version_token)
 
+    def known_windows(self) -> tuple[WindowBinding, ...]:
+        """All currently registered window bindings (bounded, in-memory)."""
+        with self._lock:
+            return tuple(self._windows.values())
+
     def resolve_window(self, window_id: str) -> WindowBinding:
         with self._lock:
             binding = self._windows.get(window_id)
