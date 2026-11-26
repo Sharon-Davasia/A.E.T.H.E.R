@@ -230,6 +230,9 @@ class ObserverService:
             with self._lock:
                 self._source_generation = _bump(self._source_generation)
                 self._advance_generation()
+                # A restarted service collects again (privacy pause
+                # superseded the stopped state at start() time).
+                self._paused = False
                 source_generation = self._source_generation
             try:
                 self.source.start(lambda event: self._enqueue(event, source_generation))

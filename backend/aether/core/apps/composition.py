@@ -179,8 +179,19 @@ class Phase3Composition:
         """
         if self._revoked:
             return
+        # Correct resume after pause/opt-out: WorldState is resumed
+        # first (retained state stays cleared; only fresh observation
+        # may repopulate it), then the observer restarts and a
+        # bounded reconciliation republishes current windows.
+        # Starting the observer without resuming WorldState would
+        # silently drop every fresh event (paused store).
+        if self.world_state is not None:
+            self.world_state.resume()  # type: ignore[attr-defined]
         if self.observer_service is not None:
             self.observer_service.start()  # type: ignore[attr-defined]
+            reconcile = getattr(self.observer_service, "reconcile", None)
+            if reconcile is not None:
+                reconcile()
         if self.activity_source is not None:
             start = getattr(self.activity_source, "start", None)
             if start is not None:
@@ -301,7 +312,17 @@ class Phase3Composition:
                 worker.on_worker_restart = snapshots.note_privacy_change
             from pathlib import PureWindowsPath as _PWP
 
+            from aether.world_state.observer import GenerationClock
+
+            # One authoritative collection generation shared by the
+            # observer (stamps at collection) and WorldState
+            # (validates at the retained-state commit boundary), so
+            # pause/resume/privacy invalidation advances the same
+            # clock on both sides and stale stamps can never
+            # repopulate retained state while fresh ones can.
+            generation_clock = GenerationClock()
             world_state = InMemoryWorldState(
+                generation_clock=generation_clock,
                 policy=privacy.policy,
                 authority=authority,
                 app_id_by_identity={
@@ -313,8 +334,12 @@ class Phase3Composition:
             observer_service = None
             if providers.event_source is not None:
                 observer_service = ObserverService(
+                    generation_clock=generation_clock,
                     source=providers.event_source,  # type: ignore[arg-type]
                     on_event=lambda event: world_state.handle_event(event, now=now_fn()),
+                    snapshot_handler=lambda events: world_state.apply_snapshot(
+                        events, now=now_fn()
+                    ),
                 )
             broker = PolicyBroker(
                 capabilities=capabilities,
@@ -404,15 +429,18 @@ class Phase3Composition:
             )
 
             def _native_modal_evidence(window_id: str):  # type: ignore[no-untyped-def]
-                """Modal evidence from bounded supervised inspection.
+                """Bounded modal evidence, including separate owned
+                modal windows.
 
-                Routes through the snapshot service (supervised UIA
-                worker when configured; bounded limits otherwise) —
-                never a direct unbounded backend call. A missing,
-                truncated or failed inspection is *unknown* (None),
-                which prevents effectful dispatch; only a complete
-                inspection with no modal secondary window proves
-                absence.
+                Two bounded sources, both through supervised/bounded
+                inspection: (a) the target window's supervised
+                snapshot tree, and (b) separate top-level windows
+                owned by the same process, enumerated through the
+                observer's bounded reconciliation and inspected via
+                the bounded UIA backend — a separate owned window
+                whose root reports modal (or is a secondary Window)
+                is modal evidence. Missing, truncated or failed
+                evidence is *unknown* (None) and prevents dispatch.
                 """
                 from aether.core.apps.dialogs import ModalWindowEvidence
 
@@ -423,7 +451,7 @@ class Phase3Composition:
                     binding = authority.resolve_window(window_id)
                 except Exception:
                     return None
-                return tuple(
+                evidence = [
                     ModalWindowEvidence(
                         window_resource_id=window_id,
                         owner_process_token=binding.process_token,
@@ -434,11 +462,86 @@ class Phase3Composition:
                     )
                     for element in result.snapshot.elements
                     if element.depth >= 1 and element.control_type in ("Window", "Dialog")
-                )
+                ]
+                # Separate owned windows: bounded enumeration via
+                # the observer event source's reconciliation.
+                source = providers.event_source
+                reconcile = getattr(source, "reconcile", None)
+                if reconcile is not None:
+                    try:
+                        events = reconcile()
+                    except Exception:
+                        return None
+                    candidates = [
+                        event
+                        for event in events
+                        if event.hwnd
+                        and event.hwnd != binding.hwnd
+                        and f"{event.pid}:{event.process_creation_time or 'unknown'}"
+                        == binding.process_token
+                    ][:8]
+                    for event in candidates:
+                        try:
+                            backend = providers.uia_backend_factory()
+                            try:
+                                root = backend.find_root(hwnd=event.hwnd)  # type: ignore[attr-defined]
+                            finally:
+                                backend.close()  # type: ignore[attr-defined]
+                        except Exception:
+                            return None
+                        if root is not None and (
+                            getattr(root, "is_modal", False) or root.control_type == "Window"
+                        ):
+                            evidence.append(
+                                ModalWindowEvidence(
+                                    window_resource_id=window_id,
+                                    owner_process_token=binding.process_token,
+                                    is_modal=True,
+                                    title_hint=None,
+                                    elevated=binding.elevated,
+                                    accessible=True,
+                                )
+                            )
+                return tuple(evidence)
 
             detector = DialogDetector(
                 modal_evidence=providers.modal_evidence or _native_modal_evidence
             )
+
+            def _live_fixture_process_verified(window_id: str) -> bool:
+                """Fresh, independent live-process integrity check.
+
+                Re-observes the platform now, finds the process
+                owning this exact window instance, and compares its
+                independently reported integrity digest against
+                freshly computed trusted evidence for the registered
+                fixture executable. Registration-time path equality
+                alone is never sufficient.
+                """
+                from aether.core.apps.launch_authority import integrity_digest_of
+
+                try:
+                    binding = authority.resolve_window(window_id)
+                    if binding.app_resource_id != providers.fixture_record.app_id:
+                        return False
+                    observation = observation_provider.observe()  # type: ignore[attr-defined]
+                    process = next(
+                        (
+                            p
+                            for p in observation.processes
+                            if p.process_token == binding.process_token
+                            and p.app_id == providers.fixture_record.app_id
+                        ),
+                        None,
+                    )
+                    if process is None or process.integrity_sha256 is None:
+                        return False
+                    evidence = providers.integrity_verifier.verify(providers.fixture_record)
+                    if evidence is None:
+                        return False
+                    return bool(process.integrity_sha256 == integrity_digest_of(evidence))
+                except Exception:
+                    return False
 
             def _dialog_present(window_id: str) -> str | None:
                 try:
@@ -483,6 +586,7 @@ class Phase3Composition:
                     getattr(activity, "healthy", lambda: False)()
                 ),
                 privacy_check=lambda: privacy.collection_enabled,
+                live_process_verifier=lambda window_id: _live_fixture_process_verified(window_id),
             )
             planner = Planner(
                 capabilities=capabilities,

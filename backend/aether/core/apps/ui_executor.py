@@ -101,6 +101,10 @@ class UiOperationExecutor:
     # Current privacy authorization, rechecked immediately before
     # dispatch when wired by composition.
     privacy_check: Callable[[], bool] | None = None
+    # Independently verified *live* process integrity for the
+    # fixture window (window_id -> bool), rechecked before dispatch
+    # when wired: path equality alone never authorizes the fixture.
+    live_process_verifier: Callable[[str], bool] | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def _now(self) -> datetime:
@@ -492,6 +496,10 @@ class UiOperationExecutor:
         token = self.snapshots.authority.app_version_token(self.approved_fixture_app_id)
         if token != self.approved_fixture_identity_token:
             raise UiDenied("fixture_identity_mismatch")
+        if self.live_process_verifier is not None and not self.live_process_verifier(
+            str(binding["window_resource_id"])
+        ):
+            raise UiDenied("fixture_live_process_unverified")
 
     def _evaluate_policy(self, task_id, step, arguments, binding, *, binding_id: str) -> None:  # type: ignore[no-untyped-def]
         if self.broker is None:

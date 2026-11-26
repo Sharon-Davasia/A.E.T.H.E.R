@@ -106,9 +106,11 @@ class _Platform:
         self.windows: list[tuple[int, str, str]] = []
         self.count = 0
         self.modal = False
+        self.modal_separate = False
 
     def new_window(self, app_id: str, hwnd: int) -> str:
-        token = f"proc:{hwnd}"
+        # Native-format process identity: pid:creation-time.
+        token = "4242:fake-creation-1"
         self.windows.append((hwnd, token, app_id))
         return token
 
@@ -179,7 +181,12 @@ class _Backend:
     def find_root(self, *, hwnd: int):  # type: ignore[no-untyped-def]
         if not any(w == hwnd for w, _t, _a in self.platform.windows):
             return None
-        return self.raw("1", "Window", "201", "Fixture Window", ("1.1", "1.2"))
+        root = self.raw("1", "Window", "201", "Fixture Window", ("1.1", "1.2"))
+        if getattr(self.platform, "modal_separate", False) and hwnd == 2002:
+            import dataclasses as _dc
+
+            return _dc.replace(root, is_modal=True)
+        return root
 
     def children(self, element):  # type: ignore[no-untyped-def]
         if element.key == "1":
@@ -1045,4 +1052,128 @@ def test_privacy_escalation_and_restart_after_revoke_denied(tmp_path: Path) -> N
     comp.revoke("test-revocation")
     bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
     assert h["event_source"].started is False
+    assert comp.shutdown() is True
+
+
+def _setup_to_activation(h, comp, bridge) -> str:  # type: ignore[no-untyped-def]
+    store = open_acceptance_store(
+        h["storage"],
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=h["authz"].decision_reference,
+            storage_id=h["authz"].storage_id,
+            expires_at=h["authz"].expires_at,
+            campaign_id=h["authz"].campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    return ""
+
+
+def test_live_process_integrity_tamper_denies_fixture(tmp_path: Path) -> None:
+    """Fixture authority requires independently verified *live*
+    process integrity: tampering the live observation's integrity
+    digest (a process that no longer matches trusted evidence)
+    denies execution even though the path/registration matched."""
+    h = _harness(tmp_path)
+    _setup_to_activation(h, None, None)
+    comp = _start(h)
+    bridge = comp.bridge
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    window_id = _launched_window(h, comp, bridge)
+    act = bridge.prepare_activation({"windowId": window_id})
+    aprev = bridge.preview_operation({"taskId": act["taskId"], "effect": "window.activate"})
+    _approve(bridge, act["taskId"], aprev, effect="window.activate")
+    # Live process integrity no longer matches trusted evidence.
+    observation = h["providers"].observation_provider
+    assert observation is not None
+    observation.sha_by_app[h["app_id"]] = "0" * 64
+    prepared = bridge.prepare_fixture_interaction({"windowId": window_id})
+    assert prepared["status"] == "ready", prepared
+    preview = bridge.preview_fixture_interaction({"taskId": prepared["taskId"]})
+    result = _approve(bridge, prepared["taskId"], preview)
+    assert result.get("outcome") != "SUCCEEDED", result
+    assert h["platform"].count == 0
+    assert comp.shutdown() is True
+
+
+def test_separate_owned_modal_window_blocks_dispatch(tmp_path: Path) -> None:
+    """A separate top-level modal window owned by the same process
+    (not in the target's UIA tree) is detected through bounded
+    observer enumeration + bounded inspection and blocks dispatch."""
+    h = _harness(tmp_path)
+    _setup_to_activation(h, None, None)
+    comp = _start(h)
+    bridge = comp.bridge
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    window_id = _launched_window(h, comp, bridge)
+    act = bridge.prepare_activation({"windowId": window_id})
+    aprev = bridge.preview_operation({"taskId": act["taskId"], "effect": "window.activate"})
+    _approve(bridge, act["taskId"], aprev, effect="window.activate")
+    # Separate owned modal window appears (same process token).
+    h["platform"].windows.append((2002, "4242:fake-creation-1", h["app_id"]))
+    h["platform"].modal_separate = True
+    h["event_source"].set_snapshot(
+        [
+            WindowEvent(
+                kind=WindowEventKind.WINDOW_CREATED,
+                hwnd=2002,
+                pid=4242,
+                process_creation_time="fake-creation-1",
+                app_identity="C:/Apps/Fixture App.exe",
+                classification=ContextClassification.PERMITTED_METADATA,
+                elevated=False,
+            )
+        ]
+    )
+    prepared = bridge.prepare_fixture_interaction({"windowId": window_id})
+    assert prepared["status"] == "ready", prepared
+    preview = bridge.preview_fixture_interaction({"taskId": prepared["taskId"]})
+    result = _approve(bridge, prepared["taskId"], preview)
+    assert result.get("outcome") != "SUCCEEDED", result
+    assert h["platform"].count == 0
+    assert comp.shutdown() is True
+
+
+def test_resume_after_opt_out_requires_and_uses_fresh_observation(tmp_path: Path) -> None:
+    """After pause/opt-out, re-opt-in must resume WorldState and
+    republish only fresh observation: the previously registered
+    window is gone until a fresh enumeration/event arrives."""
+    h = _harness(tmp_path)
+    _setup_to_activation(h, None, None)
+    comp = _start(h)
+    bridge = comp.bridge
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    window_id = _launched_window(h, comp, bridge)
+    assert comp.authority is not None
+    assert any(b.window_id == window_id for b in comp.authority.known_windows())
+    # Opt out: retained observation and authority refs are purged.
+    bridge.set_privacy({"optedIn": False, "mode": "off", "paused": True})
+    assert comp.authority.known_windows() == ()
+    # Fresh enumeration is staged for reconciliation on resume.
+    hwnd, _t, _a = h["platform"].windows[0]
+    h["event_source"].set_snapshot(
+        [
+            WindowEvent(
+                kind=WindowEventKind.WINDOW_CREATED,
+                hwnd=hwnd,
+                pid=4242,
+                process_creation_time="fake-creation-1",
+                app_identity="C:/Apps/Fixture App.exe",
+                classification=ContextClassification.PERMITTED_METADATA,
+                elevated=False,
+            )
+        ]
+    )
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    fresh_id = ""
+    for _ in range(100):
+        for binding in comp.authority.known_windows():
+            if binding.app_resource_id == h["app_id"]:
+                fresh_id = binding.window_id
+        if fresh_id:
+            break
+        time.sleep(0.05)
+    assert fresh_id, "resume did not republish fresh observation"
+    assert fresh_id != window_id  # fresh registration, not retained state
     assert comp.shutdown() is True

@@ -35,6 +35,7 @@ class RawElement:
     value_present: bool = False
     depth: int = 0
     children_keys: tuple[str, ...] = ()
+    is_modal: bool = False
 
 
 @dataclass(frozen=True, slots=True)

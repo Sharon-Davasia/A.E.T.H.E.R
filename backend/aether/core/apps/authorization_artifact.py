@@ -75,10 +75,14 @@ def build_authorization(
     if discovered_records is None or fixture_executable is None or integrity_verifier is None:
         raise ValueError("discovery, fixture executable and verifier are required")
     wanted = {name.casefold() for name in app_display_names}
+    from aether.core.contracts.app_window import ApplicationRecord as _Record
+
     selected = [
-        r for r in discovered_records if str(getattr(r, "display_name", "")).casefold() in wanted
+        r
+        for r in discovered_records
+        if isinstance(r, _Record) and r.display_name.casefold() in wanted
     ]
-    found = {str(getattr(r, "display_name", "")).casefold() for r in selected}
+    found = {r.display_name.casefold() for r in selected}
     missing = wanted - found
     if missing:
         raise ValueError(f"requested applications were not discovered: {sorted(missing)}")
@@ -99,9 +103,7 @@ def build_authorization(
         "campaign_id": campaign_id,
         "storage_id": str(uuid.uuid4()),
         "storage_path": str(storage_path),
-        "authorized_app_ids": sorted(
-            {str(getattr(r, "app_id")) for r in selected} | {fixture.app_id}
-        ),
+        "authorized_app_ids": sorted({r.app_id for r in selected} | {fixture.app_id}),
         "capability_allowlist": [
             "app.launch",
             "window.activate",

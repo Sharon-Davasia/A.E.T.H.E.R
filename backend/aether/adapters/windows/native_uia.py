@@ -100,6 +100,10 @@ class PywinautoUiaBackend:
             is_enabled=bool(info.enabled),
             is_offscreen=bool(getattr(info, "is_offscreen", False)),
             is_password=is_password,
+            is_modal=bool(
+                getattr(info, "is_modal", False)
+                or getattr(getattr(info, "iface_window", None), "CurrentIsModal", False)
+            ),
             bounding_rect=_rect(info.rectangle),
             value_present=False,
             children_keys=children,
