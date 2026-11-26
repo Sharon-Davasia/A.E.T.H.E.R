@@ -623,6 +623,113 @@ class NativeObservationProvider:
             processes=tuple(processes.values()), windows=tuple(windows), complete=True
         )
 
+    def observe_fixture(self, fixture=None, process_token=None, hwnd=None, *, app_id=None):  # type: ignore[no-untyped-def]
+        """Fixture-only live observation for fixture verification.
+
+        Unlike ``observe()`` (the broad launch-verification
+        enumeration), this returns only the exact fixture process /
+        window instance requested. The fixture executable identity
+        must be claimed by exactly one registered record, the live
+        process image path must equal that full identity, creation
+        time and session must be known and current, and trusted
+        integrity evidence must exist. Any ambiguity, inaccessibility
+        or mismatch yields no fixture process (denial upstream).
+        """
+        import os
+        from pathlib import PureWindowsPath
+
+        from aether.core.apps.launch_authority import integrity_digest_of
+        from aether.core.apps.verification import (
+            ObservedProcess,
+            ObservedWindow,
+            PlatformObservation,
+        )
+
+        def _key(value: object) -> str:
+            return PureWindowsPath(str(value or "")).as_posix().casefold()
+
+        record = None
+        if (
+            fixture is not None
+            and hasattr(fixture, "app_id")
+            and hasattr(fixture, "executable_identity")
+        ):
+            record = fixture
+        else:
+            wanted = app_id or (fixture if isinstance(fixture, str) else None)
+            if wanted is None and fixture is not None:
+                wanted = getattr(fixture, "app_id", None)
+            matches = [r for r in self._records if getattr(r, "app_id", None) == wanted]
+            if len(matches) != 1:
+                return PlatformObservation(processes=(), windows=(), complete=False)
+            record = matches[0]
+        identity = getattr(record, "executable_identity", None)
+        if not identity:
+            return PlatformObservation(processes=(), windows=(), complete=False)
+        claimants = [
+            r
+            for r in self._records
+            if _key(getattr(r, "executable_identity", None)) == _key(identity)
+        ]
+        if len(claimants) != 1 or getattr(claimants[0], "app_id", None) != record.app_id:
+            return PlatformObservation(processes=(), windows=(), complete=False)
+        evidence = self._verifier.verify(record)  # type: ignore[attr-defined]
+        if evidence is None:
+            return PlatformObservation(processes=(), windows=(), complete=False)
+        digest = integrity_digest_of(evidence)
+        own_session = None
+        with contextlib.suppress(Exception):
+            own_session = self._api.get_process_session_id(os.getpid())
+        target_pid: int | None = None
+        if process_token is not None:
+            try:
+                target_pid = int(str(process_token).split(":", 1)[0])
+            except (TypeError, ValueError):
+                return PlatformObservation(processes=(), windows=(), complete=False)
+        try:
+            enumerated = self._api.enumerate_windows()
+        except Exception:
+            return PlatformObservation(processes=(), windows=(), complete=False)
+        processes: dict[str, ObservedProcess] = {}
+        windows = []
+        for found_hwnd, pid in enumerated:
+            if hwnd is not None and found_hwnd != hwnd:
+                continue
+            if target_pid is not None and pid != target_pid:
+                continue
+            image_getter = getattr(self._api, "get_process_image_path", None)
+            image_path = image_getter(pid) if image_getter is not None else None
+            if not image_path or _key(image_path) != _key(identity):
+                continue
+            creation = self._api.get_process_creation_time(pid)
+            if not creation:
+                continue
+            token = f"{pid}:{creation}"
+            if process_token is not None and token != process_token:
+                continue
+            session = None
+            with contextlib.suppress(Exception):
+                session = self._api.get_process_session_id(pid)
+            if own_session is not None and session != own_session:
+                continue
+            if token not in processes:
+                processes[token] = ObservedProcess(
+                    process_token=token,
+                    app_id=record.app_id,
+                    integrity_sha256=digest,
+                    started_after_attempt=False,
+                )
+            windows.append(
+                ObservedWindow(
+                    window_token=f"hwnd:{found_hwnd}",
+                    process_token=token,
+                    app_id=record.app_id,
+                )
+            )
+        return PlatformObservation(
+            processes=tuple(processes.values()), windows=tuple(windows), complete=True
+        )
+
 
 class NativeForegroundProvider:  # pragma: no cover - Windows only
     """Bounded native window activation + foreground verification."""

@@ -145,6 +145,28 @@ class _Observation:
             processes=tuple(processes.values()), windows=tuple(windows), complete=True
         )
 
+    def observe_fixture(self, fixture_record=None, process_token=None, hwnd=None):  # type: ignore[no-untyped-def]
+        observation = self.observe()
+        from aether.core.apps.verification import PlatformObservation
+
+        app_id = getattr(fixture_record, "app_id", fixture_record)
+        return PlatformObservation(
+            processes=tuple(
+                p
+                for p in observation.processes
+                if p.app_id == app_id
+                and (process_token is None or p.process_token == process_token)
+            ),
+            windows=tuple(
+                w
+                for w in observation.windows
+                if w.app_id == app_id
+                and (process_token is None or w.process_token == process_token)
+                and (hwnd is None or w.window_token == f"hwnd:{hwnd}")
+            ),
+            complete=observation.complete,
+        )
+
 
 class _Backend:
     """Fake of the real native backend contract (bounded walk)."""
@@ -1177,3 +1199,197 @@ def test_resume_after_opt_out_requires_and_uses_fresh_observation(tmp_path: Path
     assert fresh_id, "resume did not republish fresh observation"
     assert fresh_id != window_id  # fresh registration, not retained state
     assert comp.shutdown() is True
+
+
+def test_observe_fixture_returns_only_exact_fixture_instance() -> None:
+    from aether.adapters.windows.native_observer import NativeObservationProvider
+    from aether.core.apps.launch_authority import FakeIntegrityVerifier, IntegrityEvidence
+
+    fixture = _record("app:fixture", "Fixture App")
+    notepad = _record("app:notepad", "Notepad")
+    evidence = IntegrityEvidence(
+        location_digest=fixture.location_digest or "",
+        content_sha256="a" * 64,
+        signer_identity="FakeSigner",
+        package_identity=None,
+        verified_at=datetime.now(UTC),
+        file_identity="3:42:100:1",
+    )
+    verifier = FakeIntegrityVerifier(
+        evidence_by_location={
+            fixture.location_digest or "": evidence,
+            notepad.location_digest or "": evidence,
+        }
+    )
+
+    class _Api:
+        def enumerate_windows(self):  # type: ignore[no-untyped-def]
+            return [(1001, 4242), (1002, 5555)]
+
+        def get_process_image_path(self, pid: int):  # type: ignore[no-untyped-def]
+            return "C:\\Apps\\Fixture App.exe" if pid == 4242 else "C:\\Apps\\Notepad.exe"
+
+        def get_process_name(self, pid: int):  # type: ignore[no-untyped-def]
+            return self.get_process_image_path(pid)
+
+        def get_process_creation_time(self, pid: int):  # type: ignore[no-untyped-def]
+            return "fake-creation-1" if pid == 4242 else "other-creation"
+
+        def get_process_session_id(self, pid: int):  # type: ignore[no-untyped-def]
+            return 1
+
+    provider = NativeObservationProvider(
+        api=_Api(), records=[fixture, notepad], integrity_verifier=verifier
+    )
+    broad = provider.observe()
+    assert {p.app_id for p in broad.processes} == {fixture.app_id, notepad.app_id}
+    scoped = provider.observe_fixture(fixture, "4242:fake-creation-1", 1001)
+    assert [p.app_id for p in scoped.processes] == [fixture.app_id]
+    assert [w.process_token for w in scoped.windows] == ["4242:fake-creation-1"]
+    # A different instance of the same executable is not the fixture
+    # instance bound to the authority window.
+    wrong = provider.observe_fixture(fixture, "9999:fake-creation-1", 1001)
+    assert wrong.processes == () and wrong.windows == ()
+
+
+def test_failed_provider_construction_does_not_poison_retry() -> None:
+    """A failed build_native_platform attempt must not retain a
+    provider assignment (the activity factory) on the caller's seams;
+    a retry with fresh authorization builds fresh providers."""
+    from aether.adapters.windows.fake_windows import build_fake_seams, fixture_executable
+    from aether.core.apps.composition import build_native_platform
+    from aether.core.contracts.app_window import (
+        LaunchMethod,
+        location_identity_digest,
+        registration_app_id,
+    )
+
+    seams = build_fake_seams()
+    seams.activity_factory = None  # exercise the default-factory path
+    fixture_id = registration_app_id(
+        display_name="AETHER Fixture",
+        executable_identity=fixture_executable(),
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+    )
+    from aether.core.apps.launch_authority import app_version_token
+
+    token = app_version_token(
+        seams.integrity_verifier.verify(  # type: ignore[attr-defined]
+            type("R", (), {"location_digest": location_identity_digest(fixture_executable())})()
+        )
+    )
+
+    def _authz(epoch: str) -> ControlledAcceptanceAuthorization:
+        return ControlledAcceptanceAuthorization(
+            approved_commit=COMMIT,
+            decision_reference="d",
+            campaign_id=CAMPAIGN,
+            storage_id="55555555-5555-4555-8555-555555555555",
+            storage_path="unused",
+            authorized_app_ids=frozenset({fixture_id}),
+            capability_allowlist=frozenset({"app.launch"}),
+            session_id=SESSION,
+            activation_epoch=epoch,
+            expires_at=datetime.now(UTC) + timedelta(hours=2),
+            privacy_mode="metadata_only",
+            fixture_app_id=fixture_id,
+            fixture_identity_token=token,
+        )
+
+    # First attempt fails late (foreground provider has no
+    # activate/foreground callables) after the point where the
+    # default activity factory used to be assigned onto the seams.
+    good_foreground = seams.foreground_provider
+    seams.foreground_provider = object()
+    with pytest.raises(AttributeError):
+        build_native_platform(_authz("epoch-1"), seams=seams)
+    assert seams.activity_factory is None
+    seams.foreground_provider = good_foreground
+    providers = build_native_platform(_authz("epoch-2"), seams=seams)
+    assert providers.fixture_record.app_id == fixture_id
+    assert seams.activity_factory is None  # still not retained
+
+
+def test_initial_snapshot_published_on_opt_in_with_raw_fake_providers(tmp_path: Path) -> None:
+    """Windows that already exist before privacy opt-in are
+    published by the explicit composition snapshot wiring when
+    observation starts (raw fake seams; not native evidence)."""
+    from aether.adapters.windows.fake_windows import build_fake_seams, fixture_executable
+    from aether.core.apps.composition import build_native_platform
+    from aether.core.apps.fixture import FIXTURE_HWND
+    from aether.core.apps.launch_authority import app_version_token
+    from aether.core.contracts.app_window import (
+        LaunchMethod,
+        location_identity_digest,
+        registration_app_id,
+    )
+
+    seams = build_fake_seams()
+    fixture_id = registration_app_id(
+        display_name="AETHER Fixture",
+        executable_identity=fixture_executable(),
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+    )
+    token = app_version_token(
+        seams.integrity_verifier.verify(  # type: ignore[attr-defined]
+            type("R", (), {"location_digest": location_identity_digest(fixture_executable())})()
+        )
+    )
+    authz = dataclasses.replace(
+        _harness(tmp_path)["authz"],
+        storage_path=str(tmp_path / "aether-phase3-acceptance-initial"),
+        authorized_app_ids=frozenset({fixture_id}),
+        fixture_app_id=fixture_id,
+        fixture_identity_token=token,
+    )
+    storage = Path(authz.storage_path)
+    store = open_acceptance_store(
+        storage,
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=authz.decision_reference,
+            storage_id=authz.storage_id,
+            expires_at=authz.expires_at,
+            campaign_id=authz.campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    providers = build_native_platform(authz, seams=seams)
+    state = seams.observer_api._state  # type: ignore[attr-defined]
+    state.windows[FIXTURE_HWND] = (4242, fixture_executable())
+    comp = Phase3Composition.native(
+        authorization=authz,
+        current_commit=COMMIT,
+        storage_dir=storage,
+        gesture_key=GESTURE_KEY,
+        platform=providers,
+    )
+    try:
+        assert comp.authority is not None
+        assert comp.authority.known_windows() == ()
+        out = comp.bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+        assert out["status"] == "ready", out
+        assert any(b.app_resource_id == fixture_id for b in comp.authority.known_windows())
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_begin_observation_does_nothing_while_privacy_paused(tmp_path: Path) -> None:
+    """Privacy pause is authoritative at the composition boundary:
+    asking to begin observation while privacy collection is disabled
+    runs no WorldState resume and no observer reconciliation, and
+    starts no source."""
+    h = _harness(tmp_path)
+    _setup_to_activation(h, None, None)
+    comp = _start(h)
+    try:
+        assert comp.world_state is not None and comp.observer_service is not None
+        generation_before = comp.world_state.generation  # type: ignore[attr-defined]
+        # Privacy is still off/paused (no opt-in has occurred).
+        comp.begin_observation()
+        # Resume would have advanced the WorldState generation;
+        # reconciliation would have started the source.
+        assert comp.world_state.generation == generation_before  # type: ignore[attr-defined]
+        assert h["event_source"].started is False
+    finally:
+        assert comp.shutdown() is True

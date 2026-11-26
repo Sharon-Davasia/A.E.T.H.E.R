@@ -190,6 +190,7 @@ class ObserverService:
     running: bool = field(default=False, init=False)
     _health: str = field(default="stopped", init=False)
     _paused: bool = field(default=False, init=False)
+    _source_active: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if self.queue_capacity < 1:
@@ -222,28 +223,34 @@ class ObserverService:
                 if self.running:
                     return
             self._stop.clear()
+            # ``start()`` is a lifecycle operation, not a privacy
+            # decision: it must never clear the authoritative pause
+            # latch. Only ``resume_collection()`` may do that, and
+            # only composition calls it after privacy permits
+            # collection. A paused service starts its consumer but
+            # does not start the source (no collection occurs).
             with self._lock:
-                self._paused = False
+                paused = self._paused
             # Drop any pre-shutdown queued events; bump generations so
             # callbacks from an obsolete source generation are ignored.
             self._drain_queue()
             with self._lock:
                 self._source_generation = _bump(self._source_generation)
                 self._advance_generation()
-                # A restarted service collects again (privacy pause
-                # superseded the stopped state at start() time).
-                self._paused = False
                 source_generation = self._source_generation
-            try:
-                self.source.start(lambda event: self._enqueue(event, source_generation))
-            except Exception:
-                # Roll back partial initialization truthfully.
-                with contextlib.suppress(Exception):
-                    self.source.stop()
+            if not paused:
+                try:
+                    self.source.start(lambda event: self._enqueue(event, source_generation))
+                except Exception:
+                    # Roll back partial initialization truthfully.
+                    with contextlib.suppress(Exception):
+                        self.source.stop()
+                    with self._lock:
+                        self.running = False
+                        self._health = "unavailable"
+                    raise
                 with self._lock:
-                    self.running = False
-                    self._health = "unavailable"
-                raise
+                    self._source_active = True
             thread = threading.Thread(target=self._consume, name="aether-observer", daemon=True)
             with self._lock:
                 self._thread = thread
@@ -279,6 +286,7 @@ class ObserverService:
                     worker.join(timeout=timeout)
                     alive = alive or worker.is_alive()
             with self._lock:
+                self._source_active = not source_stopped
                 if alive or not source_stopped:
                     self._health = "degraded"  # never claim clean shutdown
                     return False
@@ -301,15 +309,51 @@ class ObserverService:
         with contextlib.suppress(Exception):
             self.source.stop()
         with self._lock:
+            self._source_active = False
             self._source_generation = _bump(self._source_generation)
         self._advance_generation()
         self._notify_invalidate()
 
+    def resume_collection(self) -> None:
+        """Explicitly resume collection after ``pause_collection()``.
+
+        This is the only operation that clears the pause latch. If
+        the consumer is still running (the usual pause case), the
+        source is restarted under a fresh source generation; if the
+        service is stopped, clearing the latch is sufficient for a
+        later ``start()`` to collect. A failed source restart
+        restores the latch and reports failure truthfully.
+        """
+        with self._lifecycle:
+            with self._lock:
+                if not self._paused:
+                    return
+                self._paused = False
+                running = self.running
+                source_active = self._source_active
+            if not running or source_active:
+                return
+            self._drain_queue()
+            with self._lock:
+                self._source_generation = _bump(self._source_generation)
+                self._advance_generation()
+                source_generation = self._source_generation
+            try:
+                self.source.start(lambda event: self._enqueue(event, source_generation))
+            except Exception:
+                with self._lock:
+                    self._paused = True
+                    self._source_active = False
+                    self._health = "unavailable"
+                raise
+            with self._lock:
+                self._source_active = True
+
     # -- intake -----------------------------------------------------------
     def _enqueue(self, event: WindowEvent, source_generation: int) -> None:
         with self._lock:
-            if source_generation != self._source_generation or self._stop.is_set():
-                return  # obsolete source generation callback
+            if source_generation != self._source_generation or self._stop.is_set() or self._paused:
+                return  # obsolete source generation callback / paused
             self.stats.received = _bump(self.stats.received)
             generation = self.generation
         event = dataclasses.replace(event, generation=generation)

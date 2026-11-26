@@ -179,19 +179,35 @@ class Phase3Composition:
         """
         if self._revoked:
             return
-        # Correct resume after pause/opt-out: WorldState is resumed
-        # first (retained state stays cleared; only fresh observation
-        # may repopulate it), then the observer restarts and a
-        # bounded reconciliation republishes current windows.
-        # Starting the observer without resuming WorldState would
-        # silently drop every fresh event (paused store).
+        if self.privacy is not None and not self.privacy.collection_enabled:
+            # Privacy is authoritative: a paused/opted-out privacy
+            # state cannot start or resume observation, regardless
+            # of which caller asks.
+            return
+        if self.observer_service is None:
+            # No observer means observation cannot start; a privacy
+            # change in that state must not run resume/reconcile
+            # work against WorldState.
+            return
+        # Observation starts at the observer lifecycle boundary
+        # first. Only after the observer has started (and any
+        # authoritative pause latch has been explicitly resumed
+        # under the current privacy decision) does WorldState
+        # resume and a bounded reconciliation republish fresh
+        # windows. If the observer remains paused, WorldState is
+        # not resumed and no reconciliation is attempted.
+        self.observer_service.start()  # type: ignore[attr-defined]
+        if getattr(self.observer_service, "collection_paused", False):
+            resume_collection = getattr(self.observer_service, "resume_collection", None)
+            if resume_collection is not None:
+                resume_collection()
+        if getattr(self.observer_service, "collection_paused", False):
+            return
         if self.world_state is not None:
             self.world_state.resume()  # type: ignore[attr-defined]
-        if self.observer_service is not None:
-            self.observer_service.start()  # type: ignore[attr-defined]
-            reconcile = getattr(self.observer_service, "reconcile", None)
-            if reconcile is not None:
-                reconcile()
+        reconcile = getattr(self.observer_service, "reconcile", None)
+        if reconcile is not None:
+            reconcile()
         if self.activity_source is not None:
             start = getattr(self.activity_source, "start", None)
             if start is not None:
@@ -312,17 +328,7 @@ class Phase3Composition:
                 worker.on_worker_restart = snapshots.note_privacy_change
             from pathlib import PureWindowsPath as _PWP
 
-            from aether.world_state.observer import GenerationClock
-
-            # One authoritative collection generation shared by the
-            # observer (stamps at collection) and WorldState
-            # (validates at the retained-state commit boundary), so
-            # pause/resume/privacy invalidation advances the same
-            # clock on both sides and stale stamps can never
-            # repopulate retained state while fresh ones can.
-            generation_clock = GenerationClock()
             world_state = InMemoryWorldState(
-                generation_clock=generation_clock,
                 policy=privacy.policy,
                 authority=authority,
                 app_id_by_identity={
@@ -333,13 +339,43 @@ class Phase3Composition:
             )
             observer_service = None
             if providers.event_source is not None:
+                from dataclasses import replace as _event_replace
+
+                def _handle_observer_event(event):  # type: ignore[no-untyped-def]
+                    """Boundary translation for incremental events.
+
+                    ObserverService owns its local collection
+                    generation and drops queued events that are stale
+                    in that namespace before invoking this handler.
+                    WorldState owns the independent privacy
+                    generation; the composition boundary therefore
+                    presents the already-fresh event under
+                    WorldState's current generation. Paused/policy
+                    checks inside WorldState remain authoritative.
+                    """
+                    world_state.handle_event(event, now=now_fn(), generation=world_state.generation)
+
+                def _apply_observer_snapshot(events):  # type: ignore[no-untyped-def]
+                    """Explicit initial/reconciled snapshot wiring.
+
+                    ObserverService invokes this synchronously only
+                    for a complete reconciliation in its current
+                    local generation, so the enumerated snapshot is
+                    fresh in the observer namespace. It is re-stamped
+                    at this composition boundary into WorldState's
+                    independent privacy generation; WorldState still
+                    rejects publication while paused or when its
+                    policy/generation changes mid-apply, and stale
+                    queued events never take this path.
+                    """
+                    generation = world_state.generation
+                    translated = [_event_replace(event, generation=generation) for event in events]
+                    return world_state.apply_snapshot(translated, now=now_fn())
+
                 observer_service = ObserverService(
-                    generation_clock=generation_clock,
                     source=providers.event_source,  # type: ignore[arg-type]
-                    on_event=lambda event: world_state.handle_event(event, now=now_fn()),
-                    snapshot_handler=lambda events: world_state.apply_snapshot(
-                        events, now=now_fn()
-                    ),
+                    on_event=_handle_observer_event,
+                    snapshot_handler=_apply_observer_snapshot,
                 )
             broker = PolicyBroker(
                 capabilities=capabilities,
@@ -524,7 +560,14 @@ class Phase3Composition:
                     binding = authority.resolve_window(window_id)
                     if binding.app_resource_id != providers.fixture_record.app_id:
                         return False
-                    observation = observation_provider.observe()  # type: ignore[attr-defined]
+                    observe_fixture = getattr(observation_provider, "observe_fixture", None)
+                    if observe_fixture is None:
+                        return False
+                    observation = observe_fixture(
+                        providers.fixture_record,
+                        binding.process_token,
+                        binding.hwnd,
+                    )
                     process = next(
                         (
                             p
@@ -1197,8 +1240,15 @@ def build_native_platform(
             "expires_at": authorization.expires_at.timestamp(),
         }
     )
-    if seams.activity_factory is None:
-        seams.activity_factory = lambda emit_to: NativeActivitySource(
+    # Do not mutate the caller's seams during construction: an
+    # assignment retained on ``seams`` before provider construction
+    # completes would poison a later retry with the previous
+    # attempt's activation context. The factory is a local binding
+    # for this construction only; a retry builds a fresh one from
+    # the then-current authorization.
+    activity_factory = seams.activity_factory
+    if activity_factory is None:
+        activity_factory = lambda emit_to: NativeActivitySource(  # noqa: E731
             activation=activation, emit_to=emit_to
         )
     worker = SubprocessWorkerSupervisor(
@@ -1228,7 +1278,7 @@ def build_native_platform(
                 else build_native_uia_backend(activation=activation)
             )
         ),
-        activity_factory=seams.activity_factory,
+        activity_factory=activity_factory,
         activate=seams.foreground_provider.activate,  # type: ignore[attr-defined]
         foreground_hwnd=seams.foreground_provider.foreground_hwnd,  # type: ignore[attr-defined]
         event_source=NativeWindowsEventSource(api=seams.observer_api, activation=activation),  # type: ignore[arg-type]

@@ -393,3 +393,32 @@ def test_native_source_shutdown_failure_is_not_success() -> None:
     service.start()
     assert service.stop() is False
     assert service.health() == "degraded"
+
+
+def test_observer_start_preserves_pause_latch_until_explicit_resume() -> None:
+    source = FakeWindowEventSource()
+    source.set_snapshot([_event(WindowEventKind.WINDOW_CREATED, hwnd=7, process_creation_time="t")])
+    service = ObserverService(source=source, on_event=lambda event: None)
+    service.start()
+    service.pause_collection()
+    try:
+        assert service.collection_paused
+        assert service.reconcile() is False
+        # A lifecycle restart is not a privacy decision: it must not
+        # silently clear the authoritative pause latch.
+        assert service.stop() is True
+        service.start()
+        assert service.collection_paused
+        assert service.reconcile() is False
+        # Only the explicit resume clears the latch and collects.
+        service.resume_collection()
+        assert not service.collection_paused
+        assert service.reconcile() is True
+    finally:
+        service.stop()
+
+
+def test_generation_clock_is_not_a_public_world_state_export() -> None:
+    import aether.world_state as world_state_package
+
+    assert "GenerationClock" not in world_state_package.__all__
