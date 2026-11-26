@@ -153,10 +153,14 @@ def open_acceptance_store(
             raise AcceptanceStorageError("pre-existing unrelated storage is refused")
         if unexpected:
             raise AcceptanceStorageError("acceptance storage directory contains unrelated files")
+        # Validate *all* acceptance files (marker, database and
+        # every SQLite/owner-lock sidecar) before anything is opened
+        # or migrated: linked or substituted sidecars fail closed.
+        for name in sorted(_ALLOWED_NAMES):
+            candidate = directory / name
+            if candidate.exists():
+                _check_single_link(candidate)
         if marker_path.exists():
-            _check_single_link(marker_path)
-            if db_path.exists():
-                _check_single_link(db_path)
             marker = read_acceptance_marker(directory)
             if marker is None:
                 raise AcceptanceStorageError("acceptance storage marker is unreadable")

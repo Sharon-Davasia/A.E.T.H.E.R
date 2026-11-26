@@ -57,6 +57,8 @@ class InMemoryWorldState:
     max_windows: int = DEFAULT_MAX_WINDOWS
     generation_clock: GenerationClock | None = None
     authority: object | None = None  # AppWindowResourceAuthority (avoid cycle)
+    # Process-identity (executable basename, casefolded) -> app_id.
+    app_id_by_identity: dict[str, str] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _windows: dict[int, _WindowEntry] = field(default_factory=dict, init=False)
     _foreground_hwnd: int | None = field(default=None, init=False)
@@ -150,12 +152,26 @@ class InMemoryWorldState:
         # The version token represents the actual window instance,
         # not merely its process: process token + instance generation.
         version_token = f"{entry.process_token}#{instance_generation}"
+        app_resource_id = None
+        if self.app_id_by_identity and event.app_identity:
+            from pathlib import PureWindowsPath
+
+            app_resource_id = self.app_id_by_identity.get(
+                PureWindowsPath(event.app_identity).name.casefold()
+            )
         ref = self.authority.register_window(
             hwnd=event.hwnd,
             process_token=entry.process_token,
             instance_generation=instance_generation,
             version_token=version_token,
             expires_at=entry.observation.expires_at,
+            app_resource_id=app_resource_id,
+            classification=classify_context(
+                event.app_identity,
+                adapter_classification=event.classification,
+                elevated=event.elevated,
+            ),
+            elevated=event.elevated,
         )
         entry.resource_id = ref.resource_id
         entry.instance_generation = instance_generation

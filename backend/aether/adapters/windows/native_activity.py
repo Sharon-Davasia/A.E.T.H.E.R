@@ -48,6 +48,9 @@ class FakeActivitySource:
             )
         )
 
+    def healthy(self) -> bool:
+        return True
+
 
 class NativeActivitySource:
     """WinEvent-hook activity source (Windows, activation-gated)."""
@@ -254,6 +257,13 @@ class NativeActivitySource:
             self.stop()
             raise NativeActivityDisabled("activity hook could not be installed")
         self._started = True
+
+    def healthy(self) -> bool:
+        """Verified runtime health: hook thread alive, hooks installed."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():  # type: ignore[attr-defined]
+            return False
+        return bool(self._hook or self._mouse_hook or self._keyboard_hook)
 
     def stop(self) -> None:  # pragma: no cover - Windows-only
         import ctypes

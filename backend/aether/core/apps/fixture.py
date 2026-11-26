@@ -114,6 +114,9 @@ class FixtureBackend(FakeUiaBackend):
             if not live.is_enabled:
                 raise UiaBackendError("element is disabled")
             self._state.count += 1
+            status = self.elements.get(STATUS_KEY)
+            if status is not None:
+                object.__setattr__(status, "name", self._state.status_text)
             return {"invoked": live.key, "count": self._state.count}
         if live.key == MODAL_KEY:
             self._state.modal_open = True

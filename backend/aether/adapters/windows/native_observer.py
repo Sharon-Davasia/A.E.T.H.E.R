@@ -285,12 +285,22 @@ class NativeWindowsEventSource:
                 name = self._api.get_process_name(pid)
             with contextlib.suppress(Exception):
                 elevated = self._api.is_process_elevated(pid)
+        from aether.world_state.privacy import ContextClassification
+
         return WindowEvent(
             kind=kind,
             hwnd=hwnd,
             pid=pid,
             process_creation_time=creation,
             app_identity=name,
+            # Positive classification only from confirmed
+            # non-elevated inspection; unknown elevation stays
+            # UNKNOWN and therefore uncollectable (fail closed).
+            classification=(
+                ContextClassification.PERMITTED_METADATA
+                if elevated is False
+                else ContextClassification.UNKNOWN
+            ),
             # None stays unknown: failed elevation inspection is
             # never represented as confirmed non-elevated.
             elevated=elevated,
@@ -503,7 +513,7 @@ class NativeObservationProvider:
         self,
         *,
         api: Win32ObserverApi,
-        records: list[object],
+        records: list[Any],
         integrity_verifier: object,
     ) -> None:
         self._api = api
@@ -550,7 +560,7 @@ class NativeObservationProvider:
                 evidence = self._verifier.verify(record)  # type: ignore[attr-defined]
                 processes[token] = ObservedProcess(
                     process_token=token,
-                    app_id=record.app_id,  # type: ignore[attr-defined]
+                    app_id=record.app_id,
                     integrity_sha256=(integrity_digest_of(evidence) if evidence else None),
                     started_after_attempt=True,
                 )
@@ -558,9 +568,43 @@ class NativeObservationProvider:
                 ObservedWindow(
                     window_token=f"hwnd:{hwnd}",
                     process_token=token,
-                    app_id=record.app_id,  # type: ignore[attr-defined]
+                    app_id=record.app_id,
                 )
             )
         return PlatformObservation(
             processes=tuple(processes.values()), windows=tuple(windows), complete=True
         )
+
+
+class NativeForegroundProvider:  # pragma: no cover - Windows only
+    """Bounded native window activation + foreground verification."""
+
+    def __init__(self, *, user32: Any = None) -> None:
+        if user32 is None:
+            import ctypes
+
+            user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        self._user32: Any = user32
+
+    def activate(self, hwnd: int) -> bool:
+        """Bounded SetForegroundWindow attempt, verified by polling."""
+        import time
+
+        user32 = self._user32
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        except Exception:
+            return False
+        for _ in range(10):  # at most ~0.5s, then truthful failure
+            if self.foreground_hwnd() == hwnd:
+                return True
+            time.sleep(0.05)
+        return False
+
+    def foreground_hwnd(self) -> int | None:
+        try:
+            hwnd = int(self._user32.GetForegroundWindow())
+        except Exception:
+            return None
+        return hwnd or None

@@ -167,7 +167,7 @@ def _error_payload(reason: str) -> dict[str, object]:
     return {"reason": reason}
 
 
-def _controlled_phase3_composition(env: dict[str, str]):  # type: ignore[no-untyped-def]
+def _controlled_phase3_composition(env: dict[str, str], gesture_key: bytes):  # type: ignore[no-untyped-def]
     """A01 trusted startup path: explicit controlled-entry marker +
     owner authorization artifact. Ordinary startup never takes this
     path (it has no marker and no artifact). Any failure raises and
@@ -197,20 +197,31 @@ def _controlled_phase3_composition(env: dict[str, str]):  # type: ignore[no-unty
     from aether.core.apps.composition import Phase3Composition
 
     authorization = ControlledAcceptanceAuthorization.load(_Path(artifact))
-    import hashlib as _hashlib
-    import os as _os
+    if not commit:
+        from aether.core.apps.acceptance_startup import StartupDenied
 
-    gesture_key = _hashlib.sha256(
-        _os.environ.get("AETHER_DEV_SESSION_KEY", "").encode() or authorization.session_id.encode()
-    ).digest()
+        raise StartupDenied("approved_commit_unverifiable")
+    # The gesture secret is the actual independent per-launch secret
+    # from the authenticated Electron bootstrap — never derived from
+    # the authorization artifact, session id or environment.
+    platform = None
+    if env.get("AETHER_PHASE3_PLATFORM") == "fake-windows":
+        # Test-harness platform boundary only: raw Windows-API fakes
+        # feed the identical provider construction path. It enables
+        # no native capability and is never set by the desktop app.
+        from aether.adapters.windows.fake_windows import build_fake_seams
+        from aether.core.apps.composition import build_native_platform
+
+        platform = build_native_platform(authorization, seams=build_fake_seams())
     # Startup order matters: the authorization artifact's isolated
     # storage is selected here — before any real-user store exists
     # (ordinary storage is opened only after this returns).
     return Phase3Composition.native(
         authorization=authorization,
-        current_commit=commit or authorization.approved_commit[:0] or commit,
+        current_commit=commit,
         storage_dir=authorization.storage_path,
         gesture_key=gesture_key,
+        platform=platform,
     )
 
 
@@ -330,7 +341,7 @@ def main(env_override: dict[str, str] | None = None) -> int:
     phase3_bridge = Phase3Bridge(Phase3Surface.disabled())
     phase3_composition = None
     if env.get("_CONTROLLED_ENTRY") == "acceptance":
-        phase3_composition = _controlled_phase3_composition(env)
+        phase3_composition = _controlled_phase3_composition(env, gesture_key)
         phase3_bridge = phase3_composition.bridge
     # G01/G02 simulated acceptance (automated integration tests only):
     # an explicit test-harness launch may request the *simulated*

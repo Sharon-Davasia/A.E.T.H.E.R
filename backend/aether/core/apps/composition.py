@@ -133,6 +133,7 @@ class Phase3Composition:
     fixture: FixtureApp | None = None
     world_state: object | None = None  # InMemoryWorldState
     observer_service: object | None = None  # ObserverService
+    expiry_timer: object | None = None  # threading.Timer at expiry
     _started: bool = False
     _revoked: bool = False
 
@@ -146,31 +147,6 @@ class Phase3Composition:
             pass  # enablement.is_active enforces expiry per operation
         self._started = True
         return self
-
-    def note_observed_window(
-        self,
-        *,
-        hwnd: int,
-        process_token: str,
-        app_id: str,
-        version_token: str,
-        expires_at: datetime,
-    ) -> str:
-        """Register one observer-published window (observer seam)."""
-        if self.authority is None:
-            raise CompositionUnavailable("composition has no window authority")
-        from aether.world_state.privacy import ContextClassification
-
-        ref = self.authority.register_window(
-            hwnd=hwnd,
-            process_token=process_token,
-            instance_generation=1,
-            version_token=version_token,
-            expires_at=expires_at,
-            app_resource_id=app_id,
-            classification=ContextClassification.PERMITTED_METADATA,
-        )
-        return ref.resource_id
 
     @property
     def active(self) -> bool:
@@ -216,6 +192,9 @@ class Phase3Composition:
         Returns True only when the worker's exit is confirmed and
         observers are stopped; never claims success over live threads.
         """
+        if self.expiry_timer is not None:
+            self.expiry_timer.cancel()  # type: ignore[attr-defined]
+            self.expiry_timer = None
         self.pause_observation()
         self.revoke("shutdown")
         confirmed = True
@@ -299,7 +278,17 @@ class Phase3Composition:
             )
             if worker is not None:
                 worker.on_worker_restart = snapshots.note_privacy_change
-            world_state = InMemoryWorldState(policy=privacy.policy, authority=authority)
+            from pathlib import PureWindowsPath as _PWP
+
+            world_state = InMemoryWorldState(
+                policy=privacy.policy,
+                authority=authority,
+                app_id_by_identity={
+                    _PWP(r.executable_identity or "").name.casefold(): r.app_id
+                    for r in records
+                    if r.executable_identity
+                },
+            )
             observer_service = None
             if providers.event_source is not None:
                 observer_service = ObserverService(
@@ -392,7 +381,45 @@ class Phase3Composition:
                 activation_scope=authorization.campaign_id,
                 clock=now_fn,
             )
-            detector = DialogDetector(modal_evidence=providers.modal_evidence or (lambda _wid: ()))
+
+            def _native_modal_evidence(window_id: str):  # type: ignore[no-untyped-def]
+                """Independent modal evidence via the UIA provider.
+
+                None (unknown) when the window/provider is
+                unavailable; () only when the tree was actually read
+                and holds no modal secondary window.
+                """
+                from aether.core.apps.dialogs import ModalWindowEvidence
+
+                try:
+                    binding = authority.resolve_window(window_id)
+                    backend = providers.uia_backend_factory()
+                    try:
+                        root = backend.find_root(hwnd=binding.hwnd)  # type: ignore[attr-defined]
+                        if root is None:
+                            return None
+                        evidence = []
+                        for child in backend.children(root):  # type: ignore[attr-defined]
+                            if child.control_type in ("Window", "Dialog"):
+                                evidence.append(
+                                    ModalWindowEvidence(
+                                        window_resource_id=window_id,
+                                        owner_process_token=binding.process_token,
+                                        is_modal=True,
+                                        title_hint=None,
+                                        elevated=binding.elevated,
+                                        accessible=True,
+                                    )
+                                )
+                        return tuple(evidence)
+                    finally:
+                        backend.close()  # type: ignore[attr-defined]
+                except Exception:
+                    return None
+
+            detector = DialogDetector(
+                modal_evidence=providers.modal_evidence or _native_modal_evidence
+            )
 
             def _dialog_present(window_id: str) -> str | None:
                 try:
@@ -406,6 +433,18 @@ class Phase3Composition:
                     return "dialog_state_unknown"
                 return None
 
+            def _route_activity_early(signal: ActivitySignal) -> None:
+                if (
+                    signal.kind == "manual_activity_in_window"
+                    and focus._active_operation_window is None
+                ):
+                    return
+                focus.note_activity(signal)
+                for binding in authority.known_windows():
+                    if focus.takeover_detected(binding.window_id):
+                        snapshots.on_takeover(binding.window_id)
+
+            activity = providers.activity_factory(_route_activity_early)
             executor = UiOperationExecutor(
                 store=store,
                 snapshots=snapshots,
@@ -421,7 +460,9 @@ class Phase3Composition:
                 approved_fixture_identity_token=providers.fixture_identity_token,
                 dialog_present=_dialog_present,
                 worker=worker,
-                takeover_monitor_available=True,
+                takeover_monitor_available=lambda: bool(
+                    getattr(activity, "healthy", lambda: False)()
+                ),
             )
             planner = Planner(
                 capabilities=capabilities,
@@ -459,7 +500,6 @@ class Phase3Composition:
                     if focus.takeover_detected(binding.window_id):
                         snapshots.on_takeover(binding.window_id)
 
-            activity = providers.activity_factory(_route_activity)
             surface = Phase3Surface(
                 store=store,
                 snapshots=snapshots,
@@ -515,6 +555,21 @@ class Phase3Composition:
             # Reconcile before accepting any new execution (also done
             # by the storage factory; idempotent and truthful).
             recovery.reconcile_after_restart()
+            # Expiry is enforced as a lifecycle boundary: when the
+            # authorization expires, collection stops and execution
+            # authority is revoked even if nobody interacts again.
+            import threading as _threading
+
+            delay = max(0.0, (authorization.expires_at - now_fn()).total_seconds())
+
+            def _expire() -> None:
+                composition.pause_observation()
+                composition.revoke("authorization_expired")
+
+            timer = _threading.Timer(delay, _expire)
+            timer.daemon = True
+            timer.start()
+            composition.expiry_timer = timer
             return composition.start()
         except Exception:
             for cleanup in reversed(cleanups):
@@ -866,22 +921,67 @@ class NativePlatformProviders:
     worker: SubprocessWorkerSupervisor | None = None
 
 
+@dataclass(slots=True)
+class NativePlatformSeams:
+    """Raw Windows platform boundary for provider construction.
+
+    Seams carry *unconstructed* platform surfaces (Win32 API objects,
+    discovery providers, a pywinauto module object). Every provider
+    is constructed by ``build_native_platform`` itself, so the test
+    path exercises the identical construction logic as production;
+    injecting an already-constructed replacement provider is not
+    possible through this seam.
+    """
+
+    discovery_providers: object
+    launch_api: object
+    observer_api: object
+    integrity_verifier: IntegrityVerifier
+    activity_factory: Callable[[Callable[[ActivitySignal], None]], object] | None
+    foreground_provider: object  # activate(hwnd)/foreground_hwnd()
+    explorer_folder: Callable[[], object] | None = None
+    worker_command: list[str] | None = None
+    pywinauto_module: object | None = None
+
+
+def _native_explorer_folder() -> object:  # pragma: no cover - Windows COM
+    """Current Explorer folder via Shell.Application; None if unknown."""
+    try:
+        import win32com.client  # type: ignore[import-untyped]
+
+        shell = win32com.client.Dispatch("Shell.Application")
+        import ctypes
+
+        foreground = ctypes.windll.user32.GetForegroundWindow()  # type: ignore[attr-defined]
+        for window in shell.Windows():
+            try:
+                if int(window.HWND) == int(foreground):
+                    return window.Document.Folder.Self.Path
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
 def build_native_platform(
     authorization: ControlledAcceptanceAuthorization,
+    *,
+    seams: NativePlatformSeams | None = None,
 ) -> NativePlatformProviders:
-    """One trusted production platform-provider construction path.
+    """One trusted platform-provider construction path.
 
-    Windows only; raises on any other platform or when a required
-    native provider cannot be constructed, so controlled startup
-    fails closed instead of falling back.
+    With no seams this constructs the real Windows providers and
+    raises on any other platform or when a required provider cannot
+    be constructed, so controlled startup fails closed instead of
+    falling back. Tests pass raw Windows-API fakes as seams and
+    exercise this exact construction logic; that is simulated
+    evidence, never native evidence.
     """
     import sys
     from datetime import UTC as _UTC
     from datetime import datetime as _dt
     from datetime import timedelta as _td
-
-    if sys.platform != "win32":  # pragma: no cover - exercised on Windows
-        raise CompositionUnavailable("native_platform_requires_windows")
     from pathlib import Path as _Path
 
     from aether.adapters.windows.discovery import (
@@ -895,6 +995,7 @@ def build_native_platform(
         _CtypesWin32LaunchApi,
     )
     from aether.adapters.windows.native_observer import (
+        NativeForegroundProvider,
         NativeObservationProvider,
         NativeWindowsEventSource,
         _CtypesWin32Api,
@@ -912,35 +1013,55 @@ def build_native_platform(
         location_identity_digest,
         registration_app_id,
     )
+    from aether.core.workers.subprocess_supervisor import (
+        SubprocessWorkerSupervisor,
+        default_worker_command,
+    )
 
+    if seams is None:
+        if sys.platform != "win32":  # pragma: no cover - exercised on Windows
+            raise CompositionUnavailable("native_platform_requires_windows")
+        foreground = NativeForegroundProvider()
+        seams = NativePlatformSeams(
+            discovery_providers=StdlibWindowsDiscoveryProviders(),
+            launch_api=_CtypesWin32LaunchApi(),
+            observer_api=_CtypesWin32Api(),
+            integrity_verifier=NativeIntegrityProvider(),
+            activity_factory=None,
+            foreground_provider=foreground,
+            explorer_folder=_native_explorer_folder,
+        )
     now = _dt.now(_UTC)
-    batch = discover_applications(StdlibWindowsDiscoveryProviders())
+    batch = discover_applications(seams.discovery_providers)  # type: ignore[arg-type]
     records = [
         r
         for r in normalize_discovery(batch, now=now)
         if r.app_id in authorization.authorized_app_ids
     ]
     # The fixture is an explicit portable registration (owner-built
-    # executable), never auto-discovered as launchable software.
+    # executable), never auto-discovered as launchable software. Its
+    # identity is derived from the executable, exactly as registered;
+    # an authorization naming any other fixture identity is refused.
     fixture_exe = str(
-        _Path(__file__).resolve().parents[3] / "tools" / "windows-fixture" / FIXTURE_EXECUTABLE_NAME
+        _Path(__file__).resolve().parents[4] / "tools" / "windows-fixture" / FIXTURE_EXECUTABLE_NAME
     )
+    expected_fixture_id = registration_app_id(
+        display_name="AETHER Fixture",
+        executable_identity=fixture_exe,
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+    )
+    if authorization.fixture_app_id != expected_fixture_id:
+        raise CompositionUnavailable("fixture_identity_mismatch")
     fixture_record = _Record(
-        app_id=authorization.fixture_app_id,
+        app_id=expected_fixture_id,
         display_name="AETHER Fixture",
         launch_method=LaunchMethod.APPROVED_EXECUTABLE,
         executable_identity=fixture_exe,
         location_digest=location_identity_digest(fixture_exe),
-        discovery_source=DiscoverySource.USER_REGISTERED,
+        discovery_source=DiscoverySource.USER_REGISTERED_PORTABLE,
         discovered_at=now,
         fresh_until=now + _td(hours=2),
     )
-    if fixture_record.app_id == registration_app_id(
-        display_name="AETHER Fixture",
-        executable_identity=fixture_exe,
-        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
-    ):
-        pass  # identity derives from the executable, as registered
     records = [r for r in records if r.app_id != fixture_record.app_id] + [fixture_record]
     activation = activation_context_from_parent_bootstrap(
         {
@@ -952,13 +1073,12 @@ def build_native_platform(
             "expires_at": authorization.expires_at.timestamp(),
         }
     )
-    from aether.core.workers.subprocess_supervisor import (
-        SubprocessWorkerSupervisor,
-        default_worker_command,
-    )
-
+    if seams.activity_factory is None:
+        seams.activity_factory = lambda emit_to: NativeActivitySource(
+            activation=activation, emit_to=emit_to
+        )
     worker = SubprocessWorkerSupervisor(
-        command=default_worker_command(),
+        command=seams.worker_command or default_worker_command(),
         bootstrap_payload={
             "issuer": "aether-trusted-composition",
             "session_id": authorization.session_id,
@@ -973,21 +1093,26 @@ def build_native_platform(
         records=records,
         fixture_record=fixture_record,
         fixture_identity_token=authorization.fixture_identity_token,
-        integrity_verifier=NativeIntegrityProvider(),
-        launch_adapter=NativeWindowsLaunchAdapter(
-            api=_CtypesWin32LaunchApi(), activation=activation
+        integrity_verifier=seams.integrity_verifier,
+        launch_adapter=NativeWindowsLaunchAdapter(api=seams.launch_api, activation=activation),  # type: ignore[arg-type]
+        uia_backend_factory=(
+            lambda: (
+                build_native_uia_backend(
+                    activation=activation, pywinauto_module=seams.pywinauto_module
+                )
+                if seams.pywinauto_module is not None
+                else build_native_uia_backend(activation=activation)
+            )
         ),
-        uia_backend_factory=lambda: build_native_uia_backend(activation=activation),
-        activity_factory=lambda emit_to: NativeActivitySource(
-            activation=activation, emit_to=emit_to
-        ),
-        activate=lambda hwnd: False,  # pragma: no cover - win32 seam below
-        foreground_hwnd=lambda: None,
-        event_source=NativeWindowsEventSource.production(),
+        activity_factory=seams.activity_factory,
+        activate=seams.foreground_provider.activate,  # type: ignore[attr-defined]
+        foreground_hwnd=seams.foreground_provider.foreground_hwnd,  # type: ignore[attr-defined]
+        event_source=NativeWindowsEventSource(api=seams.observer_api, activation=activation),  # type: ignore[arg-type]
         observation_provider=NativeObservationProvider(
-            api=_CtypesWin32Api(),
+            api=seams.observer_api,  # type: ignore[arg-type]
             records=records,
-            integrity_verifier=NativeIntegrityProvider(),
+            integrity_verifier=seams.integrity_verifier,
         ),
+        explorer_folder=seams.explorer_folder,
         worker=worker,
     )

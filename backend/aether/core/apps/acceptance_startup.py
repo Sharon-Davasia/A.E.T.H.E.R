@@ -31,6 +31,8 @@ MAX_CAPABILITIES = frozenset(
     }
 )
 REQUIRED_PRIVACY_MODE = "metadata_only"
+# Documented maximum campaign authorization lifetime.
+MAX_AUTHORIZATION_LIFETIME = __import__("datetime").timedelta(hours=4)
 
 
 class StartupDenied(RuntimeError):
@@ -102,6 +104,8 @@ class ControlledAcceptanceAuthorization:
             raise StartupDenied("session_or_epoch_missing")
         if now >= self.expires_at:
             raise StartupDenied("authorization_expired")
+        if self.expires_at - now > MAX_AUTHORIZATION_LIFETIME:
+            raise StartupDenied("authorization_lifetime_exceeds_maximum")
         if self.privacy_mode != REQUIRED_PRIVACY_MODE:
             raise StartupDenied("privacy_mode_not_approved")
         if not self.capability_allowlist or not self.capability_allowlist <= MAX_CAPABILITIES:

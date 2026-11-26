@@ -97,11 +97,15 @@ class UiOperationExecutor:
     # relevant unexpected dialog is present.
     dialog_present: Callable[[str], str | None] | None = None
     # A04: unknown/unavailable takeover evidence denies effectful ops.
-    takeover_monitor_available: bool = True
+    takeover_monitor_available: bool | Callable[[], bool] = True
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def _now(self) -> datetime:
         return self.clock() if self.clock else datetime.now(UTC)
+
+    def _takeover_available(self) -> bool:
+        available = self.takeover_monitor_available
+        return bool(available() if callable(available) else available)
 
     # -- binding issuance (after the immutable plan exists) ---------------
 
@@ -208,7 +212,7 @@ class UiOperationExecutor:
     def _execute_locked(self, task_id: UUID, step_id: UUID, *, binding_id: str) -> UiOutcome:
         # Unknown/unavailable takeover evidence denies effectful ops
         # before any binding is consumed or effect dispatched (A04).
-        if not self.takeover_monitor_available:
+        if not self._takeover_available():
             raise UiDenied("takeover_monitoring_unavailable")
         _task, _plan, step, arguments = self._load_step(task_id, step_id)
         window_id = str(arguments["resource_id"])
@@ -264,7 +268,7 @@ class UiOperationExecutor:
         status_element = _status_element(snapshot)
         if status_element is None or status_element.name is None:
             raise UiDenied("fixture_status_unavailable")
-        if not self.takeover_monitor_available:
+        if not self._takeover_available():
             raise UiDenied("takeover_monitoring_unavailable")
         if self.focus.takeover_detected(window_id):
             raise UiDenied("manual_takeover")
@@ -309,6 +313,7 @@ class UiOperationExecutor:
                 element=element,
                 locks=locks,
                 binding=binding,
+                approved_status_name=status_element.name,
             )
         finally:
             # Ownership releases only after verification + receipt are
@@ -327,6 +332,7 @@ class UiOperationExecutor:
         element: UiaElement,
         locks: tuple[LockHandle, LockHandle],
         binding: dict[str, object],
+        approved_status_name: str | None = None,
     ) -> UiOutcome:
         if self.focus.takeover_detected(window_id):
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
@@ -339,7 +345,13 @@ class UiOperationExecutor:
         pre_status = _status_element(pre.snapshot)
         if pre_status is None or pre_status.name is None:
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
-        expected = _expected_status(pre_status.name)
+        # The fresh precondition must equal the exact approved
+        # binding's precondition immediately before dispatch. A
+        # changed counter invalidates the approval (no effect is
+        # dispatched) instead of silently authorizing another change.
+        if approved_status_name is not None and pre_status.name != approved_status_name:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        expected = _expected_status(approved_status_name or pre_status.name)
         if expected is None:
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
         target_element = (

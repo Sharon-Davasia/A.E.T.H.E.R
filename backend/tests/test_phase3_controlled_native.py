@@ -39,6 +39,8 @@ from aether.core.persistence.acceptance_storage import (
     OwnerAcceptanceAuthorization,
     open_acceptance_store,
 )
+from aether.world_state.observer import FakeWindowEventSource, WindowEvent, WindowEventKind
+from aether.world_state.privacy import ContextClassification
 
 COMMIT = "a" * 40
 GESTURE_KEY = bytes(range(32))
@@ -231,6 +233,7 @@ def _harness(tmp_path: Path):
     adapter = _Adapter(platform)
     fg: dict[str, int | None] = {"hwnd": None}
     emit_holder: dict[str, object] = {}
+    event_source = FakeWindowEventSource()
     activity = FakeActivitySource(emit_to=lambda s: emit_holder["fn"](s))  # type: ignore[arg-type]
     from aether.core.apps.launch_authority import app_version_token
 
@@ -246,6 +249,7 @@ def _harness(tmp_path: Path):
         activity_factory=lambda emit_to: (emit_holder.__setitem__("fn", emit_to), activity)[1],
         activate=lambda hwnd: fg.__setitem__("hwnd", hwnd) is None,
         foreground_hwnd=lambda: fg["hwnd"],
+        event_source=event_source,
         observation_provider=_Observation(
             platform,
             {
@@ -263,6 +267,7 @@ def _harness(tmp_path: Path):
         "fg": fg,
         "activity": activity,
         "providers": providers,
+        "event_source": event_source,
         "authz": authz,
         "storage": storage,
         "app_id": app_id,
@@ -363,10 +368,10 @@ def test_ordinary_startup_renderers_cannot_mint_authority(tmp_path: Path) -> Non
         "AETHER_PHASE3_AUTHORIZATION": str(tmp_path / "x.json"),
     }
     with pytest.raises(StartupDenied):
-        channel_service._controlled_phase3_composition(env)
+        channel_service._controlled_phase3_composition(env, b"g" * 32)
     # Ordinary startup (no controlled marker) never constructs it.
     ordinary = {"AETHER_PHASE3_AUTHORIZATION": str(tmp_path / "x.json")}
-    assert channel_service._controlled_phase3_composition(ordinary) is None
+    assert channel_service._controlled_phase3_composition(ordinary, b"g" * 32) is None
 
 
 # ---------------------------------------------------------------- A02
@@ -650,15 +655,32 @@ def test_complete_controlled_acceptance_workflow(tmp_path: Path) -> None:
     assert preview["status"] == "ready", preview
     outcome = _approve(bridge, prepared["taskId"], preview, effect="app.launch")
     assert outcome["status"] == "ready" and outcome["outcome"] == "SUCCEEDED", outcome
-    # (12) newly observed window registration
-    hwnd, token, _app = h["platform"].windows[0]
-    window_id = comp.note_observed_window(
-        hwnd=hwnd,
-        process_token=token,
-        app_id=h["app_id"],
-        version_token=f"ver:{hwnd}",
-        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+    # (12) newly observed window registration: the observer source
+    # publishes the window; WorldState registers it in the authority
+    # with the fixture app identity mapped from the process identity.
+    hwnd, _token, _app = h["platform"].windows[0]
+    h["event_source"].push(
+        WindowEvent(
+            kind=WindowEventKind.WINDOW_CREATED,
+            hwnd=hwnd,
+            pid=4242,
+            process_creation_time="fake-creation-1",
+            app_identity="Fixture App.exe",
+            classification=ContextClassification.PERMITTED_METADATA,
+            elevated=False,
+        )
     )
+    window_id = ""
+    for _ in range(100):
+        assert comp.authority is not None
+        for binding in comp.authority.known_windows():
+            if binding.app_resource_id == h["app_id"]:
+                window_id = binding.window_id
+                break
+        if window_id:
+            break
+        time.sleep(0.05)
+    assert window_id, "observer did not register the launched window"
     # (13) window selection
     activation = bridge.prepare_activation({"windowId": window_id})
     assert activation["status"] == "ready", activation
@@ -716,3 +738,131 @@ def test_complete_controlled_acceptance_workflow(tmp_path: Path) -> None:
     assert bridge.get_receipt({"taskId": task_id})["taskState"] == "COMPLETED"
     # (22) controlled shutdown
     assert comp.shutdown() is True
+
+
+def test_changed_counter_invalidates_approval(tmp_path: Path) -> None:
+    """A counter changed after approval preparation must not be
+    silently incremented again: fresh precondition != approved
+    precondition invalidates the approval before dispatch."""
+    h = _harness(tmp_path)
+    store = open_acceptance_store(
+        h["storage"],
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=h["authz"].decision_reference,
+            storage_id=h["authz"].storage_id,
+            expires_at=h["authz"].expires_at,
+            campaign_id=h["authz"].campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    comp = _start(h)
+    bridge = comp.bridge
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    prepared_launch = bridge.prepare_launch({"appId": h["app_id"]})
+    preview = bridge.preview_operation(
+        {"taskId": prepared_launch["taskId"], "effect": "app.launch"}
+    )
+    outcome = _approve(bridge, prepared_launch["taskId"], preview, effect="app.launch")
+    assert outcome["outcome"] == "SUCCEEDED", outcome
+    hwnd, _t, _a = h["platform"].windows[0]
+    h["event_source"].push(
+        WindowEvent(
+            kind=WindowEventKind.WINDOW_CREATED,
+            hwnd=hwnd,
+            pid=4242,
+            process_creation_time="fake-creation-1",
+            app_identity="Fixture App.exe",
+            classification=ContextClassification.PERMITTED_METADATA,
+            elevated=False,
+        )
+    )
+    window_id = ""
+    for _ in range(100):
+        assert comp.authority is not None
+        for binding in comp.authority.known_windows():
+            if binding.app_resource_id == h["app_id"]:
+                window_id = binding.window_id
+        if window_id:
+            break
+        time.sleep(0.05)
+    assert window_id
+    act = bridge.prepare_activation({"windowId": window_id})
+    aprev = bridge.preview_operation({"taskId": act["taskId"], "effect": "window.activate"})
+    _approve(bridge, act["taskId"], aprev, effect="window.activate")
+    prepared = bridge.prepare_fixture_interaction({"windowId": window_id})
+    assert prepared["preview"]["verifiedPrecondition"] == "Count: 0"
+    # External change after preparation (not by AETHER).
+    root = h["backend"].find_root(hwnd=hwnd)
+    assert root is not None
+    increment = h["backend"].children(root)[1]
+    h["backend"].invoke(increment)
+    assert h["platform"].count == 1
+    preview = bridge.preview_fixture_interaction({"taskId": prepared["taskId"]})
+    result = _approve(bridge, prepared["taskId"], preview)
+    assert result.get("outcome") != "SUCCEEDED", result
+    assert h["platform"].count == 1  # approval did not authorize another increment
+    assert comp.shutdown() is True
+
+
+def test_native_platform_construction_with_raw_fakes(tmp_path: Path) -> None:
+    """build_native_platform itself (not an injected provider set)
+    constructs every provider from raw Windows-API fake seams."""
+    from aether.adapters.windows.fake_windows import build_fake_seams, fixture_executable
+    from aether.adapters.windows.native_launcher import NativeWindowsLaunchAdapter
+    from aether.adapters.windows.native_observer import NativeWindowsEventSource
+    from aether.core.apps.composition import build_native_platform
+    from aether.core.contracts.app_window import (
+        LaunchMethod,
+        location_identity_digest,
+        registration_app_id,
+    )
+
+    seams = build_fake_seams()
+    fixture_id = registration_app_id(
+        display_name="AETHER Fixture",
+        executable_identity=fixture_executable(),
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+    )
+    from aether.core.apps.launch_authority import app_version_token
+
+    token = app_version_token(
+        seams.integrity_verifier.verify(  # type: ignore[attr-defined]
+            type(
+                "R",
+                (),
+                {"location_digest": location_identity_digest(fixture_executable())},
+            )()
+        )
+    )
+    authz = ControlledAcceptanceAuthorization(
+        approved_commit=COMMIT,
+        decision_reference="d",
+        campaign_id=CAMPAIGN,
+        storage_id="33333333-3333-4333-8333-333333333333",
+        storage_path=str(tmp_path / "aether-phase3-acceptance-x"),
+        authorized_app_ids=frozenset({fixture_id}),
+        capability_allowlist=frozenset({"app.launch", "uia.invoke_fixture"}),
+        session_id=SESSION,
+        activation_epoch=EPOCH,
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+        privacy_mode="metadata_only",
+        fixture_app_id=fixture_id,
+        fixture_identity_token=token,
+    )
+    providers = build_native_platform(authz, seams=seams)
+    assert providers.fixture_record.app_id == fixture_id
+    assert isinstance(providers.launch_adapter, NativeWindowsLaunchAdapter)
+    assert isinstance(providers.event_source, NativeWindowsEventSource)
+    assert providers.observation_provider is not None
+    assert providers.worker is not None
+    # Wrong fixture identity is refused by the construction path.
+    import dataclasses
+
+    from aether.core.apps.composition import CompositionUnavailable
+
+    with pytest.raises(CompositionUnavailable):
+        build_native_platform(
+            dataclasses.replace(authz, fixture_app_id="app:00000000-0000-4000-8000-000000000000"),
+            seams=build_fake_seams(),
+        )
