@@ -50,25 +50,52 @@ class PywinautoUiaBackend:
         self._pywinauto = pywinauto_module
         self._root_window = root_window
         self._known: dict[str, Any] = {}
+        # A04: collection authority is set on the provider *before*
+        # any inspection; metadata-only never reads accessible names.
+        self._collection_mode = "metadata_only"
+        self._fixture_counter_permitted = False
+
+    def set_collection_mode(self, mode: str, *, fixture_counter_permitted: bool = False) -> None:
+        if mode not in ("metadata_only", "content_on_demand"):
+            raise UiaBackendError("collection mode is not permitted")
+        self._collection_mode = mode
+        self._fixture_counter_permitted = fixture_counter_permitted
 
     # -- helpers -----------------------------------------------------
 
     def _register(self, element: Any) -> RawElement:
         info = element.element_info
-        runtime_id = ".".join(str(p) for p in (info.runtime_id or (info.handle or id(element),)))
+        # A04: actionable identity requires the actual UIA runtime
+        # id. Python object identity and raw HWND are not element
+        # identity and are never used as fallbacks.
+        if not info.runtime_id:
+            raise UiaBackendError("uia_element_has_no_runtime_identity")
+        runtime_id = ".".join(str(p) for p in info.runtime_id)
         children: tuple[str, ...] = ()
         try:
             children = tuple(self._key(c.element_info) for c in element.children())
         except Exception:
             children = ()
-        # F12: sensitive classification precedes any content-bearing
-        # read. A password control's name/value are never queried.
+        # F12/A04: sensitive classification precedes any content-
+        # bearing read. A password control's name/value are never
+        # queried. In metadata-only mode accessible names are not
+        # read at all, except the one narrow fixture-counter case:
+        # the fixture status control under its fixture authorization.
         is_password = bool(getattr(info, "is_password", False))
+        automation_id = info.automation_id or None
+        read_name = not is_password and (
+            self._collection_mode == "content_on_demand"
+            or (
+                self._fixture_counter_permitted
+                and automation_id == "101"
+                and str(info.control_type or "") == "Text"
+            )
+        )
         raw = RawElement(
             key=runtime_id,
             control_type=str(info.control_type or "unknown"),
-            name=None if is_password else (info.name or None),
-            automation_id=(info.automation_id or None),
+            name=(info.name or None) if read_name else None,
+            automation_id=automation_id,
             patterns=_pattern_names(element),
             is_enabled=bool(info.enabled),
             is_offscreen=bool(getattr(info, "is_offscreen", False)),
@@ -82,7 +109,9 @@ class PywinautoUiaBackend:
 
     @staticmethod
     def _key(info: Any) -> str:
-        return ".".join(str(p) for p in (info.runtime_id or (info.handle or 0,)))
+        if not info.runtime_id:
+            raise UiaBackendError("uia_element_has_no_runtime_identity")
+        return ".".join(str(p) for p in info.runtime_id)
 
     def _live(self, element: RawElement) -> Any:
         impl = self._known.get(element.key)

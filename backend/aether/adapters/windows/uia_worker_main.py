@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time as _time
 from collections.abc import Callable
 from typing import Any, BinaryIO
 
@@ -44,6 +45,16 @@ def handle_request(request: dict[str, Any], *, backend: UiaBackend) -> dict[str,
                 ),
             )
             mode = str(payload.get("collection_mode", "metadata_only"))
+            # A04: the native provider enforces the collection mode
+            # itself, before any content-bearing property access. The
+            # fixture counter is a narrow exception for the fixture
+            # status control only, not unrestricted content mode.
+            setter = getattr(backend, "set_collection_mode", None)
+            if setter is not None:  # pragma: no branch - capability check
+                setter(
+                    mode,
+                    fixture_counter_permitted=bool(payload.get("fixture_counter_permitted", False)),
+                )
             elements, truncated = _bounded_walk(
                 backend, root, limits, include_names=(mode == "content_on_demand")
             )
@@ -133,6 +144,7 @@ def serve(
     *,
     stdin: BinaryIO | None = None,
     stdout: BinaryIO | None = None,
+    activation: object | None = None,
 ) -> None:  # pragma: no cover - process entry, exercised via handle_request
     source = stdin or sys.stdin.buffer
     sink = stdout or sys.stdout.buffer
@@ -145,7 +157,19 @@ def serve(
                 request = validate_request(decode_message(line, bound=MAX_REQUEST_BYTES))
             except ValueError:
                 continue
-            response = handle_request(request, backend=backend)
+            # A03: operation scope + expiry enforced by the worker
+            # against its minted activation context on every request.
+            if activation is not None and not activation.operation_permitted(  # type: ignore[attr-defined]
+                str(request.get("operation")), now=_time.time()
+            ):
+                response = {
+                    "protocol": PROTOCOL_VERSION,
+                    "request_id": request.get("request_id", ""),
+                    "status": "error",
+                    "error": "operation_not_permitted",
+                }
+            else:
+                response = handle_request(request, backend=backend)
             body = json.dumps(response, separators=(",", ":")).encode("utf-8")
             if len(body) > MAX_RESPONSE_BYTES:
                 body = json.dumps(
@@ -217,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
         except NativeUiaDisabled:
             print("uia worker: native UIA activation is disabled", file=sys.stderr)
             return 2
-        serve(lambda: backend, stdin=sys.stdin.buffer)
+        serve(lambda: backend, stdin=sys.stdin.buffer, activation=activation)
         return 0
     finally:
         comtypes.CoUninitialize()

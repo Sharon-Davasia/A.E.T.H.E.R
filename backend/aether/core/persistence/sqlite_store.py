@@ -497,6 +497,25 @@ class SQLiteTaskStore:
         # owner-side procedure and composition never sets it.
         self._target_schema_version = target_schema_version
         self._acceptance_pending_authorized = _acceptance_pending_authorized
+        if target_schema_version in PENDING_MIGRATION_VERSIONS and _acceptance_pending_authorized:
+            # A02: the internal flag alone is not authorization. The
+            # database must sit beside a validated acceptance marker.
+            import json as _json
+
+            marker_path = Path(database_path).expanduser().with_name("acceptance-storage.json")
+            try:
+                marker = _json.loads(marker_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as exc:
+                raise PersistenceIntegrityError(
+                    "pending schema version requires validated acceptance storage"
+                ) from exc
+            if (
+                marker.get("kind") != "aether-phase3-acceptance"
+                or marker.get("schema_version") != 3
+            ):
+                raise PersistenceIntegrityError(
+                    "pending schema version requires validated acceptance storage"
+                )
         try:
             raw_database_path = os.fspath(database_path)
         except TypeError as exc:

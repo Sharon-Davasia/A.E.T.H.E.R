@@ -15,7 +15,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 from aether.core.contracts.uia import MAX_RESPONSE_BYTES
@@ -45,10 +45,20 @@ class SubprocessWorkerSupervisor:
     def worker_session(self) -> int:
         return self._worker_session
 
+    # Set by the snapshot service: worker identity loss purges snapshots.
+    on_worker_restart: Callable[[], None] | None = None
+
     def start(self) -> bool:
         with self._lock:
             if self._process is not None and self._process.poll() is None:
-                return True
+                # A live process is not automatically healthy (A03).
+                assert self._supervisor is not None
+                if self._supervisor.health(timeout=2.0):
+                    return True
+                self._terminate_locked()
+                self._process = None
+                self._supervisor = None
+                return False
             try:
                 self._process = subprocess.Popen(
                     list(self.command),
@@ -79,7 +89,13 @@ class SubprocessWorkerSupervisor:
                     self._process = None
                     return False
             self._supervisor = WorkerSupervisor(send=self._send)
-            return self._supervisor.health(timeout=self.startup_timeout)
+            if not self._supervisor.health(timeout=self.startup_timeout):
+                # Failed health check terminates the failed worker.
+                self._terminate_locked()
+                self._process = None
+                self._supervisor = None
+                return False
+            return True
 
     def _send(self, body: bytes, timeout: float) -> bytes:
         process = self._process
@@ -122,16 +138,29 @@ class SubprocessWorkerSupervisor:
                 return WorkerResult(WorkerOutcome.UNAVAILABLE, detail="worker_start_failed")
             assert self._supervisor is not None
             result = self._supervisor.execute(operation, payload, timeout=timeout)
+            if operation in ("invoke",) and result.outcome in (
+                WorkerOutcome.MALFORMED,
+                WorkerOutcome.STALE_RESPONSE,
+            ):
+                # Malformed/stale *effectful* responses are uncertain:
+                # the effect may or may not have happened (A03).
+                result = WorkerResult(
+                    WorkerOutcome.UNCERTAIN, detail=f"effectful_response_{result.outcome.value}"
+                )
             if result.outcome in (
                 WorkerOutcome.UNCERTAIN,
                 WorkerOutcome.CRASHED,
                 WorkerOutcome.TIMED_OUT,
             ):
                 # Identity continuity is gone; restart before any new
-                # dispatch. The ambiguous operation is never replayed.
+                # dispatch. The ambiguous operation is never replayed,
+                # and retained snapshots are invalidated with the
+                # worker identity that produced them.
                 self._terminate_locked()
                 self._process = None
                 self._supervisor = None
+                if self.on_worker_restart is not None:
+                    self.on_worker_restart()
             return result
 
     def health(self) -> bool:
@@ -156,11 +185,14 @@ class SubprocessWorkerSupervisor:
         except OSError:
             pass
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
+        """Terminate and *confirm* exit; False if still alive."""
         with self._lock:
             self._terminate_locked()
+            process = self._process
             self._process = None
             self._supervisor = None
+            return process is None or process.poll() is not None
 
     def __enter__(self) -> SubprocessWorkerSupervisor:
         self.start()

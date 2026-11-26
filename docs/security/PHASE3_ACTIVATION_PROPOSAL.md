@@ -121,3 +121,108 @@ Production enablement in ordinary launches; schema v3 for any
 real-user storage; Phase 4 capabilities; any change to the formal
 Phase 2 acceptance verdict (NOT COMPLETE, unwaived); running the
 historical combined Phase 2 verifier.
+
+---
+
+## Implemented controlled startup (A01–A05, this branch)
+
+Status: **IMPLEMENTED — owner execution still NOT authorized.**
+The mechanism below exists in source and is covered by simulated/
+fake-platform tests (`backend/tests/test_phase3_controlled_native.py`).
+It has never run natively. Do not execute this procedure until an
+independent review accepts the implementing commit and the owner
+explicitly approves that exact SHA.
+
+What is implemented:
+
+- `Phase3Composition.native(...)` is a real factory. It validates a
+  `ControlledAcceptanceAuthorization` (approved commit, owner
+  decision reference, campaign, storage id/path, app allowlist,
+  capability allowlist within the build ceiling, session, activation
+  epoch, expiry, `metadata_only` privacy mode, fixture identity
+  token) against the live commit and the acceptance-storage marker
+  **before** opening storage or constructing native components.
+- Acceptance storage (schema v3) is containment-checked: fixed local
+  volume, no symlink/junction/reparse components, exclusive
+  creation, marker bound to storage/decision/campaign/directory
+  identity, hard-link and unrelated-content rejection. Ordinary
+  storage remains v2; the pending-v3 flag alone opens nothing.
+- The UIA worker receives session/epoch/scope/operations/expiry in
+  its parent-owned bootstrap and enforces them per request; failed
+  startup is terminated, effectful malformed/stale responses are
+  uncertain and never replayed, shutdown confirms process exit.
+- The native UIA provider takes its collection mode before reading
+  any accessible name (fixture status control only, under the narrow
+  fixture authorization); password classification precedes content;
+  elements without a real UIA runtime id are refused. Same-window
+  takeover uses content-free low-level activity hooks in addition to
+  focus events; unavailable monitoring denies effectful execution.
+- One continuous authenticated workflow test runs startup → opt-in →
+  discovery → resolution → launch → verification → window
+  registration → activation → snapshot → fixture approval →
+  single-use commitment → verified effect → receipt → shutdown over
+  the real composition, store, broker, planner and gesture authority.
+
+### Exact owner-side procedure (after future approval only)
+
+Non-administrator PowerShell 5.1 at `D:\A.E.T.H.E.R`, Python
+3.12.10, Node 22.22.3, `npm.cmd` 10.9.8. No elevation, no new
+worktrees, no execution-policy changes.
+
+```powershell
+# 1. Candidate verification — HEAD must equal the approved SHA.
+git rev-parse HEAD
+git status --porcelain        # must be empty
+
+# 2. Environment checks (no reinstall if already satisfied).
+python --version              # 3.12.10
+node --version                # v22.22.3
+npm.cmd --version             # 10.9.8
+
+# 3. Gates at the candidate (skip npm ci when node_modules is present).
+cd backend; python -m pytest; python -m ruff check .; python -m mypy; cd ..
+cd apps\desktop; npm.cmd run check; cd ..\..
+
+# 4. Fixture build + integrity evidence.
+cd tools\windows-fixture; .\build_fixture.cmd; cd ..\..
+Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256
+
+# 5. Fixture identity token (paste into the authorization artifact).
+python -c "from aether.core.apps.launch_authority import app_version_token; from aether.core.contracts.app_window import registration_app_id, LaunchMethod; from aether.adapters.windows.native_launcher import NativeIntegrityProvider; import pathlib; exe=str(pathlib.Path('tools/windows-fixture/AETHERFixture.exe').resolve()); from aether.core.contracts.app_window import ApplicationRecord, DiscoverySource, location_identity_digest; from datetime import datetime, UTC, timedelta; now=datetime.now(UTC); rec=ApplicationRecord(app_id=registration_app_id(display_name='AETHER Fixture', executable_identity=exe, launch_method=LaunchMethod.APPROVED_EXECUTABLE), display_name='AETHER Fixture', launch_method=LaunchMethod.APPROVED_EXECUTABLE, executable_identity=exe, location_digest=location_identity_digest(exe), discovery_source=DiscoverySource.USER_REGISTERED_PORTABLE, discovered_at=now, fresh_until=now+timedelta(hours=2)); print(rec.app_id); print(app_version_token(NativeIntegrityProvider().verify(rec)))"
+
+# 6. Owner authorization artifact (owner-created JSON, outside repo):
+#    D:\AETHER-acceptance\authorization.json with fields:
+#    approved_commit, decision_reference, campaign_id, storage_id
+#    (UUID), storage_path (D:\AETHER-acceptance\aether-phase3-acceptance-<campaign>),
+#    authorized_app_ids (fixture app_id from step 5 + approved apps),
+#    capability_allowlist (subset of app.launch, window.activate,
+#    uia.inspect_snapshot, uia.inspect_element, uia.invoke_fixture),
+#    session_id, activation_epoch, expires_at (ISO, <= 4h),
+#    privacy_mode "metadata_only", fixture_app_id,
+#    fixture_identity_token (step 5).
+
+# 7. Isolated storage initialization (creates marker + v3 store).
+$env:AETHER_ACCEPT = "1"
+python -c "import json,pathlib; from datetime import datetime,UTC; from aether.core.persistence.acceptance_storage import OwnerAcceptanceAuthorization, open_acceptance_store; a=json.loads(pathlib.Path(r'D:\AETHER-acceptance\authorization.json').read_text()); s=open_acceptance_store(a['storage_path'], authorization=OwnerAcceptanceAuthorization(decision_reference=a['decision_reference'], storage_id=a['storage_id'], expires_at=datetime.fromisoformat(a['expires_at']), campaign_id=a['campaign_id']), now=datetime.now(UTC)); s.close(); print('acceptance storage initialized')"
+
+# 8. Controlled startup (trusted main selects the controlled entry
+#    point only from this owner-set main-process environment value).
+$env:AETHER_PHASE3_AUTHORIZATION = "D:\AETHER-acceptance\authorization.json"
+cd apps\desktop; npm.cmd run start
+# Expected indication: Phase 3 surface reports nativeAvailable=true,
+# privacy mode "off" until explicit metadata_only opt-in in the UI.
+
+# 9. Campaign: run docs/engineering/PHASE3_NATIVE_ACCEPTANCE.md
+#    P3-01...P3-25 within the authorization expiry; capture receipts.
+
+# 10. Revocation + safe shutdown: opt out of observation in the UI,
+#     close the app (composition revokes, stops observer/activity,
+#     terminates and confirms the worker, purges snapshots, closes
+#     storage). Remove the env var afterwards:
+Remove-Item Env:AETHER_PHASE3_AUTHORIZATION
+```
+
+Any mismatch — wrong commit, expired artifact, substituted storage,
+missing marker — refuses startup with no fallback to ordinary
+storage. Native results remain **unverified** until this campaign is
+actually run and independently reviewed.

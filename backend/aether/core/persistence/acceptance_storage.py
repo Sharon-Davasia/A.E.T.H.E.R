@@ -50,16 +50,59 @@ class OwnerAcceptanceAuthorization:
     decision_reference: str
     storage_id: str
     expires_at: datetime
+    campaign_id: str = ""
 
 
 def _reject_symlink_components(path: Path) -> None:
-    current = path
-    while True:
-        if current.is_symlink():
-            raise AcceptanceStorageError("acceptance storage path contains a link component")
-        if current.parent == current:
-            return
-        current = current.parent
+    """Reject symlinks, junctions and any reparse-point component."""
+    from aether.core.resources.path_safety import PathSafetyError, reject_reparse_components
+
+    try:
+        reject_reparse_components(path)
+    except PathSafetyError as exc:
+        raise AcceptanceStorageError(
+            "acceptance storage path contains a reparse component"
+        ) from exc
+
+
+def read_acceptance_marker(storage_dir: Path | str) -> dict[str, object] | None:
+    """Read and shape-check the storage marker, or None if absent."""
+    marker_path = Path(storage_dir) / _MARKER
+    if not marker_path.exists():
+        return None
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return marker if isinstance(marker, dict) else None
+
+
+def _file_identity(path: Path) -> tuple[int, int]:
+    metadata = path.lstat()
+    return (metadata.st_dev, metadata.st_ino)
+
+
+def _check_single_link(path: Path) -> None:
+    """Reject linked/substituted files: a storage file must have
+    exactly one hard link and must not be a link/reparse point."""
+    _reject_symlink_components(path)
+    metadata = path.lstat()
+    if getattr(metadata, "st_nlink", 1) != 1:
+        raise AcceptanceStorageError("acceptance storage file is hard-linked")
+
+
+# Exact sidecar names the store creates beside the database; anything
+# else in the directory is unrelated content.
+_ALLOWED_NAMES = frozenset(
+    {
+        _MARKER,
+        _DB_NAME,
+        _DB_NAME + "-wal",
+        _DB_NAME + "-shm",
+        _DB_NAME + "-journal",
+        _DB_NAME + ".owner.lock",
+    }
+)
 
 
 def open_acceptance_store(
@@ -85,39 +128,56 @@ def open_acceptance_store(
     directory = Path(storage_dir).expanduser()
     if not directory.is_absolute():
         raise AcceptanceStorageError("acceptance storage path must be absolute")
+    if any(part in (".", "..") for part in directory.parts):
+        raise AcceptanceStorageError("acceptance storage path is not canonical")
     if not directory.name.startswith(_PREFIX):
         raise AcceptanceStorageError("acceptance storage must use a dedicated synthetic directory")
     _reject_symlink_components(directory)
+    # Canonical approved local location: fixed local volume only.
+    from aether.core.resources.path_safety import VolumeKind, inspect_volume
+
+    volume = inspect_volume(directory.parent)
+    if volume.kind is not VolumeKind.FIXED:
+        raise AcceptanceStorageError("acceptance storage must be on a fixed local volume")
 
     marker_path = directory / _MARKER
     db_path = directory / _DB_NAME
     if directory.exists():
         if directory.is_symlink() or not directory.is_dir():
             raise AcceptanceStorageError("acceptance storage path is not a directory")
+        if Path(os.path.abspath(directory)) != directory or directory.resolve() != directory:
+            raise AcceptanceStorageError("acceptance storage path does not canonicalize to itself")
         existing = {p.name for p in directory.iterdir()}
-        allowed = {_MARKER, _DB_NAME, _DB_NAME + "-wal", _DB_NAME + "-shm"}
-        # Owner-lock sidecar files created by the store are permitted.
-        allowed |= {n for n in existing if n.startswith(".") or n.endswith(".lock")}
-        unexpected = existing - allowed - {n for n in existing if _DB_NAME in n}
+        unexpected = existing - _ALLOWED_NAMES
         if _DB_NAME in existing and _MARKER not in existing:
             raise AcceptanceStorageError("pre-existing unrelated storage is refused")
         if unexpected:
             raise AcceptanceStorageError("acceptance storage directory contains unrelated files")
         if marker_path.exists():
-            try:
-                marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            except (OSError, ValueError) as exc:
-                raise AcceptanceStorageError("acceptance storage marker is unreadable") from exc
+            _check_single_link(marker_path)
+            if db_path.exists():
+                _check_single_link(db_path)
+            marker = read_acceptance_marker(directory)
+            if marker is None:
+                raise AcceptanceStorageError("acceptance storage marker is unreadable")
             if (
                 marker.get("storage_id") != authorization.storage_id
                 or marker.get("schema_version") != 3
                 or marker.get("kind") != "aether-phase3-acceptance"
+                or marker.get("decision_reference") != authorization.decision_reference
+                or marker.get("campaign_id", "") != authorization.campaign_id
+                or marker.get("directory_identity") != list(_file_identity(directory))
             ):
                 raise AcceptanceStorageError(
                     "acceptance storage marker does not match authorization"
                 )
     else:
-        directory.mkdir(parents=True, mode=0o700)
+        # Exclusive creation: never adopt a directory that appears
+        # between validation and creation.
+        try:
+            directory.mkdir(parents=True, mode=0o700, exist_ok=False)
+        except FileExistsError as exc:
+            raise AcceptanceStorageError("acceptance storage directory already exists") from exc
         os.chmod(directory, 0o700)
         marker_path.write_text(
             json.dumps(
@@ -126,6 +186,8 @@ def open_acceptance_store(
                     "storage_id": authorization.storage_id,
                     "schema_version": 3,
                     "decision_reference": authorization.decision_reference,
+                    "campaign_id": authorization.campaign_id,
+                    "directory_identity": list(_file_identity(directory)),
                 },
                 sort_keys=True,
             ),
@@ -133,6 +195,11 @@ def open_acceptance_store(
         )
 
     store = SQLiteTaskStore(db_path, target_schema_version=3, _acceptance_pending_authorized=True)
+    # The opened database must be exactly the validated file.
+    _check_single_link(db_path)
+    if Path(store.database_path).resolve() != db_path.resolve():
+        store.close()
+        raise AcceptanceStorageError("opened database is not the validated acceptance database")
     # Reconcile interrupted operations before any new execution.
     store.reconcile_navigation_tasks(now=moment)
     store.reconcile_ui_tasks(now=moment)

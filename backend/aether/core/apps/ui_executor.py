@@ -96,6 +96,8 @@ class UiOperationExecutor:
     # CP6 dialog guard seam: returns a redacted reason code when a
     # relevant unexpected dialog is present.
     dialog_present: Callable[[str], str | None] | None = None
+    # A04: unknown/unavailable takeover evidence denies effectful ops.
+    takeover_monitor_available: bool = True
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def _now(self) -> datetime:
@@ -204,6 +206,10 @@ class UiOperationExecutor:
             return self._execute_locked(task_id, step_id, binding_id=binding_id)
 
     def _execute_locked(self, task_id: UUID, step_id: UUID, *, binding_id: str) -> UiOutcome:
+        # Unknown/unavailable takeover evidence denies effectful ops
+        # before any binding is consumed or effect dispatched (A04).
+        if not self.takeover_monitor_available:
+            raise UiDenied("takeover_monitoring_unavailable")
         _task, _plan, step, arguments = self._load_step(task_id, step_id)
         window_id = str(arguments["resource_id"])
         snapshot_id = str(arguments["snapshot_id"])
@@ -258,6 +264,8 @@ class UiOperationExecutor:
         status_element = _status_element(snapshot)
         if status_element is None or status_element.name is None:
             raise UiDenied("fixture_status_unavailable")
+        if not self.takeover_monitor_available:
+            raise UiDenied("takeover_monitoring_unavailable")
         if self.focus.takeover_detected(window_id):
             raise UiDenied("manual_takeover")
         if self.focus.snapshot_invalidated(snapshot_id):

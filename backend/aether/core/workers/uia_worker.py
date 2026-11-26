@@ -41,6 +41,7 @@ _PAYLOAD_SCHEMAS: dict[str, dict[str, type]] = {
         "max_elements": int,
         "max_total_text_chars": int,
         "collection_mode": str,
+        "fixture_counter_permitted": bool,
     },
     # Internal worker operations: dispatchable only by the trusted
     # parent for an authorized typed capability/target; never exposed
@@ -86,7 +87,10 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
     if unknown:
         raise ValueError(f"payload fields are not allowlisted: {sorted(unknown)}")
     for key, expected in schema.items():
-        if key in payload and (
+        if expected is bool:
+            if key in payload and not isinstance(payload[key], bool):
+                raise ValueError(f"payload field {key} has the wrong type")
+        elif key in payload and (
             not isinstance(payload[key], expected) or isinstance(payload[key], bool)
         ):
             raise ValueError(f"payload field {key} has the wrong type")

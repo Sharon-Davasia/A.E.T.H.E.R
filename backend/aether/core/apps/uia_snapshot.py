@@ -161,6 +161,14 @@ class UiaSnapshotService:
         if self.worker is not None:
             return self._inspect_via_worker(binding, window_resource_id, limits, require_content)
         backend = self.backend_factory()
+        # A04: provider-side collection authority, set before any
+        # element property is read.
+        setter = getattr(backend, "set_collection_mode", None)
+        if setter is not None:
+            setter(
+                "content_on_demand" if require_content else "metadata_only",
+                fixture_counter_permitted=require_content,
+            )
         started = self.monotonic()
         try:
             root = backend.find_root(hwnd=binding.hwnd)
@@ -224,6 +232,7 @@ class UiaSnapshotService:
                 "max_elements": limits.max_elements,
                 "max_total_text_chars": limits.max_total_text_chars,
                 "collection_mode": "content_on_demand" if require_content else "metadata_only",
+                "fixture_counter_permitted": require_content,
             },
             timeout=limits.budget_seconds + 2.0,
         )

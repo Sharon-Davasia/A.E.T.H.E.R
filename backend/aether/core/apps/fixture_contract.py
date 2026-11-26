@@ -86,7 +86,7 @@ def resolve_fixture_elements(snapshot: UiaSnapshot) -> FixtureElements:
     increment = _unique(snapshot, automation_id=INCREMENT_AUTOMATION_ID, control_type="Button")
     if not increment.is_enabled or increment.is_offscreen:
         raise FixtureContractError("fixture increment control is not dispatchable")
-    if "Invoke" not in increment.patterns:
+    if not ({"invoke", "Invoke"} & set(increment.patterns)):
         raise FixtureContractError("fixture increment control lacks the Invoke pattern")
     for element in snapshot.elements:
         if element.is_password and (element.name is not None or element.value_present):

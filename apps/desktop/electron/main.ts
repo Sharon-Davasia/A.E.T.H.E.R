@@ -175,9 +175,22 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
       env.AETHER_REVIEW_DEV_SEED = 'synthetic-review';
     }
   }
+  // A01 controlled acceptance: only an explicit owner-set absolute
+  // authorization-artifact path in the *main process* environment
+  // (never renderer input) selects the dedicated controlled backend
+  // entry point. Ordinary launches always use the disabled service.
+  const controlledAuth = !packaged ? process.env.AETHER_PHASE3_AUTHORIZATION : undefined;
+  const controlled = typeof controlledAuth === 'string' && isAbsolute(controlledAuth);
+  if (controlled) {
+    env.AETHER_PHASE3_AUTHORIZATION = controlledAuth;
+    delete env.AETHER_APP_DB;
+  }
   const spec: BackendLaunchSpec = {
     executable: absoluteExecutable,
-    args: ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service'],
+    args: [
+      '-P', '-I', '-B', '-u', '-m',
+      controlled ? 'aether.channel.controlled_service' : 'aether.channel.service',
+    ],
     // cwd is inert for imports under -P (kept only for deterministic diagnostics).
     cwd: backendRoot,
     env,

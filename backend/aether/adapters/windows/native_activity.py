@@ -71,8 +71,11 @@ class NativeActivitySource:
         self._resolve_window_id: Callable[[int], str | None] | None = resolve_window_id
         self._hook: int | None = None
         self._focus_hook: int | None = None
+        self._mouse_hook: int | None = None
+        self._keyboard_hook: int | None = None
         self._callback: object = None
         self._focus_callback: object = None
+        self._ll_callback: object = None
         self._thread: object = None
         self._thread_id: int | None = None
         self._started: bool = False
@@ -156,9 +159,46 @@ class NativeActivitySource:
                         )
                     )
 
+            # A04: same-window manual interaction cannot be detected
+            # from focus events alone (the window is already focused).
+            # Low-level mouse/keyboard hooks emit one content-free
+            # signal per event while installed; the event data itself
+            # (key code, coordinates) is never read or retained.
+            ll_callback_type = ctypes.WINFUNCTYPE(  # type: ignore[attr-defined]
+                ctypes.c_longlong,
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            )
+
+            def _ll_activity(n_code: object, w_param: object, l_param: object) -> int:
+                try:
+                    hwnd = user32.GetForegroundWindow()
+                    window_id = _window_id(hwnd)
+                    if window_id is not None:
+                        emit(
+                            ActivitySignal(
+                                kind="manual_activity_in_window",
+                                window_id=window_id,
+                                at=datetime.now(UTC),
+                            )
+                        )
+                except Exception:
+                    pass
+                return int(user32.CallNextHookEx(None, n_code, w_param, l_param))
+
             try:
                 self._callback = callback_type(_foreground)
                 self._focus_callback = callback_type(_focus)
+                self._ll_callback = ll_callback_type(_ll_activity)
+                WH_MOUSE_LL = 14
+                WH_KEYBOARD_LL = 13
+                self._mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._ll_callback, None, 0)
+                self._keyboard_hook = user32.SetWindowsHookExW(
+                    WH_KEYBOARD_LL, self._ll_callback, None, 0
+                )
+                if not self._mouse_hook or not self._keyboard_hook:
+                    raise NativeActivityDisabled("same-window activity monitoring is unavailable")
                 self._hook = user32.SetWinEventHook(
                     EVENT_SYSTEM_FOREGROUND,
                     EVENT_SYSTEM_FOREGROUND,
@@ -194,6 +234,12 @@ class NativeActivitySource:
             if self._focus_hook:
                 user32.UnhookWinEvent(self._focus_hook)
                 self._focus_hook = None
+            if self._mouse_hook:
+                user32.UnhookWindowsHookEx(self._mouse_hook)
+                self._mouse_hook = None
+            if self._keyboard_hook:
+                user32.UnhookWindowsHookEx(self._keyboard_hook)
+                self._keyboard_hook = None
 
         thread = threading.Thread(target=_run, name="aether-activity-hook", daemon=True)
         self._thread = thread

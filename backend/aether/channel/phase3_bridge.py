@@ -64,6 +64,10 @@ class Phase3Surface:
     launch_registry: InMemoryApplicationRegistry | None = None
     activation_service: WindowActivationService | None = None
     dialog_guard: DialogGuard | None = None
+    # Trusted session/scope identity minted by composition; the
+    # launch authorization must use exactly these, never literals.
+    session_id: str = "session-1"
+    activation_scope: str = "test-scope"
 
     @classmethod
     def disabled(cls) -> Phase3Surface:
@@ -702,7 +706,9 @@ class Phase3Bridge:
                 record = registry.get(str(arguments.get("resource_id")))
                 confirmation = coordinator.issue_confirmation(task_id, step.step_id)
                 authorization = authority.authorize(
-                    record, session_id="session-1", activation_scope="test-scope"
+                    record,
+                    session_id=self.surface.session_id,
+                    activation_scope=self.surface.activation_scope,
                 )
                 outcome = coordinator.execute(
                     task_id,

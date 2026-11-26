@@ -60,6 +60,19 @@ class NativeObserverDisabled(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class ActivationContext:
     issuer: str
+    # A03: the validated bootstrap bindings are retained and enforced,
+    # never discarded after validation.
+    session_id: str = ""
+    activation_epoch: str = ""
+    activation_scope: str = ""
+    worker_id: str = ""
+    permitted_operations: frozenset[str] = frozenset({"inspect", "invoke", "health", "shutdown"})
+    expires_at: float = 0.0  # epoch seconds; 0 = no expiry minted
+
+    def operation_permitted(self, operation: str, *, now: float) -> bool:
+        if self.expires_at and now > self.expires_at:
+            return False
+        return operation in self.permitted_operations
 
 
 _COMPOSITION_ISSUER = "aether-trusted-composition"
@@ -89,7 +102,32 @@ def activation_context_from_parent_bootstrap(payload: object) -> ActivationConte
         value = payload.get(field_name)
         if not isinstance(value, str) or not value or len(value) > 128:
             raise ValueError("worker bootstrap identity is malformed")
-    return ActivationContext(issuer=_COMPOSITION_ISSUER)
+    operations = payload.get("permitted_operations", ["inspect", "invoke", "health", "shutdown"])
+    if (
+        not isinstance(operations, list)
+        or not operations
+        or not all(
+            isinstance(o, str) and o in ("inspect", "invoke", "health", "shutdown")
+            for o in operations
+        )
+    ):
+        raise ValueError("worker bootstrap operations are malformed")
+    expires = payload.get("expires_at", 0)
+    if not isinstance(expires, (int, float)) or isinstance(expires, bool) or expires < 0:
+        raise ValueError("worker bootstrap expiry is malformed")
+    import time as _time
+
+    if expires and _time.time() > float(expires):
+        raise ValueError("worker bootstrap has expired")
+    return ActivationContext(
+        issuer=_COMPOSITION_ISSUER,
+        session_id=str(payload["session_id"]),
+        activation_epoch=str(payload["activation_epoch"]),
+        activation_scope=str(payload["activation_scope"]),
+        worker_id=str(payload.get("worker_id", "")),
+        permitted_operations=frozenset(operations),
+        expires_at=float(expires),
+    )
 
 
 class Win32ObserverApi(Protocol):
@@ -449,3 +487,80 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
 
     def get_foreground_window(self) -> int:
         return int(self._user32.GetForegroundWindow() or 0)
+
+
+class NativeObservationProvider:
+    """Independent launch-verification observation (A01).
+
+    Enumerates top-level windows/processes directly from Win32 —
+    deliberately separate from the launch adapter — and correlates
+    processes to registered applications by executable basename plus
+    integrity evidence. Used by ``LaunchVerifier``; never grants
+    authority by itself.
+    """
+
+    def __init__(
+        self,
+        *,
+        api: Win32ObserverApi,
+        records: list[object],
+        integrity_verifier: object,
+    ) -> None:
+        self._api = api
+        self._records = records
+        self._verifier = integrity_verifier
+
+    def observe(self):  # type: ignore[no-untyped-def]
+        from pathlib import PureWindowsPath
+
+        from aether.core.apps.launch_authority import integrity_digest_of
+        from aether.core.apps.verification import (
+            ObservedProcess,
+            ObservedWindow,
+            PlatformObservation,
+        )
+
+        processes: dict[str, ObservedProcess] = {}
+        windows = []
+        try:
+            enumerated = self._api.enumerate_windows()
+        except Exception:
+            return PlatformObservation(processes=(), windows=(), complete=False)
+        for hwnd, pid in enumerated:
+            name = self._api.get_process_name(pid)
+            if not name:
+                continue
+            base = PureWindowsPath(name).name.casefold()
+            record = next(
+                (
+                    r
+                    for r in self._records
+                    if PureWindowsPath(
+                        str(getattr(r, "executable_identity", "") or "")
+                    ).name.casefold()
+                    == base
+                ),
+                None,
+            )
+            if record is None:
+                continue
+            creation = self._api.get_process_creation_time(pid)
+            token = f"{pid}:{creation}" if creation else f"{pid}:unknown"
+            if token not in processes:
+                evidence = self._verifier.verify(record)  # type: ignore[attr-defined]
+                processes[token] = ObservedProcess(
+                    process_token=token,
+                    app_id=record.app_id,  # type: ignore[attr-defined]
+                    integrity_sha256=(integrity_digest_of(evidence) if evidence else None),
+                    started_after_attempt=True,
+                )
+            windows.append(
+                ObservedWindow(
+                    window_token=f"hwnd:{hwnd}",
+                    process_token=token,
+                    app_id=record.app_id,  # type: ignore[attr-defined]
+                )
+            )
+        return PlatformObservation(
+            processes=tuple(processes.values()), windows=tuple(windows), complete=True
+        )

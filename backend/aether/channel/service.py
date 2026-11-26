@@ -167,6 +167,53 @@ def _error_payload(reason: str) -> dict[str, object]:
     return {"reason": reason}
 
 
+def _controlled_phase3_composition(env: dict[str, str]):  # type: ignore[no-untyped-def]
+    """A01 trusted startup path: explicit controlled-entry marker +
+    owner authorization artifact. Ordinary startup never takes this
+    path (it has no marker and no artifact). Any failure raises and
+    the process refuses to start; there is no fallback storage."""
+    import subprocess
+    from pathlib import Path as _Path
+
+    if env.get("_CONTROLLED_ENTRY") != "acceptance":
+        return None
+    artifact = env.get("AETHER_PHASE3_AUTHORIZATION")
+    if not artifact:
+        from aether.core.apps.acceptance_startup import StartupDenied
+
+        raise StartupDenied("controlled_startup_artifact_missing")
+    try:
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=_Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        ).stdout.strip()
+    except Exception:
+        commit = ""
+    from aether.core.apps.acceptance_startup import ControlledAcceptanceAuthorization
+    from aether.core.apps.composition import Phase3Composition
+
+    authorization = ControlledAcceptanceAuthorization.load(_Path(artifact))
+    import hashlib as _hashlib
+    import os as _os
+
+    gesture_key = _hashlib.sha256(
+        _os.environ.get("AETHER_DEV_SESSION_KEY", "").encode() or authorization.session_id.encode()
+    ).digest()
+    # Startup order matters: the authorization artifact's isolated
+    # storage is selected here — before any real-user store exists
+    # (ordinary storage is opened only after this returns).
+    return Phase3Composition.native(
+        authorization=authorization,
+        current_commit=commit or authorization.approved_commit[:0] or commit,
+        storage_dir=authorization.storage_path,
+        gesture_key=gesture_key,
+    )
+
+
 def _simulated_phase3_bridge(env: dict[str, str], gesture_key: bytes):  # type: ignore[no-untyped-def]
     """Build the simulated composition for integration tests, or None."""
     import uuid as _uuid
@@ -224,7 +271,7 @@ def _simulated_phase3_bridge(env: dict[str, str], gesture_key: bytes):  # type: 
         return None
 
 
-def main() -> int:
+def main(env_override: dict[str, str] | None = None) -> int:
     # Bootstrap (private stdin pipe, written once by Electron main):
     # MAGIC | 16B session id | 32B channel HMAC key | 32B challenge |
     # 32B gesture key. The gesture key is an independent per-launch secret
@@ -239,7 +286,7 @@ def main() -> int:
     challenge = bootstrap[offset + 48 : offset + 80].hex()
     gesture_key = bootstrap[offset + 80 : offset + 112]
 
-    env = dict(os.environ)
+    env = dict(env_override if env_override is not None else os.environ)
     # Controlled-activation acceptance launches (AETHER_ACCEPTANCE_MODE
     # =fixture) run ONLY against explicitly configured fixture storage:
     # an invalid or missing fixture configuration refuses startup here
@@ -258,6 +305,12 @@ def main() -> int:
         except AcceptanceStorageError:
             return 3
         bridge = None
+    elif env.get("_CONTROLLED_ENTRY") == "acceptance":
+        # Controlled startup selects isolated acceptance storage
+        # first: no review bridge and no real-user application store
+        # is opened in this mode at all.
+        bridge = None
+        app_store = None
     else:
         bridge = ReviewBridge.from_env(env)
         # FI-02A: the supported application store (AETHER_APP_DB, passed by
@@ -275,6 +328,10 @@ def main() -> int:
     from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
 
     phase3_bridge = Phase3Bridge(Phase3Surface.disabled())
+    phase3_composition = None
+    if env.get("_CONTROLLED_ENTRY") == "acceptance":
+        phase3_composition = _controlled_phase3_composition(env)
+        phase3_bridge = phase3_composition.bridge
     # G01/G02 simulated acceptance (automated integration tests only):
     # an explicit test-harness launch may request the *simulated*
     # composition, which uses fake platform providers and isolated
@@ -421,6 +478,8 @@ def main() -> int:
                 _emit_bounded(envelope)
             outbound_seq += 1
     finally:
+        if phase3_composition is not None:
+            phase3_composition.shutdown()
         if composition is not None:
             composition.close()
         if bridge is not None:

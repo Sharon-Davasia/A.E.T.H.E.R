@@ -64,6 +64,11 @@ def _fake_module():
 def test_native_backend_walks_fake_pywinauto_tree() -> None:
     module, _root, button = _fake_module()
     backend = build_native_uia_backend(activation=None, pywinauto_module=module)
+    # A04: default collection is metadata-only (names never read);
+    # content requires the explicit collection authority.
+    raw_root = backend.find_root(hwnd=123)
+    assert raw_root is not None and raw_root.name is None
+    backend.set_collection_mode("content_on_demand")
     raw_root = backend.find_root(hwnd=123)
     assert raw_root is not None and raw_root.name == "Fixture"
     kids = backend.children(raw_root)

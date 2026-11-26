@@ -260,3 +260,21 @@ Simulated/Linux evidence only — not native evidence, not formal
 acceptance. The runnable campaign is
 `docs/engineering/PHASE3_NATIVE_ACCEPTANCE.md`; the decision package
 is `docs/security/PHASE3_ACTIVATION_PROPOSAL.md` (not approved).
+
+## Controlled native activation implementation (A01–A05)
+
+Implemented on this branch (simulated/fake-platform evidence only;
+native behavior unverified): operational `Phase3Composition.native`
+factory validated against an owner-controlled startup authorization
+(commit/decision/campaign/storage/apps/capabilities/session/epoch/
+expiry/privacy bindings) and the acceptance-storage marker before
+any storage opens; hardened v3 acceptance storage (reparse/volume/
+exclusivity/marker-identity/hard-link checks, pending-flag alone
+insufficient); worker bootstrap bindings retained and enforced with
+failed-start cleanup, uncertain effect classification and confirmed
+shutdown; native UIA collection-mode-before-name-access with real
+runtime-id requirement and content-free same-window takeover hooks;
+one continuous 22-step authenticated workflow test over the real
+composition/store/broker/planner/gesture authority/executor.
+Ordinary startup remains disabled; no real-user database migrated.
+Owner-side procedure: docs/security/PHASE3_ACTIVATION_PROPOSAL.md.
