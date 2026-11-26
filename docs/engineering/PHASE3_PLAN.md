@@ -14,6 +14,24 @@ Authority: `docs/architecture/MASTER_SPEC.md`. Where this plan and
 the spec's illustrative repository blueprint differ (folder names),
 the merged repository layout governs; the spec's behaviour governs.
 
+## 0. Implementation-status vocabulary (F-scope correction)
+
+| Term | Meaning here |
+|---|---|
+| Contract defined | Typed shapes exist and are tested |
+| Platform-independent behaviour implemented | Logic runs and is tested on Linux with fake sources |
+| Native implementation source written | Real Win32 source exists behind guards (F01/F02), verified only via injected API fakes |
+| Native activation disabled | No production path can start it (current state) |
+| Native behaviour verified | Requires future native Windows runs — **not achieved** |
+| Formal acceptance | Requires the future acceptance campaign — **not achieved** |
+
+After the F01–F08 correction batch: contracts and platform-independent
+behaviour are implemented; the native observer (SetWinEventHook +
+message pump) and bounded stdlib discovery sources are *written* and
+fake-verified; AppsFolder COM enumeration remains truthfully
+`unavailable` until the pywin32 checkpoint. Native activation is
+disabled and nothing native is verified.
+
 ## 1. Traceability
 
 | Requirement (spec) | Existing at baseline | CP0–CP2 implementation | Later checkpoint |

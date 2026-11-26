@@ -14,6 +14,7 @@ from aether.world_state.observer import (
     WindowEventKind,
 )
 from aether.world_state.privacy import (
+    ContextClassification,
     ObservationPolicy,
     PrivacyMode,
     collect_permitted,
@@ -21,6 +22,7 @@ from aether.world_state.privacy import (
 from aether.world_state.service import InMemoryWorldState
 
 __all__ = [
+    "ContextClassification",
     "FakeWindowEventSource",
     "InMemoryWorldState",
     "ObservationPolicy",

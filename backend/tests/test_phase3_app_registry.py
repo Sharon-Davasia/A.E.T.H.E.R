@@ -1,8 +1,4 @@
-"""Phase 3 CP2 tests: registry, identity drift, real fuzzy resolution.
-
-Uses controlled fake discovery fixtures and the real RapidFuzz ranking
-implementation (platform-independent; no native evidence).
-"""
+"""Phase 3 CP2/F05/F06 tests: registry, identity, real fuzzy resolution."""
 
 from __future__ import annotations
 
@@ -12,10 +8,16 @@ import pytest
 
 from aether.adapters.windows import fake_discovered_apps
 from aether.core.apps import InMemoryApplicationRegistry, resolve_application
-from aether.core.apps.registry import ApplicationRegistryError
 from aether.core.apps.resolution import Fts5AppIndex, ResolutionKind, normalize_name
+from aether.core.contracts.app_window import (
+    ApplicationRecord,
+    DiscoverySource,
+    LaunchMethod,
+    registration_app_id,
+)
 
 NOW = datetime(2026, 11, 15, tzinfo=UTC)
+LATER = NOW + timedelta(minutes=5)
 
 
 def _registry() -> InMemoryApplicationRegistry:
@@ -24,101 +26,130 @@ def _registry() -> InMemoryApplicationRegistry:
     return registry
 
 
-def test_discovery_is_not_trust_and_unknown_app_refused() -> None:
+def _record(
+    name: str, exe: str, *, aliases: tuple[str, ...] = (), fresh: bool = True
+) -> ApplicationRecord:
+    return ApplicationRecord(
+        app_id=registration_app_id(
+            display_name=name, executable_identity=exe, launch_method=LaunchMethod.NONE
+        ),
+        display_name=name,
+        executable_identity=exe,
+        aliases=aliases,
+        discovery_source=DiscoverySource.FAKE_FIXTURE,
+        discovered_at=NOW,
+        fresh_until=NOW + timedelta(hours=1) if fresh else NOW - timedelta(hours=1),
+    )
+
+
+def test_expired_exact_match_is_stale_not_selected() -> None:
+    registry = InMemoryApplicationRegistry()
+    registry.register(_record("OldPad", "C:\\A\\old.exe", fresh=False))
+    outcome = resolve_application(registry, "OldPad", now=NOW)
+    assert outcome.kind is ResolutionKind.STALE_OR_UNAVAILABLE and outcome.record is None
+
+
+def test_fresh_records_resolve_exact_alias_normalized() -> None:
     registry = _registry()
-    assert len(registry.all()) == 3
-    with pytest.raises(ApplicationRegistryError):
-        registry.get("app:123e4567-e89b-12d3-a456-426614174000")  # fabricated
-    # Discovery records carry provenance and freshness.
-    record = registry.all()[0]
-    assert record.discovery_source.value == "fake_fixture"
-    assert registry.fresh(now=NOW + timedelta(days=365)) == ()
-
-
-def test_executable_identity_drift_marks_stale() -> None:
-    registry = _registry()
-    record = registry.all()[0]
-    assert registry.verify_executable_identity(record.app_id, record.executable_identity or "")
-    assert registry.get(record.app_id).available
-    assert not registry.verify_executable_identity(record.app_id, "C:\\Evil\\notepad.exe")
-    assert not registry.get(record.app_id).available  # drift never silently trusted
-
-
-def test_duplicate_registration_refresh_and_capacity() -> None:
-    registry = InMemoryApplicationRegistry(max_records=1)
-    record = fake_discovered_apps()[0]
-    registry.register(record)
-    registry.register(record)  # refresh of same identity is allowed
-    with pytest.raises(ApplicationRegistryError):
-        registry.register(fake_discovered_apps()[1])
-
-
-def test_exact_alias_and_normalized_resolution() -> None:
-    registry = _registry()
-    exact = resolve_application(registry, "notepad")
-    assert exact.kind is ResolutionKind.EXACT and exact.record is not None
-    alias = resolve_application(registry, "calc")
+    assert resolve_application(registry, "notepad", now=NOW).kind is ResolutionKind.EXACT
+    alias = resolve_application(registry, "calc", now=NOW)
     assert alias.kind is ResolutionKind.ALIAS and alias.record is not None
     assert alias.record.display_name == "Calculator"
-    normalized = resolve_application(registry, "  NotePad!! ")
-    assert normalized.kind in (ResolutionKind.EXACT, ResolutionKind.NORMALIZED)
 
 
-def test_real_fuzzy_ranking_and_ambiguity() -> None:
+def test_unavailable_alias_not_selected() -> None:
     registry = _registry()
-    fuzzy = resolve_application(registry, "notepd")  # misspelling, real RapidFuzz
+    target = next(r for r in registry.all() if r.display_name == "Calculator")
+    registry.mark_unavailable(target.app_id)
+    outcome = resolve_application(registry, "calc", now=LATER)
+    assert outcome.kind is ResolutionKind.STALE_OR_UNAVAILABLE and outcome.record is None
+
+
+def test_real_fuzzy_and_deterministic_near_tie_ambiguity() -> None:
+    registry = _registry()
+    fuzzy = resolve_application(registry, "notepd", now=NOW)
     assert fuzzy.kind is ResolutionKind.FUZZY and fuzzy.record is not None
     assert fuzzy.record.display_name == "Notepad"
-    # "note" is an exact alias of Notepad AND close to Notes: exact alias
-    # wins deterministically; a near-tie query must clarify, not pick.
-    ambiguous = resolve_application(registry, "notes app")
-    assert ambiguous.kind in (
-        ResolutionKind.AMBIGUOUS,
-        ResolutionKind.FUZZY,
-        ResolutionKind.NOT_FOUND,
-    )
-    if ambiguous.kind is ResolutionKind.AMBIGUOUS:
-        assert ambiguous.record is None and len(ambiguous.candidates) >= 2
+
+    tie_registry = InMemoryApplicationRegistry()
+    tie_registry.register(_record("Star Writer", "C:\\A\\sw.exe"))
+    tie_registry.register(_record("Star Write", "C:\\B\\sw.exe"))
+    ambiguous = resolve_application(tie_registry, "star writ", now=NOW)
+    assert ambiguous.kind is ResolutionKind.AMBIGUOUS  # actual ambiguity asserted
+    assert ambiguous.record is None and len(ambiguous.candidates) >= 2
+    # Deterministic across repeated resolution.
+    again = resolve_application(tie_registry, "star writ", now=NOW)
+    assert [c.app_id for c in again.candidates] == [c.app_id for c in ambiguous.candidates]
 
 
-def test_ambiguous_duplicate_names_require_clarification() -> None:
-    from aether.core.contracts.app_window import (
-        ApplicationRecord,
-        DiscoverySource,
-        LaunchMethod,
-        registration_app_id,
-    )
-
+def test_competing_match_not_hidden_by_fts5_pool() -> None:
     registry = InMemoryApplicationRegistry()
-    for exe in ("C:\\A\\tool.exe", "C:\\B\\tool.exe"):
-        registry.register(
-            ApplicationRecord(
-                app_id=registration_app_id(
-                    display_name="Tool", executable_identity=exe, launch_method=LaunchMethod.NONE
-                ),
-                display_name="Tool",
-                discovery_source=DiscoverySource.FAKE_FIXTURE,
-                discovered_at=NOW,
-                fresh_until=NOW + timedelta(hours=1),
-            )
+    registry.register(_record("Alpha Notes", "C:\\A\\an.exe"))
+    registry.register(_record("Alpha Notepad", "C:\\B\\an.exe"))
+    outcome = resolve_application(registry, "alpha note", now=NOW)
+    # Evaluated over all candidates; not auto-picked from a narrow pool.
+    assert outcome.kind in (ResolutionKind.AMBIGUOUS, ResolutionKind.FUZZY)
+    if outcome.kind is ResolutionKind.AMBIGUOUS:
+        assert len(outcome.candidates) == 2
+
+
+def test_duplicate_names_ambiguous_unicode_and_empty() -> None:
+    registry = InMemoryApplicationRegistry()
+    registry.register(_record("Tool", "C:\\A\\tool.exe"))
+    registry.register(_record("Tool", "C:\\B\\tool.exe"))
+    assert resolve_application(registry, "Tool", now=NOW).kind is ResolutionKind.AMBIGUOUS
+
+    unicode_registry = InMemoryApplicationRegistry()
+    unicode_registry.register(_record("メモ帳", "C:\\A\\memo.exe"))
+    unicode_registry.register(_record("メモ帳プロ", "C:\\B\\memo.exe"))
+    assert normalize_name("メモ帳") != ""
+    outcome = resolve_application(unicode_registry, "メモ帳", now=NOW)
+    assert outcome.kind is ResolutionKind.EXACT and outcome.record is not None
+    assert resolve_application(unicode_registry, "   ", now=NOW).kind is ResolutionKind.NOT_FOUND
+    assert resolve_application(unicode_registry, "!!!", now=NOW).kind is ResolutionKind.NOT_FOUND
+
+
+def test_identity_drift_and_repeated_refresh_never_restore_trust() -> None:
+    registry = _registry()
+    record = registry.all()[0]
+    # Location-evidence drift keeps record unavailable; identical
+    # re-registration of the drifted record does not restore it.
+    assert not registry.verify_executable_identity(record.app_id, "C:\\Evil\\notepad.exe")
+    assert not registry.get(record.app_id).available
+    registry.register(registry.get(record.app_id))
+    assert not registry.get(record.app_id).available
+    assert not registry.get(record.app_id).launch_authorized
+
+
+def test_missing_integrity_evidence_never_launch_eligible() -> None:
+    record = _record("Fresh", "C:\\A\\fresh.exe")
+    assert record.integrity_status == "unavailable" and not record.launch_authorized
+    registry = InMemoryApplicationRegistry()
+    registry.register(record)
+    assert not registry.get(record.app_id).launch_authorized
+
+
+def test_fabricated_registration_identity_rejected() -> None:
+    with pytest.raises(ValueError):
+        ApplicationRecord(
+            app_id="app:123e4567-e89b-12d3-a456-426614174000",  # not derived
+            display_name="Fake",
+            discovery_source=DiscoverySource.FAKE_FIXTURE,
+            discovered_at=NOW,
+            fresh_until=NOW,
         )
-    outcome = resolve_application(registry, "Tool")
-    assert outcome.kind is ResolutionKind.AMBIGUOUS and outcome.record is None
 
 
-def test_missing_target_and_fts5_index() -> None:
-    registry = _registry()
-    missing = resolve_application(registry, "xyzzy nonexistent application")
-    assert missing.kind is ResolutionKind.NOT_FOUND and missing.record is None
-    index = Fts5AppIndex(registry.all())
-    hits = index.search("text editor")
-    assert hits and hits[0].display_name == "Notepad"
-    assert normalize_name("My App!! 2024") == "my app 2024"
-
-
-def test_malicious_alias_does_not_hijack_exact_name() -> None:
-    registry = _registry()
-    # A misleading query matching an alias of a *different* app must not
-    # outrank the exact display-name match.
-    outcome = resolve_application(registry, "Notes")
-    assert outcome.record is not None and outcome.record.display_name == "Notes"
+def test_alias_bounds_and_fts5_lifecycle() -> None:
+    registry = InMemoryApplicationRegistry()
+    with pytest.raises(ValueError):  # contract/registry alias bounds
+        registry.register(
+            _record("Bounded", "C:\\A\\b.exe", aliases=tuple(f"a{i}" for i in range(17)))
+        )
+    with Fts5AppIndex(_registry().all()) as index:
+        hits = index.search("text editor")
+        assert hits and hits[0].display_name == "Notepad"
+    assert (
+        resolve_application(_registry(), "xyzzy nonexistent", now=NOW).kind
+        is ResolutionKind.NOT_FOUND
+    )

@@ -1,12 +1,23 @@
-"""Observation privacy policy (Phase 3 CP1, R5).
+"""Observation privacy policy (Phase 3 CP1, corrected F04).
 
-Filtering happens at the *collection* boundary: the flow is
-enabled-sensor policy -> permitted collection -> normalization ->
-bounded WorldState -> output filtering. Sensitive metadata is not
-collected into WorldState and merely redacted later. Observation
-starts ``off``; after explicit opt-in the default is
-``metadata_only``. Nothing here enables a sensor: policy only decides
-what a separately authorized, enabled observer may collect.
+Filtering happens at the *collection* boundary: enabled-sensor policy
+-> permitted collection -> normalization -> bounded WorldState ->
+output filtering. Context classification is three-valued (F04):
+
+- ``permitted_metadata`` — the platform adapter positively classified
+  the context as metadata-safe;
+- ``prohibited_sensitive`` — positively sensitive (credential entry,
+  password managers, private browsing, finance/health, elevated);
+- ``unknown`` — not classified. Unknown fails closed for sensitive
+  content (titles/document content are never collected), because a
+  keyword-free application name is not classification evidence.
+  Keyword matching remains only a supplemental *exclusion* signal;
+  private browsing in particular cannot be inferred from an
+  executable name.
+
+Observation starts ``off``; after explicit opt-in the default is
+``metadata_only``. Policy only decides what a separately authorized,
+enabled observer may collect — it enables nothing by itself.
 """
 
 from __future__ import annotations
@@ -23,10 +34,13 @@ class PrivacyMode(StrEnum):
     CONTENT_ON_DEMAND = "content_on_demand"
 
 
-# Applications/contexts excluded from background collection by default.
-# Matched case-insensitively against the (already bounded) app identity
-# string supplied by the platform adapter; classification failure is
-# treated as sensitive (fail closed).
+class ContextClassification(StrEnum):
+    PERMITTED_METADATA = "permitted_metadata"
+    PROHIBITED_SENSITIVE = "prohibited_sensitive"
+    UNKNOWN = "unknown"
+
+
+# Supplemental exclusion signal only (never a trust classifier).
 _SENSITIVE_MARKERS = (
     "password",
     "credential",
@@ -43,14 +57,35 @@ _SENSITIVE_MARKERS = (
 )
 
 
-def is_sensitive_context(app_identity: str | None, *, elevated: bool = False) -> bool:
-    """Return True when background collection must not occur."""
-    if elevated:
-        return True
+def supplemental_sensitive_marker(app_identity: str | None) -> bool:
     if app_identity is None or not app_identity.strip():
-        return True  # unclassifiable -> fail closed
+        return False
     lowered = app_identity.casefold()
     return any(marker in lowered for marker in _SENSITIVE_MARKERS)
+
+
+def classify_context(
+    app_identity: str | None,
+    *,
+    adapter_classification: ContextClassification = ContextClassification.UNKNOWN,
+    elevated: bool = False,
+) -> ContextClassification:
+    """Combine adapter classification with supplemental exclusions.
+
+    Elevated or marker-matching contexts are prohibited regardless of
+    adapter claims; an adapter's positive classification is required
+    for anything to be treated as permitted.
+    """
+    if elevated or supplemental_sensitive_marker(app_identity):
+        return ContextClassification.PROHIBITED_SENSITIVE
+    return adapter_classification
+
+
+def is_sensitive_context(app_identity: str | None, *, elevated: bool = False) -> bool:
+    """Back-compatible helper: True only for *prohibited* contexts."""
+    return classify_context(app_identity, elevated=elevated) is (
+        ContextClassification.PROHIBITED_SENSITIVE
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,7 +93,6 @@ class ObservationPolicy:
     """What an enabled observer may collect under the current mode."""
 
     mode: PrivacyMode = PrivacyMode.OFF
-    # Explicit user opt-in has occurred (setup completed).
     opted_in: bool = False
     excluded_apps: frozenset[str] = field(default_factory=frozenset)
 
@@ -71,23 +105,25 @@ def collect_permitted(
     policy: ObservationPolicy,
     *,
     app_identity: str | None,
+    classification: ContextClassification = ContextClassification.UNKNOWN,
     elevated: bool = False,
     is_foreground: bool = False,
 ) -> bool:
     """Decide, *before collection*, whether metadata may be collected.
 
-    ``metadata_only`` collects bounded app/window identity metadata for
-    known, non-sensitive apps; ``active_app_only`` restricts that to
-    the foreground app; ``off`` (or no opt-in) collects nothing.
-    Content-bearing modes (``workspace_context``/``content_on_demand``)
-    do not widen *background* collection in CP1: content requires a
-    separate foreground-authorized path that does not exist yet.
+    Requires a positively permitted classification. Unknown contexts
+    are not collected at all at this gate (the WorldState service may
+    retain a title-free, PRIVATE minimal record separately where the
+    mode allows — never content).
     """
     if not policy.collection_enabled:
         return False
     if app_identity is not None and app_identity.casefold() in policy.excluded_apps:
         return False
-    if is_sensitive_context(app_identity, elevated=elevated):
+    if (
+        classify_context(app_identity, adapter_classification=classification, elevated=elevated)
+        is not ContextClassification.PERMITTED_METADATA
+    ):
         return False
     if policy.mode is PrivacyMode.ACTIVE_APP_ONLY and not is_foreground:
         return False

@@ -1,17 +1,23 @@
-"""In-memory application registry (Phase 3 CP2, R4).
+"""In-memory application registry (Phase 3 CP2, corrected F05/F06).
 
-Discovery is not trust and not launch authorization. The registry
-keeps registration identity, executable identity evidence, discovery
-provenance and freshness separate; executable-identity drift marks a
-record stale until re-verified. No persistence (schema v3 is not
-approved), no launching, and no real-user application database access.
+Discovery is not trust and not launch authorization. Registration
+identity, location evidence, integrity evidence, provenance and
+freshness stay separate. When location or integrity evidence changes
+under an existing registration, the record is marked drifted and
+unavailable; refreshing the same changed record never restores trust
+or launch eligibility — only explicit trusted revalidation with
+matching integrity evidence can, and no launch-authorization issuance
+exists in this batch at all. No persistence, no launching.
 """
 
 from __future__ import annotations
 
 from datetime import datetime
 
-from aether.core.contracts.app_window import ApplicationRecord, executable_identity_digest
+from aether.core.contracts.app_window import ApplicationRecord, location_identity_digest
+
+MAX_ALIASES = 16
+MAX_ALIAS_LENGTH = 128
 
 
 class ApplicationRegistryError(ValueError):
@@ -30,12 +36,31 @@ class InMemoryApplicationRegistry:
         self._records: dict[str, ApplicationRecord] = {}
 
     def register(self, record: ApplicationRecord) -> ApplicationRecord:
-        """Add or refresh one record; identity drift marks staleness."""
+        """Add or refresh; evidence drift invalidates trust (F06)."""
+        if len(record.aliases) > MAX_ALIASES or any(
+            len(alias) > MAX_ALIAS_LENGTH for alias in record.aliases
+        ):
+            raise ApplicationRegistryError("alias_bounds_exceeded")
         existing = self._records.get(record.app_id)
-        if existing is not None and existing.executable_digest != record.executable_digest:
-            # Executable identity changed under the same registration:
-            # prior trust does not carry over silently (R4).
-            record = record.model_copy(update={"available": False})
+        if existing is not None and (
+            existing.location_digest != record.location_digest
+            or existing.integrity_evidence != record.integrity_evidence
+        ):
+            # Evidence changed: prior trust does not carry over, and a
+            # repeated identical refresh must not restore it either.
+            record = record.model_copy(
+                update={
+                    "available": False,
+                    "integrity_status": (
+                        "drifted"
+                        if existing.integrity_status == "verified"
+                        else record.integrity_status
+                    ),
+                    "launch_authorized": False,
+                }
+            )
+        elif existing is not None and existing.integrity_status == "drifted":
+            record = record.model_copy(update={"available": False, "launch_authorized": False})
         if record.app_id not in self._records and len(self._records) >= self._max:
             raise ApplicationRegistryError("registry_capacity_exceeded")
         self._records[record.app_id] = record
@@ -55,19 +80,39 @@ class InMemoryApplicationRegistry:
         return tuple(self._records.values())
 
     def fresh(self, *, now: datetime) -> tuple[ApplicationRecord, ...]:
-        """Records whose discovery freshness has not expired."""
+        """Fresh, available records only (used for successful resolution)."""
+        if now.tzinfo is None:
+            raise ApplicationRegistryError("timezone_aware_time_required")
         return tuple(r for r in self._records.values() if r.fresh_until > now and r.available)
 
     def mark_unavailable(self, app_id: str) -> None:
         record = self.get(app_id)
         self._records[app_id] = record.model_copy(update={"available": False})
 
-    def verify_executable_identity(self, app_id: str, executable_identity: str) -> bool:
-        """Re-verify identity evidence; drift keeps the record stale."""
+    def revalidate_integrity(self, app_id: str, *, integrity_evidence: str) -> bool:
+        """Explicit trusted revalidation (identity evidence only).
+
+        Matching integrity evidence marks the record verified and
+        available again. This never sets ``launch_authorized``: no
+        launch-authorization issuance exists in CP0-CP2.
+        """
         record = self.get(app_id)
-        digest = executable_identity_digest(executable_identity)
-        if digest != record.executable_digest:
-            self._records[app_id] = record.model_copy(update={"available": False})
+        if record.integrity_evidence is None or integrity_evidence != record.integrity_evidence:
+            self._records[app_id] = record.model_copy(
+                update={"available": False, "launch_authorized": False}
+            )
             return False
-        self._records[app_id] = record.model_copy(update={"available": True})
+        self._records[app_id] = record.model_copy(
+            update={"integrity_status": "verified", "available": True}
+        )
         return True
+
+    def verify_executable_identity(self, app_id: str, executable_identity: str) -> bool:
+        """Back-compatible location check; drift keeps the record stale."""
+        record = self.get(app_id)
+        if location_identity_digest(executable_identity) != record.location_digest:
+            self._records[app_id] = record.model_copy(
+                update={"available": False, "launch_authorized": False}
+            )
+            return False
+        return record.available

@@ -1,17 +1,26 @@
-"""Event-driven window/process observer foundation (Phase 3 CP1, R6).
+"""Event-driven window/process observer foundation (Phase 3 CP1, F03/F07).
 
-Platform-independent core: a bounded event queue, overflow accounting
-with uncertainty marking and reconciliation, freshness, lifecycle
-(start/stop/restart) and privacy-gated collection. The event source is
-a protocol; tests use :class:`FakeWindowEventSource`, clearly a fake.
-The native Windows source lives in
+Corrected semantics:
+
+- Overflow never relies on enqueueing into the full queue. It sets an
+  out-of-band invalidation signal, bumps the invalidation generation,
+  invokes the invalidation callback immediately, and marks state
+  uncertain until a *successful reconciliation of that generation*.
+- Queue entries are generation-stamped; entries from before an
+  invalidation (or a previous lifecycle/source generation) are
+  discarded by the consumer and can never restore stale state.
+- Lifecycle is serialized; ``running`` is set only after the source
+  starts successfully, partial startup rolls back, shutdown reports
+  failure if the consumer does not terminate, and restart drops all
+  queued pre-shutdown events.
+- Periodic reconciliation is available via ``reconcile_interval``
+  (0 disables) with bounded retries per cycle — no infinite loops.
+- Counters saturate instead of growing without bound.
+
+The event source is a protocol; tests use :class:`FakeWindowEventSource`
+(clearly a fake). The native Windows source lives in
 ``aether.adapters.windows.native_observer`` behind platform+activation
 guards and is never started by this module or by ordinary launches.
-
-Threading: the service owns a single consumer thread when ``start()``
-is called; all state mutation is lock-guarded and shutdown joins the
-thread with a bounded timeout. Elapsed/expiry logic in the WorldState
-service uses caller-supplied instants so tests are deterministic.
 """
 
 from __future__ import annotations
@@ -24,9 +33,13 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Protocol
 
-# Provisional engineering defaults (not measured guarantees, R6).
+from aether.world_state.privacy import ContextClassification
+
+# Provisional engineering defaults (not measured guarantees).
 DEFAULT_QUEUE_CAPACITY = 256
 DEFAULT_RECONCILE_SECONDS = 5.0
+_MAX_COUNTER = (1 << 62) - 1
+_MAX_RECONCILE_ATTEMPTS = 3
 
 
 class ObserverUnavailable(RuntimeError):
@@ -47,14 +60,19 @@ class WindowEvent:
     """One normalized platform event (bounded metadata only)."""
 
     kind: WindowEventKind
-    # Opaque platform handles kept inside the adapter/service layer.
     hwnd: int = 0
     pid: int = 0
     # Process creation instant (ISO string) disambiguating PID reuse.
+    # Missing identity is never authorization-grade (F04).
     process_creation_time: str | None = None
     app_identity: str | None = None
-    title: str | None = None  # only ever set after privacy gating
+    title: str | None = None  # only ever retained after privacy gating
     elevated: bool = False
+    # Adapter-supplied context classification (F04 three-valued).
+    classification: ContextClassification = ContextClassification.UNKNOWN
+    # Evidence provenance: "fake" for test sources, platform name for
+    # native sources. Fake evidence is never labelled native.
+    source: str = "fake"
 
 
 class WindowEventSource(Protocol):
@@ -66,17 +84,18 @@ class WindowEventSource(Protocol):
 
 
 class FakeWindowEventSource:
-    """Deterministic fake event source for platform-independent tests.
-
-    This is a fake: it provides no native Windows evidence.
-    """
+    """Deterministic fake event source. Provides no native evidence."""
 
     def __init__(self, initial: list[WindowEvent] | None = None) -> None:
         self._emit: Callable[[WindowEvent], None] | None = None
         self._initial = list(initial or [])
+        self._snapshot: list[WindowEvent] = []
         self.started = False
+        self.fail_start = False
 
     def start(self, emit: Callable[[WindowEvent], None]) -> None:
+        if self.fail_start:
+            raise ObserverUnavailable("fake source configured to fail startup")
         self._emit = emit
         self.started = True
         for event in self._initial:
@@ -87,7 +106,10 @@ class FakeWindowEventSource:
         self._emit = None
 
     def reconcile(self) -> list[WindowEvent]:
-        return []
+        return list(self._snapshot)
+
+    def set_snapshot(self, events: list[WindowEvent]) -> None:
+        self._snapshot = list(events)
 
     def push(self, event: WindowEvent) -> None:
         if self._emit is None:
@@ -98,98 +120,242 @@ class FakeWindowEventSource:
 @dataclass(slots=True)
 class ObserverStats:
     received: int = 0
-    dropped_overflow: int = 0
+    dropped_overflow: int = 0  # cumulative telemetry
+    generation_dropped: int = 0  # drops in the current generation
     reconciliations: int = 0
+    consumer_errors: int = 0
     uncertain: bool = False
+
+
+def _bump(value: int) -> int:
+    return min(value + 1, _MAX_COUNTER)
 
 
 @dataclass(slots=True)
 class ObserverService:
-    """Bounded, privacy-gated observer over an injected event source."""
+    """Bounded, generation-aware observer over an injected event source."""
 
     source: WindowEventSource
     on_event: Callable[[WindowEvent], None]
+    on_invalidate: Callable[[], None] | None = None
     queue_capacity: int = DEFAULT_QUEUE_CAPACITY
-    _queue: queue.Queue[WindowEvent] = field(init=False)
+    reconcile_interval: float = 0.0  # seconds; 0 disables periodic reconciliation
+    _queue: queue.Queue[tuple[int, WindowEvent]] = field(init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
+    _reconcile_thread: threading.Thread | None = field(default=None, init=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
+    _invalidate_signal: threading.Event = field(default_factory=threading.Event, init=False)
+    _lifecycle: threading.Lock = field(default_factory=threading.Lock, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    _generation: int = field(default=0, init=False)
+    _source_generation: int = field(default=0, init=False)
     stats: ObserverStats = field(default_factory=ObserverStats, init=False)
     running: bool = field(default=False, init=False)
+    _health: str = field(default="stopped", init=False)
 
     def __post_init__(self) -> None:
         if self.queue_capacity < 1:
             raise ValueError("queue_capacity must be >= 1")
         self._queue = queue.Queue(maxsize=self.queue_capacity)
 
-    # -- lifecycle ---------------------------------------------------
-    def start(self) -> None:
+    @property
+    def generation(self) -> int:
         with self._lock:
-            if self.running:
-                return
-            self._stop.clear()
-            self.running = True
-        self.source.start(self._enqueue)
-        self._thread = threading.Thread(target=self._consume, name="aether-observer", daemon=True)
-        self._thread.start()
+            return self._generation
 
-    def stop(self, timeout: float = 2.0) -> None:
-        """Thread-safe shutdown; joins the consumer with a bound."""
-        self._stop.set()
-        try:
-            self.source.stop()
-        finally:
-            if self._thread is not None:
-                self._thread.join(timeout=timeout)
+    @property
+    def invalidation_pending(self) -> bool:
+        return self._invalidate_signal.is_set()
+
+    def health(self) -> str:
+        with self._lock:
+            return self._health
+
+    # -- lifecycle (serialized, F07) ------------------------------------
+    def start(self) -> None:
+        with self._lifecycle:
             with self._lock:
+                if self.running:
+                    return
+            self._stop.clear()
+            # Drop any pre-shutdown queued events; bump generations so
+            # callbacks from an obsolete source generation are ignored.
+            self._drain_queue()
+            with self._lock:
+                self._source_generation = _bump(self._source_generation)
+                self._generation = _bump(self._generation)
+                source_generation = self._source_generation
+            try:
+                self.source.start(lambda event: self._enqueue(event, source_generation))
+            except Exception:
+                # Roll back partial initialization truthfully.
+                with contextlib.suppress(Exception):
+                    self.source.stop()
+                with self._lock:
+                    self.running = False
+                    self._health = "unavailable"
+                raise
+            thread = threading.Thread(target=self._consume, name="aether-observer", daemon=True)
+            with self._lock:
+                self._thread = thread
+                self.running = True
+                self._health = "running"
+            thread.start()
+            if self.reconcile_interval > 0:
+                reconcile_thread = threading.Thread(
+                    target=self._reconcile_loop, name="aether-observer-reconcile", daemon=True
+                )
+                with self._lock:
+                    self._reconcile_thread = reconcile_thread
+                reconcile_thread.start()
+
+    def stop(self, timeout: float = 2.0) -> bool:
+        """Bounded shutdown. Returns False if the consumer stays alive."""
+        with self._lifecycle:
+            self._stop.set()
+            with contextlib.suppress(Exception):
+                self.source.stop()
+            with self._lock:
+                self._source_generation = _bump(self._source_generation)
+                thread, reconcile_thread = self._thread, self._reconcile_thread
+            alive = False
+            for worker in (thread, reconcile_thread):
+                if worker is not None:
+                    worker.join(timeout=timeout)
+                    alive = alive or worker.is_alive()
+            with self._lock:
+                if alive:
+                    self._health = "degraded"  # never claim clean shutdown
+                    return False
                 self.running = False
                 self._thread = None
+                self._reconcile_thread = None
+                self._health = "stopped"
+            self._drain_queue()
+            return True
 
-    # -- intake --------------------------------------------------------
-    def _enqueue(self, event: WindowEvent) -> None:
+    def pause_collection(self) -> None:
+        """Pause at the source boundary (F04), not merely in retention."""
+        with contextlib.suppress(Exception):
+            self.source.stop()
         with self._lock:
-            self.stats.received += 1
+            self._source_generation = _bump(self._source_generation)
+            self._generation = _bump(self._generation)
+        self._notify_invalidate()
+
+    # -- intake -----------------------------------------------------------
+    def _enqueue(self, event: WindowEvent, source_generation: int) -> None:
+        with self._lock:
+            if source_generation != self._source_generation or self._stop.is_set():
+                return  # obsolete source generation callback
+            self.stats.received = _bump(self.stats.received)
+            generation = self._generation
         try:
-            self._queue.put_nowait(event)
+            self._queue.put_nowait((generation, event))
         except queue.Full:
-            # Overflow (R6): count it, mark state uncertain, and demand
-            # reconciliation. Dropped destruction/privacy events must
-            # never silently preserve stale authorization-grade state:
-            # uncertainty propagates to the WorldState service, which
-            # invalidates current observations on reconcile.
-            with self._lock:
-                self.stats.dropped_overflow += 1
-                self.stats.uncertain = True
-            with contextlib.suppress(queue.Full):
-                self._queue.put_nowait(WindowEvent(kind=WindowEventKind.RECONCILIATION_REQUIRED))
+            self._overflow()
 
-    def reconcile(self) -> None:
-        """Re-observe via the source and clear overflow uncertainty."""
-        events = self.source.reconcile()
-        for event in events:
-            self._enqueue(event)
+    def push_for_test(self, event: WindowEvent) -> None:
+        """Enqueue through the same generation path the source uses."""
         with self._lock:
-            self.stats.reconciliations += 1
-            if self.stats.dropped_overflow == 0:
-                self.stats.uncertain = False
+            source_generation = self._source_generation
+        self._enqueue(event, source_generation)
 
-    # -- consumption ---------------------------------------------------
+    def _overflow(self) -> None:
+        with self._lock:
+            self.stats.dropped_overflow = _bump(self.stats.dropped_overflow)
+            self.stats.generation_dropped = _bump(self.stats.generation_dropped)
+            self.stats.uncertain = True
+            self._generation = _bump(self._generation)
+        # Out-of-band signal: cannot be lost to a full queue (F03).
+        self._invalidate_signal.set()
+        self._notify_invalidate()
+
+    def _notify_invalidate(self) -> None:
+        if self.on_invalidate is not None:
+            with contextlib.suppress(Exception):
+                self.on_invalidate()
+
+    # -- reconciliation -----------------------------------------------------
+    def reconcile(self) -> bool:
+        """Re-establish fresh state for the current generation.
+
+        Returns True only when a complete enumeration succeeded with
+        no overflow during this generation. Failed/incomplete
+        enumeration retains uncertainty (it is not proof windows
+        disappeared). Bounded attempts; no infinite retry.
+        """
+        for _attempt in range(_MAX_RECONCILE_ATTEMPTS):
+            self._drain_queue()  # reconciliation supersedes stale queued events
+            with self._lock:
+                self._generation = _bump(self._generation)
+                self.stats.generation_dropped = 0
+            self._notify_invalidate()
+            try:
+                events = self.source.reconcile()
+            except Exception:
+                with self._lock:
+                    self.stats.uncertain = True
+                return False
+            with self._lock:
+                source_generation = self._source_generation
+            for event in events:
+                self._enqueue(event, source_generation)
+            with self._lock:
+                self.stats.reconciliations = _bump(self.stats.reconciliations)
+                if self.stats.generation_dropped == 0:
+                    self.stats.uncertain = False
+                    self._invalidate_signal.clear()
+                    return True
+                # Overflow during reconciliation: retain uncertainty
+                # and reconcile again (bounded by the attempt loop).
+        return False
+
+    def _reconcile_loop(self) -> None:
+        while not self._stop.wait(self.reconcile_interval):
+            if self._invalidate_signal.is_set() or self.stats.uncertain:
+                self.reconcile()
+
+    # -- consumption ---------------------------------------------------------
     def _consume(self) -> None:
         while not self._stop.is_set():
             try:
-                event = self._queue.get(timeout=0.05)
+                generation, event = self._queue.get(timeout=0.05)
             except queue.Empty:
                 continue
-            self.on_event(event)
-
-    def drain_for_test(self, timeout: float = 1.0) -> None:
-        """Deterministically process queued events (tests only)."""
-        import time
-
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+            with self._lock:
+                stale = generation != self._generation
+            if stale:
+                continue  # pre-invalidation event can never restore state
             try:
-                event = self._queue.get(timeout=0.02)
+                self.on_event(event)
+            except Exception:
+                with self._lock:
+                    self.stats.consumer_errors = _bump(self.stats.consumer_errors)
+                    self.stats.uncertain = True
+                    self._health = "degraded"
+
+    def _drain_queue(self) -> None:
+        with contextlib.suppress(queue.Empty):
+            while True:
+                self._queue.get_nowait()
+
+    def drain_for_test(self) -> None:
+        """Deterministically process queued events (tests only).
+
+        Refuses to compete with a live production consumer thread.
+        """
+        with self._lock:
+            running = self.running
+        if running:
+            raise ObserverUnavailable("drain_for_test requires a stopped consumer")
+        while True:
+            try:
+                generation, event = self._queue.get_nowait()
             except queue.Empty:
                 return
+            with self._lock:
+                stale = generation != self._generation
+            if stale:
+                continue
             self.on_event(event)

@@ -15,7 +15,7 @@ from aether.core.contracts.app_window import (
     LaunchMethod,
     ProcessInstanceIdentity,
     WindowInstanceIdentity,
-    executable_identity_digest,
+    location_identity_digest,
     registration_app_id,
 )
 from aether.core.contracts.world_state import WorldStateObservation
@@ -31,10 +31,11 @@ def _record(name: str = "Notepad") -> ApplicationRecord:
             display_name=name, executable_identity=exe, launch_method=LaunchMethod.NONE
         ),
         display_name=name,
+        executable_identity=exe,
         discovery_source=DiscoverySource.FAKE_FIXTURE,
         discovered_at=NOW,
         fresh_until=NOW,
-        executable_digest=executable_identity_digest(exe),
+        location_digest=location_identity_digest(exe),
     )
 
 
@@ -139,3 +140,36 @@ def test_adapter_prepare_default_and_fake() -> None:
     # The foundation fake never reports a successful execution.
     receipt = FakeWindowsAdapter().execute(request)
     assert receipt.status == "FAILED" and FakeWindowsAdapter().verify(receipt) is False
+
+
+def test_window_token_distinguishes_same_process_recreation() -> None:
+    proc = ProcessInstanceIdentity(pid=42, creation_time=NOW)
+    first = WindowInstanceIdentity(
+        window_id="window:123e4567-e89b-12d3-a456-426614174000",
+        hwnd=100,
+        process=proc,
+        observed_at=NOW,
+        instance_generation=0,
+    )
+    recreated = WindowInstanceIdentity(
+        window_id="window:123e4567-e89b-12d3-a456-426614174000",
+        hwnd=100,
+        process=proc,
+        observed_at=NOW,
+        instance_generation=1,
+    )
+    assert first.version_token != recreated.version_token
+
+
+def test_missing_integrity_evidence_blocks_launch_authorization() -> None:
+    record = _record()
+    assert record.integrity_status == "unavailable"
+    assert record.launch_authorized is False
+    # Location digest hashes the location string only (F06): changing
+    # bytes at the same path cannot change this digest, and the
+    # contract never claims it detects replacement.
+    from aether.core.contracts.app_window import location_identity_digest
+
+    assert location_identity_digest("C:\\Fake\\a.exe") == location_identity_digest(
+        "c:\\fake\\A.exe"
+    )

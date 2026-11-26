@@ -15,7 +15,7 @@ from aether.core.contracts.app_window import (
     ApplicationRecord,
     DiscoverySource,
     LaunchMethod,
-    executable_identity_digest,
+    location_identity_digest,
     registration_app_id,
 )
 from aether.core.contracts.policy import RiskTier
@@ -46,7 +46,7 @@ def fake_discovered_apps() -> list[ApplicationRecord]:
                 app_type="desktop",
                 launch_method=LaunchMethod.APPROVED_EXECUTABLE,
                 executable_identity=exe,
-                executable_digest=executable_identity_digest(exe),
+                location_digest=location_identity_digest(exe),
                 discovery_source=DiscoverySource.FAKE_FIXTURE,
                 discovered_at=now,
                 fresh_until=now + timedelta(hours=1),
