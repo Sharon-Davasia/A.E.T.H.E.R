@@ -17,6 +17,8 @@ dependencies = [
     "structlog>=24.2,<26.0",
     "httpx>=0.27,<1.0",
     "cryptography>=43,<47",
+    # Phase 3 CP2: deterministic fuzzy alias ranking (platform-independent).
+    "rapidfuzz>=3.14,<4.0",
 ]
 
 [project.optional-dependencies]
