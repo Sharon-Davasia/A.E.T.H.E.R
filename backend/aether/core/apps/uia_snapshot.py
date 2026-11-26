@@ -81,6 +81,11 @@ class UiaSnapshotService:
     worker: object | None = None  # SubprocessWorkerSupervisor
     clock: Callable[[], datetime] | None = None
     content_inspection_permitted: Callable[[str], bool] | None = None
+    # Campaign gate for *any* inspection (metadata included): when
+    # wired, the app must be within the capability/app allowlist and
+    # current privacy authorization, or inspection is denied before
+    # any provider access.
+    inspection_permitted: Callable[[str], bool] | None = None
     monotonic: Callable[[], float] = time.monotonic
     _snapshots: OrderedDict[str, UiaSnapshot] = field(default_factory=OrderedDict)
     # Privacy/observation generation: any privacy-mode change, sensor
@@ -149,6 +154,10 @@ class UiaSnapshotService:
         )
         if classification is not ContextClassification.PERMITTED_METADATA:
             return SnapshotResult(UiaOutcome.PRIVACY_DENIED, detail=classification.value)
+        if self.inspection_permitted is not None and not self.inspection_permitted(
+            binding.app_resource_id or ""
+        ):
+            return SnapshotResult(UiaOutcome.PRIVACY_DENIED, detail="inspection_not_permitted")
         # F12: missing content-authorization authority denies content
         # inspection outright; metadata-only collection never reads
         # unrestricted accessible text.

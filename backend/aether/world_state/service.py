@@ -57,7 +57,8 @@ class InMemoryWorldState:
     max_windows: int = DEFAULT_MAX_WINDOWS
     generation_clock: GenerationClock | None = None
     authority: object | None = None  # AppWindowResourceAuthority (avoid cycle)
-    # Process-identity (executable basename, casefolded) -> app_id.
+    # Process-identity (full executable image path, normalized) ->
+    # app_id. Basename matches are never authorization-grade.
     app_id_by_identity: dict[str, str] | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _windows: dict[int, _WindowEntry] = field(default_factory=dict, init=False)
@@ -156,8 +157,10 @@ class InMemoryWorldState:
         if self.app_id_by_identity and event.app_identity:
             from pathlib import PureWindowsPath
 
+            # Exact full-path identity only: an executable with the
+            # same basename in another location is a different app.
             app_resource_id = self.app_id_by_identity.get(
-                PureWindowsPath(event.app_identity).name.casefold()
+                PureWindowsPath(event.app_identity).as_posix().casefold()
             )
         ref = self.authority.register_window(
             hwnd=event.hwnd,

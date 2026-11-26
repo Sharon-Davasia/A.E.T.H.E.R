@@ -98,6 +98,9 @@ class UiOperationExecutor:
     dialog_present: Callable[[str], str | None] | None = None
     # A04: unknown/unavailable takeover evidence denies effectful ops.
     takeover_monitor_available: bool | Callable[[], bool] = True
+    # Current privacy authorization, rechecked immediately before
+    # dispatch when wired by composition.
+    privacy_check: Callable[[], bool] | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def _now(self) -> datetime:
@@ -361,6 +364,35 @@ class UiOperationExecutor:
         )
         if target_element is None or not target_element.is_enabled:
             return self._finish(task_id, step_id, binding_id, attempt_id, "stale_target", None)
+        # Final pre-dispatch revalidation, immediately before the
+        # external effect: every condition that authorized this
+        # operation must still hold, or no effect is dispatched.
+        if self.enablement is None or not self.enablement.is_active(
+            capability_id=str(binding["capability_id"]),
+            app_id=str(binding["app_resource_id"]),
+            now=self._now(),
+        ):
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        if str(binding["expires_at"]) <= self._now().isoformat():
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        if self.privacy_check is not None and not self.privacy_check():
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        if not self._takeover_available() or self.focus.takeover_detected(window_id):
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        if self.dialog_present is not None and self.dialog_present(window_id):
+            self.snapshots.on_dialog(window_id)
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        try:
+            window_binding = self.snapshots.authority.resolve_window(window_id)
+        except Exception:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        if (
+            window_binding.app_resource_id != str(binding["app_resource_id"])
+            or not window_binding.process_token
+            or window_binding.version_token != str(binding["window_version_token"])
+            or target_element.runtime_id != str(binding["element_runtime_id"])
+        ):
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
         if not all(self.focus.is_valid(handle) for handle in locks):
             # Ownership lapsed before dispatch: confirmed no effect.
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)

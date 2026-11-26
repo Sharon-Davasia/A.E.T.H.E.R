@@ -105,6 +105,7 @@ class _Platform:
     def __init__(self) -> None:
         self.windows: list[tuple[int, str, str]] = []
         self.count = 0
+        self.modal = False
 
     def new_window(self, app_id: str, hwnd: int) -> str:
         token = f"proc:{hwnd}"
@@ -182,10 +183,13 @@ class _Backend:
 
     def children(self, element):  # type: ignore[no-untyped-def]
         if element.key == "1":
-            return (
+            children = [
                 self.raw("1.1", "Text", "101", f"Count: {self.platform.count}", ()),
                 self.raw("1.2", "Button", "102", "Increment", ()),
-            )
+            ]
+            if self.platform.modal:
+                children.append(self.raw("1.3", "Window", "900", "Dialog", ()))
+            return tuple(children)
         return ()
 
     def invoke(self, element):  # type: ignore[no-untyped-def]
@@ -324,6 +328,16 @@ def test_native_factory_denies_bad_authorization(tmp_path: Path) -> None:
     with pytest.raises(StartupDenied):  # privacy mode not the approved one
         Phase3Composition.native(
             authorization=dataclasses.replace(bad, privacy_mode="content_on_demand"),
+            current_commit=COMMIT,
+            storage_dir=h["storage"],
+            gesture_key=GESTURE_KEY,
+            platform=h["providers"],
+        )
+    with pytest.raises(StartupDenied):  # lifetime beyond the 4h ceiling
+        Phase3Composition.native(
+            authorization=dataclasses.replace(
+                bad, expires_at=datetime.now(UTC) + timedelta(hours=5)
+            ),
             current_commit=COMMIT,
             storage_dir=h["storage"],
             gesture_key=GESTURE_KEY,
@@ -665,7 +679,7 @@ def test_complete_controlled_acceptance_workflow(tmp_path: Path) -> None:
             hwnd=hwnd,
             pid=4242,
             process_creation_time="fake-creation-1",
-            app_identity="Fixture App.exe",
+            app_identity="C:/Apps/Fixture App.exe",
             classification=ContextClassification.PERMITTED_METADATA,
             elevated=False,
         )
@@ -772,7 +786,7 @@ def test_changed_counter_invalidates_approval(tmp_path: Path) -> None:
             hwnd=hwnd,
             pid=4242,
             process_creation_time="fake-creation-1",
-            app_identity="Fixture App.exe",
+            app_identity="C:/Apps/Fixture App.exe",
             classification=ContextClassification.PERMITTED_METADATA,
             elevated=False,
         )
@@ -866,3 +880,169 @@ def test_native_platform_construction_with_raw_fakes(tmp_path: Path) -> None:
             dataclasses.replace(authz, fixture_app_id="app:00000000-0000-4000-8000-000000000000"),
             seams=build_fake_seams(),
         )
+
+
+def _registered_window(h, comp, *, hwnd: int, app_identity: str) -> str:  # type: ignore[no-untyped-def]
+    h["event_source"].push(
+        WindowEvent(
+            kind=WindowEventKind.WINDOW_CREATED,
+            hwnd=hwnd,
+            pid=4242,
+            process_creation_time="fake-creation-1",
+            app_identity=app_identity,
+            classification=ContextClassification.PERMITTED_METADATA,
+            elevated=False,
+        )
+    )
+    for _ in range(100):
+        assert comp.authority is not None
+        for binding in comp.authority.known_windows():
+            if binding.hwnd == hwnd:
+                return binding.window_id
+        time.sleep(0.05)
+    raise AssertionError("window was not registered")
+
+
+def _launched_window(h, comp, bridge) -> str:  # type: ignore[no-untyped-def]
+    prepared = bridge.prepare_launch({"appId": h["app_id"]})
+    preview = bridge.preview_operation({"taskId": prepared["taskId"], "effect": "app.launch"})
+    outcome = _approve(bridge, prepared["taskId"], preview, effect="app.launch")
+    assert outcome["outcome"] == "SUCCEEDED", outcome
+    hwnd, _t, _a = h["platform"].windows[0]
+    return _registered_window(h, comp, hwnd=hwnd, app_identity="C:/Apps/Fixture App.exe")
+
+
+def test_same_basename_evil_process_gets_no_fixture_authority(tmp_path: Path) -> None:
+    """A different executable sharing the fixture's basename must
+    never be mapped to the fixture app or receive interaction
+    authority (full-path process identity only)."""
+    h = _harness(tmp_path)
+    store = open_acceptance_store(
+        h["storage"],
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=h["authz"].decision_reference,
+            storage_id=h["authz"].storage_id,
+            expires_at=h["authz"].expires_at,
+            campaign_id=h["authz"].campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    comp = _start(h)
+    bridge = comp.bridge
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    evil_window = _registered_window(h, comp, hwnd=7777, app_identity="C:/Evil/Fixture App.exe")
+    assert comp.authority is not None
+    binding = comp.authority.resolve_window(evil_window)
+    assert binding.app_resource_id is None  # not the fixture app
+    assert bridge.inspect_window({"windowId": evil_window}).get("status") != "ready"
+    prepared = bridge.prepare_fixture_interaction({"windowId": evil_window})
+    assert prepared.get("status") != "ready"
+    assert comp.shutdown() is True
+
+
+def test_observation_provider_denies_same_basename_and_ambiguity() -> None:
+    from aether.adapters.windows.native_observer import NativeObservationProvider
+    from aether.core.apps.launch_authority import FakeIntegrityVerifier, IntegrityEvidence
+
+    record = _record("app:fixture", "Fixture App")
+    evidence = IntegrityEvidence(
+        location_digest=record.location_digest or "",
+        content_sha256="a" * 64,
+        signer_identity="FakeSigner",
+        package_identity=None,
+        verified_at=datetime.now(UTC),
+        file_identity="3:42:100:1",
+    )
+    verifier = FakeIntegrityVerifier(evidence_by_location={record.location_digest or "": evidence})
+
+    class _Api:
+        def __init__(self, path: str) -> None:
+            self.path = path
+
+        def enumerate_windows(self):  # type: ignore[no-untyped-def]
+            return [(111, 50)]
+
+        def get_process_image_path(self, pid: int):  # type: ignore[no-untyped-def]
+            return self.path
+
+        def get_process_name(self, pid: int):  # type: ignore[no-untyped-def]
+            return self.path
+
+        def get_process_creation_time(self, pid: int):  # type: ignore[no-untyped-def]
+            return "t0"
+
+        def get_process_session_id(self, pid: int):  # type: ignore[no-untyped-def]
+            return 1
+
+    evil = NativeObservationProvider(
+        api=_Api("C:\\Evil\\Fixture App.exe"), records=[record], integrity_verifier=verifier
+    ).observe()
+    assert evil.processes == () and evil.windows == ()
+    legit = NativeObservationProvider(
+        api=_Api("C:\\Apps\\Fixture App.exe"), records=[record], integrity_verifier=verifier
+    ).observe()
+    assert len(legit.processes) == 1 and legit.processes[0].app_id == record.app_id
+
+
+def test_modal_via_supervised_inspection_blocks_dispatch(tmp_path: Path) -> None:
+    h = _harness(tmp_path)
+    store = open_acceptance_store(
+        h["storage"],
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=h["authz"].decision_reference,
+            storage_id=h["authz"].storage_id,
+            expires_at=h["authz"].expires_at,
+            campaign_id=h["authz"].campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    comp = _start(h)
+    bridge = comp.bridge
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    window_id = _launched_window(h, comp, bridge)
+    act = bridge.prepare_activation({"windowId": window_id})
+    aprev = bridge.preview_operation({"taskId": act["taskId"], "effect": "window.activate"})
+    _approve(bridge, act["taskId"], aprev, effect="window.activate")
+    h["platform"].modal = True
+    prepared = bridge.prepare_fixture_interaction({"windowId": window_id})
+    assert prepared["status"] == "ready", prepared
+    preview = bridge.preview_fixture_interaction({"taskId": prepared["taskId"]})
+    result = _approve(bridge, prepared["taskId"], preview)
+    assert result.get("outcome") != "SUCCEEDED", result
+    assert h["platform"].count == 0
+    assert comp.shutdown() is True
+
+
+def test_privacy_escalation_and_restart_after_revoke_denied(tmp_path: Path) -> None:
+    h = _harness(tmp_path)
+    store = open_acceptance_store(
+        h["storage"],
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=h["authz"].decision_reference,
+            storage_id=h["authz"].storage_id,
+            expires_at=h["authz"].expires_at,
+            campaign_id=h["authz"].campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    comp = _start(h)
+    bridge = comp.bridge
+    # Escalation beyond the authorized metadata-only ceiling refused.
+    escalated = bridge.set_privacy({"optedIn": True, "mode": "content_on_demand", "paused": False})
+    assert escalated.get("status") != "ready" or escalated["privacy"]["mode"] != "content_on_demand"
+    assert bridge.get_state({})["privacy"]["mode"] == "off"
+    # Opt-in works, opt-out stops collection, and after revocation a
+    # later opt-in cannot restart the observer.
+    assert (
+        bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})["status"]
+        == "ready"
+    )
+    assert h["event_source"].started is True
+    bridge.set_privacy({"optedIn": False, "mode": "off", "paused": True})
+    comp.revoke("test-revocation")
+    bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    assert h["event_source"].started is False
+    assert comp.shutdown() is True

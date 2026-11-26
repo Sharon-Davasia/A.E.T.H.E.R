@@ -144,6 +144,8 @@ class Win32ObserverApi(Protocol):
     def get_process_creation_time(self, pid: int) -> str | None: ...
     def get_process_session_id(self, pid: int) -> int | None: ...
     def get_process_name(self, pid: int) -> str | None: ...
+
+    def get_process_image_path(self, pid: int) -> str | None: ...
     def is_process_elevated(self, pid: int) -> bool | None: ...  # None = unknown
     def enumerate_windows(self) -> list[tuple[int, int]]: ...  # raises on failure
     def get_foreground_window(self) -> int: ...
@@ -287,12 +289,21 @@ class NativeWindowsEventSource:
                 elevated = self._api.is_process_elevated(pid)
         from aether.world_state.privacy import ContextClassification
 
+        # Authorization-grade identity is the full process image
+        # path, never a basename: two different executables sharing
+        # a filename must not be conflated.
+        image_path = None
+        if pid:
+            getter = getattr(self._api, "get_process_image_path", None)
+            if getter is not None:
+                with contextlib.suppress(Exception):
+                    image_path = getter(pid)
         return WindowEvent(
             kind=kind,
             hwnd=hwnd,
             pid=pid,
             process_creation_time=creation,
-            app_identity=name,
+            app_identity=image_path or name,
             # Positive classification only from confirmed
             # non-elevated inspection; unknown elevation stays
             # UNKNOWN and therefore uncollectable (fail closed).
@@ -451,6 +462,21 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
         finally:
             self._kernel32.CloseHandle(handle)
 
+    def get_process_image_path(self, pid: int) -> str | None:
+        ctypes = self._ctypes
+        handle = self._open_process(pid)
+        if not handle:
+            return None
+        try:
+            size = ctypes.c_uint(1024)
+            buffer = ctypes.create_unicode_buffer(1024)
+            ok = self._kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
+            if not ok:
+                return None
+            return buffer.value or None
+        finally:
+            self._kernel32.CloseHandle(handle)
+
     def is_process_elevated(self, pid: int) -> bool | None:
         ctypes = self._ctypes
         handle = self._open_process(pid)
@@ -521,6 +547,17 @@ class NativeObservationProvider:
         self._verifier = integrity_verifier
 
     def observe(self):  # type: ignore[no-untyped-def]
+        """Attribute windows/processes only on verified identity.
+
+        A process is attributed to a registered application only
+        when its *full* observed image path equals the registered
+        executable identity, its creation time is known, it runs in
+        this session, exactly one registered application claims that
+        identity (ambiguity denies), and trusted integrity evidence
+        for the registered executable exists. A different executable
+        sharing a basename is never attributed.
+        """
+        import os
         from pathlib import PureWindowsPath
 
         from aether.core.apps.launch_authority import integrity_digest_of
@@ -530,6 +567,17 @@ class NativeObservationProvider:
             PlatformObservation,
         )
 
+        def _key(value: object) -> str:
+            return PureWindowsPath(str(value or "")).as_posix().casefold()
+
+        by_identity: dict[str, list] = {}  # type: ignore[type-arg]
+        for record in self._records:
+            identity = getattr(record, "executable_identity", None)
+            if identity:
+                by_identity.setdefault(_key(identity), []).append(record)
+        own_session = None
+        with contextlib.suppress(Exception):
+            own_session = self._api.get_process_session_id(os.getpid())
         processes: dict[str, ObservedProcess] = {}
         windows = []
         try:
@@ -537,31 +585,31 @@ class NativeObservationProvider:
         except Exception:
             return PlatformObservation(processes=(), windows=(), complete=False)
         for hwnd, pid in enumerated:
-            name = self._api.get_process_name(pid)
-            if not name:
-                continue
-            base = PureWindowsPath(name).name.casefold()
-            record = next(
-                (
-                    r
-                    for r in self._records
-                    if PureWindowsPath(
-                        str(getattr(r, "executable_identity", "") or "")
-                    ).name.casefold()
-                    == base
-                ),
-                None,
-            )
-            if record is None:
-                continue
+            image_getter = getattr(self._api, "get_process_image_path", None)
+            image_path = image_getter(pid) if image_getter is not None else None
+            if not image_path:
+                continue  # inaccessible identity: deny attribution
+            matches = by_identity.get(_key(image_path), [])
+            if len(matches) != 1:
+                continue  # unknown or ambiguous identity
+            record = matches[0]
             creation = self._api.get_process_creation_time(pid)
-            token = f"{pid}:{creation}" if creation else f"{pid}:unknown"
+            if not creation:
+                continue  # creation identity unknown: deny
+            session = None
+            with contextlib.suppress(Exception):
+                session = self._api.get_process_session_id(pid)
+            if own_session is not None and session != own_session:
+                continue  # different session: deny
+            token = f"{pid}:{creation}"
             if token not in processes:
                 evidence = self._verifier.verify(record)  # type: ignore[attr-defined]
+                if evidence is None:
+                    continue  # no trusted evidence: deny
                 processes[token] = ObservedProcess(
                     process_token=token,
                     app_id=record.app_id,
-                    integrity_sha256=(integrity_digest_of(evidence) if evidence else None),
+                    integrity_sha256=integrity_digest_of(evidence),
                     started_after_attempt=True,
                 )
             windows.append(

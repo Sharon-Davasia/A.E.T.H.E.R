@@ -143,6 +143,9 @@ class _FakeObserverApi:
         return 1
 
     def get_process_name(self, pid: int) -> str | None:
+        return self.get_process_image_path(pid)
+
+    def get_process_image_path(self, pid: int) -> str | None:
         for _hwnd, (p, exe) in self._state.windows.items():
             if p == pid:
                 return exe

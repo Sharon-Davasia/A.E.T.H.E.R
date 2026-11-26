@@ -80,6 +80,10 @@ class ObservationPrivacyAuthority:
     policy: ObservationPolicy = field(default_factory=ObservationPolicy)
     paused: bool = False
     generation: int = 0
+    # Campaign ceiling: modes outside this set can never be selected
+    # through any caller (e.g. metadata-only campaigns cannot be
+    # escalated to content collection by a bridge request).
+    permitted_modes: frozenset[str] | None = None
     _listeners: list[Callable[[], None]] = field(default_factory=list)
 
     def add_listener(self, listener: Callable[[], None]) -> None:
@@ -94,6 +98,8 @@ class ObservationPrivacyAuthority:
         }
 
     def update(self, *, opted_in: bool, mode: str, paused: bool) -> dict[str, object]:
+        if self.permitted_modes is not None and mode not in self.permitted_modes:
+            raise ValueError("privacy mode exceeds the authorized campaign ceiling")
         try:
             parsed = PrivacyMode(mode)
         except ValueError as exc:
@@ -166,7 +172,13 @@ class Phase3Composition:
             self.worker.shutdown()
 
     def begin_observation(self) -> None:
-        """Start observer + activity source (privacy opt-in only)."""
+        """Start observer + activity source (privacy opt-in only).
+
+        A revoked composition (shutdown/expiry) can never restart
+        collection through a later privacy update.
+        """
+        if self._revoked:
+            return
         if self.observer_service is not None:
             self.observer_service.start()  # type: ignore[attr-defined]
         if self.activity_source is not None:
@@ -246,8 +258,11 @@ class Phase3Composition:
         now_fn = clock or (lambda: datetime.now(UTC))
         cleanups: list[Callable[[], None]] = []
         try:
-            # Observation starts OFF (A01): opted out, mode off.
-            privacy = ObservationPrivacyAuthority()
+            # Observation starts OFF (A01): opted out, mode off, and
+            # capped at the authorization's approved privacy mode.
+            privacy = ObservationPrivacyAuthority(
+                permitted_modes=frozenset({"off", authorization.privacy_mode})
+            )
             authority = AppWindowResourceAuthority(session_id=authorization.session_id)
             registry = InMemoryApplicationRegistry()
             records = [r for r in providers.records if r.app_id in authorization.authorized_app_ids]
@@ -267,6 +282,12 @@ class Phase3Composition:
                     raise CompositionUnavailable("uia worker failed to start")
                 cleanups.append(lambda: _shutdown_result(worker))
             snapshots = UiaSnapshotService(
+                inspection_permitted=lambda app_id: (
+                    privacy.collection_enabled
+                    and enablement.is_active(
+                        capability_id="uia.inspect_snapshot", app_id=app_id, now=now_fn()
+                    )
+                ),
                 authority=authority,
                 backend_factory=providers.uia_backend_factory,  # type: ignore[arg-type]
                 session_id=authorization.session_id,
@@ -284,7 +305,7 @@ class Phase3Composition:
                 policy=privacy.policy,
                 authority=authority,
                 app_id_by_identity={
-                    _PWP(r.executable_identity or "").name.casefold(): r.app_id
+                    _PWP(r.executable_identity or "").as_posix().casefold(): r.app_id
                     for r in records
                     if r.executable_identity
                 },
@@ -383,39 +404,37 @@ class Phase3Composition:
             )
 
             def _native_modal_evidence(window_id: str):  # type: ignore[no-untyped-def]
-                """Independent modal evidence via the UIA provider.
+                """Modal evidence from bounded supervised inspection.
 
-                None (unknown) when the window/provider is
-                unavailable; () only when the tree was actually read
-                and holds no modal secondary window.
+                Routes through the snapshot service (supervised UIA
+                worker when configured; bounded limits otherwise) —
+                never a direct unbounded backend call. A missing,
+                truncated or failed inspection is *unknown* (None),
+                which prevents effectful dispatch; only a complete
+                inspection with no modal secondary window proves
+                absence.
                 """
                 from aether.core.apps.dialogs import ModalWindowEvidence
 
+                result = snapshots.inspect(window_id, require_content=False)
+                if result.snapshot is None or result.snapshot.truncated:
+                    return None
                 try:
                     binding = authority.resolve_window(window_id)
-                    backend = providers.uia_backend_factory()
-                    try:
-                        root = backend.find_root(hwnd=binding.hwnd)  # type: ignore[attr-defined]
-                        if root is None:
-                            return None
-                        evidence = []
-                        for child in backend.children(root):  # type: ignore[attr-defined]
-                            if child.control_type in ("Window", "Dialog"):
-                                evidence.append(
-                                    ModalWindowEvidence(
-                                        window_resource_id=window_id,
-                                        owner_process_token=binding.process_token,
-                                        is_modal=True,
-                                        title_hint=None,
-                                        elevated=binding.elevated,
-                                        accessible=True,
-                                    )
-                                )
-                        return tuple(evidence)
-                    finally:
-                        backend.close()  # type: ignore[attr-defined]
                 except Exception:
                     return None
+                return tuple(
+                    ModalWindowEvidence(
+                        window_resource_id=window_id,
+                        owner_process_token=binding.process_token,
+                        is_modal=True,
+                        title_hint=None,
+                        elevated=binding.elevated,
+                        accessible=True,
+                    )
+                    for element in result.snapshot.elements
+                    if element.depth >= 1 and element.control_type in ("Window", "Dialog")
+                )
 
             detector = DialogDetector(
                 modal_evidence=providers.modal_evidence or _native_modal_evidence
@@ -463,6 +482,7 @@ class Phase3Composition:
                 takeover_monitor_available=lambda: bool(
                     getattr(activity, "healthy", lambda: False)()
                 ),
+                privacy_check=lambda: privacy.collection_enabled,
             )
             planner = Planner(
                 capabilities=capabilities,

@@ -99,7 +99,9 @@ def build_authorization(
         "campaign_id": campaign_id,
         "storage_id": str(uuid.uuid4()),
         "storage_path": str(storage_path),
-        "authorized_app_ids": sorted({str(r.app_id) for r in selected} | {fixture.app_id}),
+        "authorized_app_ids": sorted(
+            {str(getattr(r, "app_id")) for r in selected} | {fixture.app_id}
+        ),
         "capability_allowlist": [
             "app.launch",
             "window.activate",
