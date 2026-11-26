@@ -264,7 +264,9 @@ class CapabilityRegistry:
             )
         )
         registry.register(
-            CapabilityDefinition("uia.inspect_element", RiskTier.OBSERVE, UiaElementArguments, "window")
+            CapabilityDefinition(
+                "uia.inspect_element", RiskTier.OBSERVE, UiaElementArguments, "window"
+            )
         )
         registry.register(
             CapabilityDefinition(

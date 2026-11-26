@@ -56,7 +56,7 @@ class PywinautoUiaBackend:
     def _register(self, element: Any) -> RawElement:
         info = element.element_info
         runtime_id = ".".join(str(p) for p in (info.runtime_id or (info.handle or id(element),)))
-        children = ()
+        children: tuple[str, ...] = ()
         try:
             children = tuple(self._key(c.element_info) for c in element.children())
         except Exception:
@@ -123,7 +123,7 @@ class PywinautoUiaBackend:
     def read_value(self, element: RawElement) -> dict[str, object]:
         impl = self._live(element)
         try:
-            value = impl.iface_value.CurrentValue  # type: ignore[attr-defined]
+            value = impl.iface_value.CurrentValue
         except Exception as exc:
             raise UiaBackendError(f"uia_value_failed: {type(exc).__name__}") from exc
         # Presence only: the value itself is classified at the service
@@ -137,7 +137,12 @@ class PywinautoUiaBackend:
 
 def _rect(rectangle: Any) -> tuple[int, int, int, int] | None:
     try:
-        return (int(rectangle.left), int(rectangle.top), int(rectangle.right), int(rectangle.bottom))
+        return (
+            int(rectangle.left),
+            int(rectangle.top),
+            int(rectangle.right),
+            int(rectangle.bottom),
+        )
     except Exception:
         return None
 
@@ -155,6 +160,6 @@ def build_native_uia_backend(
         return PywinautoUiaBackend(pywinauto_module=pywinauto_module, root_window=None)
     if sys.platform != "win32" or activation is None:
         raise NativeUiaDisabled("native UIA requires Windows + trusted activation; disabled")
-    import pywinauto as real_pywinauto  # pragma: no cover - Windows-only path
+    import pywinauto as real_pywinauto  # type: ignore[import-not-found]  # pragma: no cover
 
     return PywinautoUiaBackend(pywinauto_module=real_pywinauto, root_window=None)

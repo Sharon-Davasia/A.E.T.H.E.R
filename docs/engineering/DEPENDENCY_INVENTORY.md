@@ -45,7 +45,7 @@ The master spec states the upstream Qwen checkpoint is Apache-2.0. That is not t
 | Electron/React/Vite | Desktop trusted review surface | In use (Phase 2B Stage 3+). The Electron main process is the trusted UI boundary; the renderer is untrusted and has no Node integration. Audit release notices before distribution. |
 | Gemma 4 E4B | Possible model challenger | Deferred; exact checkpoint terms and benchmark review |
 | pywin32 312 | Windows Win32/Shell COM (Phase 3) | **Added** (foundation-closeout batch): `pywin32>=312,<313; sys_platform == 'win32'`, PSF licence, no transitives, locked in `backend/uv.lock`. Used only by the disabled-by-default native AppsFolder discovery route. Not installed/exercised on Linux; no native evidence claimed. |
-| pywinauto 0.6.9 | Windows UIA (Phase 3 CP4) | **Deferred**: verified (BSD 3-clause; transitives pywin32+comtypes+six) but not installed; add at the CP4 UIA checkpoint only. See `PHASE3_DEPENDENCY_REPORT.md`. |
+| pywinauto 0.6.9 | Windows UIA (Phase 3 CP4) | **Added at CP4**: verified BSD 3-clause; transitives pywin32+comtypes+six (win32 markers); locked in `backend/uv.lock`. Windows-only; not installed/exercised on Linux; no native evidence claimed. See `PHASE3_DEPENDENCY_REPORT.md`. |
 | RapidFuzz >=3.14,<4.0 (3.14.6 checked) | Phase 3 alias fuzzy ranking | **In use (CP2)**, platform-independent, MIT; no default transitives. Real ranking exercised in tests. |
 | Playwright, Office/PDF tools | App integrations | Deferred |
 | SQLite (stdlib `sqlite3`) | Phase 2 task/plan/grant/receipt persistence | Schema **v2 active** since PR #36 (`ACTIVE_SCHEMA_VERSION=2`). No schema v3 exists or is approved (Phase 3 CP2 uses in-memory registry + in-memory FTS5). |

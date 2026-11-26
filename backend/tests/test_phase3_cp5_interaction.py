@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from uuid import UUID
 
 import pytest
 
@@ -42,23 +41,33 @@ class _World:
         self.fixture = FixtureApp()
         self.authority = AppWindowResourceAuthority(session_id="session-1")
         ref = self.authority.register_window(
-            hwnd=FIXTURE_HWND, process_token="pid:7:ct", instance_generation=1,
-            version_token="pid:7:ct#1", expires_at=NOW + timedelta(hours=1),
-            app_resource_id="app:fixture", classification=ContextClassification.PERMITTED_METADATA,
+            hwnd=FIXTURE_HWND,
+            process_token="pid:7:ct",
+            instance_generation=1,
+            version_token="pid:7:ct#1",
+            expires_at=NOW + timedelta(hours=1),
+            app_resource_id="app:fixture",
+            classification=ContextClassification.PERMITTED_METADATA,
         )
         self.window_id = ref.resource_id
         self.snapshots = UiaSnapshotService(
-            authority=self.authority, backend_factory=self.fixture.backend,
-            session_id="session-1", clock=clock,
+            authority=self.authority,
+            backend_factory=self.fixture.backend,
+            session_id="session-1",
+            clock=clock,
         )
         self.focus = FocusCoordinator()
         self.capabilities = CapabilityRegistry.phase3_with_uia()
         self.store = _v3_store(tmp_path)
         self.executor = UiOperationExecutor(
-            store=self.store, snapshots=self.snapshots,
-            backend_factory=self.fixture.backend, focus=self.focus,
-            capabilities=self.capabilities, session_id="session-1",
-            activation_scope="test-scope", clock=clock,
+            store=self.store,
+            snapshots=self.snapshots,
+            backend_factory=self.fixture.backend,
+            focus=self.focus,
+            capabilities=self.capabilities,
+            session_id="session-1",
+            activation_scope="test-scope",
+            clock=clock,
         )
 
     def snapshot(self):  # type: ignore[no-untyped-def]
@@ -73,7 +82,8 @@ class _World:
         planner = Planner(
             capabilities=self.capabilities,
             resources=ResourceRegistry(windows_semantics=False),
-            app_authority=self.authority, clock=lambda: NOW,
+            app_authority=self.authority,
+            clock=lambda: NOW,
         )
         planned = planner.plan(
             task.task_id,
@@ -89,7 +99,11 @@ class _World:
             ),
         )
         self.store.save_plan(planned.plan)
-        for state in (PersistentTaskState.VALIDATING, PersistentTaskState.PREVIEW_READY, PersistentTaskState.AWAITING_APPROVAL):
+        for state in (
+            PersistentTaskState.VALIDATING,
+            PersistentTaskState.PREVIEW_READY,
+            PersistentTaskState.AWAITING_APPROVAL,
+        ):
             self.store.transition_task(task.task_id, state, now=NOW)
         return task.task_id, planned.step_id
 
@@ -179,7 +193,9 @@ def test_takeover_stops_interaction(tmp_path: Path) -> None:
     world = _World(tmp_path)
     task_id, step_id = world.plan_task()
     binding_id = world.executor.issue_binding(task_id, step_id)
-    world.focus.note_activity(ActivitySignal(kind="manual_activity_in_window", window_id=world.window_id, at=NOW))
+    world.focus.note_activity(
+        ActivitySignal(kind="manual_activity_in_window", window_id=world.window_id, at=NOW)
+    )
     # note_activity alone marks signals; executor consults takeover via on_takeover
     world.focus.on_takeover(world.window_id)
     with pytest.raises(UiDenied):
@@ -192,8 +208,12 @@ def test_wrong_window_snapshot_denied(tmp_path: Path) -> None:
     world = _World(tmp_path)
     snapshot = world.snapshot()
     other = world.authority.register_window(
-        hwnd=9999, process_token="pid:9:ct", instance_generation=1, version_token="pid:9:ct#1",
-        expires_at=NOW + timedelta(hours=1), app_resource_id="app:fixture",
+        hwnd=9999,
+        process_token="pid:9:ct",
+        instance_generation=1,
+        version_token="pid:9:ct#1",
+        expires_at=NOW + timedelta(hours=1),
+        app_resource_id="app:fixture",
         classification=ContextClassification.PERMITTED_METADATA,
     )
     task_id, step_id = world.plan_task(snapshot, window_id=other.resource_id)
@@ -209,8 +229,11 @@ def test_ui_evidence_cannot_drive_navigation_and_vice_versa(tmp_path: Path) -> N
     binding_id = world.executor.issue_binding(task_id, step_id)
     with pytest.raises(IllegalPersistentTransition):
         world.store.advance_navigation_state(
-            task_id, PersistentTaskState.PRECHECK, step_id=step_id,
-            confirmation_id=binding_id, now=NOW,
+            task_id,
+            PersistentTaskState.PRECHECK,
+            step_id=step_id,
+            confirmation_id=binding_id,
+            now=NOW,
         )
     world.close()
 
@@ -245,7 +268,9 @@ def test_focus_lock_contention_ordering_and_stale_release() -> None:
     # Stale owner cannot release another's lock.
     from aether.core.apps.focus import LockHandle
 
-    forged = LockHandle(kind="window", key="w1", owner_task="t2", owner_session="s", acquired_at=0.0, expires_at=0.0)
+    forged = LockHandle(
+        kind="window", key="w1", owner_task="t2", owner_session="s", acquired_at=0.0, expires_at=0.0
+    )
     assert focus.release(forged) is False
     for handle in reversed(first):
         assert focus.release(handle) is True
@@ -270,8 +295,11 @@ def test_window_activation_t1_verified(tmp_path: Path) -> None:
         return True
 
     activator = WindowActivator(
-        focus=world.focus, snapshots=world.snapshots, activate=activate,
-        foreground_hwnd=lambda: state["foreground"], session_id="session-1",
+        focus=world.focus,
+        snapshots=world.snapshots,
+        activate=activate,
+        foreground_hwnd=lambda: state["foreground"],
+        session_id="session-1",
     )
     from uuid import uuid4
 

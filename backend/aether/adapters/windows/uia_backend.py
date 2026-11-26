@@ -73,9 +73,7 @@ class FakeUiaBackend:
 
     def replace(self, old_key: str, new: RawElement) -> None:
         """Simulate controlled element replacement/invalidation."""
-        parent = next(
-            (e for e in self.elements.values() if old_key in e.children_keys), None
-        )
+        parent = next((e for e in self.elements.values() if old_key in e.children_keys), None)
         self.elements.pop(old_key, None)
         self.elements[new.key] = new
         self.stale_keys.add(old_key)

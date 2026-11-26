@@ -9,7 +9,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from aether.adapters.windows.native_uia import NativeUiaDisabled, PywinautoUiaBackend, build_native_uia_backend
+from aether.adapters.windows.native_uia import (
+    NativeUiaDisabled,
+    build_native_uia_backend,
+)
 
 
 class _Info:
@@ -59,7 +62,7 @@ def _fake_module():
 
 
 def test_native_backend_walks_fake_pywinauto_tree() -> None:
-    module, root, button = _fake_module()
+    module, _root, button = _fake_module()
     backend = build_native_uia_backend(activation=None, pywinauto_module=module)
     raw_root = backend.find_root(hwnd=123)
     assert raw_root is not None and raw_root.name == "Fixture"
@@ -91,13 +94,20 @@ def test_native_service_adapter_uses_injected_module() -> None:
     now = datetime(2026, 11, 15, tzinfo=UTC)
     authority = AppWindowResourceAuthority(session_id="s")
     ref = authority.register_window(
-        hwnd=123, process_token="pid:1:ct", instance_generation=1, version_token="pid:1:ct#1",
-        expires_at=now + timedelta(minutes=5), app_resource_id="app:fixture",
+        hwnd=123,
+        process_token="pid:1:ct",
+        instance_generation=1,
+        version_token="pid:1:ct#1",
+        expires_at=now + timedelta(minutes=5),
+        app_resource_id="app:fixture",
         classification=ContextClassification.PERMITTED_METADATA,
     )
     adapter = NativeUiaAdapter(
-        authority=authority, activation=None, session_id="s",
-        pywinauto_module=module, clock=lambda: now,
+        authority=authority,
+        activation=None,
+        session_id="s",
+        pywinauto_module=module,
+        clock=lambda: now,
     )
     result = adapter.inspect_window(ref.resource_id)
     assert result.outcome in (UiaOutcome.OK, UiaOutcome.TRUNCATED)

@@ -21,9 +21,14 @@ HWND = 777
 def _authority(classification=ContextClassification.PERMITTED_METADATA, elevated=None):
     authority = AppWindowResourceAuthority(session_id="s1")
     ref = authority.register_window(
-        hwnd=HWND, process_token="pid:42:ct", instance_generation=1,
-        version_token="pid:42:ct#1", expires_at=NOW + timedelta(minutes=5),
-        app_resource_id="app:fixture", classification=classification, elevated=elevated,
+        hwnd=HWND,
+        process_token="pid:42:ct",
+        instance_generation=1,
+        version_token="pid:42:ct#1",
+        expires_at=NOW + timedelta(minutes=5),
+        app_resource_id="app:fixture",
+        classification=classification,
+        elevated=elevated,
     )
     return authority, ref.resource_id
 
@@ -31,12 +36,34 @@ def _authority(classification=ContextClassification.PERMITTED_METADATA, elevated
 def _backend(*, passwords: bool = True) -> FakeUiaBackend:
     backend = FakeUiaBackend()
     children = [
-        RawElement(key="btn", control_type="Button", name="Increment", patterns=frozenset({"invoke"}), depth=1),
+        RawElement(
+            key="btn",
+            control_type="Button",
+            name="Increment",
+            patterns=frozenset({"invoke"}),
+            depth=1,
+        ),
         RawElement(key="status", control_type="Text", name="Count: 0", depth=1),
     ]
     if passwords:
-        children.append(RawElement(key="pw", control_type="Edit", name="Password", patterns=frozenset({"value"}), is_password=True, value_present=True, depth=1))
-    root = RawElement(key="root", control_type="Window", name="Fixture", depth=0, children_keys=tuple(c.key for c in children))
+        children.append(
+            RawElement(
+                key="pw",
+                control_type="Edit",
+                name="Password",
+                patterns=frozenset({"value"}),
+                is_password=True,
+                value_present=True,
+                depth=1,
+            )
+        )
+    root = RawElement(
+        key="root",
+        control_type="Window",
+        name="Fixture",
+        depth=0,
+        children_keys=tuple(c.key for c in children),
+    )
     backend.add_root(hwnd=HWND, root=root, descendants=children)
     return backend
 
@@ -44,8 +71,11 @@ def _backend(*, passwords: bool = True) -> FakeUiaBackend:
 def _service(authority=None, backend=None, **kw) -> UiaSnapshotService:
     authority = authority or _authority()[0]
     return UiaSnapshotService(
-        authority=authority, backend_factory=lambda: backend or _backend(),
-        session_id="s1", clock=lambda: NOW, **kw,
+        authority=authority,
+        backend_factory=lambda: backend or _backend(),
+        session_id="s1",
+        clock=lambda: NOW,
+        **kw,
     )
 
 
@@ -69,8 +99,10 @@ def test_password_value_and_name_never_retained() -> None:
 
 
 def test_unknown_window_and_unknown_context_denied() -> None:
-    authority, window_id = _authority()
-    assert _service(authority).inspect("window:does-not-exist").outcome is UiaOutcome.WINDOW_NOT_FOUND
+    authority, _window_id = _authority()
+    assert (
+        _service(authority).inspect("window:does-not-exist").outcome is UiaOutcome.WINDOW_NOT_FOUND
+    )
     authority2, window2 = _authority(classification=ContextClassification.UNKNOWN)
     assert _service(authority2).inspect(window2).outcome is UiaOutcome.PRIVACY_DENIED
     authority3, window3 = _authority(elevated=True)
@@ -88,7 +120,9 @@ def test_truncation_is_explicit_at_limits() -> None:
     authority, window_id = _authority()
     backend = FakeUiaBackend()
     kids = [RawElement(key=f"k{i}", control_type="Text", name=f"n{i}", depth=1) for i in range(50)]
-    root = RawElement(key="root", control_type="Window", depth=0, children_keys=tuple(k.key for k in kids))
+    root = RawElement(
+        key="root", control_type="Window", depth=0, children_keys=tuple(k.key for k in kids)
+    )
     backend.add_root(hwnd=HWND, root=root, descendants=kids)
     result = _service(authority, backend).inspect(window_id, limits=UiaLimits(max_elements=10))
     assert result.outcome is UiaOutcome.TRUNCATED
@@ -104,7 +138,9 @@ def test_forged_or_unknown_element_ref_rejected() -> None:
     service = _service(authority)
     snap = service.inspect(window_id).snapshot
     assert snap is not None
-    assert service.validate_element(snap.snapshot_id, "el:999").outcome is UiaOutcome.ELEMENT_NOT_FOUND
+    assert (
+        service.validate_element(snap.snapshot_id, "el:999").outcome is UiaOutcome.ELEMENT_NOT_FOUND
+    )
     assert service.validate_element("snap:forged", "el:1").outcome is UiaOutcome.SNAPSHOT_EXPIRED
     assert service.validate_element(snap.snapshot_id, "el:2").outcome is UiaOutcome.OK
 
@@ -115,9 +151,13 @@ def test_window_replacement_stales_snapshot() -> None:
     snap = service.inspect(window_id).snapshot
     assert snap is not None
     authority.register_window(
-        hwnd=HWND, process_token="pid:42:ct", instance_generation=2,
-        version_token="pid:42:ct#2", expires_at=NOW + timedelta(minutes=5),
-        app_resource_id="app:fixture", classification=ContextClassification.PERMITTED_METADATA,
+        hwnd=HWND,
+        process_token="pid:42:ct",
+        instance_generation=2,
+        version_token="pid:42:ct#2",
+        expires_at=NOW + timedelta(minutes=5),
+        app_resource_id="app:fixture",
+        classification=ContextClassification.PERMITTED_METADATA,
     )
     assert service.get(snap.snapshot_id).outcome is UiaOutcome.WINDOW_STALE
 
@@ -127,9 +167,15 @@ def test_snapshot_contract_bounds_enforced() -> None:
 
     with pytest.raises(ValueError):
         UiaSnapshot(
-            snapshot_id="s", session_id="s1", app_resource_id="app:x",
-            window_resource_id="window:x", window_version_token="v", process_token="p",
-            observed_at=NOW, expires_at=NOW, generation=0,
+            snapshot_id="s",
+            session_id="s1",
+            app_resource_id="app:x",
+            window_resource_id="window:x",
+            window_version_token="v",
+            process_token="p",
+            observed_at=NOW,
+            expires_at=NOW,
+            generation=0,
             elements=tuple(
                 UiaElement(element_ref=f"el:{i}", runtime_id=str(i), control_type="Text", depth=0)
                 for i in range(MAX_ELEMENTS + 1)
@@ -161,28 +207,56 @@ def test_worker_malformed_and_stale_responses_rejected() -> None:
         import json
 
         req = json.loads(body)
-        return json.dumps({"protocol": req["protocol"], "request_id": "req:other", "status": "ok", "result": {}}).encode()
+        return json.dumps(
+            {"protocol": req["protocol"], "request_id": "req:other", "status": "ok", "result": {}}
+        ).encode()
 
-    assert _supervisor(wrong_id).execute("health", {}, side_effect=False).outcome is WorkerOutcome.STALE_RESPONSE
+    assert (
+        _supervisor(wrong_id).execute("health", {}, side_effect=False).outcome
+        is WorkerOutcome.STALE_RESPONSE
+    )
 
     def garbage(body: bytes, timeout: float) -> bytes:
         return b"not-json"
 
-    assert _supervisor(garbage).execute("health", {}, side_effect=False).outcome is WorkerOutcome.MALFORMED
+    assert (
+        _supervisor(garbage).execute("health", {}, side_effect=False).outcome
+        is WorkerOutcome.MALFORMED
+    )
 
     def crash(body: bytes, timeout: float) -> bytes:
         raise ConnectionError("worker died")
 
-    assert _supervisor(crash).execute("inspect", {}, side_effect=False).outcome is WorkerOutcome.CRASHED
-    assert _supervisor(crash).execute("invoke", {}, side_effect=True).outcome is WorkerOutcome.UNCERTAIN
+    assert (
+        _supervisor(crash).execute("inspect", {}, side_effect=False).outcome
+        is WorkerOutcome.CRASHED
+    )
+    assert (
+        _supervisor(crash).execute("invoke", {}, side_effect=True).outcome
+        is WorkerOutcome.UNCERTAIN
+    )
 
 
 def test_worker_request_validation_rejects_code_and_patterns() -> None:
     for payload in ({"python": "x"}, {"shell": "x"}, {"pattern_name": "Invoke"}, {"keys": "abc"}):
         with pytest.raises(ValueError):
-            validate_request({"protocol": "aether-uia-worker/1", "request_id": "r1", "operation": "inspect", "payload": payload})
+            validate_request(
+                {
+                    "protocol": "aether-uia-worker/1",
+                    "request_id": "r1",
+                    "operation": "inspect",
+                    "payload": payload,
+                }
+            )
     with pytest.raises(ValueError):
-        validate_request({"protocol": "aether-uia-worker/1", "request_id": "r1", "operation": "eval", "payload": {}})
+        validate_request(
+            {
+                "protocol": "aether-uia-worker/1",
+                "request_id": "r1",
+                "operation": "eval",
+                "payload": {},
+            }
+        )
 
 
 def test_worker_roundtrip_through_handler() -> None:

@@ -23,6 +23,14 @@ demonstrations are recorded in §8 of that document; their artifacts
 remain owner-held and are not archived in this repository. Nothing in
 Phase 3 development changes that verdict.
 
+**Phase 3 CP4–CP5 is implemented fake-backed** (bounded privacy-aware
+UIA snapshots with a real but disabled native pywinauto backend and a
+typed reliability worker; focus locks, manual-takeover invalidation,
+exact UI-operation bindings and one independently verified fixture
+interaction; CP3 prerequisites R01–R05 closed). See
+`PHASE3_CP4_CP5.md`. No native Windows evidence exists yet; native
+activation remains disabled and schema v3 remains inactive.
+
 **Phase 3 foundation (CP0-CP2) plus the CP3 completion batch
 (CP3-B01..B06) is in development** on
 `integration/phase3-windows-state-app-control` under a bounded

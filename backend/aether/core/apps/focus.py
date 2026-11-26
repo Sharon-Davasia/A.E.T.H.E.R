@@ -80,11 +80,18 @@ class FocusCoordinator:
         self, *, owner_task: str, owner_session: str, window_id: str, duration: float | None = None
     ) -> LockHandle | None:
         """The single shared foreground-desktop lock (one holder system-wide)."""
-        return self._acquire("foreground", "desktop", owner_task, owner_session, duration, window_id)
+        return self._acquire(
+            "foreground", "desktop", owner_task, owner_session, duration, window_id
+        )
 
     def _acquire(
-        self, kind: str, key: str, owner_task: str, owner_session: str,
-        duration: float | None, window_id: str | None,
+        self,
+        kind: str,
+        key: str,
+        owner_task: str,
+        owner_session: str,
+        duration: float | None,
+        window_id: str | None,
     ) -> LockHandle | None:
         with self._lock:
             self._reconcile_expired_locked()
@@ -96,7 +103,10 @@ class FocusCoordinator:
                 return None  # contention: fail, never queue-steal focus
             now = self.monotonic()
             handle = LockHandle(
-                kind=kind, key=key, owner_task=owner_task, owner_session=owner_session,
+                kind=kind,
+                key=key,
+                owner_task=owner_task,
+                owner_session=owner_session,
                 acquired_at=now,
                 expires_at=now + min(duration or self.max_lock_seconds, MAX_LOCK_SECONDS),
             )
@@ -168,7 +178,9 @@ class FocusCoordinator:
         """Record a takeover-relevant signal (content-free)."""
         with self._lock:
             if signal.window_id is not None and signal.kind in (
-                "manual_activity_in_window", "focus_lost", "foreground_changed",
+                "manual_activity_in_window",
+                "focus_lost",
+                "foreground_changed",
             ):
                 self._takeover_windows.add(signal.window_id)
 
@@ -180,9 +192,7 @@ class FocusCoordinator:
         """Stop automation on this window: drop its locks, stale its snapshots."""
         with self._lock:
             self._takeover_windows.add(window_id)
-            for key in [
-                k for k, v in self._held.items() if v.window_id == window_id
-            ]:
+            for key in [k for k, v in self._held.items() if v.window_id == window_id]:
                 self._held.pop(key, None)
             self._invalidated_snapshots.update(snapshot_ids)
 

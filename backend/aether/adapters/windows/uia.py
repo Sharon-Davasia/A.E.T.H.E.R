@@ -34,9 +34,7 @@ class NativeUiaAdapter:
         clock: Callable[[], datetime] | None = None,
         content_inspection_permitted: Callable[[str], bool] | None = None,
     ) -> None:
-        backend = build_native_uia_backend(
-            activation=activation, pywinauto_module=pywinauto_module
-        )
+        backend = build_native_uia_backend(activation=activation, pywinauto_module=pywinauto_module)
         self._service = UiaSnapshotService(
             authority=authority,
             backend_factory=lambda: backend,

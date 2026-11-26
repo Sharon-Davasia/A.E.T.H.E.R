@@ -1399,12 +1399,27 @@ class SQLiteTaskStore:
                     " intended_effect, session_id, activation_scope, issued_at, expires_at)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        binding_id, str(task_id), str(step_id), int(row["plan_revision"]),
-                        row["plan_hash"], capability_id, arguments_sha256, binding_sha256,
-                        app_resource_id, window_resource_id, window_version_token, snapshot_id,
-                        snapshot_generation, element_ref, element_runtime_id, pattern,
-                        intended_effect, session_id, activation_scope,
-                        _timestamp(issued_at), _timestamp(expires_at),
+                        binding_id,
+                        str(task_id),
+                        str(step_id),
+                        int(row["plan_revision"]),
+                        row["plan_hash"],
+                        capability_id,
+                        arguments_sha256,
+                        binding_sha256,
+                        app_resource_id,
+                        window_resource_id,
+                        window_version_token,
+                        snapshot_id,
+                        snapshot_generation,
+                        element_ref,
+                        element_runtime_id,
+                        pattern,
+                        intended_effect,
+                        session_id,
+                        activation_scope,
+                        _timestamp(issued_at),
+                        _timestamp(expires_at),
                     ),
                 )
             except sqlite3.IntegrityError as exc:
@@ -1460,18 +1475,29 @@ class SQLiteTaskStore:
                 "INSERT INTO ui_operation_attempts(id, binding_id, task_id, step_id,"
                 " capability_id, window_resource_id, attempt_number, recorded_at)"
                 " VALUES (?,?,?,?,?,?,1,?)",
-                (attempt_id, binding_id, str(task_id), str(step_id),
-                 binding["capability_id"], binding["window_resource_id"], timestamp),
+                (
+                    attempt_id,
+                    binding_id,
+                    str(task_id),
+                    str(step_id),
+                    binding["capability_id"],
+                    binding["window_resource_id"],
+                    timestamp,
+                ),
             )
             self._commit_transition_unlocked(
-                connection, task_id, PersistentTaskState.PRECHECK,
-                PersistentTaskState.EXECUTING, event_type="TASK_EXECUTING",
+                connection,
+                task_id,
+                PersistentTaskState.PRECHECK,
+                PersistentTaskState.EXECUTING,
+                event_type="TASK_EXECUTING",
                 metadata_values={
                     "confirmation_id": binding_id,
                     "attempt_id": attempt_id,
                     "authority": "BACKEND_UI_OPERATION_EVIDENCE",
                 },
-                now=timestamp, error_code=None,
+                now=timestamp,
+                error_code=None,
             )
         return attempt_id
 
@@ -1536,19 +1562,28 @@ class SQLiteTaskStore:
                 if to_state is PersistentTaskState.COMPLETED and receipt["status"] != "SUCCEEDED":
                     raise IllegalPersistentTransition("ui completion requires a SUCCEEDED receipt")
             self._commit_transition_unlocked(
-                connection, task_id, current, to_state,
+                connection,
+                task_id,
+                current,
+                to_state,
                 event_type=f"TASK_{to_state.value}",
                 metadata_values={
                     "confirmation_id": binding_id,
                     "attempt_id": attempt_id or "",
                     "authority": "BACKEND_UI_OPERATION_EVIDENCE",
                 },
-                now=timestamp, error_code=None,
+                now=timestamp,
+                error_code=None,
             )
         return self.get_task(task_id)
 
     def record_ui_verification(
-        self, *, attempt_id: str, outcome: str, observed_postcondition_token: str | None, now: datetime
+        self,
+        *,
+        attempt_id: str,
+        outcome: str,
+        observed_postcondition_token: str | None,
+        now: datetime,
     ) -> str:
         if outcome == "verified_effect" and not observed_postcondition_token:
             raise IllegalPersistentTransition(
@@ -1557,15 +1592,24 @@ class SQLiteTaskStore:
         verification_id = str(uuid4())
         with self._transaction() as connection:
             self._require_navigation_schema(connection)
-            if connection.execute(
-                "SELECT 1 FROM ui_operation_attempts WHERE id = ?", (attempt_id,)
-            ).fetchone() is None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM ui_operation_attempts WHERE id = ?", (attempt_id,)
+                ).fetchone()
+                is None
+            ):
                 raise IllegalPersistentTransition("ui verification names no recorded attempt")
             try:
                 connection.execute(
                     "INSERT INTO ui_operation_verifications(id, attempt_id, outcome,"
                     " observed_postcondition_token, verified_at) VALUES (?,?,?,?,?)",
-                    (verification_id, attempt_id, outcome, observed_postcondition_token, _timestamp(now)),
+                    (
+                        verification_id,
+                        attempt_id,
+                        outcome,
+                        observed_postcondition_token,
+                        _timestamp(now),
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise IllegalPersistentTransition("ui verification was rejected") from exc
@@ -1595,7 +1639,14 @@ class SQLiteTaskStore:
                 connection.execute(
                     "INSERT INTO ui_operation_receipts(id, attempt_id, verification_id, status,"
                     " recovery_class, created_at) VALUES (?,?,?,?,?,?)",
-                    (receipt_id, attempt_id, verification_id, status, "IRREVERSIBLE", _timestamp(now)),
+                    (
+                        receipt_id,
+                        attempt_id,
+                        verification_id,
+                        status,
+                        "IRREVERSIBLE",
+                        _timestamp(now),
+                    ),
                 )
             except sqlite3.IntegrityError as exc:
                 raise IllegalPersistentTransition("ui receipt was rejected") from exc
@@ -1643,14 +1694,18 @@ class SQLiteTaskStore:
             try:
                 if row["state"] == "PRECHECK":
                     self.advance_ui_state(
-                        task_id, PersistentTaskState.FAILED,
-                        step_id=step_id, binding_id=row["binding_id"], now=now,
+                        task_id,
+                        PersistentTaskState.FAILED,
+                        step_id=step_id,
+                        binding_id=row["binding_id"],
+                        now=now,
                     )
                     outcomes.append((task_id, "FAILED"))
                     continue
                 if row["verification_id"] is not None and row["receipt_id"] is None:
                     self.record_ui_receipt(
-                        attempt_id=row["attempt_id"], verification_id=row["verification_id"],
+                        attempt_id=row["attempt_id"],
+                        verification_id=row["verification_id"],
                         now=now or datetime.now(UTC),
                     )
                 target = (
@@ -1660,13 +1715,20 @@ class SQLiteTaskStore:
                 )
                 if PersistentTaskState(row["state"]) is not PersistentTaskState.RECOVERING:
                     self.advance_ui_state(
-                        task_id, PersistentTaskState.RECOVERING,
-                        step_id=step_id, binding_id=row["binding_id"],
-                        attempt_id=row["attempt_id"], now=now,
+                        task_id,
+                        PersistentTaskState.RECOVERING,
+                        step_id=step_id,
+                        binding_id=row["binding_id"],
+                        attempt_id=row["attempt_id"],
+                        now=now,
                     )
                 self.advance_ui_state(
-                    task_id, target, step_id=step_id, binding_id=row["binding_id"],
-                    attempt_id=row["attempt_id"], now=now,
+                    task_id,
+                    target,
+                    step_id=step_id,
+                    binding_id=row["binding_id"],
+                    attempt_id=row["attempt_id"],
+                    now=now,
                 )
                 outcomes.append((task_id, target.value))
             except IllegalPersistentTransition:

@@ -17,16 +17,16 @@ from __future__ import annotations
 import hashlib
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from uuid import UUID
 
 from aether.adapters.windows.uia_backend import UiaBackend, UiaBackendError, UiaElementStale
 from aether.core.apps.focus import FocusCoordinator
 from aether.core.apps.uia_snapshot import UiaSnapshotService
-from aether.core.policy.capabilities import CapabilityRegistry
 from aether.core.persistence.models import PersistentTaskState
-from aether.core.persistence.sqlite_store import IllegalPersistentTransition, SQLiteTaskStore
+from aether.core.persistence.sqlite_store import SQLiteTaskStore
+from aether.core.policy.capabilities import CapabilityRegistry
 
 KNOWN_INTENDED_EFFECTS = frozenset({"increment_fixture_count"})
 EFFECT_PATTERN = {"increment_fixture_count": "invoke"}
@@ -60,7 +60,7 @@ class UiOperationExecutor:
     session_id: str
     activation_scope: str
     clock: Callable[[], datetime] | None = None
-    _lock: threading.RLock = threading.RLock()
+    _lock: threading.RLock = field(default_factory=threading.RLock)
 
     def _now(self) -> datetime:
         return self.clock() if self.clock else datetime.now(UTC)
@@ -99,27 +99,45 @@ class UiOperationExecutor:
         if plan_hash is None:
             plan_hash = _plan_hash(self.store, task_id)
         binding = _issue(
-            task_id=str(task_id), step_id=str(step_id), plan_revision=plan.revision,
-            plan_hash=plan_hash, capability_id=step.capability_id,
-            arguments=dict(arguments), app_resource_id=snapshot.app_resource_id,
-            window_resource_id=window_id, window_version_token=snapshot.window_version_token,
-            snapshot_id=snapshot_id, snapshot_generation=snapshot.generation,
-            element_ref=element_ref, element_runtime_id=element.runtime_id,
-            pattern=pattern, intended_effect=intended_effect,
-            session_id=self.session_id, activation_scope=self.activation_scope,
+            task_id=str(task_id),
+            step_id=str(step_id),
+            plan_revision=plan.revision,
+            plan_hash=plan_hash,
+            capability_id=step.capability_id,
+            arguments=dict(arguments),
+            app_resource_id=snapshot.app_resource_id,
+            window_resource_id=window_id,
+            window_version_token=snapshot.window_version_token,
+            snapshot_id=snapshot_id,
+            snapshot_generation=snapshot.generation,
+            element_ref=element_ref,
+            element_runtime_id=element.runtime_id,
+            pattern=pattern,
+            intended_effect=intended_effect,
+            session_id=self.session_id,
+            activation_scope=self.activation_scope,
             now=self._now(),
         )
         self.store.record_ui_binding(
-            binding_id=binding.binding_id, task_id=task_id, step_id=step_id,
-            capability_id=step.capability_id, arguments_sha256=binding.arguments_sha256,
-            binding_sha256=binding.digest(), app_resource_id=binding.app_resource_id,
+            binding_id=binding.binding_id,
+            task_id=task_id,
+            step_id=step_id,
+            capability_id=step.capability_id,
+            arguments_sha256=binding.arguments_sha256,
+            binding_sha256=binding.digest(),
+            app_resource_id=binding.app_resource_id,
             window_resource_id=window_id,
             window_version_token=binding.window_version_token,
-            snapshot_id=snapshot_id, snapshot_generation=snapshot.generation,
-            element_ref=element_ref, element_runtime_id=element.runtime_id,
-            pattern=pattern, intended_effect=intended_effect,
-            session_id=self.session_id, activation_scope=self.activation_scope,
-            issued_at=binding.issued_at, expires_at=binding.expires_at,
+            snapshot_id=snapshot_id,
+            snapshot_generation=snapshot.generation,
+            element_ref=element_ref,
+            element_runtime_id=element.runtime_id,
+            pattern=pattern,
+            intended_effect=intended_effect,
+            session_id=self.session_id,
+            activation_scope=self.activation_scope,
+            issued_at=binding.issued_at,
+            expires_at=binding.expires_at,
         )
         return binding.binding_id
 
@@ -150,7 +168,7 @@ class UiOperationExecutor:
             return self._execute_locked(task_id, step_id, binding_id=binding_id)
 
     def _execute_locked(self, task_id: UUID, step_id: UUID, *, binding_id: str) -> UiOutcome:
-        _task, plan, step, arguments = self._load_step(task_id, step_id)
+        _task, _plan, step, arguments = self._load_step(task_id, step_id)
         window_id = str(arguments["resource_id"])
         snapshot_id = str(arguments["snapshot_id"])
         element_ref = str(arguments["element_ref"])
@@ -173,7 +191,7 @@ class UiOperationExecutor:
             raise UiDenied("binding_expired")
 
         # Fresh precheck: snapshot + exact element identity current.
-        snap_result = self.snapshots.get(snapshot_id)  # noqa: F821
+        snap_result = self.snapshots.get(snapshot_id)
         if snap_result.snapshot is None:
             raise UiDenied(f"snapshot_{snap_result.outcome.value}")
         snapshot = snap_result.snapshot
@@ -185,7 +203,7 @@ class UiOperationExecutor:
         if (
             element.runtime_id != str(binding["element_runtime_id"])
             or str(binding["pattern"]) not in element.patterns
-            or snapshot.generation != int(binding["snapshot_generation"])  # type: ignore[arg-type]
+            or snapshot.generation != int(str(binding["snapshot_generation"]))
             or snapshot.window_version_token != str(binding["window_version_token"])
         ):
             raise UiDenied("binding_element_mismatch")
@@ -202,8 +220,11 @@ class UiOperationExecutor:
         # PRECHECK -> commitment (combined durable transaction).
         if self.store.get_task(task_id).state is PersistentTaskState.AWAITING_APPROVAL:
             self.store.advance_ui_state(
-                task_id, PersistentTaskState.PRECHECK, step_id=step_id,
-                binding_id=binding_id, now=self._now(),
+                task_id,
+                PersistentTaskState.PRECHECK,
+                step_id=step_id,
+                binding_id=binding_id,
+                now=self._now(),
             )
         attempt_id = self.store.commit_ui_attempt(
             task_id=task_id, step_id=step_id, binding_id=binding_id, now=self._now()
@@ -246,8 +267,12 @@ class UiOperationExecutor:
                 self.focus.release(handle)
 
         self.store.advance_ui_state(
-            task_id, PersistentTaskState.POSTCHECK, step_id=step_id,
-            binding_id=binding_id, attempt_id=attempt_id, now=self._now(),
+            task_id,
+            PersistentTaskState.POSTCHECK,
+            step_id=step_id,
+            binding_id=binding_id,
+            attempt_id=attempt_id,
+            now=self._now(),
         )
         # Independent verification: fresh snapshot, exact postcondition.
         expected = _expected_status(status_element.name)
@@ -266,12 +291,18 @@ class UiOperationExecutor:
     def _finish(self, task_id, step_id, binding_id, attempt_id, outcome, token) -> UiOutcome:  # type: ignore[no-untyped-def]
         if self.store.get_task(task_id).state is PersistentTaskState.EXECUTING:
             self.store.advance_ui_state(
-                task_id, PersistentTaskState.POSTCHECK, step_id=step_id,
-                binding_id=binding_id, attempt_id=attempt_id, now=self._now(),
+                task_id,
+                PersistentTaskState.POSTCHECK,
+                step_id=step_id,
+                binding_id=binding_id,
+                attempt_id=attempt_id,
+                now=self._now(),
             )
         verification_id = self.store.record_ui_verification(
-            attempt_id=attempt_id, outcome=outcome,
-            observed_postcondition_token=token, now=self._now(),
+            attempt_id=attempt_id,
+            outcome=outcome,
+            observed_postcondition_token=token,
+            now=self._now(),
         )
         self.store.record_ui_receipt(
             attempt_id=attempt_id, verification_id=verification_id, now=self._now()
@@ -283,8 +314,12 @@ class UiOperationExecutor:
             "UNVERIFIED": PersistentTaskState.UNVERIFIED,
         }[status]
         self.store.advance_ui_state(
-            task_id, target, step_id=step_id, binding_id=binding_id,
-            attempt_id=attempt_id, now=self._now(),
+            task_id,
+            target,
+            step_id=step_id,
+            binding_id=binding_id,
+            attempt_id=attempt_id,
+            now=self._now(),
         )
         return UiOutcome(status=status, outcome=outcome, attempt_id=attempt_id)
 

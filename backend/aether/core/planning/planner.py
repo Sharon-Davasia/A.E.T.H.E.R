@@ -462,8 +462,11 @@ class Planner:
             recovery_class="IRREVERSIBLE",
         )
         plan = TaskPlan(
-            task_id=task_id, revision=revision, summary=intent.summary[:512],
-            steps=(step,), created_at=now,
+            task_id=task_id,
+            revision=revision,
+            summary=intent.summary[:512],
+            steps=(step,),
+            created_at=now,
         )
         plan_hash = hashlib.sha256(plan.canonical_json().encode("utf-8")).hexdigest()
         narrative = _narrative_for(intent, "authorized window", expected_effect, approved_edit=None)
@@ -523,6 +526,8 @@ class Planner:
 def _expected_effect(
     goal: PlanGoal, display_name: str, arguments: dict[str, Any]
 ) -> dict[str, Any]:
+    if goal in _WINDOW_GOALS:
+        return {"effect": goal.value, "resource": display_name}
     match goal:
         case PlanGoal.INSPECT_FILE:
             return {"effect": "metadata_read", "resource": display_name}
@@ -542,6 +547,8 @@ def _expected_effect(
             return {"effect": "file_restored", "resource": display_name}
         case PlanGoal.LAUNCH_APPLICATION:
             return {"effect": "application_launch_requested", "resource": display_name}
+        case _:
+            return {"effect": goal.value, "resource": display_name}
 
 
 def _freshly_planned_binding(planned: PlannedRevision) -> ApprovedEdit | None:
@@ -692,14 +699,8 @@ def _narrative_for(
             "authorized window instance bound to the plan. It cannot "
             "address any other window, element or application."
         )
-        external = (
-            "The fixture interaction has one declared bounded effect, "
-            "verified independently afterwards.",
-        )
-        risks = (
-            "UI text is untrusted data and is never treated as instructions.",
-            "A replaced window or element invalidates the operation.",
-        )
+        external = ("The fixture interaction has one declared, independently verified effect.",)
+        risks = ("UI text is untrusted; a replaced window or element invalidates the operation.",)
         verification = (
             "Success requires the declared postcondition to be observed "
             "in a fresh inspection; an adapter claim alone is not success.",

@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import threading
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from test_phase3_launch import NOW, _World
 
-from aether.core.apps.launcher import LaunchCallResult, LaunchDenied
+from aether.core.apps.launcher import LaunchCallResult
 from aether.core.apps.navigation_outcomes import NavigationOutcome
 from aether.core.contracts.app_window import LaunchMethod
 from aether.core.persistence.models import PersistentTaskState
@@ -21,9 +21,6 @@ from aether.world_state.observer import (
     WindowEvent,
     WindowEventKind,
 )
-
-from test_phase3_launch import NOW, _World, _record, _evidence_for
-
 
 # -- R01: interruption boundaries ----------------------------------------------
 
@@ -132,7 +129,7 @@ def test_cancel_after_commitment_reports_verified_truth(tmp_path: Path) -> None:
                 confirmation_id=confirmation.confirmation_id,
                 authorization_id=authorization.authorization_id,
             )
-        except Exception as exc:  # noqa: BLE001 - captured for assertion
+        except Exception as exc:
             result["error"] = exc
 
     thread = threading.Thread(target=_execute)
@@ -178,6 +175,8 @@ def test_revocation_during_precheck_blocks_commitment(tmp_path: Path) -> None:
 
 
 def test_integrity_provider_rejects_unsafe_targets(tmp_path: Path) -> None:
+    from datetime import timedelta as td
+
     from aether.adapters.windows.native_launcher import NativeIntegrityProvider
     from aether.core.contracts.app_window import (
         ApplicationRecord,
@@ -185,7 +184,6 @@ def test_integrity_provider_rejects_unsafe_targets(tmp_path: Path) -> None:
         location_identity_digest,
         registration_app_id,
     )
-    from datetime import timedelta as td
 
     provider = NativeIntegrityProvider()
     target = tmp_path / "app.exe"
@@ -217,6 +215,8 @@ def test_integrity_provider_rejects_unsafe_targets(tmp_path: Path) -> None:
 
 
 def test_packaged_identity_requires_platform_query() -> None:
+    from datetime import timedelta as td
+
     from aether.adapters.windows.native_launcher import NativeIntegrityProvider
     from aether.core.apps.launch_authority import LaunchAuthority, app_version_token
     from aether.core.contracts.app_window import (
@@ -225,7 +225,6 @@ def test_packaged_identity_requires_platform_query() -> None:
         location_identity_digest,
         registration_app_id,
     )
-    from datetime import timedelta as td
 
     aumid = "FakePackage!App"
     record = ApplicationRecord(
@@ -336,12 +335,13 @@ def _mk_event(hwnd: int, pid: int = 10, creation: str = "t1") -> WindowEvent:
 
 
 def test_observer_reconcile_publishes_atomically_to_world_state() -> None:
+    from test_phase3_world_state import _policy
+
     from aether.core.contracts.resource import ResourceRef
     from aether.core.resources.app_window_authority import (
         AppWindowAuthorityError,
         AppWindowResourceAuthority,
     )
-    from test_phase3_world_state import _policy
 
     clock = GenerationClock()
     authority = AppWindowResourceAuthority()

@@ -57,21 +57,52 @@ class FixtureBackend(FakeUiaBackend):
         self.roots.clear()
         increment_key = "fixture-increment-v2" if self._state.replaced else INCREMENT_KEY
         children = [
-            RawElement(key=increment_key, control_type="Button", name="Increment",
-                       patterns=frozenset({"invoke"}), depth=1),
+            RawElement(
+                key=increment_key,
+                control_type="Button",
+                name="Increment",
+                patterns=frozenset({"invoke"}),
+                depth=1,
+            ),
             RawElement(key=STATUS_KEY, control_type="Text", name=self._state.status_text, depth=1),
-            RawElement(key=DISABLED_KEY, control_type="Button", name="Disabled action",
-                       patterns=frozenset({"invoke"}), is_enabled=False, depth=1),
-            RawElement(key=PASSWORD_KEY, control_type="Edit", name="Password",
-                       patterns=frozenset({"value"}), is_password=True, value_present=True, depth=1),
-            RawElement(key=MODAL_KEY, control_type="Button", name="Open dialog",
-                       patterns=frozenset({"invoke"}), depth=1),
+            RawElement(
+                key=DISABLED_KEY,
+                control_type="Button",
+                name="Disabled action",
+                patterns=frozenset({"invoke"}),
+                is_enabled=False,
+                depth=1,
+            ),
+            RawElement(
+                key=PASSWORD_KEY,
+                control_type="Edit",
+                name="Password",
+                patterns=frozenset({"value"}),
+                is_password=True,
+                value_present=True,
+                depth=1,
+            ),
+            RawElement(
+                key=MODAL_KEY,
+                control_type="Button",
+                name="Open dialog",
+                patterns=frozenset({"invoke"}),
+                depth=1,
+            ),
         ]
         if self._state.modal_open:
-            children.append(RawElement(key=MODAL_DIALOG_KEY, control_type="Window",
-                                       name="Fixture dialog", depth=1))
-        root = RawElement(key="fixture-root", control_type="Window", name="AETHER Fixture",
-                          depth=0, children_keys=tuple(c.key for c in children))
+            children.append(
+                RawElement(
+                    key=MODAL_DIALOG_KEY, control_type="Window", name="Fixture dialog", depth=1
+                )
+            )
+        root = RawElement(
+            key="fixture-root",
+            control_type="Window",
+            name="AETHER Fixture",
+            depth=0,
+            children_keys=tuple(c.key for c in children),
+        )
         self.add_root(hwnd=FIXTURE_HWND, root=root, descendants=children)
 
     def invoke(self, element: RawElement) -> dict[str, object]:

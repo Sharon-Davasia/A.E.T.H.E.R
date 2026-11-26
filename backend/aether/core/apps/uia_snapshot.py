@@ -29,11 +29,11 @@ from aether.adapters.windows.uia_backend import (
     UiaElementStale,
 )
 from aether.core.contracts.resource import ResourceRef
-from aether.world_state.privacy import ContextClassification, classify_context
 from aether.core.contracts.uia import (
     MAX_RETAINED_SNAPSHOTS,
     SNAPSHOT_TTL_SECONDS,
     SUPPORTED_PATTERNS,
+    SnapshotPrivacy,
     UiaElement,
     UiaLimits,
     UiaSnapshot,
@@ -42,6 +42,7 @@ from aether.core.resources.app_window_authority import (
     AppWindowAuthorityError,
     AppWindowResourceAuthority,
 )
+from aether.world_state.privacy import ContextClassification, classify_context
 
 
 class UiaOutcome(StrEnum):
@@ -152,7 +153,9 @@ class UiaSnapshotService:
             observed_at=now,
             expires_at=now + timedelta(seconds=SNAPSHOT_TTL_SECONDS),
             generation=binding.instance_generation,
-            privacy_classification="content" if require_content else "metadata",
+            privacy_classification=SnapshotPrivacy.CONTENT
+            if require_content
+            else SnapshotPrivacy.METADATA,
             completeness="truncated" if truncated_reason else "complete",
             truncated=truncated_reason is not None,
             truncated_reason=truncated_reason,
@@ -189,7 +192,11 @@ class UiaSnapshotService:
                 return elements, "element_limit"
             ref = f"el:{len(elements) + 1}"
             ref_by_key[raw.key] = ref
-            ancestors = (ancestors_by_key.get(parent_ref or "", ()) + ((parent_ref,) if parent_ref else ())) if parent_ref else ()
+            ancestors = (
+                (ancestors_by_key.get(parent_ref or "", ()) + ((parent_ref,) if parent_ref else ()))
+                if parent_ref
+                else ()
+            )
             if parent_ref:
                 ancestors_by_key[raw.key] = ancestors
             name = None
