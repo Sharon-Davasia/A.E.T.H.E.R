@@ -167,6 +167,63 @@ def _error_payload(reason: str) -> dict[str, object]:
     return {"reason": reason}
 
 
+def _simulated_phase3_bridge(env: dict[str, str], gesture_key: bytes):  # type: ignore[no-untyped-def]
+    """Build the simulated composition for integration tests, or None."""
+    import uuid as _uuid
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path as _Path
+
+    storage = env.get("AETHER_PHASE3_STORAGE")
+    if not storage:
+        return None
+    try:
+        from aether.core.apps.composition import Phase3Composition
+        from aether.core.apps.fixture import FixtureApp
+        from aether.core.contracts.app_window import (
+            ApplicationRecord,
+            DiscoverySource,
+            LaunchMethod,
+            location_identity_digest,
+            registration_app_id,
+        )
+        from aether.core.persistence.acceptance_storage import (
+            OwnerAcceptanceAuthorization,
+            open_acceptance_store,
+        )
+
+        now = datetime.now(UTC)
+        store = open_acceptance_store(
+            _Path(storage),
+            authorization=OwnerAcceptanceAuthorization(
+                decision_reference="simulated-acceptance-test",
+                storage_id=str(_uuid.uuid4()),
+                expires_at=now + timedelta(hours=1),
+            ),
+            now=now,
+        )
+        exe = "C:\\Fake\\AETHERFixture.exe"
+        record = ApplicationRecord(
+            app_id=registration_app_id(
+                display_name="AETHER Fixture",
+                executable_identity=exe,
+                launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+            ),
+            display_name="AETHER Fixture",
+            launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+            executable_identity=exe,
+            location_digest=location_identity_digest(exe),
+            discovery_source=DiscoverySource.FAKE_FIXTURE,
+            discovered_at=now,
+            fresh_until=now + timedelta(hours=2),
+        )
+        composition = Phase3Composition.simulated(
+            store=store, fixture=FixtureApp(), fixture_record=record, gesture_key=gesture_key
+        )
+        return composition.bridge
+    except Exception:
+        return None
+
+
 def main() -> int:
     # Bootstrap (private stdin pipe, written once by Electron main):
     # MAGIC | 16B session id | 32B channel HMAC key | 32B challenge |
@@ -218,6 +275,14 @@ def main() -> int:
     from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
 
     phase3_bridge = Phase3Bridge(Phase3Surface.disabled())
+    # G01/G02 simulated acceptance (automated integration tests only):
+    # an explicit test-harness launch may request the *simulated*
+    # composition, which uses fake platform providers and isolated
+    # acceptance storage. Ordinary launches never set this, native
+    # providers are never constructed here, and this is not an
+    # owner-side activation mechanism.
+    if env.get("AETHER_PHASE3_SIMULATED") == "simulated-acceptance":
+        phase3_bridge = _simulated_phase3_bridge(env, gesture_key) or phase3_bridge
     # Hello is emitted only after storage resolution: an acceptance
     # launch with invalid fixture storage exits above without ever
     # becoming ready.

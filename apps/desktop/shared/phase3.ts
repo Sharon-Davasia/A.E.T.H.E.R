@@ -21,6 +21,21 @@ export interface Phase3ProjectCandidate {
   limitations: string[];
 }
 
+export interface Phase3Window {
+  windowId: string;
+  appId: string | null;
+  appDisplayName: string;
+  version: string;
+}
+
+export interface Phase3Prepared {
+  status: 'ready' | 'unavailable';
+  reason?: string;
+  taskId?: string;
+  stepId?: string;
+  preview?: Record<string, string>;
+}
+
 export interface Phase3State {
   status: 'ready' | 'unavailable';
   reason?: string;
@@ -28,6 +43,7 @@ export interface Phase3State {
   disabledReason: string | null;
   privacy: Phase3Privacy;
   projects: Phase3ProjectCandidate[];
+  windows: Phase3Window[];
   capabilities: Record<string, boolean>;
 }
 
@@ -89,7 +105,7 @@ export function parsePhase3State(value: unknown): Phase3State {
     return {
       status: 'unavailable', reason: reason(item), nativeAvailable: false,
       disabledReason: reason(item), privacy: { optedIn: false, mode: 'off', paused: false },
-      projects: [], capabilities: {},
+      projects: [], windows: [], capabilities: {},
     };
   }
   const privacy = record(item.privacy ?? {});
@@ -103,6 +119,15 @@ export function parsePhase3State(value: unknown): Phase3State {
       mode: typeof privacy.mode === 'string' ? privacy.mode : 'off',
       paused: privacy.paused === true,
     },
+    windows: (Array.isArray(item.windows) ? item.windows : []).map((raw) => {
+      const w = record(raw);
+      return {
+        windowId: String(w.windowId ?? ''),
+        appId: typeof w.appId === 'string' ? w.appId : null,
+        appDisplayName: String(w.appDisplayName ?? ''),
+        version: String(w.version ?? ''),
+      };
+    }),
     projects: projects.map((raw) => {
       const c = record(raw);
       return {
@@ -114,6 +139,20 @@ export function parsePhase3State(value: unknown): Phase3State {
       };
     }),
     capabilities: (item.capabilities ?? {}) as Record<string, boolean>,
+  };
+}
+
+export function parsePhase3Prepared(value: unknown): Phase3Prepared {
+  const item = record(value);
+  if (item.status === 'unavailable') return { status: 'unavailable', reason: reason(item) };
+  const preview = (item.preview ?? {}) as Record<string, unknown>;
+  const flat: Record<string, string> = {};
+  for (const [k, v] of Object.entries(preview)) flat[k] = String(v ?? '');
+  return {
+    status: 'ready',
+    taskId: typeof item.taskId === 'string' ? item.taskId : undefined,
+    stepId: typeof item.stepId === 'string' ? item.stepId : undefined,
+    preview: flat,
   };
 }
 

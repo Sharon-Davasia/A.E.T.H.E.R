@@ -63,19 +63,22 @@ const phase3Provider = createPhase3Provider({
   confirm: async (summary: Phase3InteractionSummary) => {
     if (!mainWindow || mainWindow.isDestroyed()) return false;
     const detail = [
-      `Capability: ${summary.capabilityId}`,
-      `Window: ${summary.windowId}`,
-      `Element: ${summary.elementRef}`,
+      `Application: ${summary.appDisplayName}`,
+      `Operation: ${summary.capabilityId}`,
+      `Target window: ${summary.windowId}`,
+      summary.elementRef ? `Fixture control: ${summary.elementRef}` : '',
+      `Verified precondition: ${summary.verifiedPrecondition}`,
       `Intended effect: ${summary.intendedEffect}`,
-      `Expected result: ${summary.expectedPostcondition}`,
-    ].join('\n');
+      `Expected postcondition: ${summary.expectedPostcondition}`,
+      `Task (diagnostic): ${summary.taskId}`,
+    ].filter(Boolean).join('\n');
     const result = await dialog.showMessageBox(mainWindow, {
       type: 'warning',
       buttons: ['Cancel', 'Approve exact action'],
       defaultId: 0,
       cancelId: 0,
-      title: 'AETHER — confirm fixture interaction',
-      message: 'Approve this exact UI operation?',
+      title: 'AETHER — confirm exact operation',
+      message: `Approve this exact operation for ${summary.appDisplayName}?`,
       detail,
     });
     return result.response === 1;
@@ -254,7 +257,10 @@ function registerIpc(): void {
   });
   ipcMain.handle('desktop:phase3-approve-interaction', async (event, raw: unknown) => {
     validateInvoke(event);
-    return phase3Provider.approveFixtureInteraction(phase3TaskId(raw));
+    if (typeof raw === 'string') return phase3Provider.approveFixtureInteraction(phase3TaskId(raw));
+    const item = raw as { taskId?: unknown; preview?: unknown } | null;
+    if (!item || typeof item !== 'object') throw new Error('malformed phase3 interaction');
+    return phase3Provider.approveFixtureInteraction(phase3TaskId(item.taskId), item.preview as never);
   });
   ipcMain.handle('desktop:phase3-task', async (event, raw: unknown) => {
     validateInvoke(event);
@@ -263,6 +269,51 @@ function registerIpc(): void {
   ipcMain.handle('desktop:phase3-pause-task', async (event, raw: unknown) => {
     validateInvoke(event);
     return phase3Provider.pauseTask(phase3TaskId(raw));
+  });
+  const phase3BoundedId = (raw: unknown): string => {
+    if (typeof raw !== 'string' || raw.length < 1 || raw.length > 256) {
+      throw new Error('malformed phase3 identity');
+    }
+    return raw;
+  };
+  ipcMain.handle('desktop:phase3-list-windows', async (event) => {
+    validateInvoke(event);
+    return phase3Provider.listWindows();
+  });
+  ipcMain.handle('desktop:phase3-prepare-launch', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.prepareLaunch(phase3BoundedId(raw));
+  });
+  ipcMain.handle('desktop:phase3-prepare-activation', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.prepareActivation(phase3BoundedId(raw));
+  });
+  ipcMain.handle('desktop:phase3-prepare-fixture', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.prepareFixture(phase3BoundedId(raw));
+  });
+  ipcMain.handle('desktop:phase3-approve-operation', async (event, raw: unknown) => {
+    validateInvoke(event);
+    const item = raw as { taskId?: unknown; effect?: unknown; preview?: unknown } | null;
+    if (!item || typeof item !== 'object' || (item.effect !== 'app.launch' && item.effect !== 'window.activate')) {
+      throw new Error('malformed phase3 operation');
+    }
+    return phase3Provider.approveOperation(
+      phase3TaskId(item.taskId), item.effect,
+      item.preview as never,
+    );
+  });
+  ipcMain.handle('desktop:phase3-receipt', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.getReceipt(phase3TaskId(raw));
+  });
+  ipcMain.handle('desktop:phase3-cancel-task', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.cancelTask(phase3TaskId(raw));
+  });
+  ipcMain.handle('desktop:phase3-resume-task', async (event, raw: unknown) => {
+    validateInvoke(event);
+    return phase3Provider.resumeTask(phase3TaskId(raw));
   });
   // FI-02 workflow steps. The renderer requests operations; main owns
   // every identity. Project registration additionally requires a native

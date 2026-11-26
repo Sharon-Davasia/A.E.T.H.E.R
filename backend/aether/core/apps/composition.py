@@ -197,6 +197,7 @@ class Phase3Composition:
         launch_registry: object | None = None,
         activation_service: WindowActivationService | None = None,
         gesture_key: bytes | None = None,
+        planner: object | None = None,
     ) -> Phase3Composition:
         """Explicit isolated simulated acceptance composition.
 
@@ -317,7 +318,7 @@ class Phase3Composition:
                 dialog_present=_dialog_present,
                 worker=worker,
             )
-            planner = Planner(
+            planner = planner or Planner(
                 capabilities=capabilities,
                 resources=ResourceRegistry(windows_semantics=False),
                 app_authority=authority,

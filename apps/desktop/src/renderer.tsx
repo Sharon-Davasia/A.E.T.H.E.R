@@ -4,7 +4,7 @@ import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
 import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
 import { Phase3Surface } from './Phase3Surface';
-import type { Phase3Outcome, Phase3Snapshot, Phase3State } from '../shared/phase3';
+import type { Phase3AppResult, Phase3Outcome, Phase3Prepared, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
 import { describeLiveApprovalOutcome } from '../shared/live';
 import type {
   LiveApprovalState,
@@ -43,9 +43,17 @@ declare global {
       phase3SetPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }) => Promise<Phase3State>;
       phase3SearchApps: (query: string) => Promise<unknown>;
       phase3InspectWindow: (windowId: string) => Promise<Phase3Snapshot>;
-      phase3ApproveInteraction: (taskId: string) => Promise<Phase3Outcome>;
+      phase3ApproveInteraction: (request: string | { taskId: string; preview?: Phase3Prepared }) => Promise<Phase3Outcome>;
       phase3GetTask: (taskId: string) => Promise<{ status: string; taskState?: string; attempts?: unknown[] }>;
       phase3PauseTask: (taskId: string) => Promise<Phase3Outcome>;
+      phase3ListWindows: () => Promise<Phase3Window[]>;
+      phase3PrepareLaunch: (appId: string) => Promise<Phase3Prepared>;
+      phase3PrepareActivation: (windowId: string) => Promise<Phase3Prepared>;
+      phase3PrepareFixture: (windowId: string) => Promise<Phase3Prepared>;
+      phase3ApproveOperation: (request: { taskId: string; effect: string; preview?: Phase3Prepared }) => Promise<Phase3Outcome>;
+      phase3GetReceipt: (taskId: string) => Promise<unknown>;
+      phase3CancelTask: (taskId: string) => Promise<Phase3Outcome>;
+      phase3ResumeTask: (taskId: string) => Promise<Phase3Outcome>;
       getWorkflowState: () => Promise<{
         project: RegisteredProject | null;
         file: { resourceId: string } | null;
@@ -75,10 +83,14 @@ function App(): React.JSX.Element {
   const [phase3Snapshot, setPhase3Snapshot] = React.useState<Phase3Snapshot | null>(null);
   const [phase3Outcome, setPhase3Outcome] = React.useState<Phase3Outcome | null>(null);
   const [phase3Busy, setPhase3Busy] = React.useState(false);
+  const [phase3Apps, setPhase3Apps] = React.useState<Phase3AppResult[]>([]);
+  const [phase3Windows, setPhase3Windows] = React.useState<Phase3Window[]>([]);
+  const [phase3Prepared, setPhase3Prepared] = React.useState<Phase3Prepared | null>(null);
+  const [phase3Receipt, setPhase3Receipt] = React.useState<unknown>(null);
 
   const refreshPhase3 = React.useCallback(async (): Promise<void> => {
     try { setPhase3State(await window.aetherDesktop.phase3GetState()); }
-    catch { setPhase3State({ status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false, disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false }, projects: [], capabilities: {} }); }
+    catch { setPhase3State({ status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false, disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false }, projects: [], windows: [], capabilities: {} }); }
   }, []);
 
   React.useEffect(() => {
@@ -90,7 +102,7 @@ function App(): React.JSX.Element {
           setPhase3State({
             status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false,
             disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false },
-            projects: [], capabilities: {},
+            projects: [], windows: [], capabilities: {},
           });
         }
       });
@@ -109,17 +121,12 @@ function App(): React.JSX.Element {
     finally { setPhase3Busy(false); }
   }
 
-  async function phase3Approve(taskId: string): Promise<void> {
+  async function phase3Run<T>(fn: () => Promise<T>, apply: (value: T) => void): Promise<void> {
     setPhase3Busy(true);
-    try { setPhase3Outcome(await window.aetherDesktop.phase3ApproveInteraction(taskId)); }
-    finally { setPhase3Busy(false); }
+    try { apply(await fn()); } finally { setPhase3Busy(false); }
   }
 
-  async function phase3Pause(taskId: string): Promise<void> {
-    setPhase3Busy(true);
-    try { setPhase3Outcome(await window.aetherDesktop.phase3PauseTask(taskId)); }
-    finally { setPhase3Busy(false); }
-  }
+  const phase3TaskId = (): string | null => phase3Prepared?.taskId ?? null;
 
 
   React.useEffect(() => {
@@ -299,14 +306,65 @@ function App(): React.JSX.Element {
     />
     <Phase3Surface
       state={phase3State}
+      apps={phase3Apps}
+      windows={phase3Windows}
       snapshot={phase3Snapshot}
+      prepared={phase3Prepared}
       outcome={phase3Outcome}
+      receipt={phase3Receipt}
       busy={phase3Busy}
-      onRefresh={() => void refreshPhase3()}
+      onRefresh={() => {
+        void refreshPhase3();
+        void phase3Run(() => window.aetherDesktop.phase3ListWindows(), setPhase3Windows);
+      }}
       onPrivacy={(privacy) => void phase3Privacy(privacy)}
+      onSearchApps={(query) => void phase3Run(
+        () => window.aetherDesktop.phase3SearchApps(query) as Promise<Phase3AppResult[]>, setPhase3Apps,
+      )}
+      onPrepareLaunch={(appId) => void phase3Run(
+        () => window.aetherDesktop.phase3PrepareLaunch(appId), setPhase3Prepared,
+      )}
+      onApproveOperation={(effect) => {
+        const taskId = phase3TaskId();
+        if (taskId) {
+          void phase3Run(
+            () => window.aetherDesktop.phase3ApproveOperation({ taskId, effect, preview: phase3Prepared ?? undefined }),
+            setPhase3Outcome,
+          );
+        }
+      }}
       onInspect={(windowId) => void phase3Inspect(windowId)}
-      onApproveInteraction={(taskId) => void phase3Approve(taskId)}
-      onPauseTask={(taskId) => void phase3Pause(taskId)}
+      onPrepareActivation={(windowId) => void phase3Run(
+        () => window.aetherDesktop.phase3PrepareActivation(windowId), setPhase3Prepared,
+      )}
+      onPrepareFixture={(windowId) => void phase3Run(
+        () => window.aetherDesktop.phase3PrepareFixture(windowId), setPhase3Prepared,
+      )}
+      onApproveFixture={() => {
+        const taskId = phase3TaskId();
+        if (taskId) {
+          void phase3Run(
+            () => window.aetherDesktop.phase3ApproveInteraction({ taskId, preview: phase3Prepared ?? undefined }),
+            setPhase3Outcome,
+          );
+        }
+      }}
+      onPauseTask={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3PauseTask(taskId), setPhase3Outcome);
+      }}
+      onCancelTask={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3CancelTask(taskId), setPhase3Outcome);
+      }}
+      onResumeTask={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3ResumeTask(taskId), setPhase3Outcome);
+      }}
+      onShowReceipt={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3GetReceipt(taskId), setPhase3Receipt);
+      }}
     />
     <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires the trusted approval window (complete exact preview with explicit review acknowledgement) and production grant issuance. Issuance is enabled only for the controlled acceptance fixture — validated fixture storage and its designated project directory. In ordinary application launches, issuance and execution remain disabled: an approved gesture is refused and nothing executes.</p>
   </main>;

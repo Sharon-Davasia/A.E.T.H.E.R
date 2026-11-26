@@ -541,6 +541,54 @@ export class BackendClient {
     return this.request(session, 'phase3.approve_interaction', payload, ['phase3.outcome', 'phase3.error']);
   }
 
+  async phase3ListWindows(): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.list_windows', {}, ['phase3.windows', 'phase3.error']);
+  }
+
+  async phase3PrepareLaunch(appId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.prepare_launch', { appId }, ['phase3.prepared', 'phase3.error']);
+  }
+
+  async phase3PrepareActivation(windowId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.prepare_activation', { windowId }, ['phase3.prepared', 'phase3.error']);
+  }
+
+  async phase3PrepareFixture(windowId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.prepare_fixture', { windowId }, ['phase3.prepared', 'phase3.error']);
+  }
+
+  async phase3PreviewOperation(taskId: string, effect: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.preview_operation', { taskId, effect }, ['phase3.preview', 'phase3.error']);
+  }
+
+  async phase3ApproveOperation(payload: {
+    taskId: string; effect: string; nonce: string; assertedAt: string; userIntent: string; signature: string;
+    binding: { taskId: string; planRevision: number; planHash: string; previewId: string; previewDigest: string; scopeDigest: string };
+  }): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.approve_operation', payload, ['phase3.outcome', 'phase3.error']);
+  }
+
+  async phase3GetReceipt(taskId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.get_receipt', { taskId }, ['phase3.receipt', 'phase3.error']);
+  }
+
+  async phase3CancelTask(taskId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.cancel_task', { taskId }, ['phase3.task', 'phase3.error']);
+  }
+
+  async phase3ResumeTask(taskId: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.resume_task', { taskId }, ['phase3.task', 'phase3.error']);
+  }
+
   async phase3GetTask(taskId: string): Promise<unknown> {
     const session = this.reviewSession();
     return this.request(session, 'phase3.get_task', { taskId }, ['phase3.task', 'phase3.error']);

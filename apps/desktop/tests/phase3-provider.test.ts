@@ -111,3 +111,38 @@ test('only one approval may be outstanding', async () => {
   release?.();
   assert.equal((await first).outcome, 'SUCCEEDED');
 });
+
+test('G02 launch approval binds human app identity and precondition', async () => {
+  const backend = fakeBackend({
+    phase3PreviewOperation: async (taskId: string) => ({
+      status: 'ready',
+      nonce: 'a'.repeat(64),
+      binding: {
+        taskId, planRevision: 1, planHash: 'b'.repeat(64), previewId: TASK,
+        previewDigest: 'c'.repeat(64), scopeDigest: 'd'.repeat(64),
+      },
+      preview: {
+        appDisplayName: 'Notepad', operation: 'app.launch',
+        expectedPostcondition: 'verified by independent observation',
+      },
+    }),
+    phase3ApproveOperation: async () => ({ status: 'ready', outcome: 'SUCCEEDED', detail: 'verified_new_instance', attemptId: 'att-9' }),
+  });
+  let seen: Phase3InteractionSummary | undefined;
+  const provider = createPhase3Provider({
+    backend: backend as never,
+    confirm: async (summary) => { seen = summary; return true; },
+  });
+  const outcome = await provider.approveOperation(TASK, 'app.launch', {
+    status: 'ready', taskId: TASK, preview: { appDisplayName: 'Notepad', verifiedPrecondition: 'registered app identity verified' },
+  });
+  assert.equal(outcome.outcome, 'SUCCEEDED');
+  assert.equal(seen?.appDisplayName, 'Notepad');
+  assert.equal(seen?.verifiedPrecondition, 'registered app identity verified');
+});
+
+test('G02 refuses unapproved operation kinds before preview', async () => {
+  const provider = createPhase3Provider({ backend: fakeBackend() as never, confirm: async () => true });
+  const outcome = await provider.approveOperation(TASK, 'uia.set_value');
+  assert.equal(outcome.reason, 'capability_not_approved_for_interaction');
+});

@@ -250,3 +250,90 @@ def test_fixture_contract_rejects_fake_runtime_ids(tmp_path: Path) -> None:
             resolve_fixture_elements(snapshot)
     finally:
         composition.shutdown()
+
+
+def test_simulated_launch_workflow_through_bridge(tmp_path: Path) -> None:
+    """§11 chain segment: discovery -> persisted launch plan -> trusted
+    gesture -> broker -> durable attempt -> simulated launch ->
+    independent verification -> receipt. Launch platform is simulated;
+    every policy/planning/persistence component is real."""
+    from test_phase3_launch import _World as LaunchWorld
+
+    from aether.core.planning.planner import Planner
+    from aether.core.resources.registry import ResourceRegistry
+
+    launch = LaunchWorld(tmp_path / "launch")
+    (tmp_path / "launch").mkdir(exist_ok=True)
+    try:
+        planner = Planner(
+            capabilities=launch.capabilities,
+            resources=ResourceRegistry(windows_semantics=False),
+            app_authority=launch.app_authority,
+            app_registry=launch.registry,
+            integrity_verifier=launch.verifier_evidence,
+            clock=lambda: NOW,
+        )
+        composition = Phase3Composition.simulated(
+            store=launch.store,
+            fixture=FixtureApp(),
+            fixture_record=_fixture_record(),
+            clock=lambda: NOW,
+            gesture_key=KEY,
+            launch_coordinator=launch.coordinator,
+            launch_authority=launch.authority,
+            launch_registry=launch.registry,
+            planner=planner,
+        )
+        bridge = composition.bridge
+        # The launch world's app is discoverable through the surface.
+        records = bridge.search_apps({"query": ""})
+        assert records["status"] == "ready"
+        prepared = bridge.prepare_launch({"appId": launch.record.app_id})
+        if prepared["status"] != "ready":
+            # Surface app_records is the fixture record in this
+            # composition; prepare against the launch registry record
+            # directly documents the wiring requirement.
+            raise AssertionError(prepared)
+        preview = bridge.preview_operation(
+            {"taskId": prepared["taskId"], "effect": "app.launch"}
+        )
+        assert preview["status"] == "ready", preview
+        outcome = _approve_operation(bridge, prepared["taskId"], "app.launch", preview)
+        assert outcome["status"] == "ready" and outcome["outcome"] == "SUCCEEDED", outcome
+        receipt = bridge.get_receipt({"taskId": prepared["taskId"]})
+        assert receipt["taskState"] == "COMPLETED"
+        assert receipt["navigationAttempts"][0]["receipt_status"] == "SUCCEEDED"
+        composition.revoke("test-done")
+    finally:
+        launch.close()
+
+
+def _approve_operation(bridge, task_id, effect, preview):  # type: ignore[no-untyped-def]
+    from aether.core.planning.authorizing_gesture import (
+        GestureBinding,
+        TrustedGestureAuthority,
+    )
+
+    authority = TrustedGestureAuthority(
+        key=KEY, nonces=bridge.surface.nonces, clock=lambda: NOW  # type: ignore[arg-type]
+    )
+    binding = GestureBinding(
+        task_id=_uuid(task_id),
+        plan_revision=preview["binding"]["planRevision"],
+        plan_hash=preview["binding"]["planHash"],
+        preview_id=_uuid(preview["binding"]["previewId"]),
+        preview_digest=preview["binding"]["previewDigest"],
+        scope_digest=preview["binding"]["scopeDigest"],
+    )
+    gesture = authority.sign(nonce=preview["nonce"], binding=binding, user_intent="APPROVE")
+    return bridge.approve_operation(
+        {
+            "taskId": task_id,
+            "effect": effect,
+            "nonce": preview["nonce"],
+            "assertedAt": gesture.asserted_at.isoformat(),
+            "userIntent": "APPROVE",
+            "signature": gesture.signature,
+            "binding": preview["binding"],
+        }
+    )
