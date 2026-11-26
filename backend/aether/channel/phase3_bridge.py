@@ -57,13 +57,13 @@ class Phase3Surface:
     native_reason: str = "phase3_native_disabled"
     # G01/G06: trusted-composition wiring (all optional; absent =
     # the corresponding workflow is truthfully unavailable).
-    privacy_authority: object | None = None  # ObservationPrivacyAuthority
-    planner: object | None = None  # Planner
-    launch_coordinator: object | None = None  # TrustedLaunchCoordinator
-    launch_authority: object | None = None  # LaunchAuthority
-    launch_registry: object | None = None  # InMemoryApplicationRegistry
-    activation_service: object | None = None  # WindowActivationService
-    dialog_guard: object | None = None  # DialogGuard
+    privacy_authority: ObservationPrivacyAuthority | None = None
+    planner: Planner | None = None
+    launch_coordinator: TrustedLaunchCoordinator | None = None
+    launch_authority: LaunchAuthority | None = None
+    launch_registry: InMemoryApplicationRegistry | None = None
+    activation_service: WindowActivationService | None = None
+    dialog_guard: DialogGuard | None = None
 
     @classmethod
     def disabled(cls) -> Phase3Surface:
@@ -71,17 +71,25 @@ class Phase3Surface:
 
 
 if TYPE_CHECKING:
+    from aether.core.apps.activation import WindowActivationService
+    from aether.core.apps.composition import ObservationPrivacyAuthority
+    from aether.core.apps.dialogs import DialogGuard
     from aether.core.apps.enablement import Phase3Enablement  # noqa: F401
+    from aether.core.apps.launch_authority import LaunchAuthority
+    from aether.core.apps.launcher import TrustedLaunchCoordinator
     from aether.core.apps.recovery import RecoveryService
+    from aether.core.apps.registry import InMemoryApplicationRegistry
     from aether.core.apps.ui_executor import UiOperationExecutor
     from aether.core.apps.uia_snapshot import UiaSnapshotService
     from aether.core.context.project_detection import ProjectDetector
     from aether.core.contracts.app_window import ApplicationRecord
     from aether.core.persistence.sqlite_store import SQLiteTaskStore
     from aether.core.planning.authorizing_gesture import (
+        GestureBinding,
         GestureNonceRegister,
         TrustedGestureAuthority,
     )
+    from aether.core.planning.planner import PlanGoal, PlannedRevision, Planner
     from aether.core.resources.app_window_authority import AppWindowResourceAuthority
 
 
@@ -134,7 +142,7 @@ class Phase3Bridge:
                     for w in surface.authority.known_windows()
                 ]
             privacy_state = (
-                surface.privacy_authority.snapshot_dict()  # type: ignore[attr-defined]
+                surface.privacy_authority.snapshot_dict()
                 if surface.privacy_authority is not None
                 else dict(surface.privacy)
             )
@@ -165,7 +173,7 @@ class Phase3Bridge:
                 # G06: update the authoritative observation policy;
                 # its listeners purge snapshots and approvals. The
                 # bridge dictionary is never the source of truth.
-                privacy = self.surface.privacy_authority.update(  # type: ignore[attr-defined]
+                privacy = self.surface.privacy_authority.update(
                     opted_in=bool(update.get("optedIn", False)),
                     mode=str(update.get("mode", "off")),
                     paused=bool(update.get("paused", False)),
@@ -406,7 +414,7 @@ class Phase3Bridge:
                         "appDisplayName": app_names.get(w.app_resource_id or "", ""),
                         "version": w.version_token,
                     }
-                    for w in self.surface.authority.known_windows()  # type: ignore[attr-defined]
+                    for w in self.surface.authority.known_windows()
                 ],
             }
 
@@ -415,7 +423,9 @@ class Phase3Bridge:
     def _now(self) -> datetime:
         return datetime.now(UTC)
 
-    def _create_planned_task(self, *, goal: object, resource_id: str, arguments: dict[str, object], summary: str) -> tuple[UUID, object]:
+    def _create_planned_task(
+        self, *, goal: PlanGoal, resource_id: str, arguments: dict[str, object], summary: str
+    ) -> tuple[UUID, PlannedRevision]:
         surface = self.surface
         if surface.store is None or surface.planner is None:
             raise _Phase3Refused("phase3_surface_incomplete")
@@ -423,9 +433,9 @@ class Phase3Bridge:
 
         task = surface.store.create_task(summary, now=self._now())
         surface.store.transition_task(task.task_id, PersistentTaskState.PLANNING, now=self._now())
-        planned = surface.planner.plan(  # type: ignore[attr-defined]
+        planned = surface.planner.plan(
             task.task_id,
-            PlanIntent(goal=goal, resource_id=resource_id, arguments=arguments, summary=summary),  # type: ignore[arg-type]
+            PlanIntent(goal=goal, resource_id=resource_id, arguments=arguments, summary=summary),
         )
         surface.store.save_plan(planned.plan)
         for state in (
@@ -455,7 +465,10 @@ class Phase3Bridge:
             task_id, planned = self._create_planned_task(
                 goal=PlanGoal.LAUNCH_APPLICATION,
                 resource_id=app_id,
-                arguments={"resource_id": app_id, "postcondition": str(payload.get("postcondition", "window_required"))},
+                arguments={
+                    "resource_id": app_id,
+                    "postcondition": str(payload.get("postcondition", "window_required")),
+                },
                 summary=f"Launch {self._app_summary(app_id)['appDisplayName']}",
             )
             return {
@@ -505,7 +518,7 @@ class Phase3Bridge:
     def _window_summary(self, window_id: str) -> dict[str, object]:
         if self.surface.authority is None:
             raise _Phase3Refused("window_unknown")
-        binding = self.surface.authority.resolve_window(window_id)  # type: ignore[attr-defined]
+        binding = self.surface.authority.resolve_window(window_id)
         summary = self._app_summary(binding.app_resource_id or "")
         return {
             "windowId": window_id,
@@ -557,7 +570,9 @@ class Phase3Bridge:
                     None,
                 )
                 if status_el is None or increment_el is None:
-                    raise FixtureContractError("fixture control contract is not satisfied") from None
+                    raise FixtureContractError(
+                        "fixture control contract is not satisfied"
+                    ) from None
                 elements = FixtureElements(
                     status=status_el,
                     increment=increment_el,
@@ -592,7 +607,9 @@ class Phase3Bridge:
 
     # -- G02: generic trusted-gesture preview/approval for launch/activate --
 
-    def _gesture_binding(self, task_id: UUID, effect: str) -> tuple[object, dict[str, object]]:
+    def _gesture_binding(
+        self, task_id: UUID, effect: str
+    ) -> tuple[GestureBinding, dict[str, object]]:
         from aether.core.planning.authorizing_gesture import GestureBinding
 
         parts = self._preview_parts(task_id)
@@ -618,6 +635,7 @@ class Phase3Bridge:
 
     def preview_operation(self, payload: object) -> dict[str, object]:
         """Preview a launch/activation task for trusted approval."""
+
         def run() -> dict[str, object]:
             if not isinstance(payload, dict) or set(payload) != {"taskId", "effect"}:
                 raise _Phase3Refused("invalid_request")
@@ -628,7 +646,7 @@ class Phase3Bridge:
             binding, parts = self._gesture_binding(task_id, effect)
             if self.surface.nonces is None:
                 raise _Phase3Refused("phase3_surface_incomplete")
-            nonce = self.surface.nonces.issue(binding)  # type: ignore[attr-defined]
+            nonce = self.surface.nonces.issue(binding)
             arguments = parts["arguments"]
             resource_id = str(arguments.get("resource_id")) if isinstance(arguments, dict) else ""
             summary = (
@@ -640,12 +658,12 @@ class Phase3Bridge:
                 "status": "ready",
                 "nonce": nonce,
                 "binding": {
-                    "taskId": str(binding.task_id),  # type: ignore[attr-defined]
-                    "planRevision": binding.plan_revision,  # type: ignore[attr-defined]
-                    "planHash": binding.plan_hash,  # type: ignore[attr-defined]
-                    "previewId": str(binding.preview_id),  # type: ignore[attr-defined]
-                    "previewDigest": binding.preview_digest,  # type: ignore[attr-defined]
-                    "scopeDigest": binding.scope_digest,  # type: ignore[attr-defined]
+                    "taskId": str(binding.task_id),
+                    "planRevision": binding.plan_revision,
+                    "planHash": binding.plan_hash,
+                    "previewId": str(binding.preview_id),
+                    "previewDigest": binding.preview_digest,
+                    "scopeDigest": binding.scope_digest,
                 },
                 "preview": {
                     **parts,
@@ -660,6 +678,7 @@ class Phase3Bridge:
 
     def approve_operation(self, payload: object) -> dict[str, object]:
         """Verify a trusted gesture and execute one launch/activation."""
+
         def run() -> dict[str, object]:
             if not isinstance(payload, dict) or "effect" not in payload:
                 raise _Phase3Refused("invalid_request")
@@ -667,33 +686,54 @@ class Phase3Bridge:
             gesture_payload = {k: v for k, v in payload.items() if k != "effect"}
             verified = self._verify_gesture(gesture_payload, effect)
             task_id = verified["task_id"]
+            if not isinstance(task_id, UUID):
+                raise _Phase3Refused("binding_mismatch")
             plan = verified["plan"]
-            step = plan.steps[0]
+            step = plan.steps[0]  # type: ignore[attr-defined]
             if effect == "app.launch":
                 coordinator = self.surface.launch_coordinator
                 authority = self.surface.launch_authority
                 registry = self.surface.launch_registry
                 if coordinator is None or authority is None or registry is None:
                     return self._unavailable()
-                record = registry.get(str(verified["arguments"].get("resource_id")))  # type: ignore[attr-defined]
-                confirmation = coordinator.issue_confirmation(task_id, step.step_id)  # type: ignore[attr-defined]
-                authorization = authority.authorize(  # type: ignore[attr-defined]
+                arguments = verified["arguments"]
+                if not isinstance(arguments, dict):
+                    raise _Phase3Refused("binding_mismatch")
+                record = registry.get(str(arguments.get("resource_id")))
+                confirmation = coordinator.issue_confirmation(task_id, step.step_id)
+                authorization = authority.authorize(
                     record, session_id="session-1", activation_scope="test-scope"
                 )
-                outcome = coordinator.execute(  # type: ignore[attr-defined]
+                outcome = coordinator.execute(
                     task_id,
                     step.step_id,
                     confirmation_id=confirmation.confirmation_id,
                     authorization_id=authorization.authorization_id,
                 )
-                return {"status": "ready", "outcome": outcome.status, "detail": outcome.outcome.value if hasattr(outcome.outcome, "value") else str(outcome.outcome), "attemptId": outcome.attempt_id}
+                return {
+                    "status": "ready",
+                    "outcome": outcome.status,
+                    "detail": outcome.outcome.value
+                    if hasattr(outcome.outcome, "value")
+                    else str(outcome.outcome),
+                    "attemptId": outcome.attempt_id,
+                }
             if effect == "window.activate":
                 service = self.surface.activation_service
                 if service is None:
                     return self._unavailable()
                 confirmation_id = service.issue_confirmation(task_id, step.step_id)
-                outcome = service.execute(task_id, step.step_id, confirmation_id=confirmation_id)
-                return {"status": "ready", "outcome": outcome.status, "detail": outcome.outcome.value if hasattr(outcome.outcome, "value") else str(outcome.outcome), "attemptId": outcome.attempt_id}
+                activation_outcome = service.execute(
+                    task_id, step.step_id, confirmation_id=confirmation_id
+                )
+                return {
+                    "status": "ready",
+                    "outcome": activation_outcome.status,
+                    "detail": activation_outcome.outcome.value
+                    if hasattr(activation_outcome.outcome, "value")
+                    else str(activation_outcome.outcome),
+                    "attemptId": activation_outcome.attempt_id,
+                }
             raise _Phase3Refused("capability_not_approved_for_interaction")
 
         return self._guarded(run)
@@ -713,18 +753,22 @@ class Phase3Bridge:
             asserted = asserted.replace(tzinfo=UTC)
         gesture = SignedGesture(
             nonce=str(payload["nonce"]),
-            binding=expected,  # type: ignore[arg-type]
+            binding=expected,
             asserted_at=asserted,
             user_intent=str(payload["userIntent"]),
             signature=str(payload["signature"]),
         )
         try:
-            self.surface.gesture_authority.verify(gesture, expected=expected)  # type: ignore[attr-defined]
+            self.surface.gesture_authority.verify(gesture, expected=expected)
         except GestureRejected as exc:
             raise _Phase3Refused(exc.reason_code) from exc
         plan = self.surface.store.get_plan(task_id)
         arguments = parts["arguments"]
-        return {"task_id": task_id, "plan": plan, "arguments": arguments if isinstance(arguments, dict) else {}}
+        return {
+            "task_id": task_id,
+            "plan": plan,
+            "arguments": arguments if isinstance(arguments, dict) else {},
+        }
 
     def get_receipt(self, payload: object) -> dict[str, object]:
         def run() -> dict[str, object]:
@@ -750,9 +794,18 @@ class Phase3Bridge:
                 raise _Phase3Refused("invalid_request")
             task_id = UUID(str(payload["taskId"]))
             task = self.surface.store.get_task(task_id)
-            if task.state in (PersistentTaskState.PLANNING, PersistentTaskState.AWAITING_APPROVAL, PersistentTaskState.PAUSED):
-                self.surface.store.transition_task(task_id, PersistentTaskState.CANCELLED, now=self._now())
-            return {"status": "ready", "taskState": PersistentTaskState(self.surface.store.get_task(task_id).state).value}
+            if task.state in (
+                PersistentTaskState.PLANNING,
+                PersistentTaskState.AWAITING_APPROVAL,
+                PersistentTaskState.PAUSED,
+            ):
+                self.surface.store.transition_task(
+                    task_id, PersistentTaskState.CANCELLED, now=self._now()
+                )
+            return {
+                "status": "ready",
+                "taskState": PersistentTaskState(self.surface.store.get_task(task_id).state).value,
+            }
 
         return self._guarded(run)
 
@@ -763,6 +816,7 @@ class Phase3Bridge:
             if not isinstance(payload, dict) or set(payload) != {"taskId"}:
                 raise _Phase3Refused("invalid_request")
             task_id = UUID(str(payload["taskId"]))
+
             # Fresh precheck is mandatory: a fresh snapshot must be
             # obtainable and no consumed approval is ever replayed
             # (approval_valid is therefore always False here; resume
@@ -770,7 +824,9 @@ class Phase3Bridge:
             def _no_consumed_authorization(tid: UUID) -> bool:
                 if self.surface.store is None:
                     return False
-                attempts = self.surface.store.ui_attempts_for_task(tid) + self.surface.store.navigation_attempts_for_task(tid)
+                attempts = self.surface.store.ui_attempts_for_task(
+                    tid
+                ) + self.surface.store.navigation_attempts_for_task(tid)
                 return not attempts
 
             assessment = self.surface.recovery.resume(
@@ -779,7 +835,11 @@ class Phase3Bridge:
                 approval_valid=_no_consumed_authorization,
                 now=self._now(),
             )
-            return {"status": "ready", "classification": assessment.classification.value, "reason": assessment.redacted_reason}
+            return {
+                "status": "ready",
+                "classification": assessment.classification.value,
+                "reason": assessment.redacted_reason,
+            }
 
         return self._guarded(run)
 

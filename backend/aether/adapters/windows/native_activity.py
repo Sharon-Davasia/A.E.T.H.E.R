@@ -68,14 +68,14 @@ class NativeActivitySource:
         # resolved only through the app/window authority (injected by
         # trusted composition). Unresolvable foreground = None, which
         # the focus coordinator treats conservatively.
-        self._resolve_window_id = resolve_window_id
+        self._resolve_window_id: Callable[[int], str | None] | None = resolve_window_id
         self._hook: int | None = None
         self._focus_hook: int | None = None
         self._callback: object = None
         self._focus_callback: object = None
         self._thread: object = None
         self._thread_id: int | None = None
-        self._started = False
+        self._started: bool = False
 
     def start(self) -> None:  # pragma: no cover - Windows-only
         """Install hooks on a dedicated hook thread and pump messages.
@@ -115,33 +115,69 @@ class NativeActivitySource:
 
             def _window_id(hwnd: object) -> str | None:
                 try:
-                    return resolve(int(hwnd)) if resolve is not None and hwnd else None  # type: ignore[arg-type]
+                    return resolve(hwnd) if resolve is not None and isinstance(hwnd, int) else None
                 except Exception:
                     return None
 
-            def _foreground(hook: object, event: object, hwnd: object, id_object: object, id_child: object, thread: object, time_ms: object) -> None:
+            def _foreground(
+                hook: object,
+                event: object,
+                hwnd: object,
+                id_object: object,
+                id_child: object,
+                thread: object,
+                time_ms: object,
+            ) -> None:
                 # Content-free: foreground identity only, no input data.
-                emit(ActivitySignal(kind="foreground_changed", window_id=_window_id(hwnd), at=datetime.now(UTC)))
+                emit(
+                    ActivitySignal(
+                        kind="foreground_changed", window_id=_window_id(hwnd), at=datetime.now(UTC)
+                    )
+                )
 
-            def _focus(hook: object, event: object, hwnd: object, id_object: object, id_child: object, thread: object, time_ms: object) -> None:
+            def _focus(
+                hook: object,
+                event: object,
+                hwnd: object,
+                id_object: object,
+                id_child: object,
+                thread: object,
+                time_ms: object,
+            ) -> None:
                 # Same-window activity *signal* only: that focus moved
                 # inside a window. No key/pointer/clipboard content.
                 window_id = _window_id(hwnd)
                 if window_id is not None:
-                    emit(ActivitySignal(kind="manual_activity_in_window", window_id=window_id, at=datetime.now(UTC)))
+                    emit(
+                        ActivitySignal(
+                            kind="manual_activity_in_window",
+                            window_id=window_id,
+                            at=datetime.now(UTC),
+                        )
+                    )
 
             try:
                 self._callback = callback_type(_foreground)
                 self._focus_callback = callback_type(_focus)
                 self._hook = user32.SetWinEventHook(
-                    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, None,
-                    self._callback, 0, 0, WINEVENT_OUTOFCONTEXT,
+                    EVENT_SYSTEM_FOREGROUND,
+                    EVENT_SYSTEM_FOREGROUND,
+                    None,
+                    self._callback,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
                 )
                 if not self._hook:
                     raise NativeActivityDisabled("activity hook could not be installed")
                 self._focus_hook = user32.SetWinEventHook(
-                    EVENT_OBJECT_FOCUS, EVENT_OBJECT_FOCUS, None,
-                    self._focus_callback, 0, 0, WINEVENT_OUTOFCONTEXT,
+                    EVENT_OBJECT_FOCUS,
+                    EVENT_OBJECT_FOCUS,
+                    None,
+                    self._focus_callback,
+                    0,
+                    0,
+                    WINEVENT_OUTOFCONTEXT,
                 )
                 ready.append(None)
             except BaseException as exc:  # surfaced to start() caller

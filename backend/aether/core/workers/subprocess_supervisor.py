@@ -64,10 +64,13 @@ class SubprocessWorkerSupervisor:
                 assert self._process.stdin is not None
                 import json as _json
 
-                line = _json.dumps(
-                    {"operation": "bootstrap", "payload": self.bootstrap_payload},
-                    separators=(",", ":"),
-                ).encode("utf-8") + b"\n"
+                line = (
+                    _json.dumps(
+                        {"operation": "bootstrap", "payload": self.bootstrap_payload},
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                    + b"\n"
+                )
                 try:
                     self._process.stdin.write(line)
                     self._process.stdin.flush()

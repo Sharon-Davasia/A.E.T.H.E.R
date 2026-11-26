@@ -62,9 +62,7 @@ def parse_fixture_count(name: str | None) -> int:
     return int(match.group(1))
 
 
-def _unique(
-    snapshot: UiaSnapshot, *, automation_id: str, control_type: str
-) -> UiaElement:
+def _unique(snapshot: UiaSnapshot, *, automation_id: str, control_type: str) -> UiaElement:
     matches = [
         e
         for e in snapshot.elements
@@ -107,7 +105,10 @@ def validate_fixture_launch_identity(*, executable_identity: str, launch_method:
     normalized = executable_identity.replace("/", "\\").casefold()
     if normalized.endswith((".py", ".pyw", ".ps1", ".bat", ".cmd")):
         raise FixtureContractError("fixture scripts are not launchable")
-    if not normalized.endswith("\\" + FIXTURE_EXECUTABLE_NAME.casefold()) and normalized != FIXTURE_EXECUTABLE_NAME.casefold():
+    if (
+        not normalized.endswith("\\" + FIXTURE_EXECUTABLE_NAME.casefold())
+        and normalized != FIXTURE_EXECUTABLE_NAME.casefold()
+    ):
         raise FixtureContractError("fixture executable identity is not the approved build")
     if launch_method != "approved_executable":
         raise FixtureContractError("fixture launch method is not approved")

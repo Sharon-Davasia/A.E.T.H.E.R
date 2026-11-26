@@ -935,7 +935,7 @@ class SQLiteTaskStore:
             ).fetchone()
         if row is None:
             return None
-        return {key: row[key] for key in row.keys()}
+        return {key: row[key] for key in row.keys()}  # noqa: SIM118 - sqlite3.Row, not a dict
 
     def revoke_navigation_confirmation(self, confirmation_id: str, *, now: datetime) -> None:
         with self._transaction() as connection:

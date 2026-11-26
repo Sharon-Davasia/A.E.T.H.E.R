@@ -113,7 +113,9 @@ def open_acceptance_store(
                 or marker.get("schema_version") != 3
                 or marker.get("kind") != "aether-phase3-acceptance"
             ):
-                raise AcceptanceStorageError("acceptance storage marker does not match authorization")
+                raise AcceptanceStorageError(
+                    "acceptance storage marker does not match authorization"
+                )
     else:
         directory.mkdir(parents=True, mode=0o700)
         os.chmod(directory, 0o700)
@@ -130,9 +132,7 @@ def open_acceptance_store(
             encoding="utf-8",
         )
 
-    store = SQLiteTaskStore(
-        db_path, target_schema_version=3, _acceptance_pending_authorized=True
-    )
+    store = SQLiteTaskStore(db_path, target_schema_version=3, _acceptance_pending_authorized=True)
     # Reconcile interrupted operations before any new execution.
     store.reconcile_navigation_tasks(now=moment)
     store.reconcile_ui_tasks(now=moment)

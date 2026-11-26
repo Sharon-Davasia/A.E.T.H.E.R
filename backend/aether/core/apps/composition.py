@@ -25,6 +25,7 @@ sensors, workers or executable capabilities.
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -43,10 +44,14 @@ if TYPE_CHECKING:
     from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
     from aether.core.apps.activation import WindowActivationService
     from aether.core.apps.fixture import FixtureApp
+    from aether.core.apps.launch_authority import LaunchAuthority
     from aether.core.apps.launcher import TrustedLaunchCoordinator
+    from aether.core.apps.registry import InMemoryApplicationRegistry
     from aether.core.apps.ui_executor import UiOperationExecutor
     from aether.core.apps.uia_snapshot import UiaSnapshotService
+    from aether.core.contracts.app_window import ApplicationRecord
     from aether.core.persistence.sqlite_store import SQLiteTaskStore
+    from aether.core.planning.planner import Planner
     from aether.core.resources.app_window_authority import AppWindowResourceAuthority
     from aether.core.workers.subprocess_supervisor import SubprocessWorkerSupervisor
 
@@ -165,7 +170,7 @@ class Phase3Composition:
 
         privacy = ObservationPrivacyAuthority()
         surface = Phase3Surface.disabled()
-        surface.privacy_authority = privacy  # type: ignore[attr-defined]
+        surface.privacy_authority = privacy
         return cls(
             mode=Phase3Mode.DISABLED,
             surface=surface,
@@ -187,18 +192,18 @@ class Phase3Composition:
         *,
         store: SQLiteTaskStore,
         fixture: FixtureApp,
-        fixture_record: object,
+        fixture_record: ApplicationRecord,
         fixture_identity_token: str = "fixture-identity-v1",
         clock: Callable[[], datetime] | None = None,
         session_id: str = "session-1",
         activation_scope: str = "test-scope",
         use_worker: bool = False,
         launch_coordinator: TrustedLaunchCoordinator | None = None,
-        launch_authority: object | None = None,
-        launch_registry: object | None = None,
+        launch_authority: LaunchAuthority | None = None,
+        launch_registry: InMemoryApplicationRegistry | None = None,
         activation_service: WindowActivationService | None = None,
         gesture_key: bytes | None = None,
-        planner: object | None = None,
+        planner: Planner | None = None,
     ) -> Phase3Composition:
         """Explicit isolated simulated acceptance composition.
 
@@ -230,7 +235,7 @@ class Phase3Composition:
                 policy=ObservationPolicy(mode=PrivacyMode.METADATA_ONLY, opted_in=True)
             )
             authority = AppWindowResourceAuthority(session_id=session_id)
-            authority.register_app(fixture_record, version_token=fixture_identity_token)  # type: ignore[arg-type]
+            authority.register_app(fixture_record, version_token=fixture_identity_token)
             from aether.core.apps.fixture import FIXTURE_HWND
             from aether.world_state.privacy import ContextClassification
 
@@ -240,7 +245,7 @@ class Phase3Composition:
                 instance_generation=1,
                 version_token="pid:7:ct#1",
                 expires_at=now_fn() + timedelta(hours=1),
-                app_resource_id=getattr(fixture_record, "app_id"),
+                app_resource_id=fixture_record.app_id,
                 classification=ContextClassification.PERMITTED_METADATA,
             )
             capabilities = CapabilityRegistry.phase3_with_uia()
@@ -261,8 +266,9 @@ class Phase3Composition:
                 backend_factory=fixture.backend,
                 session_id=session_id,
                 clock=now_fn,
-                content_inspection_permitted=lambda app_id: app_id
-                == getattr(fixture_record, "app_id", None),
+                content_inspection_permitted=lambda app_id: (
+                    app_id == getattr(fixture_record, "app_id", None)
+                ),
                 worker=worker,
             )
             privacy.add_listener(snapshots.note_privacy_change)
@@ -278,7 +284,7 @@ class Phase3Composition:
                     capability_allowlist=frozenset(
                         {"uia.invoke_fixture", "window.activate", "app.launch"}
                     ),
-                    app_allowlist=frozenset({getattr(fixture_record, "app_id")}),
+                    app_allowlist=frozenset({fixture_record.app_id}),
                     session_lifetime=timedelta(hours=1),
                     scope_name=activation_scope,
                 ),
@@ -314,7 +320,7 @@ class Phase3Composition:
                 clock=now_fn,
                 broker=broker,
                 enablement=enablement,
-                approved_fixture_app_id=getattr(fixture_record, "app_id"),
+                approved_fixture_app_id=fixture_record.app_id,
                 approved_fixture_identity_token=fixture_identity_token,
                 dialog_present=_dialog_present,
                 worker=worker,
@@ -359,19 +365,19 @@ class Phase3Composition:
                 snapshots=snapshots,
                 executor=executor,
                 authority=authority,
-                app_records=lambda: [fixture_record],  # type: ignore[list-item]
+                app_records=lambda: [fixture_record],
                 detector=detector,
                 gesture_authority=gesture_authority,
                 nonces=nonces,
                 recovery=recovery,
             )
-            surface.privacy_authority = privacy  # type: ignore[attr-defined]
-            surface.planner = planner  # type: ignore[attr-defined]
-            surface.launch_coordinator = launch_coordinator  # type: ignore[attr-defined]
-            surface.launch_authority = launch_authority  # type: ignore[attr-defined]
-            surface.launch_registry = launch_registry  # type: ignore[attr-defined]
-            surface.activation_service = activation_service  # type: ignore[attr-defined]
-            surface.dialog_guard = dialog_guard  # type: ignore[attr-defined]
+            surface.privacy_authority = privacy
+            surface.planner = planner
+            surface.launch_coordinator = launch_coordinator
+            surface.launch_authority = launch_authority
+            surface.launch_registry = launch_registry
+            surface.activation_service = activation_service
+            surface.dialog_guard = dialog_guard
             composition = cls(
                 mode=Phase3Mode.SIMULATED,
                 surface=surface,
@@ -392,16 +398,14 @@ class Phase3Composition:
                 authority=authority,
                 fixture=fixture,
             )
-            composition.fixture_window_id = fixture_window_ref.resource_id  # type: ignore[attr-defined]
+            composition.fixture_window_id = fixture_window_ref.resource_id
             composition_holder["composition"] = composition
             return composition.start()
         except Exception:
             # Initialization failure leaves nothing active behind.
             for cleanup in reversed(started):
-                try:
+                with contextlib.suppress(Exception):
                     cleanup()
-                except Exception:
-                    pass
             raise
 
 

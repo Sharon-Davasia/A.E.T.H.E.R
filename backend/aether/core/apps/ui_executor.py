@@ -25,7 +25,7 @@ from aether.adapters.windows.uia_backend import UiaBackend, UiaBackendError, Uia
 from aether.core.apps.enablement import Phase3Enablement
 from aether.core.apps.focus import FocusCoordinator, LockHandle
 from aether.core.apps.uia_snapshot import UiaSnapshotService
-from aether.core.contracts.uia import UiaElement
+from aether.core.contracts.uia import UiaElement, UiaSnapshot
 from aether.core.persistence.models import PersistentTaskState
 from aether.core.persistence.sqlite_store import SQLiteTaskStore
 from aether.core.policy.broker import PolicyBroker
@@ -37,7 +37,7 @@ EFFECT_PATTERN = {"increment_fixture_count": "invoke"}
 STATUS_RUNTIME_ID = "fixture-status"
 
 
-def _status_element(snapshot):  # type: ignore[no-untyped-def]
+def _status_element(snapshot: UiaSnapshot) -> UiaElement | None:
     """Fixture status by fake runtime id or the native control contract."""
     direct = next((e for e in snapshot.elements if e.runtime_id == STATUS_RUNTIME_ID), None)
     if direct is not None:
@@ -49,7 +49,8 @@ def _status_element(snapshot):  # type: ignore[no-untyped-def]
         for e in snapshot.elements
         if e.automation_id == STATUS_AUTOMATION_ID and e.control_type == "Text"
     ]
-    return matches[0] if len(matches) == 1 else None
+    result: UiaElement | None = matches[0] if len(matches) == 1 else None
+    return result
 
 
 class UiDenied(Exception):

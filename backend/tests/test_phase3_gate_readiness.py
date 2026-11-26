@@ -69,6 +69,7 @@ def _auth(storage_id: str = "12345678-1234-4234-8234-123456789abc") -> OwnerAcce
 
 # -- G03 -----------------------------------------------------------------
 
+
 def test_scoped_v3_acceptance_storage(tmp_path: Path) -> None:
     store = open_acceptance_store(
         tmp_path / "aether-phase3-acceptance-a", authorization=_auth(), now=NOW
@@ -88,7 +89,9 @@ def test_scoped_v3_acceptance_storage(tmp_path: Path) -> None:
     # Ordinary storage remains v2 and pending v3 is refused directly.
     ordinary = SQLiteTaskStore(tmp_path / "ordinary.db")
     ordinary.close()
-    with pytest.raises(Exception):
+    from aether.core.persistence.sqlite_store import PersistenceIntegrityError
+
+    with pytest.raises(PersistenceIntegrityError):
         SQLiteTaskStore(tmp_path / "bad.db", target_schema_version=3)
 
 
@@ -99,15 +102,16 @@ def test_acceptance_storage_rejects_unrelated_and_expired(tmp_path: Path) -> Non
     with pytest.raises(AcceptanceStorageError):
         open_acceptance_store(target, authorization=_auth(), now=NOW)
     with pytest.raises(AcceptanceStorageError):
-        open_acceptance_store(
-            tmp_path / "ordinary-dir", authorization=_auth(), now=NOW
-        )
+        open_acceptance_store(tmp_path / "ordinary-dir", authorization=_auth(), now=NOW)
     expired = OwnerAcceptanceAuthorization("d", _auth().storage_id, NOW - timedelta(seconds=1))
     with pytest.raises(AcceptanceStorageError):
-        open_acceptance_store(tmp_path / "aether-phase3-acceptance-c", authorization=expired, now=NOW)
+        open_acceptance_store(
+            tmp_path / "aether-phase3-acceptance-c", authorization=expired, now=NOW
+        )
 
 
 # -- G01/G02 ---------------------------------------------------------------
+
 
 def _composition(tmp_path: Path) -> Phase3Composition:
     store = open_acceptance_store(
@@ -171,7 +175,6 @@ def test_simulated_composition_full_fixture_workflow(tmp_path: Path) -> None:
 def _approve(bridge, task_id, preview):  # type: ignore[no-untyped-def]
     from aether.core.planning.authorizing_gesture import (
         GestureBinding,
-        GestureNonceRegister,
         TrustedGestureAuthority,
     )
 
@@ -179,7 +182,9 @@ def _approve(bridge, task_id, preview):  # type: ignore[no-untyped-def]
     # Nonces were issued by the bridge's register, so verification must
     # go through its authority — reconstruct via the bridge surface.
     authority = TrustedGestureAuthority(
-        key=KEY, nonces=bridge.surface.nonces, clock=lambda: NOW  # type: ignore[arg-type]
+        key=KEY,
+        nonces=bridge.surface.nonces,
+        clock=lambda: NOW,  # type: ignore[arg-type]
     )
     binding = GestureBinding(
         task_id=preview["binding"]["taskId"] if False else _uuid(task_id),
@@ -212,13 +217,15 @@ def test_composition_revocation_disables(tmp_path: Path) -> None:
     composition = _composition(tmp_path)
     composition.revoke("test")
     assert composition.active is False
-    assert composition.enablement.is_active(
-        capability_id="uia.invoke_fixture", app_id="x", now=NOW
-    ) is False
+    assert (
+        composition.enablement.is_active(capability_id="uia.invoke_fixture", app_id="x", now=NOW)
+        is False
+    )
     composition.shutdown()
 
 
 # -- G05 -------------------------------------------------------------------
+
 
 def test_fixture_contract_rules() -> None:
     assert parse_fixture_count("Count: 12") == 12
@@ -243,7 +250,8 @@ def test_fixture_contract_rejects_fake_runtime_ids(tmp_path: Path) -> None:
     composition = _composition(tmp_path)
     try:
         snapshot = composition.snapshots.inspect(
-            composition.fixture_window_id, require_content=True  # type: ignore[arg-type]
+            composition.fixture_window_id,
+            require_content=True,  # type: ignore[arg-type]
         ).snapshot
         assert snapshot is not None
         with pytest.raises(FixtureContractError):
@@ -294,9 +302,7 @@ def test_simulated_launch_workflow_through_bridge(tmp_path: Path) -> None:
             # composition; prepare against the launch registry record
             # directly documents the wiring requirement.
             raise AssertionError(prepared)
-        preview = bridge.preview_operation(
-            {"taskId": prepared["taskId"], "effect": "app.launch"}
-        )
+        preview = bridge.preview_operation({"taskId": prepared["taskId"], "effect": "app.launch"})
         assert preview["status"] == "ready", preview
         outcome = _approve_operation(bridge, prepared["taskId"], "app.launch", preview)
         assert outcome["status"] == "ready" and outcome["outcome"] == "SUCCEEDED", outcome
@@ -315,7 +321,9 @@ def _approve_operation(bridge, task_id, effect, preview):  # type: ignore[no-unt
     )
 
     authority = TrustedGestureAuthority(
-        key=KEY, nonces=bridge.surface.nonces, clock=lambda: NOW  # type: ignore[arg-type]
+        key=KEY,
+        nonces=bridge.surface.nonces,
+        clock=lambda: NOW,  # type: ignore[arg-type]
     )
     binding = GestureBinding(
         task_id=_uuid(task_id),

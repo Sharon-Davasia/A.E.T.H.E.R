@@ -214,13 +214,14 @@ class FocusCoordinator:
         with self._lock:
             active = self._active_operation_window
             if signal.kind == "foreground_changed":
-                if active is not None and signal.window_id != active:
+                if (active is not None and signal.window_id != active) or (
+                    signal.window_id is None and active is not None
+                ):
                     self._takeover_windows.add(active)
-                elif signal.window_id is None and active is not None:
-                    self._takeover_windows.add(active)
-            elif signal.kind in ("manual_activity_in_window", "focus_lost"):
-                if signal.window_id is not None:
-                    self._takeover_windows.add(signal.window_id)
+            elif signal.kind in ("manual_activity_in_window", "focus_lost") and (
+                signal.window_id is not None
+            ):
+                self._takeover_windows.add(signal.window_id)
 
     def takeover_detected(self, window_id: str) -> bool:
         with self._lock:

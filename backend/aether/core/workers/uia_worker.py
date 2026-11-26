@@ -91,7 +91,12 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
         ):
             raise ValueError(f"payload field {key} has the wrong type")
     # G06: bounded numeric/text values, enforced before any provider call.
-    bounds = {"hwnd": (1, 2**31 - 1), "max_depth": (0, 32), "max_elements": (1, 512), "max_total_text_chars": (0, 100_000)}
+    bounds = {
+        "hwnd": (1, 2**31 - 1),
+        "max_depth": (0, 32),
+        "max_elements": (1, 512),
+        "max_total_text_chars": (0, 100_000),
+    }
     for key, (low, high) in bounds.items():
         if key in payload and not (low <= int(payload[key]) <= high):
             raise ValueError(f"payload field {key} is outside its bound")
