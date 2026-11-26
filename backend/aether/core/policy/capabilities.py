@@ -11,6 +11,8 @@ from aether.core.contracts.policy import RiskTier
 from aether.core.contracts.resource import DataClass
 
 _RESOURCE_ID = r"^(?:file|directory):[0-9a-fA-F-]{36}$"
+_APP_RESOURCE_ID = r"^app:[0-9a-fA-F-]{36}$"
+_WINDOW_RESOURCE_ID = r"^window:[0-9a-fA-F-]{36}$"
 _HEX_SHA256 = r"^[0-9a-fA-F]{64}$"
 
 
@@ -20,6 +22,22 @@ class CapabilityArguments(BaseModel):
 
 class ResourceArguments(CapabilityArguments):
     resource_id: str = Field(pattern=_RESOURCE_ID)
+
+
+class AppResourceArguments(CapabilityArguments):
+    """App-scoped arguments; an ``app:`` id is never a filesystem id."""
+
+    resource_id: str = Field(pattern=_APP_RESOURCE_ID)
+
+
+class WindowResourceArguments(CapabilityArguments):
+    """Window-scoped arguments; a ``window:`` id is never a filesystem id."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+
+
+class AppResolveArguments(CapabilityArguments):
+    query: str = Field(min_length=1, max_length=256)
 
 
 class ReadFileArguments(ResourceArguments):
@@ -132,6 +150,29 @@ class CapabilityRegistry:
                 RiskTier.MODIFY,
                 UndoEditArguments,
                 "file",
+            ),
+        ):
+            registry.register(definition)
+        return registry
+
+    @classmethod
+    def phase3_foundation(cls) -> CapabilityRegistry:
+        """Phase 3 CP0-CP2 foundation contracts (observation/discovery only).
+
+        No executor is registered anywhere for these capabilities in
+        CP0-CP2, no launch/interaction capability exists here, and this
+        registry is not wired into the trusted composition. Resource
+        dispatch is by the capability's declared ``resource_kind``;
+        app/window kinds are disjoint from filesystem kinds.
+        """
+        registry = cls()
+        for definition in (
+            CapabilityDefinition("world.observe", RiskTier.OBSERVE, CapabilityArguments, None),
+            CapabilityDefinition("app.discover", RiskTier.OBSERVE, CapabilityArguments, None),
+            CapabilityDefinition("app.resolve", RiskTier.OBSERVE, AppResolveArguments, None),
+            CapabilityDefinition("app.inspect", RiskTier.OBSERVE, AppResourceArguments, "app"),
+            CapabilityDefinition(
+                "window.inspect", RiskTier.OBSERVE, WindowResourceArguments, "window"
             ),
         ):
             registry.register(definition)

@@ -26,6 +26,16 @@ class Adapter(ABC):
     def capabilities(self) -> AdapterCapabilities:
         """Return declared capability surface."""
 
+    def prepare(self, request: ToolRequest) -> dict[str, object]:
+        """Describe a bounded operation without performing it.
+
+        Phase 3 preparation semantics: preparation is non-effectful. It
+        may validate and describe, it must never execute, launch, focus
+        or mutate. The default declares preparation unsupported so
+        existing adapters keep their exact Phase 0 behaviour.
+        """
+        return {"prepared": False, "reason_code": "PREPARE_NOT_SUPPORTED"}
+
     @abstractmethod
     def inspect(self, target: str) -> dict[str, object]:
         """Inspect a target (read-only, synthetic in Phase 0)."""

@@ -4,42 +4,33 @@
 
 ## Current phase
 
-**Phase 2 implementation is merged to `main`** (PR #34, merge commit
-`a58bd68843091eb339e3c102b8a2cfa204d355c6`; integrated source head
-`3cd5c06`, tree-identical to independently verified commit `bf08ca9`,
-tree `811c9b75b4a42d81a582beb7f37499eb13a55b2a`). The complete stack
-formerly split across PRs #15–#32, plus the CRLF/EOF-trailer and
-legacy-binding corrections and the Windows merge-gate, entered `main`
-exactly once through that PR. PR #14 (closed, superseded — its content is
-integrated) and PR #33 (closed, superseded — corrections incorporated via
-`bf08ca9`) were not merged independently. At the moment of integration there were zero open PRs (historical, as of 2026-11-23; documentation PR #35 was opened afterwards).
+**Phase 2 controlled integration is merged to `main`** (PR #36, merge
+commit `14614dcf99c79477dec36e1c25e10e17397cf763`; final reviewed
+source head `cd3c2930340ad496f0cffc10ed65e7b73bbb08bf`;
+native-tested implementation head
+`35f9bb0e344441ed86878b6b22e8b9d8765de5d8`). Schema v2 is active
+(`ACTIVE_SCHEMA_VERSION = 2`) for the controlled candidate, and
+controlled Activation B enables production-trusted grant issuance
+*only* for validated acceptance-fixture launches, bounded to the
+designated fixture project subtree. Ordinary launches refuse issuance
+(`grant_issuance_disabled`) and execution (`mutation_not_enabled`).
 
-**Phase 2 code integration: COMPLETE. Formal Phase 2 acceptance: NOT
-COMPLETE.** What remains is of two distinct kinds: (a)
-implementation/wiring prerequisites — a separately authorized supported
-live workflow able to issue a real production grant and perform a working
-approved edit and a verified Undo, which the Master Specification's
-acceptance requires demonstrating and which the shipped product
-deliberately cannot do yet; and (b) acceptance evidence: archived native
-Windows evidence, the mandatory human demonstrations in
-`docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §8 (several live
-demonstrations are blocked until a separately authorized live workflow
-exists), a genuine interruption test, and Linux/hosted re-confirmation on
-Python 3.12.10 (Linux verification at `bf08ca9` ran on Python 3.11.2:
-847 passed, 5 skipped). Native Windows results with Python 3.12.10 have
-been user-reported (full suite, desktop 70/70, 6 Python channel tests,
-ruff/mypy/Electron build, ACL unreadable-narrative test 1 passed) but their
-logs are not archived in this repository.
+**Formal Phase 2 acceptance: NOT COMPLETE.** The finite outstanding
+evidence list is `docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §10
+(evidence archival, machine record, scenarios 5/10/11/15/18, footer
+visual confirmation, §7 sign-off). Owner-confirmed native
+demonstrations are recorded in §8 of that document; their artifacts
+remain owner-held and are not archived in this repository. Nothing in
+Phase 3 development changes that verdict.
 
-Security boundaries are unchanged by the integration and verified on
-`main`: `ACTIVE_SCHEMA_VERSION = 1` with `PENDING_MIGRATION_VERSIONS =
-{2}` (schema v2 prepared, **not activated**); production grant issuance
-remains default-deny (`GRANT_ISSUANCE_DISABLED`,
-`NullAttestationVerifier`, `IssuanceDisabledConsumptionLedger`); no live
-mutation path is wired into the running service; Phase 3 has not started.
-Activation of schema v2 or of any live grant/mutation path requires
-separate explicit user approval. The detailed post-merge record is in
-`docs/engineering/PHASE2_ACCEPTANCE_REPORT.md`.
+**Phase 3 foundation (CP0-CP2) is in development** on
+`integration/phase3-windows-state-app-control` under a bounded
+parallel-development authorization (Phase 2 acceptance is not waived):
+typed app/window contracts, privacy-gated in-memory WorldState with a
+fake event source, guarded-but-inert native source, and an in-memory
+application registry with real RapidFuzz alias resolution. No native
+observation, application launching, or UI interaction is enabled; no
+schema v3 migration exists. See `docs/engineering/PHASE3_PLAN.md`.
 
 Everything below this section that describes PR #14 or earlier stage
 branches as open/pending is **historical** and superseded by this section.
