@@ -680,6 +680,10 @@ class NativeObservationProvider:
         own_session = None
         with contextlib.suppress(Exception):
             own_session = self._api.get_process_session_id(os.getpid())
+        if own_session is None:
+            # Unknown own session: no fixture identity can be
+            # verified, so the observation is incomplete and empty.
+            return PlatformObservation(processes=(), windows=(), complete=False)
         target_pid: int | None = None
         if process_token is not None:
             try:
@@ -710,8 +714,8 @@ class NativeObservationProvider:
             session = None
             with contextlib.suppress(Exception):
                 session = self._api.get_process_session_id(pid)
-            if own_session is not None and session != own_session:
-                continue
+            if session is None or session != own_session:
+                continue  # unknown or foreign session: deny identity
             if token not in processes:
                 processes[token] = ObservedProcess(
                     process_token=token,

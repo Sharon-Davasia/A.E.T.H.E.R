@@ -517,17 +517,16 @@ class Phase3Composition:
                         == binding.process_token
                     ][:8]
                     for event in candidates:
-                        try:
-                            backend = providers.uia_backend_factory()
-                            try:
-                                root = backend.find_root(hwnd=event.hwnd)  # type: ignore[attr-defined]
-                            finally:
-                                backend.close()  # type: ignore[attr-defined]
-                        except Exception:
+                        # All UIA access for separate windows goes
+                        # through the snapshot service (supervised
+                        # worker when configured; bounded backend
+                        # otherwise) — never a direct backend call
+                        # from composition. Unavailable evidence is
+                        # unknown and denies dispatch.
+                        modal = snapshots.probe_window_root(event.hwnd)
+                        if modal is None:
                             return None
-                        if root is not None and (
-                            getattr(root, "is_modal", False) or root.control_type == "Window"
-                        ):
+                        if modal:
                             evidence.append(
                                 ModalWindowEvidence(
                                     window_resource_id=window_id,
@@ -554,11 +553,22 @@ class Phase3Composition:
                 fixture executable. Registration-time path equality
                 alone is never sufficient.
                 """
-                from aether.core.apps.launch_authority import integrity_digest_of
+                from aether.core.apps.launch_authority import app_version_token
 
                 try:
                     binding = authority.resolve_window(window_id)
                     if binding.app_resource_id != providers.fixture_record.app_id:
+                        return False
+                    # The anchor is the *approved* fixture identity
+                    # token from the owner authorization, not a pair
+                    # of freshly computed hashes: fresh trusted
+                    # evidence must still reproduce the approved
+                    # token, and the live process must match it.
+                    approved_token = providers.fixture_identity_token
+                    evidence = providers.integrity_verifier.verify(providers.fixture_record)
+                    if evidence is None:
+                        return False
+                    if app_version_token(evidence) != approved_token:
                         return False
                     observe_fixture = getattr(observation_provider, "observe_fixture", None)
                     if observe_fixture is None:
@@ -568,6 +578,8 @@ class Phase3Composition:
                         binding.process_token,
                         binding.hwnd,
                     )
+                    if not observation.complete:
+                        return False
                     process = next(
                         (
                             p
@@ -579,10 +591,7 @@ class Phase3Composition:
                     )
                     if process is None or process.integrity_sha256 is None:
                         return False
-                    evidence = providers.integrity_verifier.verify(providers.fixture_record)
-                    if evidence is None:
-                        return False
-                    return bool(process.integrity_sha256 == integrity_digest_of(evidence))
+                    return bool(process.integrity_sha256 == approved_token)
                 except Exception:
                     return False
 

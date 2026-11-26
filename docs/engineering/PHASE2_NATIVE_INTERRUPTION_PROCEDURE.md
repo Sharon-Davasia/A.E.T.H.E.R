@@ -36,51 +36,59 @@ success, never automatic replay of the mutation.
 - No automatic cleanup: preserve the synthetic file, journal, and
   receipts untouched for inspection after the run.
 
-## Preparation
+## Runnable harness (deterministic; no manual timing)
 
-1. Verify `git rev-parse HEAD` prints the merged-main SHA above and
-   `git status --porcelain` is empty.
-2. Run the automated gates (these are Linux-evidence-free native
-   prerequisites, expected to already pass):
-   - `python -m pytest backend/tests -q`
-   - `python -m ruff check backend`
-   - `mypy` (from `backend/`)
-3. Create an isolated synthetic dataset: one small text file with
-   known content and hash (record both), inside a fresh directory
-   reserved exclusively for this test.
-4. Start the application normally (ordinary startup; no Phase 3
-   authorization or enablement involved). Note the process ID of the
-   AETHER test process you will terminate.
+Ordinary startup disables mutation, so this procedure is executed
+by the standalone harness in
+`backend/tests/test_phase2_interruption_harness.py`. It uses the
+controlled fixture activation of the Phase 2 acceptance suite
+(test-scoped consumption ledger with an explicit budget, persisted
+plan with the canonical approval binding, trusted gesture
+signature) over an isolated synthetic project, performs a genuine
+approved edit through `EditExecutor.apply`, and terminates the
+test child from the executor's own `"replaced"` checkpoint —
+after the atomic file replacement and the journal's
+REPLACED_UNVERIFIED record, before readback verification and
+before any verified receipt is persisted. It then restarts over
+the same durable files and asserts the reconciliation verdict and
+the absence of replay. No journal entry is fabricated and no
+timing is manual.
 
-## Execution
+Exact commands (non-admin PowerShell 5.1, repository root
+`D:\A.E.T.H.E.R`, HEAD verified first):
 
-5. Through the normal UI/approval flow, approve and execute one
-   filesystem edit on the isolated synthetic file (e.g. append one
-   line). A genuine approved execution only.
-6. At the moment the synthetic file's content has changed on disk
-   (mutation applied) but before the verified receipt is persisted,
-   terminate the AETHER test process from step 4 (e.g.
-   `Stop-Process -Id <pid>`). If exact timing cannot be achieved,
-   record that outcome honestly and repeat the attempt; do not
-   simulate the interruption any other way.
-7. Verify on disk: the synthetic file contains the mutation; the
-   persisted receipt set does NOT claim a verified success for the
-   interrupted edit (record journal/task state exactly as found).
-8. Restart the application normally against the same isolated
-   storage.
+```powershell
+git rev-parse HEAD   # expect 14614dcf99c79477dec36e1c25e10e17397cf763 on main
+git status --porcelain   # expect empty
+python -m pytest backend/tests/test_phase2_interruption_harness.py -q
+```
+
+Expected: both tests pass — the control run completes a genuine
+verified edit (`SUCCEEDED`), and the killed run exits with the
+harness kill code, leaves the post-image on disk exactly once,
+persists no verified receipt, reconciles on restart as
+`COMPLETED_UNVERIFIED` (needs review), and does not replay.
+
+Optional standalone child invocation (what the harness spawns):
+
+```powershell
+$env:PYTHONPATH = "backend;backend/tests"
+python backend/tests/test_phase2_interruption_harness.py control <isolated-workspace>
+python backend/tests/test_phase2_interruption_harness.py kill <isolated-workspace>
+```
 
 ## Expected result (acceptance-correct behavior)
 
-9. On startup, recovery/reconciliation reports the interrupted edit
-   as `COMPLETED_UNVERIFIED` / needing review (the file bytes are
+1. Recovery/reconciliation reports the interrupted edit as
+   `COMPLETED_UNVERIFIED` / needing review (the file bytes are
    checked against journal evidence; nothing is reported as a
    verified success).
-10. The mutation is **not automatically replayed**: the synthetic
-    file's hash after restart equals the hash recorded in step 7
-    (single mutation, no duplicate append, no revert either).
-11. The only path to resolution is an owner-visible review action
-    (accept the observed state or explicitly undo via the normal
-    flow). Record the reconciliation output verbatim.
+2. The mutation is **not automatically replayed**: the synthetic
+   file's hash after restart equals the hash recorded at the kill
+   (single mutation, no duplicate append, no revert either).
+3. The only path to resolution is an owner-visible review action
+   (accept the observed state or explicitly undo via the normal
+   flow). Record the reconciliation output verbatim.
 
 ## Evidence to record
 

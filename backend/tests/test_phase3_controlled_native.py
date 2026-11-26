@@ -1393,3 +1393,71 @@ def test_begin_observation_does_nothing_while_privacy_paused(tmp_path: Path) -> 
         assert h["event_source"].started is False
     finally:
         assert comp.shutdown() is True
+
+
+def test_observe_fixture_denies_unknown_session() -> None:
+    from aether.adapters.windows.native_observer import NativeObservationProvider
+    from aether.core.apps.launch_authority import FakeIntegrityVerifier, IntegrityEvidence
+
+    fixture = _record("app:fixture", "Fixture App")
+    evidence = IntegrityEvidence(
+        location_digest=fixture.location_digest or "",
+        content_sha256="a" * 64,
+        signer_identity="FakeSigner",
+        package_identity=None,
+        verified_at=datetime.now(UTC),
+        file_identity="3:42:100:1",
+    )
+    verifier = FakeIntegrityVerifier(evidence_by_location={fixture.location_digest or "": evidence})
+
+    class _Api:
+        def enumerate_windows(self):  # type: ignore[no-untyped-def]
+            return [(1001, 4242)]
+
+        def get_process_image_path(self, pid: int):  # type: ignore[no-untyped-def]
+            return "C:\\Apps\\Fixture App.exe"
+
+        def get_process_name(self, pid: int):  # type: ignore[no-untyped-def]
+            return "C:\\Apps\\Fixture App.exe"
+
+        def get_process_creation_time(self, pid: int):  # type: ignore[no-untyped-def]
+            return "fake-creation-1"
+
+        def get_process_session_id(self, pid: int):  # type: ignore[no-untyped-def]
+            return None if pid == 4242 else 1  # fixture session unknown
+
+    provider = NativeObservationProvider(api=_Api(), records=[fixture], integrity_verifier=verifier)
+    scoped = provider.observe_fixture(fixture, "4242:fake-creation-1", 1001)
+    assert scoped.processes == () and scoped.windows == ()
+
+
+def test_modal_probe_routes_through_supervised_worker() -> None:
+    """Separate-window modal evidence comes from the snapshot
+    service's supervised worker path, never a direct backend call."""
+    from types import SimpleNamespace
+
+    from aether.core.apps.uia_snapshot import UiaSnapshotService
+    from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+    from aether.core.workers.uia_worker import WorkerOutcome
+
+    calls: list[str] = []
+
+    class _Worker:
+        def execute(self, operation, payload, *, timeout=5.0):  # type: ignore[no-untyped-def]
+            calls.append(operation)
+            return SimpleNamespace(
+                outcome=WorkerOutcome.OK,
+                response={"elements": [{"control_type": "Window", "is_modal": True}]},
+            )
+
+    def _no_backend():  # type: ignore[no-untyped-def]
+        raise AssertionError("direct backend must not be used when a worker is configured")
+
+    service = UiaSnapshotService(
+        authority=AppWindowResourceAuthority(session_id="s"),
+        backend_factory=_no_backend,
+        session_id="s",
+        worker=_Worker(),
+    )
+    assert service.probe_window_root(2002) is True
+    assert calls == ["inspect"]

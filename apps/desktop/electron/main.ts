@@ -184,6 +184,17 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
   if (controlled) {
     env.AETHER_PHASE3_AUTHORIZATION = controlledAuth;
     delete env.AETHER_APP_DB;
+    // The sanitized backend PATH (runtime dir + System32) excludes
+    // the normal Git installation directory, so the controlled
+    // backend cannot resolve `git` by name. Forward an owner-set
+    // absolute Git executable path from the main-process
+    // environment only (never renderer input); the backend
+    // validates it as an existing regular git/git.exe file before
+    // use and denies controlled startup when it cannot.
+    const gitExecutable = process.env.AETHER_GIT_EXECUTABLE;
+    if (typeof gitExecutable === 'string' && isAbsolute(gitExecutable)) {
+      env.AETHER_GIT_EXECUTABLE = resolve(gitExecutable);
+    }
   }
   const spec: BackendLaunchSpec = {
     executable: absoluteExecutable,

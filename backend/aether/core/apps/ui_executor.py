@@ -400,6 +400,14 @@ class UiOperationExecutor:
         if not all(self.focus.is_valid(handle) for handle in locks):
             # Ownership lapsed before dispatch: confirmed no effect.
             return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
+        # Fresh fixture process verification immediately before
+        # dispatch: the live process instance must still match the
+        # approved fixture identity token at this moment, not merely
+        # at binding time. Any denial here is a confirmed no-effect.
+        try:
+            self._verify_fixture_identity(binding)
+        except UiDenied:
+            return self._finish(task_id, step_id, binding_id, attempt_id, "failed", None)
 
         effect_outcome = self._dispatch_invoke(window_id, element.runtime_id)
         if effect_outcome == "stale_target":

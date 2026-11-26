@@ -167,6 +167,70 @@ def _error_payload(reason: str) -> dict[str, object]:
     return {"reason": reason}
 
 
+_GIT_BASENAMES = {"git", "git.exe"}
+
+
+def _trusted_git_executable(
+    env: dict[str, str], *, candidates: list[str] | None = None
+) -> str | None:
+    """Resolve Git from an explicitly validated trusted path only.
+
+    The controlled backend is launched by Electron with a sanitized
+    PATH (runtime dir + System32 on Windows) that intentionally
+    excludes the normal Git installation directory, so invoking
+    ``git`` by name cannot work and must not be attempted: a PATH
+    lookup would also let any directory on that PATH supply the
+    executable. Resolution therefore uses, in order:
+
+    1. ``AETHER_GIT_EXECUTABLE`` when the trusted main process
+       forwarded an owner-set absolute path — it must be absolute,
+       name ``git``/``git.exe`` and be an existing regular file;
+       an explicitly configured but invalid path denies resolution
+       outright (no silent fallback).
+    2. Fixed well-known installation locations (Program Files /
+       per-user Git for Windows; ``/usr/bin/git`` etc. elsewhere),
+       each validated the same way.
+
+    Returns the validated absolute path or None (unverifiable).
+    """
+    from pathlib import Path as _Path
+
+    def _valid(value: str) -> str | None:
+        try:
+            path = _Path(value)
+            if not path.is_absolute() or path.name.casefold() not in _GIT_BASENAMES:
+                return None
+            if not path.is_file():
+                return None
+            return str(path)
+        except Exception:
+            return None
+
+    explicit = env.get("AETHER_GIT_EXECUTABLE")
+    if explicit:
+        return _valid(explicit)
+    if candidates is None:
+        import os as _os
+        import sys as _sys
+
+        if _sys.platform == "win32":
+            roots = [
+                _os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                _os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+                str(_Path.home() / "AppData" / "Local" / "Programs"),
+            ]
+            candidates = [str(_Path(root) / "Git" / "cmd" / "git.exe") for root in roots] + [
+                str(_Path(root) / "Git" / "bin" / "git.exe") for root in roots
+            ]
+        else:
+            candidates = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"]
+    for candidate in candidates:
+        resolved = _valid(candidate)
+        if resolved is not None:
+            return resolved
+    return None
+
+
 def _controlled_phase3_composition(env: dict[str, str], gesture_key: bytes):  # type: ignore[no-untyped-def]
     """A01 trusted startup path: explicit controlled-entry marker +
     owner authorization artifact. Ordinary startup never takes this
@@ -182,15 +246,20 @@ def _controlled_phase3_composition(env: dict[str, str], gesture_key: bytes):  # 
         from aether.core.apps.acceptance_startup import StartupDenied
 
         raise StartupDenied("controlled_startup_artifact_missing")
+    git_executable = _trusted_git_executable(env)
     try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=_Path(__file__).resolve().parents[2],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        ).stdout.strip()
+        commit = (
+            subprocess.run(
+                [git_executable, "rev-parse", "HEAD"],
+                cwd=_Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            ).stdout.strip()
+            if git_executable is not None
+            else ""
+        )
     except Exception:
         commit = ""
     from aether.core.apps.acceptance_startup import ControlledAcceptanceAuthorization

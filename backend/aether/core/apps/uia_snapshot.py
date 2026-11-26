@@ -14,6 +14,7 @@ is always explicit; it never implies absence of further elements.
 
 from __future__ import annotations
 
+import contextlib
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable
@@ -221,6 +222,59 @@ class UiaSnapshotService:
         return SnapshotResult(
             UiaOutcome.TRUNCATED if truncated_reason else UiaOutcome.OK, snapshot=snapshot
         )
+
+    def probe_window_root(self, hwnd: int) -> bool | None:
+        """Bounded modal probe of one top-level window root by HWND.
+
+        Returns True when the window's root is a separate Window or
+        reports modal, False when a root exists and is neither, and
+        None when the evidence is unavailable (no root, worker
+        failure/timeout, backend error) — unknown never proves
+        absence of a modal. All UIA access stays inside this
+        service: through the supervised worker when one is
+        configured, otherwise through the bounded backend factory
+        under metadata-only collection. Callers (composition) never
+        touch a UIA backend directly.
+        """
+        if self.worker is not None:
+            from aether.core.workers.uia_worker import WorkerOutcome
+
+            try:
+                result = self.worker.execute(  # type: ignore[attr-defined]
+                    "inspect",
+                    {
+                        "hwnd": hwnd,
+                        "max_depth": 0,
+                        "max_elements": 1,
+                        "max_total_text_chars": 0,
+                        "collection_mode": "metadata_only",
+                        "fixture_counter_permitted": False,
+                    },
+                    timeout=7.0,
+                )
+            except Exception:
+                return None
+            if result.outcome is not WorkerOutcome.OK or result.response is None:
+                return None
+            elements = result.response.get("elements")
+            if not isinstance(elements, list) or not elements or not isinstance(elements[0], dict):
+                return None
+            root_raw = elements[0]
+            return bool(root_raw.get("is_modal")) or root_raw.get("control_type") == "Window"
+        backend = self.backend_factory()
+        try:
+            setter = getattr(backend, "set_collection_mode", None)
+            if setter is not None:
+                setter("metadata_only", fixture_counter_permitted=False)
+            root = backend.find_root(hwnd=hwnd)
+            if root is None:
+                return None
+            return bool(getattr(root, "is_modal", False)) or root.control_type == "Window"
+        except Exception:
+            return None
+        finally:
+            with contextlib.suppress(Exception):
+                backend.close()
 
     def _inspect_via_worker(
         self,

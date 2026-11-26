@@ -204,9 +204,12 @@ class EditExecutor:
 
         ``checkpoint`` (FI-04) is invoked at the real execution checkpoints
         so callers can record actual progress: ``"consumed"`` after the
-        grant use is durably spent and before any mutation, ``"verified"``
-        after the durable verified receipt exists. A checkpoint that raises
-        aborts the operation at that point (before mutation for
+        grant use is durably spent and before any mutation, ``"replaced"``
+        after the atomic file replacement and the journal's
+        replaced-unverified record but *before* readback verification
+        and before any verified receipt is persisted, and ``"verified"``
+        after the durable verified receipt exists. A checkpoint that
+        raises aborts the operation at that point (before mutation for
         ``"consumed"``); progress is never reconstructed after the fact.
         """
 
@@ -660,6 +663,15 @@ class EditExecutor:
         # crash window to "bytes written, verification not finished", which
         # reconciliation can interpret.
         self._journal_replaced_unverified(journal_id)
+
+        # FI-04 replaced checkpoint: the bytes on disk are now the
+        # approved post-image and the journal durably says
+        # REPLACED_UNVERIFIED, but no verification has run and no
+        # verified receipt exists. Deterministic interruption tests
+        # terminate the process here; restart reconciliation must
+        # then report the edit UNVERIFIED, never replay it.
+        if checkpoint is not None:
+            checkpoint("replaced")
 
         # Verification: re-read from disk, never trust the write call.
         try:
