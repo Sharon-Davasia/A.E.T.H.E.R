@@ -27,6 +27,11 @@ class SubprocessWorkerSupervisor:
     """Parent-owned lifecycle for one UIA worker child process."""
 
     command: Sequence[str]
+    # Parent-owned worker bootstrap (native workers): written as the
+    # first line on the private stdin pipe before health checks. The
+    # worker mints its activation context from it and refuses to
+    # start without it. Never set from renderer/model input.
+    bootstrap_payload: dict[str, object] | None = None
     startup_timeout: float = 10.0
     shutdown_timeout: float = 3.0
     _process: subprocess.Popen[bytes] | None = field(default=None, init=False)
@@ -55,6 +60,21 @@ class SubprocessWorkerSupervisor:
                 self._process = None
                 return False
             self._worker_session += 1
+            if self.bootstrap_payload is not None:
+                assert self._process.stdin is not None
+                import json as _json
+
+                line = _json.dumps(
+                    {"operation": "bootstrap", "payload": self.bootstrap_payload},
+                    separators=(",", ":"),
+                ).encode("utf-8") + b"\n"
+                try:
+                    self._process.stdin.write(line)
+                    self._process.stdin.flush()
+                except OSError:
+                    self._terminate_locked()
+                    self._process = None
+                    return False
             self._supervisor = WorkerSupervisor(send=self._send)
             return self._supervisor.health(timeout=self.startup_timeout)
 

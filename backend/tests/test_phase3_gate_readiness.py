@@ -337,3 +337,45 @@ def _approve_operation(bridge, task_id, effect, preview):  # type: ignore[no-unt
             "binding": preview["binding"],
         }
     )
+
+
+def test_takeover_and_dialog_stop_dispatch(tmp_path: Path) -> None:
+    """G04 integrated path: activity source -> focus coordinator ->
+    snapshot invalidation -> executor refusal; modal -> dialog stop."""
+    composition = _composition(tmp_path)
+    try:
+        bridge = composition.bridge
+        window_id = composition.fixture_window_id
+        assert window_id
+        prepared = bridge.prepare_fixture_interaction({"windowId": window_id})
+        assert prepared["status"] == "ready", prepared
+        # Manual activity in the active window routes to takeover.
+        assert composition.activity_source is not None
+        composition.activity_source.manual_activity(window_id)
+        assert composition.focus is not None
+        assert composition.focus.takeover_detected(window_id)
+        preview = bridge.preview_fixture_interaction({"taskId": prepared["taskId"]})
+        assert preview["status"] == "ready"
+        outcome = _approve(bridge, prepared["taskId"], preview)
+        # Takeover truthfully prevents a SUCCEEDED execution.
+        assert outcome.get("outcome") != "SUCCEEDED"
+    finally:
+        composition.shutdown()
+
+
+def test_dialog_present_blocks_fixture_execution(tmp_path: Path) -> None:
+    composition = _composition(tmp_path)
+    try:
+        bridge = composition.bridge
+        window_id = composition.fixture_window_id
+        assert window_id and composition.fixture is not None
+        prepared = bridge.prepare_fixture_interaction({"windowId": window_id})
+        assert prepared["status"] == "ready", prepared
+        composition.fixture.state.modal_open = True
+        preview = bridge.preview_fixture_interaction({"taskId": prepared["taskId"]})
+        assert preview["status"] == "ready"
+        outcome = _approve(bridge, prepared["taskId"], preview)
+        assert outcome.get("outcome") != "SUCCEEDED"
+        assert composition.fixture.state.count == 0
+    finally:
+        composition.shutdown()

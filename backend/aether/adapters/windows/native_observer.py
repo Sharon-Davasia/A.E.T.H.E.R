@@ -69,6 +69,29 @@ def _mint_activation_context() -> ActivationContext:  # pragma: no cover - futur
     return ActivationContext(issuer=_COMPOSITION_ISSUER)
 
 
+def activation_context_from_parent_bootstrap(payload: object) -> ActivationContext:
+    """Mint an activation context from a parent-owned bootstrap.
+
+    The bootstrap arrives only over the worker's private parent-owned
+    stdin pipe before any request is served (the same trusted
+    bootstrap channel the desktop service uses). It must name the
+    trusted-composition issuer and bounded session/epoch/scope
+    identities; anything else is refused and the worker never starts.
+    This is not an environment flag, CLI argument or importable token:
+    without a parent that owns the pipe and writes this first line,
+    no context exists.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("worker bootstrap is malformed")
+    if payload.get("issuer") != _COMPOSITION_ISSUER:
+        raise ValueError("worker bootstrap issuer is not trusted")
+    for field_name in ("session_id", "activation_epoch", "activation_scope"):
+        value = payload.get(field_name)
+        if not isinstance(value, str) or not value or len(value) > 128:
+            raise ValueError("worker bootstrap identity is malformed")
+    return ActivationContext(issuer=_COMPOSITION_ISSUER)
+
+
 class Win32ObserverApi(Protocol):
     """Injectable Win32 surface. All hook/pump calls are thread-affine."""
 

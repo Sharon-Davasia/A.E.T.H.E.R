@@ -187,11 +187,25 @@ def main(argv: list[str] | None = None) -> int:
     if sys.platform != "win32":
         print("uia worker: native provider unavailable on this platform", file=sys.stderr)
         return 2
-    # Windows: explicit COM apartment initialization/cleanup around the
-    # serving loop. Construction of the native backend requires the
-    # trusted activation the parent supplies out-of-band; without it
-    # the worker refuses to start (no env-var or importable-token
-    # enablement).
+    # Windows: explicit COM apartment initialization/cleanup around
+    # the serving loop. The trusted parent owns initialization: the
+    # first line on the private stdin pipe must be a bounded bootstrap
+    # envelope from which the activation context is minted. Without
+    # it (or with a malformed one) the worker refuses to start. No
+    # environment variable, CLI flag or importable token enables it.
+    bootstrap_line = sys.stdin.buffer.readline(MAX_REQUEST_BYTES + 1)
+    try:
+        bootstrap = decode_message(bootstrap_line, bound=MAX_REQUEST_BYTES)
+        if bootstrap.get("operation") != "bootstrap":
+            raise ValueError("first worker line is not a bootstrap")
+        from aether.adapters.windows.native_observer import (
+            activation_context_from_parent_bootstrap,
+        )
+
+        activation = activation_context_from_parent_bootstrap(bootstrap.get("payload"))
+    except (ValueError, UnicodeDecodeError):
+        print("uia worker: parent bootstrap is required", file=sys.stderr)
+        return 2
     import comtypes  # type: ignore[import-not-found]
 
     comtypes.CoInitialize()
@@ -199,11 +213,11 @@ def main(argv: list[str] | None = None) -> int:
         from aether.adapters.windows.native_uia import NativeUiaDisabled, build_native_uia_backend
 
         try:
-            backend = build_native_uia_backend(activation=None)
+            backend = build_native_uia_backend(activation=activation)
         except NativeUiaDisabled:
             print("uia worker: native UIA activation is disabled", file=sys.stderr)
             return 2
-        serve(lambda: backend)
+        serve(lambda: backend, stdin=sys.stdin.buffer)
         return 0
     finally:
         comtypes.CoUninitialize()

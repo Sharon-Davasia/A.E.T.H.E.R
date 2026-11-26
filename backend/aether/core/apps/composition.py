@@ -123,6 +123,7 @@ class Phase3Composition:
     store: SQLiteTaskStore | None = None
     authority: AppWindowResourceAuthority | None = None
     fixture_window_id: str | None = None
+    fixture: FixtureApp | None = None
     _started: bool = False
     _revoked: bool = False
 
@@ -389,6 +390,7 @@ class Phase3Composition:
                 worker=worker,
                 store=store,
                 authority=authority,
+                fixture=fixture,
             )
             composition.fixture_window_id = fixture_window_ref.resource_id  # type: ignore[attr-defined]
             composition_holder["composition"] = composition
