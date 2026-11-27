@@ -32,6 +32,7 @@ import hashlib
 import os
 import stat
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from aether.adapters.windows.native_observer import ActivationContext, NativeObserverDisabled
@@ -42,6 +43,7 @@ from aether.core.contracts.app_window import (
     LaunchMethod,
     location_identity_digest,
 )
+from aether.core.resources.path_safety import PathSafetyError, reject_reparse_components
 
 MAX_INTEGRITY_FILE_BYTES = 1 << 30  # 1 GiB streamed-hash bound
 
@@ -177,21 +179,13 @@ def _is_supported_local_executable(identity: str) -> bool:
     elif not os.path.isabs(identity):
         return False  # relative identity is never canonical
     try:
-        if os.path.islink(identity):
-            return False  # reparse point / symlink: conservative deny
-        # A reparse/symlink ancestor (e.g. a directory junction)
-        # defeats the final-component check, so walk the ancestors
-        # with the same conservative deny.
-        parent = os.path.dirname(os.path.abspath(identity))
-        while True:
-            if os.path.islink(parent):
-                return False
-            upper = os.path.dirname(parent)
-            if upper == parent:
-                break
-            parent = upper
-    except OSError:
-        return False
+        # Rejects symlinks, Windows reparse points and directory
+        # junctions in every path component. os.path.islink() is not
+        # sufficient on Windows: it does not reliably report
+        # directory junctions.
+        reject_reparse_components(Path(identity))
+    except PathSafetyError:
+        return False  # reparse point / symlink / junction: conservative deny
     return True
 
 

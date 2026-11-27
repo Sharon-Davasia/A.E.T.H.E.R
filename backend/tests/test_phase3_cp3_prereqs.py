@@ -236,7 +236,7 @@ def test_integrity_provider_rejects_unsafe_targets(tmp_path: Path) -> None:
         # Directory junctions are reparse points creatable without
         # any privilege: an executable reached through a junction
         # must be rejected exactly like a symlink.
-        from tests.fs_support import make_junction
+        from fs_support import make_junction
 
         junction_real = tmp_path / "junction-real"
         junction_real.mkdir()
