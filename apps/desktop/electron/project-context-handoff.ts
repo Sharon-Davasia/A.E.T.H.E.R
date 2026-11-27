@@ -44,3 +44,31 @@ export class ProjectContextHandoff {
     this.deadlineMs = null;
   }
 }
+
+import type { Phase3ProjectContextArm } from '../shared/phase3';
+
+/**
+ * Establish the one-shot handoff - ONLY after an explicit trusted
+ * owner confirmation in the main process and a successful backend
+ * arm (C2). A sender-validated renderer request by itself never
+ * reaches the backend: with no confirmation (or a decline) the
+ * backend arm is never invoked and no handoff exists.
+ */
+export async function establishProjectContextArm(options: {
+  confirm: () => Promise<boolean>;
+  armBackend: () => Promise<Phase3ProjectContextArm>;
+  handoff: ProjectContextHandoff;
+  now: () => number;
+}): Promise<Phase3ProjectContextArm> {
+  const confirmed = await options.confirm();
+  if (!confirmed) {
+    return { status: 'unavailable', reason: 'owner_confirmation_declined' };
+  }
+  const result = await options.armBackend();
+  if (result.status === 'armed') {
+    options.handoff.establish(options.now());
+  } else {
+    options.handoff.cancel();
+  }
+  return result;
+}

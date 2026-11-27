@@ -197,6 +197,17 @@ window, with late responses dropped after invalidation; and the
 activation proposal's clean-tree guard permits only the exact
 known untracked fixture while defining every variable its
 controlled-startup procedure uses.
+Completion of C2/C3: arming additionally requires an explicit
+native owner confirmation in the trusted main process (declining
+makes zero backend arm calls); the backend handoff enforces
+privacy/expiry/revocation at the collection boundary, validates
+workspace scope before retaining any evidence, rechecks
+authorization after native collection, and is consumed and purged
+by every completion attempt and by pause, opt-out, generation
+change, revocation, shutdown and expiry; the renderer binds
+retained context to the authoritative campaign lifecycle
+(execution availability and expiry) in addition to generation and
+the 60-second freshness window.
 
 ## 7. Performance defaults (provisional, unmeasured)
 

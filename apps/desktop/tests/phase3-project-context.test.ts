@@ -10,15 +10,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { ProjectContextHandoff, PROJECT_CONTEXT_HANDOFF_MS } from '../electron/project-context-handoff';
+import { ProjectContextHandoff, PROJECT_CONTEXT_HANDOFF_MS, establishProjectContextArm } from '../electron/project-context-handoff';
 import { createPhase3Provider } from '../electron/phase3-provider';
 import {
   parsePhase3ProjectContext, projectContextView, visibleProjectContext,
   PROJECT_CONTEXT_FRESHNESS_MS,
-  type Phase3Privacy, type Phase3ProjectContextView,
+  type Phase3Privacy, type Phase3ProjectContextView, type Phase3State,
 } from '../shared/phase3';
 
 const PRIVACY: Phase3Privacy = { optedIn: true, mode: 'metadata_only', paused: false, generation: 3 };
+
+function lifecycle(overrides: Partial<Phase3State> = {}): Phase3State {
+  return {
+    status: 'ready', nativeAvailable: true, disabledReason: null,
+    executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: PRIVACY, projects: [], windows: [], capabilities: {},
+    ...overrides,
+  };
+}
 
 function view(overrides: Partial<Phase3ProjectContextView> = {}): Phase3ProjectContextView {
   return {
@@ -61,24 +70,95 @@ test('handoff: establish, one-shot consume, expiry, cancel', () => {
 
 test('visible context binds to generation, lifecycle and freshness', () => {
   const v = view();
-  assert.equal(visibleProjectContext(v, PRIVACY, 1_000_100)?.length, 1);
+  assert.equal(visibleProjectContext(v, lifecycle(), 1_000_100)?.length, 1);
   // Freshness boundary: exactly 60s old is still bounded-fresh.
-  assert.equal(visibleProjectContext(v, PRIVACY, 1_000_000 + PROJECT_CONTEXT_FRESHNESS_MS)?.length, 1);
-  // Expiry.
-  assert.equal(visibleProjectContext(v, PRIVACY, 1_000_000 + PROJECT_CONTEXT_FRESHNESS_MS + 1), null);
+  assert.equal(visibleProjectContext(v, lifecycle(), 1_000_000 + PROJECT_CONTEXT_FRESHNESS_MS)?.length, 1);
+  // Evidence-freshness expiry.
+  assert.equal(visibleProjectContext(v, lifecycle(), 1_000_000 + PROJECT_CONTEXT_FRESHNESS_MS + 1), null);
   // Evidence from the future is never displayed.
-  assert.equal(visibleProjectContext(v, PRIVACY, 999_999), null);
+  assert.equal(visibleProjectContext(v, lifecycle(), 999_999), null);
   // Privacy generation change invalidates.
-  assert.equal(visibleProjectContext(v, { ...PRIVACY, generation: 4 }, 1_000_100), null);
+  assert.equal(visibleProjectContext(v, lifecycle({ privacy: { ...PRIVACY, generation: 4 } }), 1_000_100), null);
   // Pause / opt-out invalidates.
-  assert.equal(visibleProjectContext(v, { ...PRIVACY, paused: true }, 1_000_100), null);
-  assert.equal(visibleProjectContext(v, { ...PRIVACY, optedIn: false }, 1_000_100), null);
-  // Backend disconnect shape: opted-out generation-0 privacy hides it.
-  assert.equal(visibleProjectContext(v, { optedIn: false, mode: 'off', paused: false, generation: 0 }, 1_000_100), null);
+  assert.equal(visibleProjectContext(v, lifecycle({ privacy: { ...PRIVACY, paused: true } }), 1_000_100), null);
+  assert.equal(visibleProjectContext(v, lifecycle({ privacy: { ...PRIVACY, optedIn: false } }), 1_000_100), null);
+  // Backend disconnect shape: unavailable state hides everything.
+  assert.equal(visibleProjectContext(v, {
+    status: 'unavailable', nativeAvailable: false, executionAvailable: false, expiresAtMs: null,
+    disabledReason: 'backend_unavailable',
+    privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
+    projects: [], windows: [], capabilities: {},
+  }, 1_000_100), null);
   // Missing authoritative state hides everything.
   assert.equal(visibleProjectContext(v, null, 1_000_100), null);
   assert.equal(visibleProjectContext(v, undefined, 1_000_100), null);
-  assert.equal(visibleProjectContext(null, PRIVACY, 1_000_100), null);
+  assert.equal(visibleProjectContext(null, lifecycle(), 1_000_100), null);
+});
+
+test('campaign expiry/revocation hides evidence inside its freshness window', () => {
+  const v = view();
+  // Captured 5 s ago: evidence is fresh, everything else live...
+  const fresh = 1_005_000;
+  assert.equal(visibleProjectContext(v, lifecycle(), fresh)?.length, 1);
+  // ...but the campaign expired before now (freshness is irrelevant).
+  assert.equal(visibleProjectContext(v, lifecycle({ expiresAtMs: 1_004_999 }), fresh), null);
+  assert.equal(visibleProjectContext(v, lifecycle({ expiresAtMs: fresh }), fresh), null);
+  // Revoked campaign: authoritative lifecycle unavailable.
+  assert.equal(visibleProjectContext(v, lifecycle({ executionAvailable: false }), fresh), null);
+  // Unknown campaign expiry fails closed.
+  assert.equal(visibleProjectContext(v, lifecycle({ expiresAtMs: null }), fresh), null);
+  // Expired state status hides regardless of other fields.
+  assert.equal(visibleProjectContext(v, lifecycle({ status: 'unavailable' }), fresh), null);
+});
+
+test('only an explicit owner confirmation + backend arm establishes the handoff', async () => {
+  const order: string[] = [];
+  let backendArmCalls = 0;
+  const armBackend = async () => {
+    backendArmCalls += 1;
+    order.push('arm');
+    return { status: 'armed' as const, expiresInSeconds: 60 };
+  };
+
+  // Sender validation alone (no confirmation flow at all): the
+  // handoff is simply not live - nothing to consume.
+  const bare = new ProjectContextHandoff();
+  assert.equal(bare.consume(Date.now()), false);
+
+  // Declined confirmation: zero backend arm calls, no handoff.
+  const declinedHandoff = new ProjectContextHandoff();
+  const declined = await establishProjectContextArm({
+    confirm: async () => { order.push('confirm'); return false; },
+    armBackend, handoff: declinedHandoff, now: () => 1_000,
+  });
+  assert.equal(declined.status, 'unavailable');
+  assert.equal(declined.reason, 'owner_confirmation_declined');
+  assert.equal(backendArmCalls, 0);
+  assert.equal(declinedHandoff.isLive(1_000), false);
+
+  // Confirmed: confirmation is obtained BEFORE the backend arm,
+  // and only then does the handoff exist (one-shot).
+  const handoff = new ProjectContextHandoff();
+  const armed = await establishProjectContextArm({
+    confirm: async () => { order.push('confirm'); return true; },
+    armBackend, handoff, now: () => 1_000,
+  });
+  assert.equal(armed.status, 'armed');
+  assert.equal(backendArmCalls, 1);
+  assert.deepEqual(order, ['confirm', 'confirm', 'arm']);
+  assert.equal(handoff.isLive(1_000), true);
+  assert.equal(handoff.consume(1_500), true);
+  assert.equal(handoff.consume(1_600), false);
+
+  // Confirmed but the backend refuses: still no handoff.
+  const refusedHandoff = new ProjectContextHandoff();
+  const refused = await establishProjectContextArm({
+    confirm: async () => true,
+    armBackend: async () => ({ status: 'unavailable' as const, reason: 'project_context_not_authorized' }),
+    handoff: refusedHandoff, now: () => 1_000,
+  });
+  assert.equal(refused.status, 'unavailable');
+  assert.equal(refusedHandoff.isLive(1_000), false);
 });
 
 test('check results bind to evidence metadata or to nothing', () => {

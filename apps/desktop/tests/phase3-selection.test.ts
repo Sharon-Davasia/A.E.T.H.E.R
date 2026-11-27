@@ -23,6 +23,7 @@ function search(...apps: Array<typeof APP>): Phase3AppSearch {
 function state(generation: number): Phase3State {
   return {
     status: 'ready', nativeAvailable: true, disabledReason: null,
+    executionAvailable: true, expiresAtMs: null,
     privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation },
     projects: [], windows: [], capabilities: { 'app.launch': true },
   };

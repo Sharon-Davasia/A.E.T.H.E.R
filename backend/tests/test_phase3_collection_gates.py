@@ -126,16 +126,16 @@ def test_explorer_collection_requires_opt_in_and_stops_on_pause_optout_revoke(
 
         # The one-shot handoff: arm (trusted-main-established), the
         # owner focuses an Explorer window, the verified foreground
-        # event captures its folder (provider consulted exactly
-        # once), and the check evaluates the captured evidence. The
-        # folder is outside the synthetic workspace: collected for
-        # comparison only, neither retained nor published.
+        # event consults the provider exactly once. The folder is
+        # outside the synthetic workspace: scope is validated before
+        # retention, so it is never retained as evidence and the
+        # completion is truthfully unavailable (nothing published).
         assert comp.bridge.arm_project_context({})["status"] == "armed"
         comp.project_context_capture(4242)  # foreground event HWND
         assert explorer.calls == 1
         check = comp.bridge.check_project_context({})
-        assert check["status"] == "ready"
-        assert check["projects"] == []
+        assert check["status"] == "unavailable"
+        assert check["reason"] == "explorer_evidence_unavailable"
         # Disarmed afterwards: refreshes consult nothing again.
         comp.bridge.get_state({})
         assert explorer.calls == 1
@@ -257,11 +257,14 @@ def test_registration_boundary_and_unregistered_explorer(tmp_path: Path) -> None
         assert refused["reason"] == "root_outside_activation_boundary"
 
         # An Explorer folder outside the authorized workspace is
-        # not published as project evidence at all (F3 scope), even
-        # by a captured handoff check.
+        # never retained as evidence (scope before retention), so a
+        # handoff check resting on it is truthfully unavailable and
+        # publishes nothing.
         assert comp.bridge.arm_project_context({})["status"] == "armed"
         comp.project_context_capture(4242)
-        assert comp.bridge.check_project_context({})["projects"] == []
+        outside_check = comp.bridge.check_project_context({})
+        assert outside_check["status"] == "unavailable"
+        assert outside_check["reason"] == "explorer_evidence_unavailable"
         assert comp.bridge.get_state({})["projects"] == []
 
         # Inside the workspace but unregistered: the explicit check

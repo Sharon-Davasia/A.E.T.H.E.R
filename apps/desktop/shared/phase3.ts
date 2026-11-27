@@ -42,6 +42,11 @@ export interface Phase3State {
   status: 'ready' | 'unavailable';
   reason?: string;
   nativeAvailable: boolean;
+  /** Authoritative lifecycle truth: false once the campaign is
+   * revoked or expired - independent of privacy opt-in (C3). */
+  executionAvailable: boolean;
+  /** Authoritative campaign expiry (epoch ms); null = unknown. */
+  expiresAtMs: number | null;
   disabledReason: string | null;
   privacy: Phase3Privacy;
   projects: Phase3ProjectCandidate[];
@@ -131,6 +136,7 @@ export function parsePhase3State(value: unknown): Phase3State {
   if (item.status === 'unavailable') {
     return {
       status: 'unavailable', reason: reason(item), nativeAvailable: false,
+      executionAvailable: false, expiresAtMs: null,
       disabledReason: reason(item), privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
       projects: [], windows: [], capabilities: {},
     };
@@ -140,6 +146,8 @@ export function parsePhase3State(value: unknown): Phase3State {
   return {
     status: 'ready',
     nativeAvailable: item.nativeAvailable === true,
+    executionAvailable: item.executionAvailable === true,
+    expiresAtMs: typeof item.expiresAtMs === 'number' && Number.isFinite(item.expiresAtMs) ? item.expiresAtMs : null,
     disabledReason: typeof item.disabledReason === 'string' ? item.disabledReason : null,
     privacy: {
       optedIn: privacy.optedIn === true,
@@ -222,18 +230,28 @@ export function projectContextView(context: Phase3ProjectContext): Phase3Project
 /**
  * The only candidates the surface may display as current project
  * context (C3): evidence bound to the CURRENT authoritative privacy
- * generation, an opted-in unpaused lifecycle, and a capture instant
- * within the bounded freshness window (never from the future). Any
- * pause/opt-out, generation change, expiry or disconnect state
+ * generation, an opted-in unpaused privacy state, a live campaign
+ * lifecycle (not revoked, not expired - even while the 60 s
+ * evidence-freshness window still has time left), and a capture
+ * instant within the bounded freshness window (never from the
+ * future). Unknown campaign expiry fails closed. Any pause/opt-out,
+ * generation change, campaign expiry/revocation or disconnect state
  * yields null, so stale evidence cannot remain on screen.
  */
 export function visibleProjectContext(
   view: Phase3ProjectContextView | null,
-  privacy: Phase3Privacy | null | undefined,
+  state: Phase3State | null | undefined,
   nowMs: number,
 ): Phase3ProjectCandidate[] | null {
   if (view === null) return null;
-  if (privacy === null || privacy === undefined) return null;
+  if (state === null || state === undefined) return null;
+  if (state.status !== 'ready') return null;
+  // Authoritative lifecycle (C3): a revoked or expired campaign
+  // hides retained evidence immediately, freshness notwithstanding.
+  if (!state.executionAvailable) return null;
+  if (state.expiresAtMs === null) return null;
+  if (nowMs >= state.expiresAtMs) return null;
+  const privacy = state.privacy;
   if (!privacy.optedIn || privacy.paused) return null;
   if (privacy.generation !== view.generation) return null;
   if (nowMs < view.capturedAtMs) return null;

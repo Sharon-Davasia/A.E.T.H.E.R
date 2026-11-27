@@ -8,7 +8,7 @@ import { createLiveApprovalProvider } from './live-approval-provider';
 import { createPhase3Provider, type Phase3InteractionSummary } from './phase3-provider';
 import { createApprovalWindowConfirmer } from './approval-window';
 import { workflowFailureReason } from './workflow';
-import { ProjectContextHandoff } from './project-context-handoff';
+import { ProjectContextHandoff, establishProjectContextArm } from './project-context-handoff';
 import { LiveWorkflow } from './workflow';
 import { parseEditReceipt } from '../shared/live';
 import { parseReviewOutcomeRequest } from '../shared/review';
@@ -290,13 +290,38 @@ function registerIpc(): void {
   const projectContextHandoff = new ProjectContextHandoff();
   ipcMain.handle('desktop:phase3-arm-project-context', async (event) => {
     validateInvoke(event);
-    const result = await phase3Provider.armProjectContext();
-    if (result.status === 'armed') {
-      projectContextHandoff.establish(Date.now());
-    } else {
-      projectContextHandoff.cancel();
-    }
-    return result;
+    // Sender validation alone NEVER arms collection: the owner
+    // must first confirm, in this native main-process dialog, the
+    // bounded one-shot scope. Declining (or having no window to
+    // confirm in) means zero backend arm calls.
+    return establishProjectContextArm({
+      confirm: async () => {
+        if (!mainWindow || mainWindow.isDestroyed()) return false;
+        const result = await dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          buttons: ['Cancel', 'Begin 60-second Explorer check'],
+          defaultId: 0,
+          cancelId: 0,
+          title: 'AETHER — Explorer project check',
+          message: 'Begin a one-shot Explorer project check?',
+          detail: [
+            'If you proceed, switch to the Explorer window showing the registered',
+            'synthetic project folder within 60 seconds. AETHER remembers only',
+            'that one foreground Explorer folder, only long enough to compare it',
+            'with the registered synthetic workspace.',
+            '',
+            'Nothing is collected from any other window, state refreshes never',
+            'read Explorer folders, and out-of-scope folders are discarded -',
+            'never retained or shown. The attempt expires after 60 seconds and',
+            'can be cancelled at any time.',
+          ].join('\n'),
+        });
+        return result.response === 1;
+      },
+      armBackend: () => phase3Provider.armProjectContext(),
+      handoff: projectContextHandoff,
+      now: () => Date.now(),
+    });
   });
   ipcMain.handle('desktop:phase3-check-project-context', async (event) => {
     validateInvoke(event);

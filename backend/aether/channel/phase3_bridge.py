@@ -80,6 +80,9 @@ class Phase3Surface:
     # only "available" while the composition is unrevoked and the
     # authorization unexpired - independent of privacy opt-in.
     execution_available: Callable[[], bool] | None = None
+    # Authoritative campaign expiry (C3): the renderer binds
+    # retained Explorer evidence to this lifecycle boundary.
+    authorization_expires_at: Callable[[], datetime] | None = None
     # Explicit project-context arm/disarm (F3): the foreground
     # Explorer provider is consulted ONLY between begin/end of one
     # owner-initiated project-context check; generic state refreshes
@@ -214,9 +217,20 @@ class Phase3Bridge:
             execution_available = surface.executor is not None and (
                 surface.execution_available() if surface.execution_available is not None else True
             )
+            expires_at = (
+                surface.authorization_expires_at()
+                if surface.authorization_expires_at is not None
+                else None
+            )
             return {
                 "status": "ready",
                 "nativeAvailable": execution_available,
+                # Authoritative lifecycle for evidence binding (C3):
+                # revoked/expired campaigns report these truthfully.
+                "executionAvailable": execution_available,
+                "expiresAtMs": (
+                    int(expires_at.timestamp() * 1000) if expires_at is not None else None
+                ),
                 "disabledReason": None if surface.executor is not None else surface.native_reason,
                 "privacy": privacy_state,
                 "projects": projects,
@@ -420,18 +434,34 @@ class Phase3Bridge:
         return self._guarded(run)
 
     def check_project_context(self, payload: object) -> dict[str, object]:
-        """Explicit owner-initiated project-context check (F3, P3-23).
+        """Complete the one-shot project-context handoff (P3-23).
 
-        This is the ONLY bridge operation that may consult the
-        foreground Explorer folder provider, and only for comparison
-        against the registered synthetic workspace. It requires the
-        bounded project-context authorization (opted-in, unexpired,
-        unrevoked), arms Explorer collection for this single check,
-        and always disarms it afterwards: generic state refreshes
-        never retrieve arbitrary Explorer paths, and out-of-scope
-        paths are neither retained nor published (detector scope).
+        The completion rests only on Explorer evidence captured by
+        composition from a verified foreground change inside the
+        armed window - never on the mere existence of a registered
+        project, and never by consulting the provider here. Every
+        completion attempt, successful or unavailable, consumes and
+        purges the backend handoff (see the finally below), so the
+        same evidence can never complete twice. Generic state
+        refreshes never retrieve Explorer paths, and out-of-scope
+        paths are neither retained nor published (scope is enforced
+        before retention at capture time).
         """
 
+        def run() -> dict[str, object]:
+            try:
+                return self._check_project_context_once()
+            finally:
+                # Authoritative one-shot lifecycle (C2): EVERY
+                # completion attempt - successful or unavailable -
+                # consumes and purges the backend handoff, so the
+                # same evidence can never complete twice.
+                if self.surface.project_context_cancel is not None:
+                    self.surface.project_context_cancel()
+
+        return self._guarded(run)
+
+    def _check_project_context_once(self) -> dict[str, object]:
         def run() -> dict[str, object]:
             surface = self.surface
             if surface.detector is None or surface.project_registry is None:

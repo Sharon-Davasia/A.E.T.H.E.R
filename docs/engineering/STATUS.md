@@ -80,7 +80,18 @@ renderer context display is bound to the privacy generation,
 lifecycle and evidence freshness, dropping late responses after
 invalidation; and the activation proposal permits only the exact
 known untracked fixture in its clean-tree guard with every
-controlled-startup variable defined. Candidate awaits independent
+controlled-startup variable defined.
+Completion of C2/C3: arming additionally requires an explicit
+native owner confirmation in the trusted main process (declining
+makes zero backend arm calls); the backend handoff enforces
+privacy/expiry/revocation at the collection boundary, validates
+workspace scope before retaining any evidence, rechecks
+authorization after native collection, and is consumed and purged
+by every completion attempt and by pause, opt-out, generation
+change, revocation, shutdown and expiry; the renderer binds
+retained context to the authoritative campaign lifecycle
+(execution availability and expiry) in addition to generation and
+the 60-second freshness window. Candidate awaits independent
 review; no native activation has been performed.
 
 **Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented

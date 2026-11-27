@@ -143,6 +143,7 @@ class Phase3Composition:
     # One-shot project-context capture delegate (C2): invoked by the
     # verified foreground-event boundary with the foreground HWND.
     project_context_capture: Callable[[int], None] | None = None
+    project_context_cancel: Callable[[], None] | None = None
     _started: bool = False
     _revoked: bool = False
 
@@ -165,6 +166,12 @@ class Phase3Composition:
         """Revoke capabilities and purge volatile observation state."""
         self._revoked = True
         self.enablement.revoke()
+        # Revocation (including shutdown and authorization expiry)
+        # cancels and purges any armed project-context handoff and
+        # any captured Explorer evidence with it.
+        if self.project_context_cancel is not None:
+            with contextlib.suppress(Exception):
+                self.project_context_cancel()
         if self.snapshots is not None:
             self.snapshots.note_privacy_change()
         if self.activity_source is not None:
@@ -388,14 +395,32 @@ class Phase3Composition:
                 if (
                     now_fn() > armed_until  # type: ignore[operator]
                     or privacy.generation != _project_context["generation"]
-                    or not privacy.collection_enabled
-                    or now_fn() >= authorization.expires_at
+                    # Authoritative lifecycle at the collection
+                    # boundary: current privacy, authorization expiry
+                    # and composition revocation in one predicate.
+                    or not _collection_permitted()
                 ):
-                    _project_context["armed_until"] = None
+                    # Expired/stale/revoked arm: purge, never collect.
+                    _cancel_project_context()
                     return
                 folder = _sample_explorer(hwnd)
                 if folder is None:
                     return  # not an Explorer window; stay armed (bounded)
+                # Recheck authorization AFTER native collection,
+                # before retaining anything: an invalidation that
+                # landed while the provider ran voids the sample.
+                if (
+                    _project_context["armed_until"] is None
+                    or privacy.generation != _project_context["generation"]
+                    or not _collection_permitted()
+                ):
+                    _cancel_project_context()
+                    return
+                # Workspace scope is validated BEFORE retention: an
+                # out-of-scope folder path is never stored as
+                # captured evidence (not even transiently).
+                if not project_registry.is_within_registration_boundary(folder):
+                    return
                 _project_context["folder"] = folder
                 _project_context["captured_at"] = now_fn()
                 _project_context["armed_until"] = None  # one-shot consumed
@@ -756,6 +781,8 @@ class Phase3Composition:
                     return None  # stale evidence is not evidence
                 if not _collection_permitted():
                     return None
+                if not project_registry.is_within_registration_boundary(folder):  # type: ignore[arg-type]
+                    return None  # out-of-scope evidence is never used
                 return folder  # type: ignore[return-value]
 
             def _arm_project_context() -> bool:
@@ -840,6 +867,7 @@ class Phase3Composition:
             surface.collection_permitted = _collection_permitted
             surface.project_registry = project_registry
             surface.execution_available = _execution_available
+            surface.authorization_expires_at = lambda: authorization.expires_at
             surface.project_context_begin = lambda: _context_gate.__setitem__("armed", True)
             surface.project_context_end = lambda: _context_gate.__setitem__("armed", False)
             surface.project_context_arm = _arm_project_context
@@ -874,6 +902,7 @@ class Phase3Composition:
             composition.world_state = world_state
             composition.observer_service = observer_service
             composition.project_context_capture = _capture_foreground
+            composition.project_context_cancel = _cancel_project_context
             holder["composition"] = composition
             _gate_holder["composition"] = composition
 

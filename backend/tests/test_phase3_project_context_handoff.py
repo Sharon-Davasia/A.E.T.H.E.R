@@ -29,12 +29,15 @@ class _ExplorerByHwnd:
     """Foreground-Explorer provider keyed by verified window id."""
 
     def __init__(self, project: Path) -> None:
-        self._project = str(project)
+        self.folder = str(project)
         self.calls: list[object] = []
+        self.on_call = None  # optional side effect during collection
 
     def __call__(self, hwnd: object = None) -> object:
         self.calls.append(hwnd)
-        return self._project if hwnd == EXPLORER_HWND else None
+        if self.on_call is not None:
+            self.on_call()
+        return self.folder if hwnd == EXPLORER_HWND else None
 
 
 def _start(tmp_path: Path, *, clock=None, expires_at: datetime | None = None):  # type: ignore[no-untyped-def]
@@ -82,8 +85,11 @@ def test_foreground_mismatch_and_missing_evidence(tmp_path: Path) -> None:
         comp.project_context_capture(OTHER_HWND)
         assert bridge.check_project_context({})["reason"] == "explorer_evidence_unavailable"
 
-        # An unrelated window never consumes the one-shot arm: the
-        # subsequent real Explorer foreground completes it.
+        # An unrelated window never consumes the one-shot arm - but
+        # that failed completion attempt DID purge the backend
+        # handoff (every completion is single-use). Re-arming lets
+        # the real Explorer foreground complete the check.
+        assert bridge.arm_project_context({})["status"] == "armed"
         comp.project_context_capture(EXPLORER_HWND)
         check = bridge.check_project_context({})
         assert check["status"] == "ready"
@@ -188,15 +194,96 @@ def test_real_foreground_event_path_via_fake_platform(tmp_path: Path) -> None:
         assert seams_state is not None, "fake platform state not reachable"
         seams_state.windows[EXPLORER_HWND] = (5150, "explorer.exe")
         assert seams_state.activate(EXPLORER_HWND) is True
+        # Wait for the foreground-event CAPTURE itself - repeatedly
+        # invoking the single-use completion would consume the
+        # handoff before the evidence exists.
+        captured = None
         deadline = time.monotonic() + 10.0
-        check: dict = {}
         while time.monotonic() < deadline:
-            check = bridge.check_project_context({})
-            if check.get("status") == "ready":
+            captured = comp.surface.project_context_captured()
+            if captured is not None:
                 break
             time.sleep(0.05)
+        assert captured is not None, "foreground capture never landed"
+        check = bridge.check_project_context({})
         assert check.get("status") == "ready", check
         assert [c["evidenceSource"] for c in check["projects"]] == ["explorer_registered"]
         assert explorer.calls == [EXPLORER_HWND]
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_direct_revocation_before_capture(tmp_path: Path) -> None:
+    """Revoking the composition directly (no privacy-detour) kills
+    the armed handoff: the foreground event collects nothing."""
+    comp, explorer, _project = _start(tmp_path)
+    try:
+        bridge = comp.bridge
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.revoke("test_direct_revocation")
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == []
+        assert bridge.check_project_context({})["status"] == "unavailable"
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_out_of_scope_folder_never_retained(tmp_path: Path) -> None:
+    """Scope is validated before retention: an Explorer folder
+    outside the registered workspace is never stored as evidence."""
+    comp, explorer, _project = _start(tmp_path)
+    try:
+        bridge = comp.bridge
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        explorer.folder = str(elsewhere)
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == [EXPLORER_HWND]  # collection happened
+        # ... but nothing was retained, so no check can rest on it.
+        assert comp.surface.project_context_captured() is None
+        check = bridge.check_project_context({})
+        assert check["status"] == "unavailable"
+        assert check["reason"] == "explorer_evidence_unavailable"
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_duplicate_completion_never_returns_same_evidence(tmp_path: Path) -> None:
+    """Every completion attempt consumes and purges the handoff."""
+    comp, explorer, _project = _start(tmp_path)
+    try:
+        bridge = comp.bridge
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(EXPLORER_HWND)
+        assert bridge.check_project_context({})["status"] == "ready"
+        # The same evidence can never complete a second check.
+        second = bridge.check_project_context({})
+        assert second["status"] == "unavailable"
+        assert second["reason"] == "explorer_evidence_unavailable"
+        # And a fresh foreground event alone cannot resurrect it:
+        # the arm was consumed by the first completion.
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == [EXPLORER_HWND]
+        assert bridge.check_project_context({})["reason"] == "explorer_evidence_unavailable"
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_invalidation_during_native_collection(tmp_path: Path) -> None:
+    """Authorization is rechecked AFTER native collection: a pause
+    landing while the provider runs voids the sample before it is
+    retained."""
+    comp, explorer, _project = _start(tmp_path)
+    try:
+        bridge = comp.bridge
+        explorer.on_call = lambda: bridge.set_privacy(
+            {"optedIn": True, "mode": "metadata_only", "paused": True}
+        )
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == [EXPLORER_HWND]  # collection ran...
+        assert comp.surface.project_context_captured() is None  # ...not retained
+        assert bridge.check_project_context({})["status"] == "unavailable"
     finally:
         assert comp.shutdown() is True

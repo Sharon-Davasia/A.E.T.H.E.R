@@ -110,10 +110,12 @@ function App(): React.JSX.Element {
   const refreshPhase3 = React.useCallback(async (): Promise<void> => {
     try { setPhase3State(await window.aetherDesktop.phase3GetState()); }
     catch {
-      setPhase3ProjectContext(null);
-      setPhase3State({ status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false, disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 }, projects: [], windows: [], capabilities: {} });
+      // Backend disconnect invalidates retained evidence AND any
+      // in-flight check response (epoch bump), not just storage.
+      invalidateProjectContext();
+      setPhase3State({ status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false, executionAvailable: false, expiresAtMs: null, disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 }, projects: [], windows: [], capabilities: {} });
     }
-  }, []);
+  }, [invalidateProjectContext]);
 
   React.useEffect(() => {
     let active = true;
@@ -123,6 +125,7 @@ function App(): React.JSX.Element {
         if (active) {
           setPhase3State({
             status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false,
+            executionAvailable: false, expiresAtMs: null,
             disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
             projects: [], windows: [], capabilities: {},
           });
@@ -383,7 +386,7 @@ function App(): React.JSX.Element {
       state={phase3State}
       search={phase3Search}
       searchSerial={phase3SearchSerial}
-      projectContext={visibleProjectContext(phase3ProjectContext, phase3State?.privacy, phase3ContextNow)}
+      projectContext={visibleProjectContext(phase3ProjectContext, phase3State, phase3ContextNow)}
       projectContextArmed={phase3ContextArmed}
       windows={phase3Windows}
       snapshot={phase3Snapshot}
