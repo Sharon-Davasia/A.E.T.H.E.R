@@ -89,6 +89,8 @@ _PHASE3_KINDS = {
     "phase3.list_windows": ("list_windows", "phase3.windows"),
     "phase3.register_project": ("register_project", "phase3.project"),
     "phase3.check_project_context": ("check_project_context", "phase3.project"),
+    "phase3.arm_project_context": ("arm_project_context", "phase3.project"),
+    "phase3.cancel_project_context": ("cancel_project_context", "phase3.project"),
     "phase3.prepare_launch": ("prepare_launch", "phase3.prepared"),
     "phase3.prepare_activation": ("prepare_activation", "phase3.prepared"),
     "phase3.prepare_fixture": ("prepare_fixture_interaction", "phase3.prepared"),

@@ -113,45 +113,57 @@ def test_explorer_collection_requires_opt_in_and_stops_on_pause_optout_revoke(
         assert state["projects"] == []
         assert explorer.calls == 0
 
-        # F3: even after opt-in, a generic metadata state refresh
+        # F3/C2: even after opt-in, a generic metadata state refresh
         # does NOT retrieve the foreground Explorer folder.
         _opt_in(comp)
         state = comp.bridge.get_state({})
         assert explorer.calls == 0
         assert state["projects"] == []
 
-        # Only the explicit owner-initiated project-context check
-        # consults the provider (exactly once per check). The path
-        # is outside the authorized synthetic workspace: collected
-        # for comparison, but neither retained nor published.
+        # A check with no captured Explorer evidence fails truthfully.
+        assert comp.bridge.check_project_context({})["reason"] == ("explorer_evidence_unavailable")
+        assert explorer.calls == 0
+
+        # The one-shot handoff: arm (trusted-main-established), the
+        # owner focuses an Explorer window, the verified foreground
+        # event captures its folder (provider consulted exactly
+        # once), and the check evaluates the captured evidence. The
+        # folder is outside the synthetic workspace: collected for
+        # comparison only, neither retained nor published.
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)  # foreground event HWND
+        assert explorer.calls == 1
         check = comp.bridge.check_project_context({})
         assert check["status"] == "ready"
-        assert explorer.calls == 1
         assert check["projects"] == []
-        # Disarmed afterwards: refreshes collect nothing again.
+        # Disarmed afterwards: refreshes consult nothing again.
         comp.bridge.get_state({})
         assert explorer.calls == 1
 
-        # Pause: the check is refused and the provider untouched.
+        # Pause: arming and checking are refused; provider untouched.
         comp.bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": True})
+        assert comp.bridge.arm_project_context({})["status"] == "unavailable"
         assert comp.bridge.check_project_context({})["status"] == "unavailable"
         assert comp.bridge.get_state({})["projects"] == []
         assert explorer.calls == 1
 
         # Opt-out: same refusal, synchronously.
         comp.bridge.set_privacy({"optedIn": False, "mode": "off", "paused": False})
+        assert comp.bridge.arm_project_context({})["status"] == "unavailable"
         assert comp.bridge.check_project_context({})["status"] == "unavailable"
         assert explorer.calls == 1
 
         # Revocation: a later privacy update cannot reactivate it.
         comp.revoke("test_revocation")
         _opt_in(comp)
+        assert comp.bridge.arm_project_context({})["status"] == "unavailable"
         assert comp.bridge.check_project_context({})["status"] == "unavailable"
         assert comp.bridge.get_state({})["projects"] == []
         assert explorer.calls == 1
     finally:
         assert comp.shutdown() is True
     # After shutdown the provider is likewise never consulted again.
+    assert comp.bridge.arm_project_context({})["status"] == "unavailable"
     assert comp.bridge.check_project_context({})["status"] == "unavailable"
     assert comp.bridge.get_state({})["projects"] == []
     assert explorer.calls == 1
@@ -203,8 +215,10 @@ def test_registration_detection_and_explorer_string_normalization(tmp_path: Path
         assert explorer.calls == 0
         assert [c["evidenceSource"] for c in state["projects"]] == ["registered_project"]
 
-        # Explicit project-context check: Explorer is consulted once
-        # and the registered root is upgraded with Explorer evidence.
+        # Explicit handoff: arm, foreground capture, then the check
+        # upgrades the registered root with Explorer evidence.
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
         check = comp.bridge.check_project_context({})
         assert explorer.calls == 1
         candidates = check["projects"]
@@ -244,7 +258,9 @@ def test_registration_boundary_and_unregistered_explorer(tmp_path: Path) -> None
 
         # An Explorer folder outside the authorized workspace is
         # not published as project evidence at all (F3 scope), even
-        # by the explicit check.
+        # by a captured handoff check.
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
         assert comp.bridge.check_project_context({})["projects"] == []
         assert comp.bridge.get_state({})["projects"] == []
 
@@ -253,6 +269,8 @@ def test_registration_boundary_and_unregistered_explorer(tmp_path: Path) -> None
         # permission. Generic refresh still shows nothing.
         explorer.value = tmp_path / "aether-phase3-workspace-gates" / "unregistered-project"  # type: ignore[attr-defined]
         assert comp.bridge.get_state({})["projects"] == []
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
         state = comp.bridge.check_project_context({})
         assert len(state["projects"]) == 1
         candidate = state["projects"][0]
@@ -358,6 +376,8 @@ def test_collection_denied_after_authorization_expiry(tmp_path: Path) -> None:
     )
     try:
         _opt_in(comp)
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
         assert comp.bridge.check_project_context({})["projects"] != []
         calls = explorer.calls
         _time.sleep(1.2)  # past expiry (timer + synchronous predicate agree)

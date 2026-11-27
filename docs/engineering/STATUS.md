@@ -67,6 +67,22 @@ campaign procedures use a fresh campaign directory inside the
 owner evidence root, and package-query buffer reads are contained
 and termination-checked.
 
+Acceptance interaction closure C1–C4 is implemented on top in a
+fourth checkpoint on PR #37 (same Linux/fake test surface; native
+junction and Explorer-COM behavior remain owner-verified only): a
+Windows junction regression proves workspace substitution refuses
+startup validation and can never become the registration boundary;
+the Explorer project check runs as a one-shot focus handoff armed
+by the trusted desktop main process and succeeds only on actual
+Explorer evidence captured from a verified foreground change within
+60 seconds (no polling; unrelated windows cannot complete it);
+renderer context display is bound to the privacy generation,
+lifecycle and evidence freshness, dropping late responses after
+invalidation; and the activation proposal permits only the exact
+known untracked fixture in its clean-tree guard with every
+controlled-startup variable defined. Candidate awaits independent
+review; no native activation has been performed.
+
 **Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
 fake-backed** on top of CP4–CP5: authoritative persisted UI-operation
 bindings enforced end-to-end, PolicyBroker/enablement integration,

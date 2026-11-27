@@ -181,6 +181,23 @@ campaign procedures use a fresh campaign directory inside the
 owner evidence root, and package-query buffer reads are contained
 and termination-checked.
 
+Acceptance interaction closure C1–C4 is implemented on top in a
+fourth checkpoint on PR #37 (same Linux/fake test surface; native
+junction and Explorer-COM behavior remain owner-verified only):
+a Windows junction regression (via `fs_support.make_junction`)
+proves workspace substitution refuses startup validation and can
+never be adopted as the registration boundary; the Explorer project
+check is a one-shot focus handoff whose arm is established by the
+trusted desktop main process and whose success rests only on
+Explorer evidence captured from a verified foreground change
+within a bounded 60-second window (no polling, no collection on
+refresh, no candidate from mere registration); displayed context is
+bound to the privacy generation, lifecycle and that freshness
+window, with late responses dropped after invalidation; and the
+activation proposal's clean-tree guard permits only the exact
+known untracked fixture while defining every variable its
+controlled-startup procedure uses.
+
 ## 7. Performance defaults (provisional, unmeasured)
 
 Queue 256 events; observation TTL 30 s; reconciliation on demand /

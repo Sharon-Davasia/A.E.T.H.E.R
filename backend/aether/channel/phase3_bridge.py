@@ -86,6 +86,15 @@ class Phase3Surface:
     # never retrieve Explorer folder paths.
     project_context_begin: Callable[[], None] | None = None
     project_context_end: Callable[[], None] | None = None
+    # One-shot focus-handoff hooks (C2), wired by controlled
+    # composition: arm (established by trusted main), cancel, and
+    # fresh-captured-evidence query.
+    project_context_arm: Callable[[], bool] | None = None
+    project_context_cancel: Callable[[], None] | None = None
+    # Fresh-captured-evidence query (C2/C3): returns
+    # (capturedAtMs, privacyGeneration) of live captured Explorer
+    # evidence, or None when no fresh evidence exists.
+    project_context_captured: Callable[[], tuple[int, int] | None] | None = None
     # Trusted composition clock; freshness/resolution are evaluated
     # on the same time source as the rest of the composition.
     clock: Callable[[], datetime] | None = None
@@ -376,6 +385,40 @@ class Phase3Bridge:
             )
         return summaries
 
+    def arm_project_context(self, payload: object) -> dict[str, object]:
+        """Arm the one-shot project-context focus handoff (C2).
+
+        Established only through the trusted main process (native
+        owner confirmation + sender-validated IPC); the renderer
+        cannot arm collection by itself. Arming itself collects
+        nothing: evidence arrives only from a subsequent verified
+        foreground change to an Explorer window, within the arm TTL.
+        """
+
+        def run() -> dict[str, object]:
+            surface = self.surface
+            if surface.detector is None or surface.project_registry is None:
+                return self._unavailable("project_context_unavailable")
+            if not self._collection_permitted():
+                return self._unavailable("project_context_not_authorized")
+            if surface.project_context_arm is None:
+                return self._unavailable("project_context_unavailable")
+            if not surface.project_context_arm():
+                return self._unavailable("project_context_not_authorized")
+            return {"status": "armed", "expiresInSeconds": 60}
+
+        return self._guarded(run)
+
+    def cancel_project_context(self, payload: object) -> dict[str, object]:
+        """Cancel an armed handoff and drop any captured evidence."""
+
+        def run() -> dict[str, object]:
+            if self.surface.project_context_cancel is not None:
+                self.surface.project_context_cancel()
+            return {"status": "ready", "cancelled": True}
+
+        return self._guarded(run)
+
     def check_project_context(self, payload: object) -> dict[str, object]:
         """Explicit owner-initiated project-context check (F3, P3-23).
 
@@ -397,6 +440,14 @@ class Phase3Bridge:
                 return self._unavailable("project_context_not_authorized")
             authority = surface.privacy_authority
             generation = authority.generation if authority is not None else None
+            captured: tuple[int, int] | None = None
+            if surface.project_context_captured is not None:
+                captured = surface.project_context_captured()
+                if captured is None:
+                    # A successful check must rest on actual, fresh
+                    # Explorer evidence (C2) - never on the mere
+                    # existence of a registered project.
+                    return self._unavailable("explorer_evidence_unavailable")
             try:
                 if surface.project_context_begin is not None:
                     surface.project_context_begin()
@@ -410,7 +461,14 @@ class Phase3Bridge:
                 or not self._collection_permitted()
             ):
                 found = ()
-            return {"status": "ready", "projects": self._project_summaries(found)}
+            return {
+                "status": "ready",
+                "projects": self._project_summaries(found),
+                # C3: display is bound to this exact evidence: the
+                # privacy generation and capture instant it rests on.
+                "capturedAtMs": captured[0] if captured is not None else None,
+                "generation": captured[1] if captured is not None else None,
+            }
 
         return self._guarded(run)
 

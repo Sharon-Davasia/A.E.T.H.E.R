@@ -12,6 +12,7 @@ Fake platform seams only; nothing here is native Windows evidence.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -182,6 +183,8 @@ def test_workspace_lifecycle_and_storage_reopen(tmp_path: Path) -> None:
         assert explorer.calls == 0
         assert [c["evidenceSource"] for c in state["projects"]] == ["registered_project"]
         # Explicit check: Explorer consulted once, scope-validated.
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)  # verified foreground event
         check = bridge.check_project_context({})
         assert explorer.calls == 1
         candidates = check["projects"]
@@ -287,6 +290,8 @@ def test_expiry_enforced_synchronously_with_deterministic_clock(tmp_path: Path) 
         state = bridge.get_state({})
         assert explorer.calls == 0  # refresh alone never collects (F3)
         assert state["capabilities"]["app.launch"] is True
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
         check = bridge.check_project_context({})
         assert check["projects"] != []
         assert explorer.calls == 1
@@ -447,3 +452,66 @@ def test_registry_boundary_drift_refuses_registration(tmp_path: Path) -> None:
     shutil.rmtree(workspace)
     with pytest.raises(ResourceRegistryError, match="registration_boundary_invalid"):
         registry.register_root("gone", project, allowed_capabilities=frozenset({"fs.inspect_file"}))
+
+
+def test_workspace_junction_substitution_refused(tmp_path: Path) -> None:
+    """C1 (Windows, no elevation): substituting the authorized
+    synthetic workspace with a directory junction refuses startup
+    validation; the junction destination can never be adopted as
+    the registration boundary; and no registration outside the
+    original workspace succeeds. Uses the established
+    ``fs_support.make_junction`` helper (mklink /J). Missing-workspace
+    and identity-drift coverage lives in the tests above and stays
+    independently executable."""
+    from fs_support import make_junction
+
+    from aether.core.apps.acceptance_startup import workspace_directory_error
+    from aether.core.resources.registry import ResourceRegistry, ResourceRegistryError
+
+    now = datetime.now(UTC)
+    authz = _authz(tmp_path, expires_at=now + timedelta(hours=2))
+    storage = Path(authz.storage_path)
+    workspace = Path(authz.workspace_path)
+    assert workspace_directory_error(str(storage), str(workspace), authz.workspace_identity) is None
+
+    project = workspace / "synthetic-project"
+    project.mkdir()
+    registry = ResourceRegistry(
+        registration_boundary=workspace,
+        registration_boundary_identity=authz.workspace_identity,
+    )
+    registry.register_root("project", project, allowed_capabilities=frozenset({"fs.inspect_file"}))
+
+    # Substitute the workspace path with a junction to a destination
+    # holding a lookalike project. The original directory survives
+    # under another name (identity preserved for comparison).
+    destination = tmp_path / "junction-destination"
+    (destination / "synthetic-project").mkdir(parents=True)
+    workspace.rename(tmp_path / "workspace-original")
+    make_junction(workspace, destination)
+    try:
+        # Startup validation refuses the substituted workspace.
+        assert (
+            workspace_directory_error(str(storage), str(workspace), authz.workspace_identity)
+            == "synthetic_workspace_reparse"
+        )
+        with pytest.raises(StartupDenied, match="synthetic_workspace_reparse"):
+            authz.validate(current_commit=COMMIT, now=now, storage_marker=None)
+
+        # The junction cannot be adopted as a registration boundary.
+        with pytest.raises(ResourceRegistryError, match="registration_boundary_invalid"):
+            ResourceRegistry(registration_boundary=workspace)
+
+        # The previously valid registry refuses registration into
+        # the junction destination (outside the original workspace):
+        # its boundary revalidation fails closed.
+        with pytest.raises(ResourceRegistryError, match="registration_boundary_invalid"):
+            registry.register_root(
+                "outside",
+                destination / "synthetic-project",
+                allowed_capabilities=frozenset({"fs.inspect_file"}),
+            )
+    finally:
+        # Remove the junction itself; never delete through it.
+        with contextlib.suppress(OSError):
+            workspace.rmdir()

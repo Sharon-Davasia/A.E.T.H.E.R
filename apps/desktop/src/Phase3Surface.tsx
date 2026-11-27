@@ -18,6 +18,7 @@ interface Phase3SurfaceProps {
   search: Phase3AppSearch | null;
   searchSerial: number;
   projectContext: Phase3ProjectCandidate[] | null;
+  projectContextArmed: boolean;
   windows: Phase3Window[];
   snapshot: Phase3Snapshot | null;
   prepared: Phase3Prepared | null;
@@ -27,7 +28,9 @@ interface Phase3SurfaceProps {
   onRefresh: () => void;
   onPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }) => void;
   onSearchApps: (query: string) => void;
+  onArmProjectContext: () => void;
   onCheckProjectContext: () => void;
+  onCancelProjectContext: () => void;
   onPrepareLaunch: (appId: string) => void;
   onRegisterProject: () => void;
   onApproveOperation: (effect: string) => void;
@@ -216,13 +219,26 @@ export function Phase3Surface(props: Phase3SurfaceProps): React.JSX.Element {
               <button type="button" className="ping-button" disabled={busy}
                 onClick={props.onRegisterProject}>Register synthetic project folder…</button>
               <button type="button" className="ping-button" disabled={busy}
-                onClick={props.onCheckProjectContext}>Check current project context</button>
+                onClick={props.onArmProjectContext}>Begin Explorer project check</button>
+              <button type="button" className="ping-button" disabled={busy || !props.projectContextArmed}
+                onClick={props.onCheckProjectContext}>Complete project check</button>
+              <button type="button" className="ping-button" disabled={busy || !props.projectContextArmed}
+                onClick={props.onCancelProjectContext}>Cancel project check</button>
             </div>
+            {props.projectContextArmed && (
+              <p role="status">
+                Check armed for 60 seconds. Switch to the Explorer window showing the
+                synthetic project folder, then return here and choose “Complete project
+                check”. Nothing is read unless that Explorer window actually comes to
+                the foreground; unrelated windows cannot complete the check.
+              </p>
+            )}
             <p>
-              The check is explicit and one-shot: it reads the foreground Explorer
-              folder once and compares it only against the registered synthetic
-              workspace. State refreshes never read it, and out-of-scope paths
-              are neither retained nor shown.
+              The check is explicit and one-shot: the trusted main process establishes
+              a single 60-second authorization, and the backend captures the folder
+              only when the Explorer window itself becomes foreground. It is compared
+              only against the registered synthetic workspace. State refreshes never
+              read it, and out-of-scope paths are neither retained nor shown.
             </p>
             {(props.projectContext ?? state.projects).length > 0 && (
               <>

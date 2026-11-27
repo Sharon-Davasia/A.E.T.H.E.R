@@ -176,16 +176,87 @@ export interface Phase3ProjectContext {
   status: 'ready' | 'unavailable';
   reason?: string;
   projects: Phase3ProjectCandidate[];
+  /** Capture instant (epoch ms) of the Explorer evidence this result
+   * rests on, and the privacy generation it belongs to (C3). Either
+   * may be null when no captured evidence backs the result; such a
+   * result must never be displayed as current project context. */
+  capturedAtMs: number | null;
+  generation: number | null;
 }
 
 /** Result of one explicit owner-initiated project-context check. */
 export function parsePhase3ProjectContext(value: unknown): Phase3ProjectContext {
   const item = record(value);
   if (item.status === 'unavailable') {
-    return { status: 'unavailable', reason: reason(item), projects: [] };
+    return { status: 'unavailable', reason: reason(item), projects: [], capturedAtMs: null, generation: null };
   }
   const projects = Array.isArray(item.projects) ? item.projects : [];
-  return { status: 'ready', projects: projects.map(projectCandidate) };
+  return {
+    status: 'ready',
+    projects: projects.map(projectCandidate),
+    capturedAtMs: typeof item.capturedAtMs === 'number' && Number.isFinite(item.capturedAtMs) ? item.capturedAtMs : null,
+    generation: typeof item.generation === 'number' && Number.isFinite(item.generation) ? item.generation : null,
+  };
+}
+
+/** Bounded freshness for displayed Explorer-context evidence (C3). */
+export const PROJECT_CONTEXT_FRESHNESS_MS = 60_000;
+
+/** Project-context evidence retained by the renderer (C3): the
+ * candidates plus the capture instant and privacy generation they
+ * were produced under. */
+export interface Phase3ProjectContextView {
+  projects: Phase3ProjectCandidate[];
+  capturedAtMs: number;
+  generation: number;
+}
+
+/** Bind a check result to its evidence; unusable evidence binds to
+ * nothing (never display success without fresh captured evidence). */
+export function projectContextView(context: Phase3ProjectContext): Phase3ProjectContextView | null {
+  if (context.status !== 'ready') return null;
+  if (context.capturedAtMs === null || context.generation === null) return null;
+  return { projects: context.projects, capturedAtMs: context.capturedAtMs, generation: context.generation };
+}
+
+/**
+ * The only candidates the surface may display as current project
+ * context (C3): evidence bound to the CURRENT authoritative privacy
+ * generation, an opted-in unpaused lifecycle, and a capture instant
+ * within the bounded freshness window (never from the future). Any
+ * pause/opt-out, generation change, expiry or disconnect state
+ * yields null, so stale evidence cannot remain on screen.
+ */
+export function visibleProjectContext(
+  view: Phase3ProjectContextView | null,
+  privacy: Phase3Privacy | null | undefined,
+  nowMs: number,
+): Phase3ProjectCandidate[] | null {
+  if (view === null) return null;
+  if (privacy === null || privacy === undefined) return null;
+  if (!privacy.optedIn || privacy.paused) return null;
+  if (privacy.generation !== view.generation) return null;
+  if (nowMs < view.capturedAtMs) return null;
+  if (nowMs - view.capturedAtMs > PROJECT_CONTEXT_FRESHNESS_MS) return null;
+  return view.projects;
+}
+
+export interface Phase3ProjectContextArm {
+  status: 'armed' | 'unavailable';
+  reason?: string;
+  expiresInSeconds?: number;
+}
+
+/** Parse an arm/cancel result from the trusted main-mediated flow. */
+export function parsePhase3ProjectContextArm(value: unknown): Phase3ProjectContextArm {
+  const item = record(value);
+  if (item.status === 'armed') {
+    return {
+      status: 'armed',
+      expiresInSeconds: typeof item.expiresInSeconds === 'number' ? item.expiresInSeconds : undefined,
+    };
+  }
+  return { status: 'unavailable', reason: reason(item) };
 }
 
 export function parsePhase3Prepared(value: unknown): Phase3Prepared {

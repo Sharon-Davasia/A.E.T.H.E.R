@@ -12,7 +12,7 @@
 
 import type { BackendClient } from './backend-client';
 import {
-  parsePhase3AppSearch, parsePhase3Outcome, parsePhase3ProjectContext, parsePhase3Prepared, parsePhase3ProjectRegistration, parsePhase3Snapshot, parsePhase3State,
+  parsePhase3AppSearch, parsePhase3Outcome, parsePhase3ProjectContext, parsePhase3ProjectContextArm, parsePhase3Prepared, parsePhase3ProjectRegistration, parsePhase3Snapshot, parsePhase3State,
   type Phase3Outcome, type Phase3Prepared, type Phase3ProjectRegistration, type Phase3Snapshot, type Phase3State,
 } from '../shared/phase3';
 import type { GestureBindingInput } from './gesture';
@@ -37,7 +37,7 @@ export interface Phase3ProviderOptions {
     | 'phase3ListWindows' | 'phase3PrepareLaunch' | 'phase3PrepareActivation'
     | 'phase3PrepareFixture' | 'phase3PreviewOperation' | 'phase3ApproveOperation'
     | 'phase3GetReceipt' | 'phase3CancelTask' | 'phase3ResumeTask' | 'phase3RegisterProject'
-    | 'phase3CheckProjectContext'
+    | 'phase3CheckProjectContext' | 'phase3ArmProjectContext' | 'phase3CancelProjectContext'
   >;
   /** Native trusted confirmation; resolves true only on explicit affirmation. */
   confirm: (summary: Phase3InteractionSummary) => Promise<boolean>;
@@ -91,9 +91,23 @@ export function createPhase3Provider(options: Phase3ProviderOptions) {
   }
 
   async function checkProjectContext() {
-    // One explicit owner-initiated check: the only operation that
-    // may read the foreground Explorer folder (backend-armed, F3).
+    // One explicit completion of a main-established one-shot handoff
+    // (C2): succeeds only on actual fresh Explorer evidence captured
+    // by the backend from a verified foreground change - never on
+    // the mere existence of a registered project.
     return parsePhase3ProjectContext(await backend.phase3CheckProjectContext());
+  }
+
+  async function armProjectContext() {
+    // Arm the one-shot focus handoff. This runs in the trusted main
+    // process path: arming itself collects nothing; the backend
+    // collects only from a later verified Explorer foreground event.
+    return parsePhase3ProjectContextArm(await backend.phase3ArmProjectContext());
+  }
+
+  async function cancelProjectContext() {
+    await backend.phase3CancelProjectContext().catch(() => undefined);
+    return { status: 'ready', cancelled: true } as const;
   }
 
   async function registerProject(path: string): Promise<Phase3ProjectRegistration> {
@@ -248,6 +262,7 @@ export function createPhase3Provider(options: Phase3ProviderOptions) {
     getState, setPrivacy, searchApps, listWindows, inspectWindow,
     prepareLaunch, prepareActivation, prepareFixture,
     getReceipt, cancelTask, resumeTask, registerProject, checkProjectContext,
+    armProjectContext, cancelProjectContext,
     getTaskState, pauseTask, approveFixtureInteraction, approveOperation,
   };
 }

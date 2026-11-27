@@ -8,6 +8,7 @@ import { createLiveApprovalProvider } from './live-approval-provider';
 import { createPhase3Provider, type Phase3InteractionSummary } from './phase3-provider';
 import { createApprovalWindowConfirmer } from './approval-window';
 import { workflowFailureReason } from './workflow';
+import { ProjectContextHandoff } from './project-context-handoff';
 import { LiveWorkflow } from './workflow';
 import { parseEditReceipt } from '../shared/live';
 import { parseReviewOutcomeRequest } from '../shared/review';
@@ -257,7 +258,12 @@ function registerIpc(): void {
   };
   ipcMain.handle('desktop:phase3-state', async (event) => {
     validateInvoke(event);
-    return phase3Provider.getState();
+    const state = await phase3Provider.getState();
+    if (state.status === 'unavailable') {
+      // Backend disconnect/unavailability invalidates any handoff.
+      projectContextHandoff.cancel();
+    }
+    return state;
   });
   ipcMain.handle('desktop:phase3-set-privacy', async (event, raw: unknown) => {
     validateInvoke(event);
@@ -274,9 +280,40 @@ function registerIpc(): void {
     if (typeof raw !== 'string' || raw.length > 256) throw new Error('malformed phase3 query');
     return phase3Provider.searchApps(raw);
   });
+  // C2 focus handoff: the one-shot owner authorization is
+  // established HERE, in the trusted main process - renderer IPC
+  // sender validation alone is never proof of owner intent. Arming
+  // requires a successful backend arm; a completion attempt is
+  // admitted only while main's own handoff is live, and consumes
+  // it. The backend still requires actual fresh Explorer evidence
+  // captured from a verified foreground change.
+  const projectContextHandoff = new ProjectContextHandoff();
+  ipcMain.handle('desktop:phase3-arm-project-context', async (event) => {
+    validateInvoke(event);
+    const result = await phase3Provider.armProjectContext();
+    if (result.status === 'armed') {
+      projectContextHandoff.establish(Date.now());
+    } else {
+      projectContextHandoff.cancel();
+    }
+    return result;
+  });
   ipcMain.handle('desktop:phase3-check-project-context', async (event) => {
     validateInvoke(event);
+    if (!projectContextHandoff.consume(Date.now())) {
+      // No live main-established handoff: refuse without touching
+      // the backend - a renderer click can never self-authorize.
+      return {
+        status: 'unavailable', reason: 'explorer_evidence_unavailable',
+        projects: [], capturedAtMs: null, generation: null,
+      };
+    }
     return phase3Provider.checkProjectContext();
+  });
+  ipcMain.handle('desktop:phase3-cancel-project-context', async (event) => {
+    validateInvoke(event);
+    projectContextHandoff.cancel();
+    return phase3Provider.cancelProjectContext();
   });
   ipcMain.handle('desktop:phase3-inspect-window', async (event, raw: unknown) => {
     validateInvoke(event);

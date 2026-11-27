@@ -4,7 +4,8 @@ import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
 import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
 import { Phase3Surface } from './Phase3Surface';
-import type { Phase3AppSearch, Phase3Outcome, Phase3Prepared, Phase3ProjectCandidate, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
+import type { Phase3AppSearch, Phase3Outcome, Phase3Prepared, Phase3ProjectContext, Phase3ProjectContextArm, Phase3ProjectContextView, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
+import { projectContextView, visibleProjectContext } from '../shared/phase3';
 import { describeLiveApprovalOutcome } from '../shared/live';
 import type {
   LiveApprovalState,
@@ -42,7 +43,9 @@ declare global {
       phase3GetState: () => Promise<Phase3State>;
       phase3SetPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }) => Promise<Phase3State>;
       phase3SearchApps: (query: string) => Promise<unknown>;
-      phase3CheckProjectContext: () => Promise<unknown>;
+      phase3ArmProjectContext: () => Promise<Phase3ProjectContextArm>;
+      phase3CheckProjectContext: () => Promise<Phase3ProjectContext>;
+      phase3CancelProjectContext: () => Promise<{ status: 'ready'; cancelled: boolean }>;
       phase3InspectWindow: (windowId: string) => Promise<Phase3Snapshot>;
       phase3ApproveInteraction: (request: string | { taskId: string; preview?: Phase3Prepared }) => Promise<Phase3Outcome>;
       phase3GetTask: (taskId: string) => Promise<{ status: string; taskState?: string; attempts?: unknown[] }>;
@@ -87,14 +90,29 @@ function App(): React.JSX.Element {
   const [phase3Busy, setPhase3Busy] = React.useState(false);
   const [phase3Search, setPhase3Search] = React.useState<Phase3AppSearch | null>(null);
   const [phase3SearchSerial, setPhase3SearchSerial] = React.useState(0);
-  const [phase3ProjectContext, setPhase3ProjectContext] = React.useState<Phase3ProjectCandidate[] | null>(null);
+  const [phase3ProjectContext, setPhase3ProjectContext] = React.useState<Phase3ProjectContextView | null>(null);
+  const [phase3ContextArmed, setPhase3ContextArmed] = React.useState(false);
+  const [phase3ContextNow, setPhase3ContextNow] = React.useState(() => Date.now());
+  const phase3ContextEpoch = React.useRef(0);
   const [phase3Windows, setPhase3Windows] = React.useState<Phase3Window[]>([]);
   const [phase3Prepared, setPhase3Prepared] = React.useState<Phase3Prepared | null>(null);
   const [phase3Receipt, setPhase3Receipt] = React.useState<unknown>(null);
 
+  // C3: project-context evidence is invalidated as one unit. Bumping
+  // the epoch makes any in-flight check/arm response stale, so a late
+  // response can never restore context after invalidation.
+  const invalidateProjectContext = React.useCallback((): void => {
+    phase3ContextEpoch.current += 1;
+    setPhase3ProjectContext(null);
+    setPhase3ContextArmed(false);
+  }, []);
+
   const refreshPhase3 = React.useCallback(async (): Promise<void> => {
     try { setPhase3State(await window.aetherDesktop.phase3GetState()); }
-    catch { setPhase3State({ status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false, disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 }, projects: [], windows: [], capabilities: {} }); }
+    catch {
+      setPhase3ProjectContext(null);
+      setPhase3State({ status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false, disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 }, projects: [], windows: [], capabilities: {} });
+    }
   }, []);
 
   React.useEffect(() => {
@@ -114,6 +132,9 @@ function App(): React.JSX.Element {
   }, []);
 
   async function phase3Privacy(privacy: { optedIn: boolean; mode: string; paused: boolean }): Promise<void> {
+    // Any privacy change invalidates retained Explorer evidence and
+    // any in-flight context check (C3).
+    invalidateProjectContext();
     setPhase3Busy(true);
     try { setPhase3State(await window.aetherDesktop.phase3SetPrivacy(privacy)); }
     finally { setPhase3Busy(false); }
@@ -123,6 +144,56 @@ function App(): React.JSX.Element {
     setPhase3Busy(true);
     try { setPhase3Snapshot(await window.aetherDesktop.phase3InspectWindow(windowId)); }
     finally { setPhase3Busy(false); }
+  }
+
+  // Bounded freshness (C3): while Explorer evidence is retained,
+  // re-render on a timer so expired evidence disappears on time.
+  React.useEffect(() => {
+    if (phase3ProjectContext === null) return;
+    const timer = setInterval(() => setPhase3ContextNow(Date.now()), 5_000);
+    return () => clearInterval(timer);
+  }, [phase3ProjectContext]);
+
+  // C2 desktop flow: (1) trusted main establishes the one-shot arm;
+  // (2) the owner foregrounds the Explorer window; (3) completion
+  // rests only on the backend's fresh captured evidence. Every step
+  // is epoch-guarded: invalidation during flight drops late replies.
+  async function phase3ArmProjectContext(): Promise<void> {
+    const epoch = phase3ContextEpoch.current + 1;
+    phase3ContextEpoch.current = epoch;
+    setPhase3ProjectContext(null);
+    setPhase3Busy(true);
+    try {
+      const result = await window.aetherDesktop.phase3ArmProjectContext();
+      if (phase3ContextEpoch.current !== epoch) return;
+      setPhase3ContextArmed(result.status === 'armed');
+    } catch {
+      if (phase3ContextEpoch.current === epoch) setPhase3ContextArmed(false);
+    } finally { setPhase3Busy(false); }
+  }
+
+  async function phase3CheckProjectContext(): Promise<void> {
+    const epoch = phase3ContextEpoch.current + 1;
+    phase3ContextEpoch.current = epoch;
+    setPhase3Busy(true);
+    try {
+      const result = await window.aetherDesktop.phase3CheckProjectContext();
+      if (phase3ContextEpoch.current !== epoch) return; // invalidated in flight
+      // Unavailable/failed checks clear retained context (C3); a
+      // ready result is bound to its capture instant + generation.
+      setPhase3ProjectContext(projectContextView(result));
+      setPhase3ContextArmed(false);
+    } catch {
+      if (phase3ContextEpoch.current === epoch) {
+        setPhase3ProjectContext(null);
+        setPhase3ContextArmed(false);
+      }
+    } finally { setPhase3Busy(false); }
+  }
+
+  async function phase3CancelProjectContext(): Promise<void> {
+    invalidateProjectContext();
+    try { await window.aetherDesktop.phase3CancelProjectContext(); } catch { /* already dropped locally */ }
   }
 
   async function phase3Run<T>(fn: () => Promise<T>, apply: (value: T) => void): Promise<void> {
@@ -312,7 +383,8 @@ function App(): React.JSX.Element {
       state={phase3State}
       search={phase3Search}
       searchSerial={phase3SearchSerial}
-      projectContext={phase3ProjectContext}
+      projectContext={visibleProjectContext(phase3ProjectContext, phase3State?.privacy, phase3ContextNow)}
+      projectContextArmed={phase3ContextArmed}
       windows={phase3Windows}
       snapshot={phase3Snapshot}
       prepared={phase3Prepared}
@@ -328,10 +400,9 @@ function App(): React.JSX.Element {
         () => window.aetherDesktop.phase3SearchApps(query) as Promise<Phase3AppSearch>,
         (search) => { setPhase3Search(search); setPhase3SearchSerial((n) => n + 1); },
       )}
-      onCheckProjectContext={() => void phase3Run(
-        () => window.aetherDesktop.phase3CheckProjectContext() as Promise<{ projects: Phase3ProjectCandidate[] }>,
-        (result) => setPhase3ProjectContext(result.projects),
-      )}
+      onArmProjectContext={() => void phase3ArmProjectContext()}
+      onCheckProjectContext={() => void phase3CheckProjectContext()}
+      onCancelProjectContext={() => void phase3CancelProjectContext()}
       onRegisterProject={() => {
         void (async () => {
           await window.aetherDesktop.phase3RegisterProject();

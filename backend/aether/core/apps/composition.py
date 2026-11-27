@@ -140,6 +140,9 @@ class Phase3Composition:
     world_state: object | None = None  # InMemoryWorldState
     observer_service: object | None = None  # ObserverService
     expiry_timer: object | None = None  # threading.Timer at expiry
+    # One-shot project-context capture delegate (C2): invoked by the
+    # verified foreground-event boundary with the foreground HWND.
+    project_context_capture: Callable[[int], None] | None = None
     _started: bool = False
     _revoked: bool = False
 
@@ -349,6 +352,54 @@ class Phase3Composition:
                     if r.executable_identity
                 },
             )
+            # C2: bounded one-shot project-context capture. Arming
+            # is established by the trusted main process (through
+            # the bridge); Explorer collection happens ONLY when a
+            # verified foreground-change event for a window arrives
+            # while armed - never by polling, never on refresh, and
+            # clicking the panel can never be its own evidence,
+            # because the panel click is not a foreground event for
+            # an Explorer window.
+            from datetime import timedelta as _td
+
+            _project_context: dict[str, object] = {
+                "armed_until": None,
+                "generation": None,
+                "folder": None,
+                "captured_at": None,
+            }
+            # Detect-time gate: only captured evidence is ever read.
+            _context_gate: dict[str, bool] = {"armed": False}
+
+            def _sample_explorer(hwnd: int) -> _Path | None:
+                raw_provider = providers.explorer_folder
+                if raw_provider is None:
+                    return None
+                try:
+                    raw = raw_provider(hwnd)
+                except TypeError:
+                    raw = raw_provider()
+                return _Path(str(raw)) if raw else None
+
+            def _capture_foreground(hwnd: int) -> None:
+                armed_until = _project_context["armed_until"]
+                if armed_until is None:
+                    return
+                if (
+                    now_fn() > armed_until  # type: ignore[operator]
+                    or privacy.generation != _project_context["generation"]
+                    or not privacy.collection_enabled
+                    or now_fn() >= authorization.expires_at
+                ):
+                    _project_context["armed_until"] = None
+                    return
+                folder = _sample_explorer(hwnd)
+                if folder is None:
+                    return  # not an Explorer window; stay armed (bounded)
+                _project_context["folder"] = folder
+                _project_context["captured_at"] = now_fn()
+                _project_context["armed_until"] = None  # one-shot consumed
+
             observer_service = None
             if providers.event_source is not None:
                 from dataclasses import replace as _event_replace
@@ -366,6 +417,8 @@ class Phase3Composition:
                     checks inside WorldState remain authoritative.
                     """
                     world_state.handle_event(event, now=now_fn(), generation=world_state.generation)
+                    if getattr(event.kind, "value", event.kind) == "foreground_changed":
+                        _capture_foreground(int(getattr(event, "hwnd", 0) or 0))
 
                 def _apply_observer_snapshot(events):  # type: ignore[no-untyped-def]
                     """Explicit initial/reconciled snapshot wiring.
@@ -686,19 +739,52 @@ class Phase3Composition:
                     return False
                 return now_fn() < authorization.expires_at
 
-            _raw_explorer_folder = providers.explorer_folder
-            # F3: foreground Explorer collection only inside one
-            # explicit owner-initiated project-context check. Generic
-            # metadata state refreshes never consult the provider.
-            _context_gate: dict[str, bool] = {"armed": False}
-
+            # F3+C2: detection NEVER consults the Explorer provider.
+            # It reads only the fresh captured evidence from the
+            # one-shot focus handoff (verified foreground event), and
+            # only while the bounded project-context check is running.
             def _explorer_folder() -> _Path | None:
                 if not _context_gate["armed"]:
                     return None
-                if _raw_explorer_folder is None or not _collection_permitted():
+                folder = _project_context["folder"]
+                captured_at = _project_context["captured_at"]
+                if folder is None or captured_at is None:
                     return None
-                raw = _raw_explorer_folder()
-                return _Path(str(raw)) if raw else None
+                if privacy.generation != _project_context["generation"]:
+                    return None
+                if now_fn() - captured_at > _td(seconds=60):  # type: ignore[operator]
+                    return None  # stale evidence is not evidence
+                if not _collection_permitted():
+                    return None
+                return folder  # type: ignore[return-value]
+
+            def _arm_project_context() -> bool:
+                if not _collection_permitted():
+                    return False
+                _project_context["armed_until"] = now_fn() + _td(seconds=60)
+                _project_context["generation"] = privacy.generation
+                _project_context["folder"] = None
+                _project_context["captured_at"] = None
+                return True
+
+            def _cancel_project_context() -> None:
+                _project_context["armed_until"] = None
+                _project_context["folder"] = None
+                _project_context["captured_at"] = None
+
+            def _project_context_captured() -> tuple[int, int] | None:
+                if _project_context["folder"] is None or _project_context["captured_at"] is None:
+                    return None
+                if privacy.generation != _project_context["generation"]:
+                    return None
+                captured_at = _project_context["captured_at"]
+                if now_fn() - captured_at > _td(seconds=60):  # type: ignore[operator]
+                    return None  # stale evidence is not evidence
+                epoch_ms = int(captured_at.timestamp() * 1000)  # type: ignore[attr-defined]
+                captured_generation = _project_context["generation"]
+                if not isinstance(captured_generation, int):
+                    return None
+                return (epoch_ms, captured_generation)
 
             if not authorization.workspace_path:
                 raise CompositionUnavailable("synthetic_workspace_missing")
@@ -756,6 +842,9 @@ class Phase3Composition:
             surface.execution_available = _execution_available
             surface.project_context_begin = lambda: _context_gate.__setitem__("armed", True)
             surface.project_context_end = lambda: _context_gate.__setitem__("armed", False)
+            surface.project_context_arm = _arm_project_context
+            surface.project_context_cancel = _cancel_project_context
+            surface.project_context_captured = _project_context_captured
             surface.clock = now_fn
             surface.planner = planner
             surface.launch_coordinator = coordinator
@@ -784,10 +873,12 @@ class Phase3Composition:
             )
             composition.world_state = world_state
             composition.observer_service = observer_service
+            composition.project_context_capture = _capture_foreground
             holder["composition"] = composition
             _gate_holder["composition"] = composition
 
             def _on_privacy_change() -> None:
+                _cancel_project_context()
                 snapshots.note_privacy_change()
                 world_state.set_policy(privacy.policy)
                 if _collection_permitted():
@@ -1177,7 +1268,7 @@ class NativePlatformProviders:
     foreground_hwnd: Callable[[], int | None]
     observation_provider: object | None = None  # LaunchVerifier provider
     event_source: object | None = None  # WindowEventSource (observer)
-    explorer_folder: Callable[[], object] | None = None
+    explorer_folder: Callable[..., object] | None = None
     modal_evidence: Callable[[str], tuple[ModalWindowEvidence, ...] | None] | None = None
     worker: SubprocessWorkerSupervisor | None = None
 
@@ -1200,25 +1291,34 @@ class NativePlatformSeams:
     integrity_verifier: IntegrityVerifier
     activity_factory: Callable[[Callable[[ActivitySignal], None]], object] | None
     foreground_provider: object  # activate(hwnd)/foreground_hwnd()
-    explorer_folder: Callable[[], object] | None = None
+    explorer_folder: Callable[..., object] | None = None
     worker_command: list[str] | None = None
     pywinauto_module: object | None = None
 
 
-def _native_explorer_folder() -> object:  # pragma: no cover - Windows COM
-    """Current Explorer folder via Shell.Application; None if unknown."""
+def _native_explorer_folder(hwnd: object = None) -> object:  # pragma: no cover - Windows COM
+    """Explorer folder for one verified window identity.
+
+    The composition passes the HWND from a verified foreground-change
+    event (the existing window-identity mechanism); only a Shell
+    window with exactly that HWND yields its folder. Without an HWND
+    the current foreground window is used (direct callers).
+    """
     try:
         import win32com.client  # type: ignore[import-untyped]
 
         shell = win32com.client.Dispatch("Shell.Application")
-        import ctypes
-        from typing import Any as _Any
+        if isinstance(hwnd, int) and hwnd:
+            target = hwnd
+        else:
+            import ctypes
+            from typing import Any as _Any
 
-        _windll: _Any = getattr(ctypes, "windll", None)
-        foreground = _windll.user32.GetForegroundWindow()
+            _windll: _Any = getattr(ctypes, "windll", None)
+            target = int(_windll.user32.GetForegroundWindow())
         for window in shell.Windows():
             try:
-                if int(window.HWND) == int(foreground):
+                if int(window.HWND) == target:
                     return window.Document.Folder.Self.Path
             except Exception:
                 continue

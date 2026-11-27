@@ -91,7 +91,15 @@ preserved venv, `node_modules`, portable Node and compiled fixture
 are verified, and any absence is a stop-and-report condition.
 
 ```powershell
-git rev-parse HEAD            # must match the approved candidate SHA
+$Git = "C:\Program Files\Git\cmd\git.exe"   # verified trusted Git; the global PATH is never relied on
+if (-not (Test-Path $Git)) { throw "trusted Git executable not found; stop and report" }
+& $Git rev-parse HEAD         # must match the approved candidate SHA
+# Clean tree with exactly one allowed exception: the known untracked
+# fixture build output (hash-verified below; never rebuilt here).
+# Any other porcelain entry is a stop-and-report condition.
+$StatusLines = & $Git status --porcelain
+$Unexpected = $StatusLines | Where-Object { $_ -ne "?? tools/windows-fixture/AETHERFixture.exe" }
+if ($Unexpected) { throw "unexpected working-tree state; stop and report: $Unexpected" }
 $Python = "D:\A.E.T.H.E.R\backend\.venv\Scripts\python.exe"
 & $Python --version           # Python 3.12.10 (preserved backend venv)
 $EvidenceRoot = "D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a"
@@ -183,8 +191,15 @@ worktrees, no execution-policy changes.
 
 ```powershell
 # 1. Candidate verification — HEAD must equal the approved SHA.
-git rev-parse HEAD
-git status --porcelain        # must be empty
+$Git = "C:\Program Files\Git\cmd\git.exe"   # verified trusted Git; the global PATH is never relied on
+if (-not (Test-Path $Git)) { throw "trusted Git executable not found; stop and report" }
+& $Git rev-parse HEAD
+# Clean tree with exactly one allowed exception: the known untracked
+# fixture build output (hash-verified in step 4; never rebuilt).
+# Any other porcelain entry is a stop-and-report condition.
+$StatusLines = & $Git status --porcelain
+$Unexpected = $StatusLines | Where-Object { $_ -ne "?? tools/windows-fixture/AETHERFixture.exe" }
+if ($Unexpected) { throw "unexpected working-tree state; stop and report: $Unexpected" }
 
 # 2. Environment checks (verify only; never reinstall/rebuild).
 $Python = "D:\A.E.T.H.E.R\backend\.venv\Scripts\python.exe"
@@ -193,6 +208,9 @@ $EvidenceRoot = "D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a"
 $NodeDir = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64"
 & (Join-Path $NodeDir "node.exe") --version   # v22.22.3
 & (Join-Path $NodeDir "npm.cmd") --version    # 10.9.8
+$Npm = Join-Path $NodeDir "npm.cmd"
+# Fresh stamp for this campaign's isolated directories (step 5-7):
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 
 # 3. Gates at the candidate: see "Exact owner-side acceptance
 #    commands" above (pinned Python, fresh basetemp, no npm ci,
@@ -223,7 +241,7 @@ if ((Get-Item $CampaignRoot).Attributes -match "ReparsePoint") { throw "campaign
 #     inside the workspace (never inside the database directory).
 #     The tool reads the candidate commit via git: put the trusted
 #     Git directory on this shell's PATH explicitly first.
-$env:PATH = "C:\Program Files\Git\cmd;$NodeDir;$env:PATH"
+$env:PATH = "$([System.IO.Path]::GetDirectoryName($Git));$NodeDir;$env:PATH"
 #     Each campaign uses a NEW --campaign name. No internal
 #     identifier is constructed by hand. If discovery reports a
 #     requested name as ambiguous, re-run with exact --app-ids
@@ -237,7 +255,7 @@ cd ..
 #    The trusted Git executable is pinned absolutely (the sanitized
 #    backend PATH cannot resolve git by name).
 $env:AETHER_PHASE3_AUTHORIZATION = Join-Path $CampaignRoot "authorization-<campaign>.json"   # the exact file written in step 5-7
-$env:AETHER_GIT_EXECUTABLE = "C:\Program Files\Git\cmd\git.exe"
+$env:AETHER_GIT_EXECUTABLE = $Git
 if (-not (Test-Path $env:AETHER_GIT_EXECUTABLE)) { throw "trusted Git executable not found; stop and report" }
 $env:AETHER_DEV_PYTHON = $Python
 $env:PATH = "D:\A.E.T.H.E.R\backend\.venv\Scripts;$NodeDir;$env:PATH"   # pinned venv + portable Node for all subprocesses
