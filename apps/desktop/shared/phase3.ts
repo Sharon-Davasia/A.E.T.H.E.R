@@ -279,51 +279,71 @@ export interface Phase3Lifecycle extends Phase3LifecycleAuthority {
  * authority fails closed (never execution-available).
  */
 export function parsePhase3Lifecycle(value: unknown): Phase3Lifecycle {
-  if (value === null || typeof value !== 'object') {
-    // Unknown lifecycle authority fails closed.
-    return {
-      status: 'unavailable', reason: 'lifecycle_unavailable', executionAvailable: false,
-      expiresAtMs: null, privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
-    };
-  }
+  // Unknown or malformed lifecycle authority fails closed: it is
+  // NEVER normalized into a potentially ready state.
+  const failClosed = (why: string): Phase3Lifecycle => ({
+    status: 'unavailable', reason: why, executionAvailable: false,
+    expiresAtMs: null, privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
+  });
+  if (value === null || typeof value !== 'object') return failClosed('lifecycle_unavailable');
   const item = record(value);
-  const privacy = record(item.privacy ?? {});
-  const parsed: Phase3Lifecycle = {
-    status: item.status === 'unavailable' ? 'unavailable' : 'ready',
-    executionAvailable: item.executionAvailable === true,
-    expiresAtMs: typeof item.expiresAtMs === 'number' && Number.isFinite(item.expiresAtMs) ? item.expiresAtMs : null,
+  if (item.status !== 'ready' && item.status !== 'unavailable') {
+    return failClosed('lifecycle_status_unknown');
+  }
+  if (item.status === 'unavailable') {
+    return { ...failClosed('lifecycle_unavailable'), reason: reason(item) };
+  }
+  // status === 'ready': every required authority field must be
+  // present and well-formed, or the reading is not authority.
+  if (typeof item.executionAvailable !== 'boolean') return failClosed('lifecycle_malformed');
+  if (typeof item.expiresAtMs !== 'number' || !Number.isFinite(item.expiresAtMs)) {
+    return failClosed('lifecycle_expiry_unknown');
+  }
+  const rawPrivacy = item.privacy;
+  if (rawPrivacy === null || typeof rawPrivacy !== 'object') return failClosed('lifecycle_malformed');
+  const privacy = record(rawPrivacy);
+  if (
+    typeof privacy.optedIn !== 'boolean' || typeof privacy.paused !== 'boolean'
+    || typeof privacy.mode !== 'string'
+    || typeof privacy.generation !== 'number' || !Number.isFinite(privacy.generation)
+  ) {
+    return failClosed('lifecycle_malformed');
+  }
+  return {
+    status: 'ready',
+    executionAvailable: item.executionAvailable,
+    expiresAtMs: item.expiresAtMs,
     privacy: {
-      optedIn: privacy.optedIn === true,
-      mode: typeof privacy.mode === 'string' ? privacy.mode : 'off',
-      paused: privacy.paused === true,
-      generation: typeof privacy.generation === 'number' ? privacy.generation : 0,
+      optedIn: privacy.optedIn, mode: privacy.mode,
+      paused: privacy.paused, generation: privacy.generation,
     },
   };
-  if (item.status === 'unavailable') {
-    return { ...parsed, status: 'unavailable', reason: reason(item), executionAvailable: false };
-  }
-  return parsed;
 }
 
 /**
  * The renderer's lifecycle-monitoring decision (AS2): given one
  * authoritative lightweight reading (null = the read itself failed,
- * i.e. backend disconnect) and the privacy generation retained
- * evidence is bound to, decide whether retained context and pending
- * attempts must be invalidated. It never restores anything - it can
- * only invalidate or keep - so late readings cannot resurrect
- * invalidated context.
+ * i.e. backend disconnect) and the binding of the work it protects,
+ * decide whether retained context and pending attempts must be
+ * invalidated. The binding covers retained evidence AND pending
+ * arm/completion attempts: `active` says such work exists, and
+ * `generation` is the authoritative privacy generation it is bound
+ * to (null = unknown, which fails closed). Pause and opt-out
+ * invalidate active work regardless of retained evidence. It never
+ * restores anything - it can only invalidate or keep - so late
+ * readings cannot resurrect invalidated context.
  */
 export function evaluateLifecycleReading(
   lifecycle: Phase3Lifecycle | null,
-  retainedGeneration: number | null,
+  binding: { generation: number | null; active: boolean },
   nowMs: number,
 ): 'invalidate' | 'keep' {
   if (lifecycleInvalidatesContext(lifecycle, nowMs)) return 'invalidate';
-  if (lifecycle !== null && retainedGeneration !== null) {
-    if (!lifecycle.privacy.optedIn || lifecycle.privacy.paused) return 'invalidate';
-    if (lifecycle.privacy.generation !== retainedGeneration) return 'invalidate';
-  }
+  if (lifecycle === null) return 'invalidate';
+  if (!binding.active) return 'keep';
+  if (!lifecycle.privacy.optedIn || lifecycle.privacy.paused) return 'invalidate';
+  if (binding.generation === null) return 'invalidate';
+  if (lifecycle.privacy.generation !== binding.generation) return 'invalidate';
   return 'keep';
 }
 
@@ -342,7 +362,9 @@ export function lifecycleInvalidatesContext(
   if (state === null || state === undefined) return true;
   if (state.status !== 'ready') return true;
   if (!state.executionAvailable) return true;
-  if (state.expiresAtMs !== null && nowMs >= state.expiresAtMs) return true;
+  // Unknown campaign expiry is not authority to keep evidence.
+  if (state.expiresAtMs === null) return true;
+  if (nowMs >= state.expiresAtMs) return true;
   return false;
 }
 

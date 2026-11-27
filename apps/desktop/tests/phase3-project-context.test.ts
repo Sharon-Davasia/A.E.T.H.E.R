@@ -293,6 +293,8 @@ test('authoritative lifecycle invalidation decisions (AS2)', () => {
   // No authoritative state at all (disconnect / rejected request).
   assert.equal(lifecycleInvalidatesContext(null, now), true);
   assert.equal(lifecycleInvalidatesContext(undefined, now), true);
+  // Unknown campaign expiry fails closed.
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ expiresAtMs: null }), now), true);
 });
 
 test('unexpected revocation/disconnection drops late responses (AS2)', () => {
@@ -342,6 +344,34 @@ test('lifecycle read parsing fails closed on unknown authority', () => {
   assert.equal(ok.privacy.generation, 5);
 });
 
+test('lifecycle parser rejects unknown status and malformed authority', () => {
+  const base = {
+    executionAvailable: true, expiresAtMs: 99,
+    privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 5 },
+  };
+  // Unknown status is rejected, never normalized into 'ready'.
+  const unknown = parsePhase3Lifecycle({ status: 'banana', ...base });
+  assert.equal(unknown.status, 'unavailable');
+  assert.equal(unknown.executionAvailable, false);
+  assert.equal(unknown.reason, 'lifecycle_status_unknown');
+  // Missing required lifecycle authority (ready status claim).
+  assert.equal(parsePhase3Lifecycle({ status: 'ready', expiresAtMs: 99, privacy: base.privacy }).reason, 'lifecycle_malformed');
+  assert.equal(parsePhase3Lifecycle({ status: 'ready', executionAvailable: true, privacy: base.privacy }).reason, 'lifecycle_expiry_unknown');
+  assert.equal(parsePhase3Lifecycle({ status: 'ready', executionAvailable: true, expiresAtMs: 99 }).reason, 'lifecycle_malformed');
+  // Malformed privacy authority.
+  assert.equal(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 99,
+    privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: '5' },
+  }).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: Number.NaN, privacy: base.privacy,
+  }).reason, 'lifecycle_expiry_unknown');
+  // A well-formed unavailable reading stays unavailable (not 'ready').
+  const unavailable = parsePhase3Lifecycle({ status: 'unavailable', reason: 'revoked' });
+  assert.equal(unavailable.status, 'unavailable');
+  assert.equal(unavailable.executionAvailable, false);
+});
+
 test('monitoring orchestration: decisions, retention, supersession', () => {
   // Mirrors the renderer's monitor: fetch a lightweight reading,
   // drop it if superseded in flight, else apply the pure decision.
@@ -354,7 +384,7 @@ test('monitoring orchestration: decisions, retention, supersession', () => {
   const monitor = (reading: Phase3Lifecycle | null, nowMs: number): string => {
     const epochAtStart = guard.snapshot();
     if (guard.snapshot() !== epochAtStart) return 'superseded';
-    if (evaluateLifecycleReading(reading, retainedGeneration, nowMs) === 'invalidate') {
+    if (evaluateLifecycleReading(reading, { generation: retainedGeneration, active: retainedGeneration !== null }, nowMs) === 'invalidate') {
       guard.invalidate();
       retainedGeneration = null;
       return 'invalidated';
@@ -402,4 +432,66 @@ test('monitoring orchestration: decisions, retention, supersession', () => {
   // (The renderer's monitor returns 'superseded' here and re-reads
   // on the next tick; the newer attempt is untouched.)
   assert.equal(retainedGeneration, 3);
+});
+
+test('pending attempts are bound to their privacy generation', () => {
+  const healthyFor = (generation: number) => parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, generation },
+  });
+  const paused = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, paused: true },
+  });
+  const optedOut = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, optedIn: false },
+  });
+  const pending = { generation: 3, active: true };
+
+  // Healthy lifecycle under the bound generation: pending kept.
+  assert.equal(evaluateLifecycleReading(healthyFor(3), pending, 1_000_100), 'keep');
+  // Generation changed since the attempt began: invalidated.
+  assert.equal(evaluateLifecycleReading(healthyFor(4), pending, 1_000_100), 'invalidate');
+  // Pause / opt-out invalidate pending attempts regardless of any
+  // retained evidence (there is none here).
+  assert.equal(evaluateLifecycleReading(paused, pending, 1_000_100), 'invalidate');
+  assert.equal(evaluateLifecycleReading(optedOut, pending, 1_000_100), 'invalidate');
+  // Missing binding generation fails closed for pending work.
+  assert.equal(evaluateLifecycleReading(healthyFor(3), { generation: null, active: true }, 1_000_100), 'invalidate');
+  // No active work: privacy readings alone do not invalidate.
+  assert.equal(evaluateLifecycleReading(paused, { generation: null, active: false }, 1_000_100), 'keep');
+  assert.equal(evaluateLifecycleReading(optedOut, { generation: 3, active: false }, 1_000_100), 'keep');
+});
+
+test('late pending response after invalidation is dropped', () => {
+  const guard = new ProjectContextAttemptGuard();
+  // Pending arm attempt bound to generation 3; no retained context.
+  const attempt = guard.begin();
+  // The monitor sees a pause reading and invalidates.
+  const decision = evaluateLifecycleReading(
+    parsePhase3Lifecycle({
+      status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+      privacy: { ...PRIVACY, paused: true },
+    }),
+    { generation: 3, active: true },
+    1_000_100,
+  );
+  assert.equal(decision, 'invalidate');
+  guard.invalidate();
+  // The arm response arriving now is stale and must be dropped.
+  assert.equal(guard.isCurrent(attempt), false);
+  // Same for a completion attempt invalidated by generation change.
+  const attempt2 = guard.begin();
+  const decision2 = evaluateLifecycleReading(
+    parsePhase3Lifecycle({
+      status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+      privacy: { ...PRIVACY, generation: 9 },
+    }),
+    { generation: 3, active: true },
+    1_001_000,
+  );
+  assert.equal(decision2, 'invalidate');
+  guard.invalidate();
+  assert.equal(guard.isCurrent(attempt2), false);
 });

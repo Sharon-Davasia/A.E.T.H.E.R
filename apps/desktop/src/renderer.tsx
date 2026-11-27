@@ -95,6 +95,12 @@ function App(): React.JSX.Element {
   const [phase3ContextArmed, setPhase3ContextArmed] = React.useState(false);
   const [phase3ContextInFlight, setPhase3ContextInFlight] = React.useState(false);
   const phase3ContextViewRef = React.useRef<Phase3ProjectContextView | null>(null);
+  // Privacy generation the pending arm/completion attempt is bound
+  // to (captured when the attempt begins), and the monitor binding.
+  const phase3AttemptGenerationRef = React.useRef<number | null>(null);
+  const phase3ContextBindingRef = React.useRef<{ generation: number | null; active: boolean }>({
+    generation: null, active: false,
+  });
   const [phase3ContextNow, setPhase3ContextNow] = React.useState(() => Date.now());
   const [phase3ContextGuard] = React.useState(() => new ProjectContextAttemptGuard());
   const [phase3Windows, setPhase3Windows] = React.useState<Phase3Window[]>([]);
@@ -106,6 +112,7 @@ function App(): React.JSX.Element {
   // response can never restore context after invalidation.
   const invalidateProjectContext = React.useCallback((): void => {
     phase3ContextGuard.invalidate();
+    phase3AttemptGenerationRef.current = null;
     setPhase3ProjectContext(null);
     setPhase3ContextArmed(false);
   }, [phase3ContextGuard]);
@@ -181,7 +188,7 @@ function App(): React.JSX.Element {
     if (phase3ContextGuard.snapshot() !== epochAtStart) return; // superseded
     if (evaluateLifecycleReading(
       lifecycle,
-      phase3ContextViewRef.current?.generation ?? null,
+      phase3ContextBindingRef.current,
       Date.now(),
     ) === 'invalidate') {
       invalidateProjectContext();
@@ -189,6 +196,12 @@ function App(): React.JSX.Element {
   }, [phase3ContextGuard, invalidateProjectContext]);
 
   const phase3ContextActive = phase3ProjectContext !== null || phase3ContextArmed || phase3ContextInFlight;
+  React.useEffect(() => {
+    phase3ContextBindingRef.current = {
+      generation: phase3ProjectContext?.generation ?? phase3AttemptGenerationRef.current,
+      active: phase3ContextActive,
+    };
+  }, [phase3ProjectContext, phase3ContextActive]);
   React.useEffect(() => {
     if (!phase3ContextActive) return;
     const timer = setInterval(() => {
@@ -204,6 +217,9 @@ function App(): React.JSX.Element {
   // is epoch-guarded: invalidation during flight drops late replies.
   async function phase3ArmProjectContext(): Promise<void> {
     const attempt = phase3ContextGuard.begin();
+    // Bind this attempt to the authoritative privacy generation it
+    // starts under; the monitor invalidates it on any change.
+    phase3AttemptGenerationRef.current = phase3State?.privacy.generation ?? null;
     setPhase3ProjectContext(null);
     setPhase3ContextInFlight(true);
     setPhase3Busy(true);
@@ -218,6 +234,7 @@ function App(): React.JSX.Element {
 
   async function phase3CheckProjectContext(): Promise<void> {
     const attempt = phase3ContextGuard.begin();
+    phase3AttemptGenerationRef.current = phase3State?.privacy.generation ?? null;
     setPhase3ContextInFlight(true);
     setPhase3Busy(true);
     try {
