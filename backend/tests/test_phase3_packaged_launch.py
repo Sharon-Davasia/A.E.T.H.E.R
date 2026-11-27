@@ -100,6 +100,21 @@ def test_package_identity_requires_exact_unambiguous_aumid() -> None:
     assert package_identity_for_aumid(good, AUMID.upper()) == (PACKAGE_FULL_NAME, PACKAGE_VERSION)
     # Off-Windows the production query is unavailable, never a guess.
     assert native_package_query(AUMID) is None
+    # Malformed platform responses: no evidence, never partial trust.
+    assert package_identity_for_aumid(_QueryApi([PACKAGE_FULL_NAME], version="1.2"), AUMID) is None
+    assert (
+        package_identity_for_aumid(_QueryApi([PACKAGE_FULL_NAME], version="1.2.3.70000"), AUMID)
+        is None
+    )
+    assert (
+        package_identity_for_aumid(_QueryApi([PACKAGE_FULL_NAME], version="not-a-version"), AUMID)
+        is None
+    )
+    assert package_identity_for_aumid(_QueryApi([""]), AUMID) is None
+    # Platform disagreement between full name and reported version.
+    assert (
+        package_identity_for_aumid(_QueryApi([PACKAGE_FULL_NAME], version="5.0.0.0"), AUMID) is None
+    )
 
 
 def test_start_menu_roots_never_use_relative_pseudo_roots() -> None:
@@ -162,6 +177,13 @@ class _PackagedObserverApi:
             return HOST_IMAGE  # hosted image: NOT the registered identity
         return self._base.get_process_image_path(pid)
 
+    def get_process_package_full_name(self, pid):  # type: ignore[no-untyped-def]
+        # The running process's own package identity (live evidence),
+        # matching the authorized catalogue identity in this scenario.
+        if self._base.get_process_aumid(pid):
+            return PACKAGE_FULL_NAME
+        return None
+
 
 class _Verifier:
     """Delegates packaged records to the real integrity provider with
@@ -208,6 +230,7 @@ def _start_packaged(tmp_path: Path, *, package_query):  # type: ignore[no-untype
         campaign_id="campaign-packaged",
         storage_id="66666666-6666-4666-8666-666666666666",
         storage_path=str(storage),
+        workspace_path=str(tmp_path / "aether-phase3-workspace-packaged"),
         authorized_app_ids=frozenset({packaged_id, legacy_id, fixture_id}),
         capability_allowlist=frozenset(
             {"app.launch", "window.activate", "uia.inspect_snapshot", "uia.inspect_element"}
@@ -327,6 +350,10 @@ def test_observation_packaged_attribution_rules() -> None:
         )
 
     class _Api:
+        # Deterministic sessions: every process (including this test
+        # process, pid queried via os.getpid) is in session 1.
+        live_full_name: str | None = PACKAGE_FULL_NAME
+
         def enumerate_windows(self):  # type: ignore[no-untyped-def]
             return [(11, 501)]
 
@@ -336,11 +363,14 @@ def test_observation_packaged_attribution_rules() -> None:
         def get_process_aumid(self, pid):  # type: ignore[no-untyped-def]
             return AUMID
 
+        def get_process_package_full_name(self, pid):  # type: ignore[no-untyped-def]
+            return self.live_full_name
+
         def get_process_creation_time(self, pid):  # type: ignore[no-untyped-def]
             return "creation-1"
 
         def get_process_session_id(self, pid):  # type: ignore[no-untyped-def]
-            return None
+            return 1
 
     class _VerifierOk:
         def verify(self, record):  # type: ignore[no-untyped-def]
@@ -374,6 +404,68 @@ def test_observation_packaged_attribution_rules() -> None:
         api=_NoAumid(), records=[one], integrity_verifier=_VerifierOk()
     )
     assert unattributed.observe().processes == ()  # never basename/name matching
+
+    # R1: matching AUMID but a DIFFERENT running package version must
+    # not verify - the live process identity is checked against the
+    # fresh authorized package evidence, not the catalogue alone.
+    class _WrongVersion(_Api):
+        live_full_name = "Synthetic.Notes_9.9.9.9_x64__8wekyb3d8bbwe"
+
+    mismatched = NativeObservationProvider(
+        api=_WrongVersion(), records=[one], integrity_verifier=_VerifierOk()
+    )
+    assert mismatched.observe().processes == ()
+
+    # R1: live package identity unavailable -> deny.
+    class _NoLiveIdentity(_Api):
+        live_full_name = None
+
+    unavailable = NativeObservationProvider(
+        api=_NoLiveIdentity(), records=[one], integrity_verifier=_VerifierOk()
+    )
+    assert unavailable.observe().processes == ()
+
+    # R1: malformed live package identity -> deny.
+    class _MalformedLive(_Api):
+        live_full_name = "not-a-package-full-name"
+
+    malformed = NativeObservationProvider(
+        api=_MalformedLive(), records=[one], integrity_verifier=_VerifierOk()
+    )
+    assert malformed.observe().processes == ()
+
+    # R1: unknown own-session identity fails closed (incomplete).
+    import os as _os
+
+    class _UnknownOwnSession(_Api):
+        def get_process_session_id(self, pid):  # type: ignore[no-untyped-def]
+            return None if pid == _os.getpid() else 1
+
+    unknown_own = NativeObservationProvider(
+        api=_UnknownOwnSession(), records=[one], integrity_verifier=_VerifierOk()
+    )
+    observation = unknown_own.observe()
+    assert observation.processes == () and observation.complete is False
+
+    # R1: unknown target-session identity denies attribution.
+    class _UnknownTargetSession(_Api):
+        def get_process_session_id(self, pid):  # type: ignore[no-untyped-def]
+            return 1 if pid == _os.getpid() else None
+
+    unknown_target = NativeObservationProvider(
+        api=_UnknownTargetSession(), records=[one], integrity_verifier=_VerifierOk()
+    )
+    assert unknown_target.observe().processes == ()
+
+    # R1: foreign session denies attribution.
+    class _ForeignSession(_Api):
+        def get_process_session_id(self, pid):  # type: ignore[no-untyped-def]
+            return 1 if pid == _os.getpid() else 2
+
+    foreign = NativeObservationProvider(
+        api=_ForeignSession(), records=[one], integrity_verifier=_VerifierOk()
+    )
+    assert foreign.observe().processes == ()
 
 
 def test_artifact_requires_unambiguous_identity_selection() -> None:

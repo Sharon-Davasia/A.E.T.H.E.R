@@ -154,6 +154,22 @@ class ResourceRegistry:
         self._aliases[normalized_alias] = root.root_id
         return root
 
+    def is_within_registration_boundary(self, path: Path) -> bool:
+        """Whether a path lies inside the registration boundary.
+
+        With no boundary configured every path is in scope (the
+        boundary is then enforced by registration itself). With a
+        boundary, comparison uses the canonical resolved path, and
+        an unresolvable path is out of scope (fail closed).
+        """
+        if self._registration_boundary is None:
+            return True
+        try:
+            canonical = Path(path).resolve()
+        except OSError:
+            return False
+        return canonical.is_relative_to(self._registration_boundary)
+
     def known_roots(self) -> tuple[RegisteredRoot, ...]:
         """Read-only enumeration of registered roots (CP6 detection)."""
         return tuple(self._roots.values())

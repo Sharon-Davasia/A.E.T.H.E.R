@@ -25,8 +25,9 @@ verifier must NOT be run.
   `D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a\phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64`
   (use its `npm.cmd` by full path or prepend that directory to the
   session PATH explicitly).
-- Compiled fixture (preserved; verify, never rebuild unless the hash
-  mismatches): `tools\windows-fixture\AETHERFixture.exe`,
+- Compiled fixture (preserved; hash-verify only — a rebuild is NOT
+  part of this campaign, and a hash mismatch is a stop-and-report
+  condition, not a rebuild trigger): `tools\windows-fixture\AETHERFixture.exe`,
   SHA256 `E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D`.
 - Trusted Git executable for controlled startup: record the actual
   installed absolute path once (e.g. `C:\Program Files\Git\cmd\git.exe`)
@@ -35,8 +36,8 @@ verifier must NOT be run.
   controlled startup without it.
 - Representative suite: Notepad, Calculator, File Explorer, VS Code
   if installed, Windows Settings (permitted read/navigation only),
-  and the native synthetic fixture (`AETHERFixture.exe`, built by
-  `tools/windows-fixture/build_fixture.cmd`; the fixture is the ONLY
+  and the native synthetic fixture (the preserved compiled
+  `AETHERFixture.exe`; the fixture is the ONLY
   approved effectful UI operation target).
 - No unnecessary duplicate dependency installs; no recursive cleanup
   of unverified paths; offline operation expected (observe and record
@@ -46,7 +47,11 @@ verifier must NOT be run.
 ## Windows verification commands (exact)
 
 Run from non-admin PowerShell 5.1 at `D:\A.E.T.H.E.R`, HEAD equal to
-the approved candidate SHA, clean tree. pytest scratch MUST be a
+the approved candidate SHA, clean tree — with exactly one known
+allowed exception: the preserved compiled fixture may appear as the
+untracked file `?? tools/windows-fixture/AETHERFixture.exe` (it is
+owner-held build output, hash-verified below; any *other* porcelain
+output is a stop condition). pytest scratch MUST be a
 new, non-reparse, non-protected directory under the existing owner
 evidence root — synthetic projects under protected AppData paths
 fail resource registration by design, and those protections must
@@ -68,7 +73,11 @@ if ((Get-Item $BaseTemp).Attributes -match "ReparsePoint") { throw "basetemp mus
 cd backend; & $Python -m mypy; cd ..
 # desktop gates (portable npm by full path; node_modules preserved -
 # if it is missing, stop and report instead of reinstalling)
-$Npm = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64\npm.cmd"
+$NodeDir = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64"
+$Npm = Join-Path $NodeDir "npm.cmd"
+# Subprocesses (node/tsx/tsc/electron) resolve the portable Node
+# from the session PATH - never from any global installation.
+$env:PATH = "$NodeDir;$env:PATH"
 cd apps/desktop; $env:AETHER_DEV_PYTHON = $Python; & $Npm run check; & $Npm test; cd ..\..
 # fixture integrity (verify only; rebuild is NOT part of verification)
 (Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256).Hash
@@ -82,18 +91,23 @@ always creates a fresh one.
 
 S1. Start from the exact candidate SHA recorded in the activation
     decision package; verify `git rev-parse HEAD` matches.
-S2. Do NOT pre-create the acceptance storage directory: the
-    authorization tool initializes it exclusively
-    (`aether-phase3-acceptance-<campaign>` under the acceptance
-    root) and pre-existing storage is rejected. Before the run,
-    confirm the campaign name is fresh and no directory or
-    `authorization.json` from an earlier campaign will be
-    overwritten (archive the previous artifact as
-    `authorization-<campaign>.json`; never delete campaign evidence).
-    After storage initialization, create the synthetic project at
-    `aether-phase3-acceptance-<campaign>\synthetic-project` inside
-    that storage layout, with a synthetic `pyproject.toml` marker.
-    The real AETHER repository is never registered (P3-23).
+S2. Campaign layout (three separate siblings under the acceptance
+    root `D:\AETHER-acceptance`; never nested): the schema-v3
+    database directory `aether-phase3-acceptance-<campaign>`, the
+    synthetic workspace `aether-phase3-workspace-<campaign>`, and
+    the artifact `authorization-<campaign>.json`. Do NOT pre-create
+    any of them: the authorization tool initializes storage
+    exclusively first, then creates the workspace, then writes the
+    artifact exclusively (an existing campaign artifact is never
+    overwritten — choose a fresh campaign name; never delete
+    campaign evidence). Verify `D:\AETHER-acceptance` exists and is
+    not a reparse point before the run; the database directory
+    refuses unrelated content, so NOTHING is ever created inside
+    it. After the tool run, create the synthetic project at
+    `aether-phase3-workspace-<campaign>\synthetic-project` inside
+    the *workspace* (never inside the database directory), with a
+    synthetic `pyproject.toml` marker. The real AETHER repository
+    is never registered (P3-23).
 S3. Start the desktop app in the reviewed controlled-acceptance
     configuration (decision package §"Exact owner-side commands").
     Confirm the Phase 3 panel shows observation **off** before opt-in.
@@ -118,16 +132,16 @@ C4. At campaign end: shut the app down (worker must exit; verify no
 | P3-02 | Event-driven active-window observation | Opt in (metadata_only); switch between two allowed apps | Active window identity updates event-driven; no polling artifacts | Correct app/window identity each switch | State log |
 | P3-03 | Closure and identity invalidation | Close the observed window; reopen the app | Old window identity invalid; new instance gets a new identity | Stale identity cannot be inspected/used | State log |
 | P3-04 | Privacy changes | Opt out, then pause, mid-session | Collection stops; retained snapshots void; approvals on old snapshots refused | Old snapshot/approval unusable | Denial reasons |
-| P3-05 | Application discovery | Open app search | Registered/discovered apps listed with availability | No unregistered app presented as launchable | Search results |
-| P3-06 | Exact and fuzzy resolution | Search exact name, then a near-miss fuzzy name | Exact resolves uniquely; fuzzy offers candidates without auto-select | No silent wrong-app selection | Candidate list |
-| P3-07 | Ambiguous candidate clarification | Search a name matching two apps | Clarification required; no launch prepared until selection | Selection is explicit | Panel state |
+| P3-05 | Application discovery | Open app search (empty query) | Discovered apps listed with discovery availability and launch-method support shown separately | No discovered app presented as launch-eligible; eligibility is decided only at preparation | Search results |
+| P3-06 | Exact and fuzzy resolution | Search exact name, then a near-miss fuzzy name, then a partial name | Exact resolves uniquely; fuzzy shows the best match for confirmation; partial names show retrieval-only candidates, never a resolution | No silent wrong-app selection | Candidate list + resolution label |
+| P3-07 | Ambiguous candidate clarification | Search a name matching two apps | "Ambiguous match" shown; no launch prepared until the exact application is selected | Selection is explicit; changing the search clears a stale selection | Panel state |
 | P3-08 | Verified application launching | Prepare launch of Notepad; approve in trusted window | One process; verified window; durable receipt SUCCEEDED | Exactly one instance; receipt matches | Receipt id |
 | P3-09 | Single-instance application activation | With Notepad open, prepare window activation; approve | Same instance foreground-verified once | No second process; no keystrokes/clicks | Activation receipt |
 | P3-10 | Native UIA snapshot bounds | Inspect Calculator window | Bounded snapshot; completeness stated; no silent truncation | Sizes within limits; truncation flagged if present | Snapshot summary |
 | P3-11 | Sensitive control exclusion | Inspect fixture window with password field | Password name/value absent everywhere | No password content in snapshot/logs | Snapshot summary |
 | P3-12 | Metadata-only collection | Inspect fixture in metadata_only mode | No unrestricted accessible names retained | Worker enforced mode at collection | Snapshot summary |
 | P3-13 | Worker interruption | During a long fixture inspection, terminate worker (reviewed test harness) | TIMED_OUT/unavailable truthfully; worker cleaned up; no replay | No hung process; no duplicate request | Outcome + process list |
-| P3-14 | Verified fixture interaction | Build fixture; launch via approved identity; prepare Increment; approve | Count 0→1 exactly; independent verification; SUCCEEDED receipt | Exactly +1 | Receipt + final Count |
+| P3-14 | Verified fixture interaction | Hash-verify the preserved fixture (no rebuild); launch via approved identity; prepare Increment; approve | Count 0→1 exactly; independent verification; SUCCEEDED receipt | Exactly +1 | Receipt + final Count |
 | P3-15 | Stale element rejection | Prepare Increment; click fixture Replace; approve the old plan | Refused pre-dispatch; no invocation on the replacement | Count unchanged | Denial outcome |
 | P3-16 | Disabled/hidden control rejection | Prepare against the disabled fixture button (diagnostic plan) or hide Increment | Denied (`element_disabled`/not dispatchable) | No effect | Denial |
 | P3-17 | Delayed effect truthfulness | Enable fixture delay toggle; approve Increment | Timeout/uncertain truthfully; never auto-replayed; final count read independently | No duplicate increment | Outcome + Count |
@@ -135,8 +149,8 @@ C4. At campaign end: shut the app down (worker must exit; verify no
 | P3-19 | Alt-Tab takeover | Arm a fixture op; Alt-Tab to another app | Foreground takeover detected; dispatch stopped | No effect dispatched | Indication + Count |
 | P3-20 | Unexpected dialog | Open fixture modal; attempt an op | Dispatch halted; dialog never auto-dismissed; fresh observation+approval required to resume | No effect behind dialog | Dialog indication |
 | P3-21 | Safe pause/resume | Pause an armed task; resume | PAUSED holds nothing live; resume goes to fresh planning/precheck; consumed approvals never replay | No PAUSED→EXECUTING jump | Task states |
-| P3-22 | Restart reconciliation | Restart the app with an armed/paused task | States reconciled truthfully; uncertain never auto-succeeded | No replay after restart | Task state after restart |
-| P3-23 | Project reference resolution | Create the synthetic project inside the campaign storage (S2); register it via the panel's trusted directory dialog; focus Explorer there; ask for current project | Deterministic candidate (the synthetic project) or clarification if ambiguous | Registered roots only (campaign storage boundary); no permission expansion; no executor enabled | Candidate/limitations |
+| P3-22 | Restart reconciliation | Restart the app (controlled config) with an armed/paused task; then re-register the same synthetic project in the workspace and ask for the current project | States reconciled truthfully; uncertain never auto-succeeded; acceptance storage reopens cleanly and workspace project evidence is untouched | No replay after restart; no storage/evidence loss | Task state after restart + project candidate |
+| P3-23 | Project reference resolution | Create the synthetic project inside the synthetic workspace (S2); register it via the panel's trusted directory dialog; focus Explorer there; ask for current project | Deterministic candidate (the synthetic project) or clarification if ambiguous | Registered roots only (synthetic-workspace boundary — never the database directory); no permission expansion; no executor enabled | Candidate/limitations |
 | P3-24 | Real-app read-only navigation suite | For Explorer and VS Code (if installed) and Settings (read/navigation scope): activate window + snapshot only | Verified activation; bounded snapshot; zero interactions sent | No clicks/keys; limitations reported truthfully for missing apps | Receipts |
 | P3-25 | Boundaries preserved | Ordinary relaunch per §"Ordinary-mode verification" below; attempt Phase 3 actions without acceptance config; confirm offline behavior | Ordinary mode default-denied (`phase3_native_disabled`); Phase 2 surfaces unchanged; no outbound network required/observed beyond OS noise recorded | No ordinary-mode execution; no real-user database opened, migrated or modified | Panel + synthetic-DB schema check (`PRAGMA user_version` = 2 on the *synthetic* database) + real-storage fingerprint comparison only when its verified actual path is known (never opened through SQLite; an unverifiable path is reported, not assumed) |
 
@@ -193,6 +207,7 @@ Remove-Item Env:AETHER_ACCEPTANCE_MODE, Env:AETHER_PHASE3_AUTHORIZATION, Env:AET
 # launches Electron (it is not a no-rebuild command). node_modules
 # is preserved; if it is missing, stop and report.
 $Npm = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64\npm.cmd"
+$env:PATH = "$((Split-Path $Npm));$env:PATH"   # portable Node resolves for all subprocesses
 cd apps\desktop; & $Npm run start; cd ..\..
 
 # In the app: the Phase 3 panel shows observation off /
@@ -200,6 +215,9 @@ cd apps\desktop; & $Npm run start; cd ..\..
 # one Phase 2 approved-edit in a synthetic project: expect
 # phase3_native_disabled and grant_issuance_disabled /
 # mutation_not_enabled respectively. Record any network observation.
+# Close the app, RESTART it once with the same ordinary-mode
+# environment, and confirm the panel still shows
+# phase3_native_disabled and no Phase 3 action becomes available.
 # Then close the app and verify the SYNTHETIC database only:
 & $Python -c "import sqlite3,sys; print(sqlite3.connect('file:' + sys.argv[1].replace('\\','/') + '?mode=ro', uri=True).execute('PRAGMA user_version').fetchone()[0])" $SyntheticDb
 # Expected: 2 (schema v2). If the verified actual path of real-user

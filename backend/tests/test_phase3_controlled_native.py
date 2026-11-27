@@ -246,6 +246,7 @@ def _harness(tmp_path: Path):
         campaign_id=CAMPAIGN,
         storage_id="11111111-1111-4111-8111-111111111111",
         storage_path=str(storage),
+        workspace_path=str(tmp_path / "aether-phase3-workspace-test"),
         authorized_app_ids=frozenset({app_id, notepad.app_id}),
         capability_allowlist=frozenset(
             {
@@ -884,6 +885,7 @@ def test_native_platform_construction_with_raw_fakes(tmp_path: Path) -> None:
         campaign_id=CAMPAIGN,
         storage_id="33333333-3333-4333-8333-333333333333",
         storage_path=str(tmp_path / "aether-phase3-acceptance-x"),
+        workspace_path=str(tmp_path / "aether-phase3-workspace-x"),
         authorized_app_ids=frozenset({fixture_id}),
         capability_allowlist=frozenset({"app.launch", "uia.invoke_fixture"}),
         session_id=SESSION,

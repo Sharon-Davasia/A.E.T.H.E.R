@@ -61,6 +61,7 @@ def _start(tmp_path: Path, explorer: object) -> Phase3Composition:
         campaign_id="campaign-gates",
         storage_id="44444444-4444-4444-8444-444444444444",
         storage_path=str(storage),
+        workspace_path=str(tmp_path / "aether-phase3-workspace-gates"),
         authorized_app_ids=frozenset({fixture_id}),
         capability_allowlist=frozenset({"app.launch", "uia.invoke_fixture"}),
         session_id="session-gates",
@@ -111,7 +112,10 @@ def test_explorer_collection_requires_opt_in_and_stops_on_pause_optout_revoke(
         _opt_in(comp)
         state = comp.bridge.get_state({})
         assert explorer.calls >= 1
-        assert [p["evidenceSource"] for p in state["projects"]] == ["explorer_discovered"]
+        # The Explorer folder is outside the authorized synthetic
+        # workspace: collection ran under opt-in, but the arbitrary
+        # path is not published as project evidence (R3 scope).
+        assert state["projects"] == []
 
         # Pause: collection stops synchronously.
         calls_after_opt_in = explorer.calls
@@ -149,13 +153,13 @@ def test_detector_gate_covers_reference_resolution() -> None:
     )
     assert detector.detect() == ()
     resolution = detector.resolve_reference("this project")
-    assert resolution.candidate is None and resolution.reason == "no_fresh_project_evidence"
+    assert resolution.candidate is None and resolution.reason == "project_evidence_invalidated"
     assert explorer.calls == 0
 
 
 def test_registration_detection_and_explorer_string_normalization(tmp_path: Path) -> None:
-    storage = tmp_path / "aether-phase3-acceptance-gates"
-    project = storage / "synthetic-project"
+    workspace = tmp_path / "aether-phase3-workspace-gates"
+    project = workspace / "synthetic-project"
     # The native Explorer provider returns a *string*; composition
     # must normalize it to Path before the detector compares roots.
     explorer = _CountingExplorer(str(project))
@@ -164,17 +168,19 @@ def test_registration_detection_and_explorer_string_normalization(tmp_path: Path
         project.mkdir(parents=True)
         (project / "pyproject.toml").write_text('[project]\nname = "synthetic"\n')
 
-        # Registration is an owner act (not collection): permitted
-        # before opt-in, through the canonical registry checks.
-        registered = comp.bridge.register_project({"alias": "project", "path": str(project)})
-        assert registered["status"] == "ready", registered
-        root_id = registered["rootId"]
-
-        # Detection is still collection: nothing before opt-in.
+        # Registration requires the minimum explicit project-context
+        # authorization (live, opted-in, unexpired): refused before
+        # opt-in, so registration can never precede collection rights.
+        refused = comp.bridge.register_project({"alias": "project", "path": str(project)})
+        assert refused["status"] == "unavailable"
+        assert refused["reason"] == "project_context_not_authorized"
         assert comp.bridge.get_state({})["projects"] == []
         assert explorer.calls == 0
 
         _opt_in(comp)
+        registered = comp.bridge.register_project({"alias": "project", "path": str(project)})
+        assert registered["status"] == "ready", registered
+        root_id = registered["rootId"]
         state = comp.bridge.get_state({})
         assert explorer.calls >= 1
         candidates = state["projects"]
@@ -205,13 +211,20 @@ def test_registration_boundary_and_unregistered_explorer(tmp_path: Path) -> None
     comp = _start(tmp_path, explorer)
     try:
         outside.mkdir()
-        # Outside the campaign storage boundary: refused, and no
+        _opt_in(comp)
+        # Outside the synthetic-workspace boundary: refused, and no
         # authorized identity is issued for it.
         refused = comp.bridge.register_project({"alias": "outside", "path": str(outside)})
         assert refused["status"] == "unavailable"
         assert refused["reason"] == "root_outside_activation_boundary"
 
-        _opt_in(comp)
+        # An Explorer folder outside the authorized workspace is not
+        # published as project evidence at all (R3 scope).
+        assert comp.bridge.get_state({})["projects"] == []
+
+        # Inside the workspace but unregistered: reported as a
+        # discovered candidate with no identity and no permission.
+        explorer.value = tmp_path / "aether-phase3-workspace-gates" / "unregistered-project"  # type: ignore[attr-defined]
         state = comp.bridge.get_state({})
         assert len(state["projects"]) == 1
         candidate = state["projects"][0]
@@ -232,22 +245,22 @@ def test_registration_boundary_and_unregistered_explorer(tmp_path: Path) -> None
 
 
 def test_ambiguous_project_evidence_requires_clarification(tmp_path: Path) -> None:
-    storage = tmp_path / "aether-phase3-acceptance-gates"
-    first = storage / "synthetic-project"
-    second = storage / "synthetic-project-b"
+    workspace = tmp_path / "aether-phase3-workspace-gates"
+    first = workspace / "synthetic-project"
+    second = workspace / "synthetic-project-b"
     explorer = _CountingExplorer(first)
     comp = _start(tmp_path, explorer)
     try:
         for root in (first, second):
             root.mkdir(parents=True)
             (root / "pyproject.toml").write_text('[project]\nname = "synthetic"\n')
+        _opt_in(comp)
         assert comp.bridge.register_project({"alias": "one", "path": str(first)})["status"] == (
             "ready"
         )
         assert comp.bridge.register_project({"alias": "two", "path": str(second)})["status"] == (
             "ready"
         )
-        _opt_in(comp)
         detector = comp.detector
         assert detector is not None
         # registered (0.9) vs explorer-registered (0.8): the margin is
@@ -280,6 +293,7 @@ def test_collection_denied_after_authorization_expiry(tmp_path: Path) -> None:
         campaign_id="campaign-gates",
         storage_id="55555555-5555-4555-8555-555555555555",
         storage_path=str(storage),
+        workspace_path=str(tmp_path / "aether-phase3-workspace-gates"),
         authorized_app_ids=frozenset({fixture_id}),
         capability_allowlist=frozenset({"app.launch"}),
         session_id="session-gates",
@@ -300,7 +314,7 @@ def test_collection_denied_after_authorization_expiry(tmp_path: Path) -> None:
         now=datetime.now(UTC),
     )
     store.close()
-    explorer = _CountingExplorer(tmp_path / "elsewhere")
+    explorer = _CountingExplorer(tmp_path / "aether-phase3-workspace-gates" / "elsewhere")
     seams.explorer_folder = explorer  # type: ignore[attr-defined]
     providers = build_native_platform(authz, seams=seams)
     comp = Phase3Composition.native(

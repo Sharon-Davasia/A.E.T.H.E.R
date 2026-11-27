@@ -113,12 +113,17 @@ def build_authorization(
     if len(commit) < 40:
         raise ValueError("candidate commit could not be determined")
     storage_path = Path(acceptance_root) / f"aether-phase3-acceptance-{campaign_id}"
+    # R2: the synthetic project workspace is a SEPARATE sibling
+    # directory - project evidence never lives inside the schema-v3
+    # database directory (whose content allowlist stays closed).
+    workspace_path = Path(acceptance_root) / f"aether-phase3-workspace-{campaign_id}"
     artifact: dict[str, object] = {
         "approved_commit": commit,
         "decision_reference": decision_reference,
         "campaign_id": campaign_id,
         "storage_id": str(uuid.uuid4()),
         "storage_path": str(storage_path),
+        "workspace_path": str(workspace_path),
         "authorized_app_ids": sorted({r.app_id for r in selected} | {fixture.app_id}),
         "capability_allowlist": [
             "app.launch",
@@ -180,13 +185,14 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - owner CLI
         app_ids=[item.strip() for item in args.app_ids.split(",") if item.strip()] or None,
     )
     root.mkdir(parents=True, exist_ok=True)
-    artifact_path = root / "authorization.json"
-    if artifact_path.exists():
-        # A historical campaign artifact is evidence; it is never
-        # silently overwritten by a new campaign.
+    # Campaign-scoped artifact path: each campaign writes its own
+    # file, and creation is exclusive - an earlier campaign artifact
+    # is evidence and is never overwritten.
+    artifact_path = root / f"authorization-{args.campaign}.json"
+    if artifact_path.exists() or artifact_path.is_symlink():
         print(
             f"authorization artifact already exists: {artifact_path}; "
-            "archive it or choose a new campaign first",
+            "choose a new campaign name (historical artifacts are never overwritten)",
             file=sys.stderr,
         )
         return 2
@@ -204,9 +210,21 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - owner CLI
         now=now,
     )
     store.close()
-    artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
+    # Create the dedicated synthetic workspace as a sibling of the
+    # database directory (exclusive; never inside database storage).
+    workspace_path = Path(str(artifact["workspace_path"]))
+    if workspace_path.exists() or workspace_path.is_symlink():
+        print(
+            f"synthetic workspace already exists: {workspace_path}; choose a new campaign name",
+            file=sys.stderr,
+        )
+        return 2
+    workspace_path.mkdir(mode=0o700)
+    with artifact_path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(artifact, indent=2, sort_keys=True))
     print(f"authorization artifact: {artifact_path}")
     print(f"acceptance storage initialized: {storage_path}")
+    print(f"synthetic workspace created: {workspace_path}")
     print(f"fixture app id: {artifact['fixture_app_id']}")
     return 0
 

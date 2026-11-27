@@ -151,12 +151,24 @@ unsupported/unverifiable launch records before approval; (D)
 project registration is main-process-owned (native directory
 dialog, sender validation, native confirmation naming the
 directory, no renderer-supplied path) and restricts projects to the
-composition storage boundary, metadata-only; (E) the campaign
+dedicated synthetic workspace (a sibling of the database
+directory, never inside it), metadata-only; (E) the campaign
 documentation preserves the owner evidence root, venv, portable
 Node and fixture hash and defines a synthetic-storage ordinary-mode
 verification that never opens real-user storage. Native acceptance
 still requires the single consolidated owner campaign in
 `PHASE3_NATIVE_ACCEPTANCE.md`.
+
+Residual corrections R1–R5 are implemented on top of A–E in a
+follow-up checkpoint on PR #37 (same test surface): live
+running-process package identity (`GetPackageFullName`) verified
+against fresh authorized package evidence with fail-closed session
+rules and typed `PACKAGE_ID` parsing; a separate synthetic
+workspace sibling to the database directory as the registration
+boundary; generation-change protection inherited by direct
+reference resolution and synchronous expiry at observation
+resumption; resolver outcomes preserved across desktop IPC with
+stale-selection invalidation; and reconciled campaign procedures.
 
 ## 7. Performance defaults (provisional, unmeasured)
 

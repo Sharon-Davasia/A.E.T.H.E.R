@@ -151,6 +151,19 @@ class _FakeObserverApi:
         image = self.get_process_image_path(pid)
         return image if image and "!" in image else None
 
+    def get_process_package_full_name(self, pid: int) -> str | None:
+        # Fake platform: a packaged process spawned by AUMID reports
+        # a deterministic fake package full name derived from its
+        # package family (name_publisherhash). Not native evidence.
+        aumid = self.get_process_aumid(pid)
+        if not aumid:
+            return None
+        family = aumid.partition("!")[0]
+        name, separator, publisher = family.rpartition("_")
+        if not separator or not name or not publisher:
+            return None
+        return f"{name}_1.0.0.0_x64__{publisher}"
+
     def get_process_image_path(self, pid: int) -> str | None:
         for _hwnd, (p, exe) in self._state.windows.items():
             if p == pid:

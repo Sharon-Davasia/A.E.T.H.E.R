@@ -146,6 +146,8 @@ class Win32ObserverApi(Protocol):
     def get_process_name(self, pid: int) -> str | None: ...
 
     def get_process_image_path(self, pid: int) -> str | None: ...
+
+    def get_process_package_full_name(self, pid: int) -> str | None: ...
     def is_process_elevated(self, pid: int) -> bool | None: ...  # None = unknown
     def enumerate_windows(self) -> list[tuple[int, int]]: ...  # raises on failure
     def get_foreground_window(self) -> int: ...
@@ -366,6 +368,25 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
         user32.UnhookWinEvent.argtypes = [ctypes.c_void_p]
         user32.GetWindowThreadProcessId.restype = ctypes.c_uint
         user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)]
+        kernel32 = self._kernel32
+        # Handle-width safety: process handles are pointer-width and
+        # must never be truncated through a default C-int restype.
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_bool, ctypes.c_uint]
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.GetApplicationUserModelId.restype = ctypes.c_long
+        kernel32.GetApplicationUserModelId.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_wchar_p,
+        ]
+        kernel32.GetPackageFullName.restype = ctypes.c_long
+        kernel32.GetPackageFullName.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_wchar_p,
+        ]
 
     # -- hook/pump (observer thread only) ---------------------------------
     def initialize_message_queue(self) -> None:
@@ -443,6 +464,38 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
                 return None
             buffer = ctypes.create_unicode_buffer(length.value)
             result = kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), buffer)
+            if result != 0:
+                return None
+            return str(buffer.value) or None
+        finally:
+            kernel32.CloseHandle(handle)
+
+    def get_process_package_full_name(self, pid: int) -> str | None:
+        """Exact package full name of a running packaged process.
+
+        Platform-reported via GetPackageFullName on the process
+        handle; a process without a package
+        (ERROR_APPMODEL_NO_PACKAGE) or any failure yields None,
+        which the observation provider treats as unavailable live
+        identity and denies packaged attribution - never as a guess
+        from the registered catalogue.
+        """
+        ctypes = self._ctypes
+        kernel32 = self._kernel32
+        ERROR_APPMODEL_NO_PACKAGE = 15700
+        ERROR_INSUFFICIENT_BUFFER = 122
+        handle = self._open_process(pid)
+        if not handle:
+            return None
+        try:
+            length = ctypes.c_uint32(0)
+            result = kernel32.GetPackageFullName(handle, ctypes.byref(length), None)
+            if result == ERROR_APPMODEL_NO_PACKAGE:
+                return None
+            if result != ERROR_INSUFFICIENT_BUFFER or length.value == 0 or length.value > 1024:
+                return None
+            buffer = ctypes.create_unicode_buffer(length.value)
+            result = kernel32.GetPackageFullName(handle, ctypes.byref(length), buffer)
             if result != 0:
                 return None
             return str(buffer.value) or None
@@ -561,6 +614,31 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
         return int(self._user32.GetForegroundWindow() or 0)
 
 
+def _live_package_matches(evidence: object, live_package_full_name: str | None) -> bool:
+    """Running package identity must equal the fresh authorized one.
+
+    Compares the process's own package full name (platform-reported)
+    against the fresh integrity evidence for the registered record,
+    including the version embedded in the full name. Missing or
+    malformed identity on either side never matches.
+    """
+    if not live_package_full_name:
+        return False
+    from aether.adapters.windows.native_launcher import package_version_from_full_name
+
+    authorized_full_name = getattr(evidence, "package_identity", None)
+    if not authorized_full_name or str(authorized_full_name).casefold() != (
+        live_package_full_name.casefold()
+    ):
+        return False
+    authorized_version = getattr(evidence, "package_version", None)
+    if authorized_version:
+        live_version = package_version_from_full_name(live_package_full_name)
+        if live_version is None or live_version != str(authorized_version):
+            return False
+    return True
+
+
 class NativeObservationProvider:
     """Independent launch-verification observation (A01).
 
@@ -624,6 +702,11 @@ class NativeObservationProvider:
         own_session = None
         with contextlib.suppress(Exception):
             own_session = self._api.get_process_session_id(os.getpid())
+        if own_session is None:
+            # Unknown own-session identity: no process identity can
+            # be verified, so the observation is incomplete and
+            # empty (fail closed, as in observe_fixture).
+            return PlatformObservation(processes=(), windows=(), complete=False)
         processes: dict[str, ObservedProcess] = {}
         windows = []
         try:
@@ -663,13 +746,29 @@ class NativeObservationProvider:
             session = None
             with contextlib.suppress(Exception):
                 session = self._api.get_process_session_id(pid)
-            if own_session is not None and session != own_session:
-                continue  # different session: deny
+            if session is None or session != own_session:
+                continue  # unknown or foreign session: deny identity
+            # Live packaged identity (R1): a process attributed to a
+            # packaged record must independently prove its exact
+            # running package identity (GetPackageFullName class);
+            # the registered catalogue alone never verifies a live
+            # process.
+            live_package_full_name: str | None = None
+            packaged = getattr(record, "launch_method", None) is LaunchMethod.APPS_FOLDER_ACTIVATION
+            if packaged:
+                full_name_getter = getattr(self._api, "get_process_package_full_name", None)
+                if full_name_getter is not None:
+                    with contextlib.suppress(Exception):
+                        live_package_full_name = full_name_getter(pid)
+                if not live_package_full_name:
+                    continue  # live package identity unavailable: deny
             token = f"{pid}:{creation}"
             if token not in processes:
                 evidence = self._verifier.verify(record)  # type: ignore[attr-defined]
                 if evidence is None:
                     continue  # no trusted evidence: deny
+                if packaged and not _live_package_matches(evidence, live_package_full_name):
+                    continue  # running package != authorized package: deny
                 processes[token] = ObservedProcess(
                     process_token=token,
                     app_id=record.app_id,

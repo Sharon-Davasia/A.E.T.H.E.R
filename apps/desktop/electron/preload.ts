@@ -14,7 +14,7 @@ import type {
 } from '../shared/live';
 import type { ExactPreview } from '../shared/review';
 import type { WorkflowState } from './workflow';
-import type { Phase3Outcome, Phase3Prepared, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3AppResult, Phase3Window } from '../shared/phase3';
+import type { Phase3AppSearch, Phase3Outcome, Phase3Prepared, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
 
 const desktopApi = Object.freeze({
   getBackendStatus: (): Promise<{ state: string; message: string }> => ipcRenderer.invoke('desktop:backend-status'),
@@ -50,7 +50,7 @@ const desktopApi = Object.freeze({
   phase3GetState: (): Promise<Phase3State> => ipcRenderer.invoke('desktop:phase3-state'),
   phase3SetPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }): Promise<Phase3State> =>
     ipcRenderer.invoke('desktop:phase3-set-privacy', privacy),
-  phase3SearchApps: (query: string): Promise<Phase3AppResult[]> => ipcRenderer.invoke('desktop:phase3-search-apps', query),
+  phase3SearchApps: (query: string): Promise<Phase3AppSearch> => ipcRenderer.invoke('desktop:phase3-search-apps', query),
   phase3InspectWindow: (windowId: string): Promise<Phase3Snapshot> => ipcRenderer.invoke('desktop:phase3-inspect-window', windowId),
   phase3ApproveInteraction: (request: string | { taskId: string; preview?: Phase3Prepared }): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-approve-interaction', request),
   phase3GetTask: (taskId: string): Promise<{ status: string; taskState?: string; attempts?: unknown[] }> =>

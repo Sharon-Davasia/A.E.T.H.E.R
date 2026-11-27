@@ -12,7 +12,7 @@
 
 import type { BackendClient } from './backend-client';
 import {
-  parsePhase3Apps, parsePhase3Outcome, parsePhase3Prepared, parsePhase3ProjectRegistration, parsePhase3Snapshot, parsePhase3State,
+  parsePhase3AppSearch, parsePhase3Outcome, parsePhase3Prepared, parsePhase3ProjectRegistration, parsePhase3Snapshot, parsePhase3State,
   type Phase3Outcome, type Phase3Prepared, type Phase3ProjectRegistration, type Phase3Snapshot, type Phase3State,
 } from '../shared/phase3';
 import type { GestureBindingInput } from './gesture';
@@ -84,7 +84,9 @@ export function createPhase3Provider(options: Phase3ProviderOptions) {
   }
 
   async function searchApps(query: string) {
-    return parsePhase3Apps(await backend.phase3SearchApps(query));
+    // The authoritative resolver outcome crosses IPC intact (R4);
+    // the renderer never re-derives it from result counts.
+    return parsePhase3AppSearch(await backend.phase3SearchApps(query));
   }
 
   async function registerProject(path: string): Promise<Phase3ProjectRegistration> {

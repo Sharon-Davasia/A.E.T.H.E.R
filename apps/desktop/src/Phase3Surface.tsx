@@ -8,12 +8,12 @@
  */
 import React from 'react';
 import type {
-  Phase3AppResult, Phase3Outcome, Phase3Prepared, Phase3Snapshot, Phase3State, Phase3Window,
+  Phase3AppSearch, Phase3Outcome, Phase3Prepared, Phase3Snapshot, Phase3State, Phase3Window,
 } from '../shared/phase3';
 
 interface Phase3SurfaceProps {
   state: Phase3State | null;
-  apps: Phase3AppResult[];
+  search: Phase3AppSearch | null;
   windows: Phase3Window[];
   snapshot: Phase3Snapshot | null;
   prepared: Phase3Prepared | null;
@@ -37,11 +37,29 @@ interface Phase3SurfaceProps {
 }
 
 export function Phase3Surface(props: Phase3SurfaceProps): React.JSX.Element {
-  const { state, apps, windows, snapshot, prepared, outcome, busy } = props;
+  const { state, search, windows, snapshot, prepared, outcome, busy } = props;
   const [query, setQuery] = React.useState('');
-  const [appId, setAppId] = React.useState('');
   const [windowId, setWindowId] = React.useState('');
-  const ambiguous = apps.length > 1;
+  const apps = React.useMemo(() => search?.results ?? [], [search]);
+  // The resolver outcome is authoritative and arrives typed over
+  // IPC (R4); ambiguity is never re-derived from result counts.
+  const resolution = search?.resolution;
+  // Selection invalidation (derived, not stored): a selection is
+  // effective only while its supporting search result still
+  // contains the exact app and the authorization (privacy/native)
+  // state it was made under is unchanged. A new search result or an
+  // authorization change therefore drops stale picks automatically.
+  const authorizationKey = state === null
+    ? 'none'
+    : `${state.nativeAvailable}:${state.privacy.optedIn}:${state.privacy.mode}:${state.privacy.paused}`;
+  const [selection, setSelection] = React.useState<{ appId: string; key: string }>({
+    appId: '',
+    key: '',
+  });
+  const appId = selection.key === authorizationKey
+    && apps.some((a) => a.appId === selection.appId)
+    ? selection.appId
+    : '';
   return (
     <section className="status" aria-label="Phase 3 verification surface">
       <div>
@@ -84,17 +102,41 @@ export function Phase3Surface(props: Phase3SurfaceProps): React.JSX.Element {
               <button type="button" className="ping-button" disabled={busy}
                 onClick={() => props.onSearchApps(query)}>Search</button>
             </div>
-            {ambiguous && <p role="status">Multiple candidates — select the exact application before preparing a launch.</p>}
+            {search?.status === 'unavailable' && (
+              <p role="status">Application search unavailable: {search.reason ?? 'unavailable'}</p>
+            )}
+            {resolution === 'ambiguous' && (
+              <p role="status">Ambiguous match — select the exact application before preparing a launch.</p>
+            )}
+            {resolution === 'fuzzy' && (
+              <p role="status">Best fuzzy match — confirm the exact application before preparing a launch.</p>
+            )}
+            {resolution === 'candidates' && (
+              <p role="status">Retrieved candidates (not resolved) — select the exact application explicitly.</p>
+            )}
+            {(resolution === 'exact' || resolution === 'alias' || resolution === 'normalized') && (
+              <p role="status">Resolved application — confirm before preparing a launch.</p>
+            )}
+            {resolution === 'not_found' && <p role="status">No matching application.</p>}
+            {resolution === 'stale_or_unavailable' && (
+              <p role="status">Matching application is stale or unavailable.</p>
+            )}
             <ul>
               {apps.map((a) => (
                 <li key={a.appId}>
-                  <button type="button" className="ping-button" disabled={busy || !a.available}
-                    onClick={() => setAppId(a.appId)}>
-                    {a.appId === appId ? '✓ ' : ''}{a.displayName}{a.available ? '' : ' (unavailable)'}
+                  <button type="button" className="ping-button" disabled={busy || !a.available || !a.launchSupported}
+                    onClick={() => setSelection({ appId: a.appId, key: authorizationKey })}>
+                    {a.appId === appId ? '✓ ' : ''}{a.displayName}
+                    {a.available ? '' : ' (discovered record stale)'}
+                    {a.launchSupported ? '' : ' (launch method unsupported)'}
                   </button>
                 </li>
               ))}
             </ul>
+            <p>
+              Discovery alone never authorizes a launch: eligibility is verified again,
+              with fresh integrity evidence, when a launch is prepared.
+            </p>
             <button type="button" className="ping-button" disabled={busy || !appId}
               onClick={() => props.onPrepareLaunch(appId)}>
               Prepare launch plan…

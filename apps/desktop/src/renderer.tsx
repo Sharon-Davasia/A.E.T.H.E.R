@@ -4,7 +4,7 @@ import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
 import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
 import { Phase3Surface } from './Phase3Surface';
-import type { Phase3AppResult, Phase3Outcome, Phase3Prepared, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
+import type { Phase3AppSearch, Phase3Outcome, Phase3Prepared, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
 import { describeLiveApprovalOutcome } from '../shared/live';
 import type {
   LiveApprovalState,
@@ -84,7 +84,7 @@ function App(): React.JSX.Element {
   const [phase3Snapshot, setPhase3Snapshot] = React.useState<Phase3Snapshot | null>(null);
   const [phase3Outcome, setPhase3Outcome] = React.useState<Phase3Outcome | null>(null);
   const [phase3Busy, setPhase3Busy] = React.useState(false);
-  const [phase3Apps, setPhase3Apps] = React.useState<Phase3AppResult[]>([]);
+  const [phase3Search, setPhase3Search] = React.useState<Phase3AppSearch | null>(null);
   const [phase3Windows, setPhase3Windows] = React.useState<Phase3Window[]>([]);
   const [phase3Prepared, setPhase3Prepared] = React.useState<Phase3Prepared | null>(null);
   const [phase3Receipt, setPhase3Receipt] = React.useState<unknown>(null);
@@ -307,7 +307,7 @@ function App(): React.JSX.Element {
     />
     <Phase3Surface
       state={phase3State}
-      apps={phase3Apps}
+      search={phase3Search}
       windows={phase3Windows}
       snapshot={phase3Snapshot}
       prepared={phase3Prepared}
@@ -320,7 +320,7 @@ function App(): React.JSX.Element {
       }}
       onPrivacy={(privacy) => void phase3Privacy(privacy)}
       onSearchApps={(query) => void phase3Run(
-        () => window.aetherDesktop.phase3SearchApps(query) as Promise<Phase3AppResult[]>, setPhase3Apps,
+        () => window.aetherDesktop.phase3SearchApps(query) as Promise<Phase3AppSearch>, setPhase3Search,
       )}
       onRegisterProject={() => {
         void (async () => {

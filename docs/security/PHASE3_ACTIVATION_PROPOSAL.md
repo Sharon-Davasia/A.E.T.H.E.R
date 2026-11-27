@@ -45,9 +45,9 @@ from *production enablement* (not proposed here).
    by the desktop app).
 4. **Authorized app identities**: Notepad, Calculator, File Explorer,
    VS Code (if installed), Windows Settings (read/navigation scope),
-   and `AETHERFixture.exe` built by `tools/windows-fixture/build_fixture.cmd`
-   (in-box `csc.exe`; the Python fixture is never launched as a
-   script). Fixture identity is the approved executable identity +
+   and the preserved compiled `AETHERFixture.exe` (hash-verified
+   only; no rebuild in this campaign; the Python fixture is never
+   launched as a script). Fixture identity is the approved executable identity +
    verified process/window instance tokens — never title text.
 5. **Exact capability allowlist**: `app.launch` (registered apps
    only), `window.activate`, read-only UIA observation under
@@ -197,24 +197,32 @@ $NodeDir = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec
 #    commands" above (pinned Python, fresh basetemp, no npm ci,
 #    no fixture rebuild - hash verification only).
 
-# 4. Fixture build + integrity evidence.
-cd tools\windows-fixture; .\build_fixture.cmd; cd ..\..
-Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256
+# 4. Fixture integrity evidence (verify ONLY; never rebuild here -
+#    a mismatch is a stop-and-report condition).
+(Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256).Hash
+#    must equal E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D
 
 # 5-7. Authorization artifact + isolated storage (one tool run).
-#     It discovers the approved apps, derives the fixture identity
-#     and token, generates session/epoch/storage identity,
-#     initializes the isolated v3 acceptance storage FIRST and only
-#     then writes D:\AETHER-acceptance\authorization.json, so a
-#     failed run leaves no usable-looking authorization. Run it from
-#     a shell where git resolves (the tool reads the candidate
-#     commit via git). Each campaign uses a NEW --campaign name;
-#     before re-running, archive the previous artifact as
-#     authorization-<campaign>.json - the tool refuses to overwrite
-#     an existing artifact, and storage creation is exclusive.
-#     No internal identifier is constructed by hand. If discovery
-#     reports a requested name as ambiguous, re-run with exact
-#     --app-ids values instead of names.
+#     First verify the campaign root and freshness (nothing from an
+#     earlier campaign is overwritten or reused):
+if ((Get-Item D:\AETHER-acceptance).Attributes -match "ReparsePoint") { throw "acceptance root must not be reparse" }
+#     The tool discovers the approved apps, derives the fixture
+#     identity and token, generates session/epoch/storage identity,
+#     initializes the isolated v3 database directory
+#     aether-phase3-acceptance-<campaign> FIRST, then creates the
+#     SEPARATE sibling synthetic workspace
+#     aether-phase3-workspace-<campaign>, and only then writes
+#     D:\AETHER-acceptance\authorization-<campaign>.json
+#     (exclusively), so a failed run leaves no usable-looking
+#     authorization. The synthetic project is created by the owner
+#     inside the workspace (never inside the database directory).
+#     The tool reads the candidate commit via git: put the trusted
+#     Git directory on this shell's PATH explicitly first.
+$env:PATH = "C:\Program Files\Git\cmd;$NodeDir;$env:PATH"
+#     Each campaign uses a NEW --campaign name. No internal
+#     identifier is constructed by hand. If discovery reports a
+#     requested name as ambiguous, re-run with exact --app-ids
+#     values instead of names.
 cd backend
 & $Python -m aether.core.apps.authorization_artifact --decision-reference "<owner decision reference>" --campaign campaign-<unique-name> --apps "Notepad,Calculator,File Explorer" --acceptance-root D:\AETHER-acceptance
 cd ..
@@ -223,9 +231,11 @@ cd ..
 #    point only from this owner-set main-process environment value).
 #    The trusted Git executable is pinned absolutely (the sanitized
 #    backend PATH cannot resolve git by name).
-$env:AETHER_PHASE3_AUTHORIZATION = "D:\AETHER-acceptance\authorization.json"
-$env:AETHER_GIT_EXECUTABLE = "C:\Program Files\Git\cmd\git.exe"   # verify: Test-Path $env:AETHER_GIT_EXECUTABLE
+$env:AETHER_PHASE3_AUTHORIZATION = "D:\AETHER-acceptance\authorization-<campaign>.json"   # the exact file written in step 5-7
+$env:AETHER_GIT_EXECUTABLE = "C:\Program Files\Git\cmd\git.exe"
+if (-not (Test-Path $env:AETHER_GIT_EXECUTABLE)) { throw "trusted Git executable not found; stop and report" }
 $env:AETHER_DEV_PYTHON = $Python
+$env:PATH = "$NodeDir;$env:PATH"   # portable Node resolves for Electron/backend subprocesses
 cd apps\desktop; & $Npm run start   # builds the bundles, then launches Electron
 # Expected indication: Phase 3 surface reports nativeAvailable=true,
 # privacy mode "off" until explicit metadata_only opt-in in the UI.

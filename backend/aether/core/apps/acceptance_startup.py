@@ -16,9 +16,39 @@ reality before any native component is constructed.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+WORKSPACE_PREFIX = "aether-phase3-workspace-"
+
+
+def campaign_layout_error(storage_path: str, workspace_path: str) -> str | None:
+    """Validate the campaign directory layout (R2).
+
+    The schema-v3 acceptance database directory and the synthetic
+    project workspace are *separate sibling directories*: the
+    database directory's content allowlist stays closed, and project
+    evidence lives in the workspace, never inside database storage.
+    Returns a denial reason, or None when the layout is sound.
+    """
+    if not workspace_path:
+        return "synthetic_workspace_missing"
+    storage = Path(storage_path)
+    workspace = Path(workspace_path)
+    if not storage.is_absolute() or not workspace.is_absolute():
+        return "campaign_layout_not_absolute"
+    storage_norm = Path(os.path.normpath(storage))
+    workspace_norm = Path(os.path.normpath(workspace))
+    if os.path.normcase(str(storage_norm)) == os.path.normcase(str(workspace_norm)):
+        return "campaign_layout_paths_identical"
+    if os.path.normcase(str(workspace_norm.parent)) != os.path.normcase(str(storage_norm.parent)):
+        return "campaign_layout_not_sibling"
+    if not workspace_norm.name.startswith(WORKSPACE_PREFIX):
+        return "synthetic_workspace_name_invalid"
+    return None
+
 
 # Hard ceilings of this build: an authorization may only narrow these.
 MAX_CAPABILITIES = frozenset(
@@ -56,6 +86,10 @@ class ControlledAcceptanceAuthorization:
     privacy_mode: str
     fixture_app_id: str
     fixture_identity_token: str
+    # Dedicated synthetic project workspace (sibling of the schema-v3
+    # acceptance database directory; project registration binds here,
+    # never inside database storage).
+    workspace_path: str = ""
 
     @classmethod
     def load(cls, path: Path) -> ControlledAcceptanceAuthorization:
@@ -86,6 +120,7 @@ class ControlledAcceptanceAuthorization:
             privacy_mode=str(raw.get("privacy_mode", "")),
             fixture_app_id=str(raw.get("fixture_app_id", "")),
             fixture_identity_token=str(raw.get("fixture_identity_token", "")),
+            workspace_path=str(raw.get("workspace_path", "")),
         )
 
     def validate(
@@ -108,6 +143,9 @@ class ControlledAcceptanceAuthorization:
             raise StartupDenied("authorization_lifetime_exceeds_maximum")
         if self.privacy_mode != REQUIRED_PRIVACY_MODE:
             raise StartupDenied("privacy_mode_not_approved")
+        layout_error = campaign_layout_error(self.storage_path, self.workspace_path)
+        if layout_error is not None:
+            raise StartupDenied(layout_error)
         if not self.capability_allowlist or not self.capability_allowlist <= MAX_CAPABILITIES:
             raise StartupDenied("capability_allowlist_exceeds_build_ceiling")
         if not self.authorized_app_ids:

@@ -74,9 +74,23 @@ class ProjectDetector:
     # all: the Explorer provider is never invoked and no registered
     # root is probed. Reference resolution inherits the same gate.
     collection_permitted: Callable[[], bool] | None = None
+    # Privacy generation source: when collection runs across a
+    # privacy-generation change, its evidence was collected under an
+    # invalidated authorization and must not be published - the same
+    # publication protection the bridge applies, inherited by direct
+    # reference resolution (R3).
+    collection_generation: Callable[[], int] | None = None
+    # Bounded project-context scope: an unregistered Explorer folder
+    # is only published as a discovered candidate when it lies inside
+    # this scope (the authorized synthetic workspace). Registration
+    # never confers authority to collect arbitrary Explorer paths.
+    explorer_scope: Callable[[Path], bool] | None = None
 
     def _collection_allowed(self) -> bool:
         return self.collection_permitted is None or bool(self.collection_permitted())
+
+    def _generation(self) -> int | None:
+        return self.collection_generation() if self.collection_generation is not None else None
 
     def _now(self) -> datetime:
         from datetime import UTC
@@ -97,6 +111,7 @@ class ProjectDetector:
     def detect(self) -> tuple[ProjectCandidate, ...]:
         if not self._collection_allowed():
             return ()
+        generation = self._generation()
         now = self._now()
         candidates: dict[str, ProjectCandidate] = {}
         roots = list(self.registry.known_roots())  # type: ignore[attr-defined]
@@ -141,6 +156,15 @@ class ProjectDetector:
                 ),
                 manifests=manifests,
             )
+        if (
+            explorer is not None
+            and self.explorer_scope is not None
+            and not self.explorer_scope(explorer)
+        ):
+            # Outside the authorized project-context scope: the path
+            # is not published at all. General metadata observation
+            # elsewhere never becomes workspace-context collection.
+            explorer = None
         if explorer is not None and not any(
             _same_path(root.canonical_root, explorer) for root in roots
         ):
@@ -161,6 +185,13 @@ class ProjectDetector:
                 # G06: no filesystem probing of unregistered locations.
                 manifests=(),
             )
+        if generation is not None and (
+            self._generation() != generation or not self._collection_allowed()
+        ):
+            # Privacy generation changed (or collection stopped being
+            # permitted) while collecting: evidence gathered under an
+            # invalidated authorization is never published.
+            return ()
         return tuple(
             sorted(
                 candidates.values(),
@@ -178,7 +209,14 @@ class ProjectDetector:
             "this workspace",
         ):
             return ReferenceResolution(None, True, "unsupported_reference")
+        generation = self._generation()
         detected = self.detect()
+        if not self._collection_allowed() or (
+            generation is not None and self._generation() != generation
+        ):
+            # Direct reference resolution inherits the bridge's
+            # generation-change publication protection (R3).
+            return ReferenceResolution(None, True, "project_evidence_invalidated")
         # Freshness is evaluated against the moment AFTER collection:
         # sampling the reference time before detection would make
         # every freshly observed candidate stale by construction.

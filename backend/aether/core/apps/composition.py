@@ -184,6 +184,16 @@ class Phase3Composition:
             # state cannot start or resume observation, regardless
             # of which caller asks.
             return
+        if (
+            self.surface is not None
+            and self.surface.collection_permitted is not None
+            and not self.surface.collection_permitted()
+        ):
+            # Synchronous lifetime predicate at the observation
+            # startup/resumption boundary (R3): an expired or revoked
+            # authorization never restarts observation, even when a
+            # privacy update arrives before the expiry timer fires.
+            return
         if self.observer_service is None:
             # No observer means observation cannot start; a privacy
             # change in that state must not run resume/reconcile
@@ -651,10 +661,11 @@ class Phase3Composition:
                 clock=now_fn,
             )
             recovery = RecoveryService(store=store)
-            # A/D: one composition-owned project registry with native
-            # Windows semantics, contained to the campaign storage
-            # layout (the explicitly authorized synthetic-project
-            # boundary). Explorer evidence is normalized to Path at
+            # A/D + R2: one composition-owned project registry with
+            # native Windows semantics, contained to the dedicated
+            # synthetic workspace directory (sibling of the schema-v3
+            # database directory, never inside it). Explorer evidence
+            # is normalized to Path at
             # this provider boundary, and every detector collection
             # is gated synchronously on privacy + authorization
             # lifetime + composition lifecycle (revocation/shutdown)
@@ -677,15 +688,19 @@ class Phase3Composition:
                 raw = _raw_explorer_folder()
                 return _Path(str(raw)) if raw else None
 
+            if not authorization.workspace_path:
+                raise CompositionUnavailable("synthetic_workspace_missing")
             project_registry = ResourceRegistry(
                 windows_semantics=True,
-                registration_boundary=_Path(str(authorization.storage_path)),
+                registration_boundary=_Path(str(authorization.workspace_path)),
             )
             project_detector = ProjectDetector(
                 registry=project_registry,
                 explorer_folder=_explorer_folder,
                 clock=now_fn,
                 collection_permitted=_collection_permitted,
+                collection_generation=lambda: privacy.generation,
+                explorer_scope=project_registry.is_within_registration_boundary,
             )
             dialog_guard = DialogGuard(
                 detector=detector, on_dialog=lambda wid, _a: snapshots.on_dialog(wid)
@@ -759,7 +774,7 @@ class Phase3Composition:
             def _on_privacy_change() -> None:
                 snapshots.note_privacy_change()
                 world_state.set_policy(privacy.policy)
-                if privacy.collection_enabled:
+                if _collection_permitted():
                     composition.begin_observation()
                 else:
                     composition.pause_observation()
@@ -1046,6 +1061,7 @@ class Phase3Composition:
                 return privacy.collection_enabled
 
             detector.collection_permitted = _collection_permitted
+            detector.collection_generation = lambda: privacy.generation
 
             def _route_activity(signal: ActivitySignal) -> None:
                 focus.note_activity(signal)

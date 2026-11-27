@@ -44,12 +44,17 @@ package query with runtime-AUMID observer attribution, the
 canonical fuzzy/alias resolver connected to the bridge and desktop
 (FTS retrieval/display only), refusal of unsupported/unverifiable
 launch records before approval, main-process-owned trusted project
-registration restricted to the composition storage boundary, and
+registration restricted to the dedicated synthetic workspace
+(sibling of the acceptance database directory), and
 reconciled campaign/ordinary-mode documentation. The next step is
 the single consolidated owner native campaign
 (`PHASE3_NATIVE_ACCEPTANCE.md`), after which independent review
 decides Phase 3 acceptance; no intermediate owner runs are
-requested.
+requested. Residual corrections R1–R5 (live running-process package
+identity, separate synthetic workspace boundary, complete privacy
+generation/lifecycle enforcement, resolver outcomes preserved across
+desktop IPC, and procedure consistency) are implemented on top in a
+follow-up checkpoint on PR #37, same Linux/fake test surface only.
 
 **Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
 fake-backed** on top of CP4–CP5: authoritative persisted UI-operation

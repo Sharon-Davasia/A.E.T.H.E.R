@@ -196,6 +196,11 @@ class Phase3Bridge:
                 if surface.privacy_authority is not None
                 else dict(surface.privacy)
             )
+            # Capabilities are presented only while the synchronous
+            # lifetime predicate holds: an expired/revoked (or not
+            # opted-in) authorization never presents expired
+            # capabilities as available (R3).
+            permitted = self._collection_permitted()
             return {
                 "status": "ready",
                 "nativeAvailable": surface.executor is not None,
@@ -204,11 +209,11 @@ class Phase3Bridge:
                 "projects": projects,
                 "windows": windows,
                 "capabilities": {
-                    "app.launch": surface.launch_coordinator is not None,
-                    "window.activate": surface.activation_service is not None,
-                    "uia.inspect_snapshot": surface.snapshots is not None,
-                    "uia.inspect_element": surface.snapshots is not None,
-                    "uia.invoke_fixture": surface.executor is not None,
+                    "app.launch": permitted and surface.launch_coordinator is not None,
+                    "window.activate": permitted and surface.activation_service is not None,
+                    "uia.inspect_snapshot": permitted and surface.snapshots is not None,
+                    "uia.inspect_element": permitted and surface.snapshots is not None,
+                    "uia.invoke_fixture": permitted and surface.executor is not None,
                 },
             }
 
@@ -269,10 +274,22 @@ class Phase3Bridge:
             query = str(payload["query"])
 
             def entry(record: object) -> dict[str, object]:
+                from aether.core.contracts.app_window import LaunchMethod
+
+                # Discovered availability (a fresh discovery record)
+                # is distinct from launch eligibility: eligibility is
+                # decided at prepare_launch against fresh integrity
+                # evidence; here we only state whether the record's
+                # launch mechanism is an approved one at all.
                 return {
                     "appId": record.app_id,  # type: ignore[attr-defined]
                     "displayName": record.display_name,  # type: ignore[attr-defined]
                     "available": record.available,  # type: ignore[attr-defined]
+                    "launchSupported": record.launch_method  # type: ignore[attr-defined]
+                    in (
+                        LaunchMethod.APPROVED_EXECUTABLE,
+                        LaunchMethod.APPS_FOLDER_ACTIVATION,
+                    ),
                 }
 
             if not query.strip():
@@ -317,6 +334,13 @@ class Phase3Bridge:
             registry = self.surface.project_registry
             if registry is None:
                 return self._unavailable("project_registration_unavailable")
+            if not self._collection_permitted():
+                # Minimum explicit project-context authorization
+                # (R3): registration is accepted only under a live,
+                # opted-in, unexpired, unrevoked composition. It
+                # confers metadata-only detection inside the registry
+                # boundary - never general Explorer collection.
+                return self._unavailable("project_context_not_authorized")
             if not isinstance(payload, dict) or set(payload) != {"alias", "path"}:
                 raise _Phase3Refused("invalid_request")
             alias, path = payload["alias"], payload["path"]

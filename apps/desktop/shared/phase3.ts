@@ -50,7 +50,25 @@ export interface Phase3State {
 export interface Phase3AppResult {
   appId: string;
   displayName: string;
+  /** Fresh discovered record (discovery availability only). */
   available: boolean;
+  /** The record's launch mechanism is an approved one; verified
+   * launch eligibility is decided later, at preparation, against
+   * fresh integrity evidence — never from discovery. */
+  launchSupported: boolean;
+}
+
+/** Authoritative resolver outcomes, preserved across IPC (R4). The
+ * renderer must never re-derive ambiguity from result counts. */
+export type Phase3Resolution =
+  | 'exact' | 'alias' | 'normalized' | 'fuzzy'
+  | 'candidates' | 'ambiguous' | 'not_found' | 'stale_or_unavailable' | 'list';
+
+export interface Phase3AppSearch {
+  status: 'ready' | 'unavailable';
+  reason?: string;
+  resolution: Phase3Resolution | 'unavailable';
+  results: Phase3AppResult[];
 }
 
 export interface Phase3ProjectRegistration {
@@ -163,18 +181,37 @@ export function parsePhase3Prepared(value: unknown): Phase3Prepared {
   };
 }
 
-export function parsePhase3Apps(value: unknown): Phase3AppResult[] {
+const RESOLUTIONS: ReadonlySet<string> = new Set([
+  'exact', 'alias', 'normalized', 'fuzzy', 'candidates', 'ambiguous',
+  'not_found', 'stale_or_unavailable', 'list',
+]);
+
+export function parsePhase3AppSearch(value: unknown): Phase3AppSearch {
   const item = record(value);
-  if (item.status === 'unavailable') return [];
+  if (item.status === 'unavailable') {
+    return { status: 'unavailable', reason: reason(item), resolution: 'unavailable', results: [] };
+  }
   const results = Array.isArray(item.results) ? item.results : [];
-  return results.map((raw) => {
-    const r = record(raw);
-    return {
-      appId: String(r.appId ?? ''),
-      displayName: String(r.displayName ?? ''),
-      available: r.available === true,
-    };
-  });
+  return {
+    status: 'ready',
+    resolution: (typeof item.resolution === 'string' && RESOLUTIONS.has(item.resolution)
+      ? item.resolution
+      : 'list') as Phase3Resolution,
+    results: results.map((raw) => {
+      const r = record(raw);
+      return {
+        appId: String(r.appId ?? ''),
+        displayName: String(r.displayName ?? ''),
+        available: r.available === true,
+        launchSupported: r.launchSupported === true,
+      };
+    }),
+  };
+}
+
+/** Back-compatible list-only view of a search response. */
+export function parsePhase3Apps(value: unknown): Phase3AppResult[] {
+  return parsePhase3AppSearch(value).results;
 }
 
 export function parsePhase3ProjectRegistration(value: unknown): Phase3ProjectRegistration {
