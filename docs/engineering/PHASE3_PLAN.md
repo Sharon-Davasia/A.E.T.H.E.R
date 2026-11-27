@@ -9,10 +9,10 @@ NOT activated (`ACTIVE_SCHEMA_VERSION = 2`). CP4+ and native
 activation require separate authorization.** CP3 source is
 fake-backed integration only: the native launcher is disabled and
 no real application has been launched.
-Formal Phase 2 acceptance remains **NOT COMPLETE**
-(`PHASE2_WINDOWS_ACCEPTANCE.md` §10 outstanding); this plan does not
-waive it. Parallel CP0–CP2 development was explicitly authorized as
-foundation-only work.
+Phase 2 owner acceptance is complete and locally archived (see
+`docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §8). Parallel
+CP0–CP2 development was explicitly authorized as foundation-only
+work.
 
 Authority: `docs/architecture/MASTER_SPEC.md`. Where this plan and
 the spec's illustrative repository blueprint differ (folder names),
@@ -132,7 +132,33 @@ the native acceptance procedure at the CP7 checkpoint. Foundation
 tests in this batch are platform-independent (fake sources) plus real
 RapidFuzz ranking; **they are not native Windows evidence.**
 
-## 6. Performance defaults (provisional, unmeasured)
+## 6. Consolidated pre-activation corrections A–E (implemented)
+
+Implemented on PR #37 in one correction checkpoint (Linux/fake test
+surface only; not native evidence): (A) collection is gated on the
+live authorization lifetime at the provider boundary — Explorer and
+project observation never run before opt-in, after opt-out/pause,
+at/after expiry, after revocation or after shutdown, and generation
+changes during collection block publication; (B) packaged-app
+integrity comes from the platform package query (package family →
+full name + version, exact AUMID membership) and observer process
+attribution uses the runtime-AUMID query, refusing disagreement —
+`ActivateApplication` PIDs alone never prove success; (C) discovery
+never scans relative pseudo-roots and reports partial/unavailable
+truthfully, the bridge connects the canonical registry and
+fuzzy/alias resolver (FTS is retrieval/display only) and refuses
+unsupported/unverifiable launch records before approval; (D)
+project registration is main-process-owned (native directory
+dialog, sender validation, native confirmation naming the
+directory, no renderer-supplied path) and restricts projects to the
+composition storage boundary, metadata-only; (E) the campaign
+documentation preserves the owner evidence root, venv, portable
+Node and fixture hash and defines a synthetic-storage ordinary-mode
+verification that never opens real-user storage. Native acceptance
+still requires the single consolidated owner campaign in
+`PHASE3_NATIVE_ACCEPTANCE.md`.
+
+## 7. Performance defaults (provisional, unmeasured)
 
 Queue 256 events; observation TTL 30 s; reconciliation on demand /
 overflow (5 s sweep proposed for native activation); registry cap

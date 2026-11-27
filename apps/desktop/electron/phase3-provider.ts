@@ -12,8 +12,8 @@
 
 import type { BackendClient } from './backend-client';
 import {
-  parsePhase3Apps, parsePhase3Outcome, parsePhase3Prepared, parsePhase3Snapshot, parsePhase3State,
-  type Phase3Outcome, type Phase3Prepared, type Phase3Snapshot, type Phase3State,
+  parsePhase3Apps, parsePhase3Outcome, parsePhase3Prepared, parsePhase3ProjectRegistration, parsePhase3Snapshot, parsePhase3State,
+  type Phase3Outcome, type Phase3Prepared, type Phase3ProjectRegistration, type Phase3Snapshot, type Phase3State,
 } from '../shared/phase3';
 import type { GestureBindingInput } from './gesture';
 
@@ -36,7 +36,7 @@ export interface Phase3ProviderOptions {
     | 'phase3PauseTask' | 'signGesture' | 'status'
     | 'phase3ListWindows' | 'phase3PrepareLaunch' | 'phase3PrepareActivation'
     | 'phase3PrepareFixture' | 'phase3PreviewOperation' | 'phase3ApproveOperation'
-    | 'phase3GetReceipt' | 'phase3CancelTask' | 'phase3ResumeTask'
+    | 'phase3GetReceipt' | 'phase3CancelTask' | 'phase3ResumeTask' | 'phase3RegisterProject'
   >;
   /** Native trusted confirmation; resolves true only on explicit affirmation. */
   confirm: (summary: Phase3InteractionSummary) => Promise<boolean>;
@@ -85,6 +85,10 @@ export function createPhase3Provider(options: Phase3ProviderOptions) {
 
   async function searchApps(query: string) {
     return parsePhase3Apps(await backend.phase3SearchApps(query));
+  }
+
+  async function registerProject(path: string): Promise<Phase3ProjectRegistration> {
+    return parsePhase3ProjectRegistration(await backend.phase3RegisterProject(path));
   }
 
   async function listWindows() {
@@ -234,7 +238,7 @@ export function createPhase3Provider(options: Phase3ProviderOptions) {
   return {
     getState, setPrivacy, searchApps, listWindows, inspectWindow,
     prepareLaunch, prepareActivation, prepareFixture,
-    getReceipt, cancelTask, resumeTask,
+    getReceipt, cancelTask, resumeTask, registerProject,
     getTaskState, pauseTask, approveFixtureInteraction, approveOperation,
   };
 }

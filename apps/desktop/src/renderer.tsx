@@ -4,7 +4,7 @@ import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
 import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
 import { Phase3Surface } from './Phase3Surface';
-import type { Phase3AppResult, Phase3Outcome, Phase3Prepared, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
+import type { Phase3AppResult, Phase3Outcome, Phase3Prepared, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
 import { describeLiveApprovalOutcome } from '../shared/live';
 import type {
   LiveApprovalState,
@@ -54,6 +54,7 @@ declare global {
       phase3GetReceipt: (taskId: string) => Promise<unknown>;
       phase3CancelTask: (taskId: string) => Promise<Phase3Outcome>;
       phase3ResumeTask: (taskId: string) => Promise<Phase3Outcome>;
+      phase3RegisterProject: () => Promise<Phase3ProjectRegistration>;
       getWorkflowState: () => Promise<{
         project: RegisteredProject | null;
         file: { resourceId: string } | null;
@@ -321,6 +322,12 @@ function App(): React.JSX.Element {
       onSearchApps={(query) => void phase3Run(
         () => window.aetherDesktop.phase3SearchApps(query) as Promise<Phase3AppResult[]>, setPhase3Apps,
       )}
+      onRegisterProject={() => {
+        void (async () => {
+          await window.aetherDesktop.phase3RegisterProject();
+          await refreshPhase3();
+        })();
+      }}
       onPrepareLaunch={(appId) => void phase3Run(
         () => window.aetherDesktop.phase3PrepareLaunch(appId), setPhase3Prepared,
       )}

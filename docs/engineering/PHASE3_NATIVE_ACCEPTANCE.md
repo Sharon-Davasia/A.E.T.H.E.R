@@ -15,8 +15,24 @@ verifier must NOT be run.
 
 - Windows 11, non-administrator PowerShell 5.1 (no execution-policy
   bypass, no elevation, no Developer Mode, no WSL, no new worktrees).
-- Python 3.12.10; Node 22.22.3; npm 10.9.8 via `npm.cmd`.
 - Permanent repository `D:\A.E.T.H.E.R`.
+- Owner evidence root (preserved; never recreated):
+  `D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a`.
+- Backend interpreter (preserved venv, Python 3.12.10):
+  `D:\A.E.T.H.E.R\backend\.venv\Scripts\python.exe`. Do not rely
+  on the global PATH for Python, Node or Git.
+- Portable Node.js 22.22.3 / npm 10.9.8 (preserved):
+  `D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a\phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64`
+  (use its `npm.cmd` by full path or prepend that directory to the
+  session PATH explicitly).
+- Compiled fixture (preserved; verify, never rebuild unless the hash
+  mismatches): `tools\windows-fixture\AETHERFixture.exe`,
+  SHA256 `E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D`.
+- Trusted Git executable for controlled startup: record the actual
+  installed absolute path once (e.g. `C:\Program Files\Git\cmd\git.exe`)
+  and set it explicitly (see the controlled-startup step). If it
+  cannot be verified, stop and report — the backend denies
+  controlled startup without it.
 - Representative suite: Notepad, Calculator, File Explorer, VS Code
   if installed, Windows Settings (permitted read/navigation only),
   and the native synthetic fixture (`AETHERFixture.exe`, built by
@@ -37,19 +53,26 @@ fail resource registration by design, and those protections must
 not be weakened. **Never reuse an existing `--basetemp` path.**
 
 ```powershell
-$EvidenceRoot = "D:\AETHER-evidence"          # existing owner evidence root
+$Python = "D:\A.E.T.H.E.R\backend\.venv\Scripts\python.exe"
+$EvidenceRoot = "D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a"   # existing owner evidence root
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $BaseTemp = Join-Path $EvidenceRoot "phase3-pytest-$Stamp"
 if (Test-Path $BaseTemp) { throw "basetemp already exists; choose a new name" }
 New-Item -ItemType Directory -Path $BaseTemp | Out-Null
 if ((Get-Item $BaseTemp).Attributes -match "ReparsePoint") { throw "basetemp must not be a reparse point" }
-python -m pytest backend/tests -q --basetemp $BaseTemp
-python -m ruff check backend tools
-python -m ruff format --check backend tools
+& $Python --version            # must print Python 3.12.10
+& $Python -m pytest backend/tests -q --basetemp $BaseTemp
+& $Python -m ruff check backend tools
+& $Python -m ruff format --check backend tools
 # strict mypy, from backend\
-cd backend; python -m mypy; cd ..
-# desktop gates
-cd apps/desktop; npm.cmd run check; npm.cmd test; cd ../..
+cd backend; & $Python -m mypy; cd ..
+# desktop gates (portable npm by full path; node_modules preserved -
+# if it is missing, stop and report instead of reinstalling)
+$Npm = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64\npm.cmd"
+cd apps/desktop; $env:AETHER_DEV_PYTHON = $Python; & $Npm run check; & $Npm test; cd ..\..
+# fixture integrity (verify only; rebuild is NOT part of verification)
+(Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256).Hash
+# must equal E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D
 ```
 
 Record the exact basetemp used with the campaign evidence; a rerun
@@ -59,9 +82,18 @@ always creates a fresh one.
 
 S1. Start from the exact candidate SHA recorded in the activation
     decision package; verify `git rev-parse HEAD` matches.
-S2. Create the dedicated synthetic storage directory named
-    `aether-phase3-acceptance-<campaign>` in the location recorded in
-    the decision package; confirm it is new/empty and not a link.
+S2. Do NOT pre-create the acceptance storage directory: the
+    authorization tool initializes it exclusively
+    (`aether-phase3-acceptance-<campaign>` under the acceptance
+    root) and pre-existing storage is rejected. Before the run,
+    confirm the campaign name is fresh and no directory or
+    `authorization.json` from an earlier campaign will be
+    overwritten (archive the previous artifact as
+    `authorization-<campaign>.json`; never delete campaign evidence).
+    After storage initialization, create the synthetic project at
+    `aether-phase3-acceptance-<campaign>\synthetic-project` inside
+    that storage layout, with a synthetic `pyproject.toml` marker.
+    The real AETHER repository is never registered (P3-23).
 S3. Start the desktop app in the reviewed controlled-acceptance
     configuration (decision package §"Exact owner-side commands").
     Confirm the Phase 3 panel shows observation **off** before opt-in.
@@ -104,9 +136,9 @@ C4. At campaign end: shut the app down (worker must exit; verify no
 | P3-20 | Unexpected dialog | Open fixture modal; attempt an op | Dispatch halted; dialog never auto-dismissed; fresh observation+approval required to resume | No effect behind dialog | Dialog indication |
 | P3-21 | Safe pause/resume | Pause an armed task; resume | PAUSED holds nothing live; resume goes to fresh planning/precheck; consumed approvals never replay | No PAUSED→EXECUTING jump | Task states |
 | P3-22 | Restart reconciliation | Restart the app with an armed/paused task | States reconciled truthfully; uncertain never auto-succeeded | No replay after restart | Task state after restart |
-| P3-23 | Project reference resolution | Register the repo root; focus Explorer there; ask for current project | Deterministic candidate (this repo) or clarification if ambiguous | Registered roots only; no permission expansion | Candidate/limitations |
+| P3-23 | Project reference resolution | Create the synthetic project inside the campaign storage (S2); register it via the panel's trusted directory dialog; focus Explorer there; ask for current project | Deterministic candidate (the synthetic project) or clarification if ambiguous | Registered roots only (campaign storage boundary); no permission expansion; no executor enabled | Candidate/limitations |
 | P3-24 | Real-app read-only navigation suite | For Explorer and VS Code (if installed) and Settings (read/navigation scope): activate window + snapshot only | Verified activation; bounded snapshot; zero interactions sent | No clicks/keys; limitations reported truthfully for missing apps | Receipts |
-| P3-25 | Boundaries preserved | Ordinary relaunch; attempt Phase 3 actions without acceptance config; confirm offline behavior | Ordinary mode default-denied (`phase3_native_disabled`); Phase 2 surfaces unchanged; no outbound network required/observed beyond OS noise recorded | No ordinary-mode execution; no real DB migration (schema stays v2) | Panel + DB schema check (`PRAGMA user_version` = 2 on the real DB, untouched) |
+| P3-25 | Boundaries preserved | Ordinary relaunch per §"Ordinary-mode verification" below; attempt Phase 3 actions without acceptance config; confirm offline behavior | Ordinary mode default-denied (`phase3_native_disabled`); Phase 2 surfaces unchanged; no outbound network required/observed beyond OS noise recorded | No ordinary-mode execution; no real-user database opened, migrated or modified | Panel + synthetic-DB schema check (`PRAGMA user_version` = 2 on the *synthetic* database) + real-storage fingerprint comparison only when its verified actual path is known (never opened through SQLite; an unverifiable path is reported, not assumed) |
 
 ## Recording and verdict
 
@@ -114,4 +146,65 @@ Record PASS/FAIL per row with evidence digests; update
 `docs/engineering/STATUS.md`. A FAIL in P3-01, P3-04, P3-11, P3-14,
 P3-20 or P3-25 stops the campaign. This campaign, even if fully
 passed, is *native acceptance evidence for review* — it does not by
-itself change the Phase 2 verdict or formally accept Phase 3.
+itself formally accept Phase 3. (Phase 2 owner acceptance is
+complete and archived; this campaign neither reopens nor alters
+it.)
+
+## Representative application support matrix
+
+| Application | Discovery identity | Integrity evidence | Launch | Notes |
+|---|---|---|---|---|
+| AETHER Fixture | explicit portable registration (.exe) | SHA-256 of the opened file + file identity | `CreateProcessW` | Only approved effectful UI target; full workflow |
+| Notepad | AppsFolder (AUMID) | platform package query (family → full name + version, exact AUMID membership) | `IApplicationActivationManager` | Single-instance: success is declared only for an independently attributed process/window; otherwise truthfully uncertain |
+| Calculator | AppsFolder (AUMID) | same packaged route | same | P3-10 inspects an already-open window |
+| File Explorer | AppsFolder (AUMID), when enumerated | same packaged route | same, else truthfully refused | Shell-hosted windows may lack an attributable AUMID; existing-window activation/inspection uses observer bindings |
+| Windows Settings | AppsFolder (AUMID) | same packaged route | read/navigation scope only | Activate + snapshot; no interactions |
+| VS Code | uninstall / Start Menu listing | none (no approved launch method) | **unsupported in this campaign** | Search/listing and existing-window activation/inspection only; launch would require a separately approved portable-registration decision |
+
+Discovery never confers authorization: every launch re-verifies
+fresh, method-appropriate integrity evidence, and unverifiable
+records are refused before any trusted approval is requested.
+
+## Ordinary-mode verification (P3-01 / P3-25)
+
+Run from non-admin PowerShell 5.1 at `D:\A.E.T.H.E.R`. This uses a
+fresh isolated synthetic schema-v2 database; Phase 3 authorization
+and Phase 2 Activation B stay disabled; ordinary mutation issuance
+and execution stay disabled; real-user storage is never opened.
+
+```powershell
+$Python = "D:\A.E.T.H.E.R\backend\.venv\Scripts\python.exe"
+$EvidenceRoot = "D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a"
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$OrdRoot = Join-Path $EvidenceRoot "ordinary-v2-$Stamp"
+if (Test-Path $OrdRoot) { throw "fresh path required" }
+New-Item -ItemType Directory -Path $OrdRoot | Out-Null
+if ((Get-Item $OrdRoot).Attributes -match "ReparsePoint") { throw "must not be reparse" }
+$SyntheticDb = Join-Path $OrdRoot "tasks.sqlite3"
+
+# Pin the interpreter; select ONLY the synthetic database; make
+# sure no acceptance/review configuration leaks into this launch.
+$env:AETHER_DEV_PYTHON = $Python
+$env:AETHER_DEV_PYTHON_VERSION = "3.12.10"
+$env:AETHER_FIXTURE_DB = $SyntheticDb
+Remove-Item Env:AETHER_ACCEPTANCE_MODE, Env:AETHER_PHASE3_AUTHORIZATION, Env:AETHER_PHASE3_SIMULATED, Env:AETHER_REVIEW_DB, Env:AETHER_REVIEW_NARRATIVE, Env:AETHER_REVIEW_DEV_SEED -ErrorAction SilentlyContinue
+
+# `npm.cmd run start` builds the renderer/Electron bundles and then
+# launches Electron (it is not a no-rebuild command). node_modules
+# is preserved; if it is missing, stop and report.
+$Npm = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64\npm.cmd"
+cd apps\desktop; & $Npm run start; cd ..\..
+
+# In the app: the Phase 3 panel shows observation off /
+# phase3_native_disabled (P3-01). Attempt one Phase 3 action and
+# one Phase 2 approved-edit in a synthetic project: expect
+# phase3_native_disabled and grant_issuance_disabled /
+# mutation_not_enabled respectively. Record any network observation.
+# Then close the app and verify the SYNTHETIC database only:
+& $Python -c "import sqlite3,sys; print(sqlite3.connect('file:' + sys.argv[1].replace('\\','/') + '?mode=ro', uri=True).execute('PRAGMA user_version').fetchone()[0])" $SyntheticDb
+# Expected: 2 (schema v2). If the verified actual path of real-user
+# storage is known from the machine record, compare Get-FileHash +
+# LastWriteTimeUtc before/after WITHOUT opening it in SQLite; if it
+# cannot be verified, record it as unverifiable rather than assuming
+# an Electron userData location.
+```

@@ -145,6 +145,12 @@ class _FakeObserverApi:
     def get_process_name(self, pid: int) -> str | None:
         return self.get_process_image_path(pid)
 
+    def get_process_aumid(self, pid: int) -> str | None:
+        # A fake packaged process was spawned by AUMID; the platform
+        # reports exactly that application user model id for it.
+        image = self.get_process_image_path(pid)
+        return image if image and "!" in image else None
+
     def get_process_image_path(self, pid: int) -> str | None:
         for _hwnd, (p, exe) in self._state.windows.items():
             if p == pid:

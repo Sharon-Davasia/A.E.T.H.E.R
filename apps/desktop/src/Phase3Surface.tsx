@@ -24,6 +24,7 @@ interface Phase3SurfaceProps {
   onPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }) => void;
   onSearchApps: (query: string) => void;
   onPrepareLaunch: (appId: string) => void;
+  onRegisterProject: () => void;
   onApproveOperation: (effect: string) => void;
   onInspect: (windowId: string) => void;
   onPrepareActivation: (windowId: string) => void;
@@ -167,6 +168,11 @@ export function Phase3Surface(props: Phase3SurfaceProps): React.JSX.Element {
             {props.receipt != null && (
               <pre aria-label="Durable receipt">{JSON.stringify(props.receipt, null, 2).slice(0, 2000)}</pre>
             )}
+            <h3>Projects</h3>
+            <div>
+              <button type="button" className="ping-button" disabled={busy}
+                onClick={props.onRegisterProject}>Register synthetic project folder…</button>
+            </div>
             {state.projects.length > 0 && (
               <>
                 <h3>Current project</h3>

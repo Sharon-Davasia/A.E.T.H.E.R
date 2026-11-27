@@ -15,13 +15,12 @@ controlled Activation B enables production-trusted grant issuance
 designated fixture project subtree. Ordinary launches refuse issuance
 (`grant_issuance_disabled`) and execution (`mutation_not_enabled`).
 
-**Formal Phase 2 acceptance: NOT COMPLETE.** The finite outstanding
-evidence list is `docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §10
-(evidence archival, machine record, scenarios 5/10/11/15/18, footer
-visual confirmation, §7 sign-off). Owner-confirmed native
-demonstrations are recorded in §8 of that document; their artifacts
-remain owner-held and are not archived in this repository. Nothing in
-Phase 3 development changes that verdict.
+**Formal Phase 2 acceptance: COMPLETE (owner-accepted).** The owner
+acceptance record, including the independently executed native
+interruption harness, is locally archived with the owner (see
+`docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §8; artifacts remain
+owner-held and are not archived in this repository). Phase 3
+development does not reopen Phase 2.
 
 **Phase 3 integration/activation-readiness gate (G01–G06) is
 implemented** on top of the final batch: a controlled composition
@@ -36,6 +35,21 @@ to a durable receipt). The runnable P3-01…P3-25 campaign and the
 activation decision package are prepared for independent review;
 native activation remains disabled in ordinary operation and no
 owner-side run is requested yet.
+
+**Consolidated pre-activation corrections A–E are implemented** on
+PR #37 in one correction checkpoint (Linux/fake test surface only;
+not native evidence): privacy-lifetime collection gates at the
+provider boundary, verified packaged-app identity via the platform
+package query with runtime-AUMID observer attribution, the
+canonical fuzzy/alias resolver connected to the bridge and desktop
+(FTS retrieval/display only), refusal of unsupported/unverifiable
+launch records before approval, main-process-owned trusted project
+registration restricted to the composition storage boundary, and
+reconciled campaign/ordinary-mode documentation. The next step is
+the single consolidated owner native campaign
+(`PHASE3_NATIVE_ACCEPTANCE.md`), after which independent review
+decides Phase 3 acceptance; no intermediate owner runs are
+requested.
 
 **Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
 fake-backed** on top of CP4–CP5: authoritative persisted UI-operation

@@ -68,6 +68,15 @@ class ProjectDetector:
     explorer_folder: Callable[[], Path | None] | None = None
     recent_focus_root: Callable[[], str | None] | None = None
     clock: Callable[[], datetime] | None = None
+    # Authoritative collection gate (privacy + authorization lifetime
+    # + composition lifecycle), supplied by trusted composition.
+    # When present and False, detection performs NO collection at
+    # all: the Explorer provider is never invoked and no registered
+    # root is probed. Reference resolution inherits the same gate.
+    collection_permitted: Callable[[], bool] | None = None
+
+    def _collection_allowed(self) -> bool:
+        return self.collection_permitted is None or bool(self.collection_permitted())
 
     def _now(self) -> datetime:
         from datetime import UTC
@@ -86,6 +95,8 @@ class ProjectDetector:
         return tuple(found)
 
     def detect(self) -> tuple[ProjectCandidate, ...]:
+        if not self._collection_allowed():
+            return ()
         now = self._now()
         candidates: dict[str, ProjectCandidate] = {}
         roots = list(self.registry.known_roots())  # type: ignore[attr-defined]
@@ -161,14 +172,18 @@ class ProjectDetector:
         self, reference: str, *, now: datetime | None = None
     ) -> ReferenceResolution:
         """Resolve "this project" against fresh evidence only."""
-        moment = now or self._now()
         if reference.strip().casefold() not in (
             "this project",
             "current project",
             "this workspace",
         ):
             return ReferenceResolution(None, True, "unsupported_reference")
-        fresh = [c for c in self.detect() if c.fresh(moment) and c.available]
+        detected = self.detect()
+        # Freshness is evaluated against the moment AFTER collection:
+        # sampling the reference time before detection would make
+        # every freshly observed candidate stale by construction.
+        moment = now or self._now()
+        fresh = [c for c in detected if c.fresh(moment) and c.available]
         if not fresh:
             return ReferenceResolution(None, True, "no_fresh_project_evidence")
         if len(fresh) > 1 and (

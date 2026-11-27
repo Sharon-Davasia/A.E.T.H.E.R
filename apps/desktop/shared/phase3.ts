@@ -53,6 +53,13 @@ export interface Phase3AppResult {
   available: boolean;
 }
 
+export interface Phase3ProjectRegistration {
+  status: string;
+  rootId?: string;
+  alias?: string;
+  reason?: string;
+}
+
 export interface Phase3Element {
   ref: string;
   runtimeId: string;
@@ -168,6 +175,16 @@ export function parsePhase3Apps(value: unknown): Phase3AppResult[] {
       available: r.available === true,
     };
   });
+}
+
+export function parsePhase3ProjectRegistration(value: unknown): Phase3ProjectRegistration {
+  const item = record(value);
+  return {
+    status: String(item.status ?? 'unavailable'),
+    rootId: typeof item.rootId === 'string' ? item.rootId : undefined,
+    alias: typeof item.alias === 'string' ? item.alias : undefined,
+    reason: typeof item.reason === 'string' ? item.reason : undefined,
+  };
 }
 
 export function parsePhase3Snapshot(value: unknown): Phase3Snapshot {

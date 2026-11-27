@@ -62,18 +62,18 @@ class StdlibWindowsDiscoveryProviders:
     def start_menu_shortcuts(self) -> tuple[list[DiscoveredAppCandidate], SourceStatus]:
         if sys.platform != "win32":  # pragma: no cover - platform guard
             return [], SourceStatus("start_menu_shortcut", "unavailable", "requires_windows")
-        roots = [
-            os.path.join(
-                os.environ.get("APPDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"
-            ),
-            os.path.join(
-                os.environ.get("PROGRAMDATA", ""), "Microsoft", "Windows", "Start Menu", "Programs"
-            ),
-        ]
+        roots = _start_menu_roots(os.environ, _known_folder_path)
+        scanned = [root for root in roots if os.path.isdir(root)]
+        if not scanned:
+            # No root could be resolved or examined (e.g. the
+            # restricted backend environment carries neither the
+            # environment variables nor shell folder access): the
+            # source is unavailable, never an empty "ok".
+            return [], SourceStatus(
+                "start_menu_shortcut", "unavailable", "start_menu_roots_unavailable"
+            )
         candidates: list[DiscoveredAppCandidate] = []
-        for root in roots:  # bounded, single-level + one sublevel
-            if not root or not os.path.isdir(root):
-                continue
+        for root in scanned:  # bounded, single-level + one sublevel
             for base in (root, *[os.path.join(root, d) for d in _subdirs(root)]):
                 for entry in _scandir_bounded(base):
                     if entry.lower().endswith(".lnk") and len(candidates) < MAX_RECORDS_PER_SOURCE:
@@ -86,7 +86,12 @@ class StdlibWindowsDiscoveryProviders:
                                 source="start_menu_shortcut",
                             )
                         )
-        return candidates, SourceStatus("start_menu_shortcut", "ok")
+        status = (
+            SourceStatus("start_menu_shortcut", "ok")
+            if len(scanned) == len(roots)
+            else SourceStatus("start_menu_shortcut", "partial", "some_start_menu_roots_unavailable")
+        )
+        return candidates, status
 
     def uninstall_entries(self) -> tuple[list[DiscoveredAppCandidate], SourceStatus]:
         if sys.platform != "win32":  # pragma: no cover - platform guard
@@ -170,6 +175,69 @@ class StdlibWindowsDiscoveryProviders:
                 pythoncom.CoUninitialize()
         except Exception:
             return [], SourceStatus("apps_folder", "unavailable", "shell_com_unavailable")
+
+
+def _start_menu_roots(environ: os._Environ[str], known_folder: object) -> list[str]:
+    """Start Menu roots from shell known folders, env as fallback.
+
+    The Electron-spawned backend runs with a deliberately restricted
+    environment (no APPDATA/PROGRAMDATA); known-folder resolution
+    keeps discovery correct there. A base that cannot be resolved
+    contributes NO root - a relative pseudo-root is never scanned.
+    """
+    resolve = known_folder  # Callable[[str], str | None]
+    bases = [
+        resolve("roaming") or environ.get("APPDATA", ""),  # type: ignore[operator]
+        resolve("programdata") or environ.get("PROGRAMDATA", ""),  # type: ignore[operator]
+    ]
+    return [
+        os.path.join(base, "Microsoft", "Windows", "Start Menu", "Programs")
+        for base in bases
+        if base
+    ]
+
+
+_KNOWN_FOLDER_GUIDS = {
+    # FOLDERID_RoamingAppData / FOLDERID_ProgramData
+    "roaming": "{3EB685DB-65F9-4CF6-A03A-E3EF65729F3D}",
+    "programdata": "{62AB5D82-FDC1-4DC3-A9DD-070D1D495D97}",
+}
+
+
+def _known_folder_path(kind: str) -> str | None:  # pragma: no cover - Windows only
+    """SHGetKnownFolderPath for the Start Menu base folders."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Guid(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        text = _KNOWN_FOLDER_GUIDS[kind].strip("{}")
+        parts = text.split("-")
+        guid = _Guid(
+            int(parts[0], 16),
+            int(parts[1], 16),
+            int(parts[2], 16),
+            (ctypes.c_ubyte * 8)(*bytes.fromhex(parts[3] + parts[4])),
+        )
+        shell32 = getattr(ctypes, "windll").shell32  # noqa: B009
+        ole32 = getattr(ctypes, "windll").ole32  # noqa: B009
+        path_ptr = ctypes.c_wchar_p()
+        if shell32.SHGetKnownFolderPath(ctypes.byref(guid), 0, None, ctypes.byref(path_ptr)) != 0:
+            return None
+        try:
+            return str(path_ptr.value) if path_ptr.value else None
+        finally:
+            if path_ptr.value:
+                ole32.CoTaskMemFree(path_ptr)
+    except Exception:
+        return None
 
 
 def _subdirs(root: str) -> list[str]:  # pragma: no cover - Windows path helper

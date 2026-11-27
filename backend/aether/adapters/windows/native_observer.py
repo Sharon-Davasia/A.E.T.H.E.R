@@ -419,6 +419,36 @@ class _CtypesWin32Api:  # pragma: no cover - exercised only on Windows
         # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) only.
         return self._kernel32.OpenProcess(0x1000, False, pid)
 
+    def get_process_aumid(self, pid: int) -> str | None:
+        """Exact application user model id of a packaged process.
+
+        Platform-reported via GetApplicationUserModelId; a process
+        without a package (ERROR_APPMODEL_NO_PACKAGE) or any failure
+        yields None, which the observation provider treats as no
+        packaged identity - never as a guess.
+        """
+        ctypes = self._ctypes
+        kernel32 = self._kernel32
+        ERROR_APPMODEL_NO_PACKAGE = 15700
+        ERROR_INSUFFICIENT_BUFFER = 122
+        handle = self._open_process(pid)
+        if not handle:
+            return None
+        try:
+            length = ctypes.c_uint32(0)
+            result = kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), None)
+            if result == ERROR_APPMODEL_NO_PACKAGE:
+                return None
+            if result != ERROR_INSUFFICIENT_BUFFER or length.value == 0 or length.value > 1024:
+                return None
+            buffer = ctypes.create_unicode_buffer(length.value)
+            result = kernel32.GetApplicationUserModelId(handle, ctypes.byref(length), buffer)
+            if result != 0:
+                return None
+            return str(buffer.value) or None
+        finally:
+            kernel32.CloseHandle(handle)
+
     def get_process_creation_time(self, pid: int) -> str | None:
         ctypes = self._ctypes
         handle = self._open_process(pid)
@@ -576,10 +606,20 @@ class NativeObservationProvider:
         def _key(value: object) -> str:
             return PureWindowsPath(str(value or "")).as_posix().casefold()
 
+        from aether.core.contracts.app_window import LaunchMethod
+
         by_identity: dict[str, list] = {}  # type: ignore[type-arg]
+        by_aumid: dict[str, list] = {}  # type: ignore[type-arg]
         for record in self._records:
             identity = getattr(record, "executable_identity", None)
-            if identity:
+            if not identity:
+                continue
+            if getattr(record, "launch_method", None) is LaunchMethod.APPS_FOLDER_ACTIVATION:
+                # Packaged identity is an AUMID, not a filesystem
+                # path: it can only be attributed through the
+                # process's own application user model id.
+                by_aumid.setdefault(_key(identity), []).append(record)
+            else:
                 by_identity.setdefault(_key(identity), []).append(record)
         own_session = None
         with contextlib.suppress(Exception):
@@ -593,12 +633,30 @@ class NativeObservationProvider:
         for hwnd, pid in enumerated:
             image_getter = getattr(self._api, "get_process_image_path", None)
             image_path = image_getter(pid) if image_getter is not None else None
-            if not image_path:
-                continue  # inaccessible identity: deny attribution
-            matches = by_identity.get(_key(image_path), [])
-            if len(matches) != 1:
-                continue  # unknown or ambiguous identity
-            record = matches[0]
+            matches = by_identity.get(_key(image_path), []) if image_path else []
+            if len(matches) > 1:
+                continue  # ambiguous executable identity: deny attribution
+            record = matches[0] if matches else None
+            # Method-aware packaged attribution: the process's exact
+            # AUMID (platform-reported) against packaged records. If
+            # both identity routes resolve and disagree, attribution
+            # is ambiguous and denied; basename/display-name matching
+            # is never used.
+            aumid_getter = getattr(self._api, "get_process_aumid", None)
+            if aumid_getter is not None:
+                observed_aumid = None
+                with contextlib.suppress(Exception):
+                    observed_aumid = aumid_getter(pid)
+                if observed_aumid:
+                    claimants = by_aumid.get(_key(observed_aumid), [])
+                    if len(claimants) > 1:
+                        continue  # ambiguous packaged identity
+                    if claimants:
+                        if record is not None and claimants[0] is not record:
+                            continue  # identity disagreement: ambiguous
+                        record = claimants[0]
+            if record is None:
+                continue  # unknown or inaccessible identity: deny attribution
             creation = self._api.get_process_creation_time(pid)
             if not creation:
                 continue  # creation identity unknown: deny

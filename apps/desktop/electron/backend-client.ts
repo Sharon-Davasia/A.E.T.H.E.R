@@ -561,6 +561,11 @@ export class BackendClient {
     return this.request(session, 'phase3.prepare_fixture', { windowId }, ['phase3.prepared', 'phase3.error']);
   }
 
+  async phase3RegisterProject(path: string): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.register_project', { alias: 'project', path }, ['phase3.project', 'phase3.error']);
+  }
+
   async phase3PreviewOperation(taskId: string, effect: string): Promise<unknown> {
     const session = this.reviewSession();
     return this.request(session, 'phase3.preview_operation', { taskId, effect }, ['phase3.preview', 'phase3.error']);

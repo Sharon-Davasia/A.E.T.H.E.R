@@ -339,6 +339,38 @@ function registerIpc(): void {
     validateInvoke(event);
     return phase3Provider.resumeTask(phase3TaskId(raw));
   });
+  // Controlled project registration (P3-23): the directory is chosen
+  // in this main-process dialog and confirmed natively; the renderer
+  // never supplies an authoritative filesystem path. Registration
+  // grants detection metadata only (no file read/search/open/edit).
+  ipcMain.handle('desktop:phase3-register-project', async (event) => {
+    validateInvoke(event);
+    if (!mainWindow) return { status: 'unavailable', reason: 'window_unavailable' };
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose the synthetic project directory',
+      properties: ['openDirectory'],
+    });
+    if (picked.canceled || picked.filePaths.length !== 1) {
+      return { status: 'unavailable', reason: 'selection_cancelled' };
+    }
+    const directory = picked.filePaths[0]!;
+    const granted = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Register project'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: 'Register project for detection',
+      message: `Allow AETHER to use this directory only as current-project detection context:\n\n${directory}`,
+      detail: 'Detection metadata only: this enables no file reading, searching, opening or editing, and applies to this session only.',
+    });
+    if (granted.response !== 1) return { status: 'unavailable', reason: 'registration_declined' };
+    try {
+      return await phase3Provider.registerProject(directory);
+    } catch {
+      return { status: 'unavailable', reason: 'registration_failed' };
+    }
+  });
   // FI-02 workflow steps. The renderer requests operations; main owns
   // every identity. Project registration additionally requires a native
   // confirmation naming the directory — that dialog *is* the explicit

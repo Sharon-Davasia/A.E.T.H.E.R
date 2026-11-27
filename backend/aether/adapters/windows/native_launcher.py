@@ -189,6 +189,212 @@ def _is_supported_local_executable(identity: str) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# Native packaged-application identity (AppsFolder / AUMID verification)
+#
+# An AUMID ("<package family>!<application id>") is verified against
+# the platform package catalogue - never against registry strings,
+# display names or discovery records:
+#   1. GetPackagesByPackageFamily must return exactly one installed
+#      package for the family (current user); zero or several is
+#      ambiguous and yields no evidence.
+#   2. GetPackageApplicationIds for that package must list the exact
+#      requested AUMID (application-specific membership).
+#   3. The version comes from the platform PACKAGE_ID of the same
+#      package (GetPackageInfo), not from string inference.
+# Any malformed input, API failure or unverifiable identity returns
+# None (no evidence), which the integrity provider and launch
+# authority already treat as denial.
+# ---------------------------------------------------------------------------
+
+_MAX_FAMILY_PACKAGES = 128
+_MAX_PACKAGE_APPLICATIONS = 256
+_MAX_PACKAGE_QUERY_BUFFER = 1 << 20  # bytes, hard bound for native buffers
+
+
+class PackageQueryApi(Protocol):
+    """Injectable appmodel boundary (ctypes in production)."""
+
+    def packages_by_family(self, family_name: str) -> list[str] | None: ...
+
+    def package_version(self, package_full_name: str) -> str | None: ...
+
+    def application_ids(self, package_full_name: str) -> list[str] | None: ...
+
+
+def _aumid_parts(aumid: object) -> tuple[str, str] | None:
+    if not isinstance(aumid, str) or "\x00" in aumid:
+        return None
+    family, separator, application = aumid.partition("!")
+    if not separator or not family or not application or "!" in application:
+        return None
+    return family, application
+
+
+def package_identity_for_aumid(api: PackageQueryApi, aumid: object) -> tuple[str, str] | None:
+    """Resolve an exact AUMID to (package full name, version) or None."""
+    parts = _aumid_parts(aumid)
+    if parts is None:
+        return None
+    family, _application = parts
+    packages = api.packages_by_family(family)
+    if not packages or len(packages) != 1:
+        return None  # absent or ambiguous installed identity
+    package_full_name = packages[0]
+    application_ids = api.application_ids(package_full_name)
+    if not application_ids:
+        return None
+    if str(aumid).casefold() not in {entry.casefold() for entry in application_ids}:
+        return None  # the exact application is not in this package
+    version = api.package_version(package_full_name)
+    if not version:
+        return None
+    return package_full_name, version
+
+
+def native_package_query(aumid: str) -> tuple[str, str] | None:  # pragma: no cover - Windows only
+    """Production package query over the Win32 appmodel APIs."""
+    try:
+        return package_identity_for_aumid(_CtypesPackageQueryApi(), aumid)
+    except Exception:
+        return None
+
+
+class _CtypesPackageQueryApi:  # pragma: no cover - Windows only source
+    """GetPackagesByPackageFamily / GetPackageInfo / GetPackageApplicationIds."""
+
+    _ERROR_INSUFFICIENT_BUFFER = 122
+    _PACKAGE_FILTER_ALL_LOADED = 0x00000000
+
+    def __init__(self) -> None:
+        import ctypes
+
+        self._ctypes = ctypes
+        windll: Any = getattr(ctypes, "windll", None)
+        if windll is None:
+            raise OSError("appmodel requires Windows")
+        self._kernel32: Any = windll.kernel32
+
+    def packages_by_family(self, family_name: str) -> list[str] | None:
+        ctypes = self._ctypes
+        kernel32 = self._kernel32
+        count = ctypes.c_uint32(0)
+        length = ctypes.c_uint32(0)
+        kernel32.GetPackagesByPackageFamily(
+            family_name, ctypes.byref(count), None, ctypes.byref(length), None
+        )
+        if count.value == 0 or count.value > _MAX_FAMILY_PACKAGES:
+            return [] if count.value == 0 else None
+        if length.value == 0 or length.value > 32768:
+            return None
+        buffer = ctypes.create_unicode_buffer(length.value)
+        pointers = (ctypes.c_void_p * count.value)()
+        filled = ctypes.c_uint32(count.value)
+        filled_length = ctypes.c_uint32(length.value)
+        result = kernel32.GetPackagesByPackageFamily(
+            family_name,
+            ctypes.byref(filled),
+            pointers,
+            ctypes.byref(filled_length),
+            buffer,
+        )
+        if result != 0:
+            return None
+        names: list[str] = []
+        for index in range(min(filled.value, _MAX_FAMILY_PACKAGES)):
+            address = pointers[index]
+            if not address:
+                return None
+            names.append(ctypes.wstring_at(address))
+        return names
+
+    def _open_package_info(self, package_full_name: str):  # type: ignore[no-untyped-def]
+        ctypes = self._ctypes
+        reference = ctypes.c_void_p()
+        result = self._kernel32.OpenPackageInfoByFullName(
+            package_full_name, 0, ctypes.byref(reference)
+        )
+        if result != 0 or not reference.value:
+            return None
+        return reference
+
+    def package_version(self, package_full_name: str) -> str | None:
+        ctypes = self._ctypes
+        kernel32 = self._kernel32
+        reference = self._open_package_info(package_full_name)
+        if reference is None:
+            return None
+        try:
+            length = ctypes.c_uint32(0)
+            count = ctypes.c_uint32(0)
+            kernel32.GetPackageInfo(
+                reference,
+                self._PACKAGE_FILTER_ALL_LOADED,
+                ctypes.byref(length),
+                None,
+                ctypes.byref(count),
+            )
+            if length.value == 0 or length.value > _MAX_PACKAGE_QUERY_BUFFER:
+                return None
+            buffer = ctypes.create_string_buffer(length.value)
+            filled = ctypes.c_uint32(count.value)
+            result = kernel32.GetPackageInfo(
+                reference,
+                self._PACKAGE_FILTER_ALL_LOADED,
+                ctypes.byref(length),
+                buffer,
+                ctypes.byref(filled),
+            )
+            if result != 0 or filled.value < 1:
+                return None
+            # PACKAGE_INFO { reserved, flags, PACKAGE_ID id, ... };
+            # PACKAGE_ID { reserved, architecture, PACKAGE_VERSION
+            # version { Revision, Build, Minor, Major : UINT16 } }.
+            raw = buffer.raw
+            if len(raw) < 24:
+                return None
+            import struct
+
+            revision, build, minor, major = struct.unpack_from("<HHHH", raw, 16)
+            return f"{major}.{minor}.{build}.{revision}"
+        finally:
+            kernel32.ClosePackageInfo(reference)
+
+    def application_ids(self, package_full_name: str) -> list[str] | None:
+        ctypes = self._ctypes
+        kernel32 = self._kernel32
+        reference = self._open_package_info(package_full_name)
+        if reference is None:
+            return None
+        try:
+            length = ctypes.c_uint32(0)
+            count = ctypes.c_uint32(0)
+            kernel32.GetPackageApplicationIds(
+                reference, ctypes.byref(length), None, ctypes.byref(count)
+            )
+            if count.value == 0 or count.value > _MAX_PACKAGE_APPLICATIONS:
+                return [] if count.value == 0 else None
+            if length.value == 0 or length.value > _MAX_PACKAGE_QUERY_BUFFER:
+                return None
+            buffer = ctypes.create_string_buffer(length.value)
+            filled = ctypes.c_uint32(count.value)
+            result = kernel32.GetPackageApplicationIds(
+                reference, ctypes.byref(length), buffer, ctypes.byref(filled)
+            )
+            if result != 0 or filled.value < 1:
+                return None
+            pointers = (ctypes.c_void_p * filled.value).from_buffer(buffer)
+            ids: list[str] = []
+            for index in range(filled.value):
+                address = pointers[index]
+                if not address:
+                    return None
+                ids.append(ctypes.wstring_at(address))
+            return ids
+        finally:
+            kernel32.ClosePackageInfo(reference)
+
+
 @dataclass(slots=True)
 class NativeWindowsLaunchAdapter:
     """Bounded native launcher; disabled without trusted activation."""

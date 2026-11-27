@@ -14,7 +14,7 @@ import type {
 } from '../shared/live';
 import type { ExactPreview } from '../shared/review';
 import type { WorkflowState } from './workflow';
-import type { Phase3Outcome, Phase3Prepared, Phase3Snapshot, Phase3State, Phase3AppResult, Phase3Window } from '../shared/phase3';
+import type { Phase3Outcome, Phase3Prepared, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3AppResult, Phase3Window } from '../shared/phase3';
 
 const desktopApi = Object.freeze({
   getBackendStatus: (): Promise<{ state: string; message: string }> => ipcRenderer.invoke('desktop:backend-status'),
@@ -65,6 +65,9 @@ const desktopApi = Object.freeze({
   phase3GetReceipt: (taskId: string): Promise<unknown> => ipcRenderer.invoke('desktop:phase3-receipt', taskId),
   phase3CancelTask: (taskId: string): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-cancel-task', taskId),
   phase3ResumeTask: (taskId: string): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-resume-task', taskId),
+  // No path argument: the directory is chosen and confirmed in the
+  // main process; the renderer can only request the trusted flow.
+  phase3RegisterProject: (): Promise<Phase3ProjectRegistration> => ipcRenderer.invoke('desktop:phase3-register-project'),
 });
 
 contextBridge.exposeInMainWorld('aetherDesktop', desktopApi);

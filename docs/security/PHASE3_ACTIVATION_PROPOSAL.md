@@ -84,21 +84,32 @@ from *production enablement* (not proposed here).
 
 ## Exact owner-side acceptance commands (after approval only)
 
-Run in non-administrator PowerShell 5.1 at `D:\A.E.T.H.E.R`:
+Run in non-administrator PowerShell 5.1 at `D:\A.E.T.H.E.R`. All
+tool paths are explicit; the global PATH is never relied on for
+Python, Node or Git. Nothing is reinstalled or rebuilt: the
+preserved venv, `node_modules`, portable Node and compiled fixture
+are verified, and any absence is a stop-and-report condition.
 
 ```powershell
 git rev-parse HEAD            # must match the approved candidate SHA
-cd apps\desktop
-npm.cmd ci                    # pinned lockfile; skip if node_modules already matches
-npm.cmd run check
-$env:AETHER_DEV_PYTHON = "<python 3.12.10 path>"
-npm.cmd test
-cd ..\..\backend
-python -m pytest              # full backend gates at the candidate
-python -m ruff check .
-python -m mypy
-cd ..\tools\windows-fixture
-.\build_fixture.cmd           # builds AETHERFixture.exe (in-box csc)
+$Python = "D:\A.E.T.H.E.R\backend\.venv\Scripts\python.exe"
+& $Python --version           # Python 3.12.10 (preserved backend venv)
+$EvidenceRoot = "D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a"
+$Npm = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64\npm.cmd"
+# Fresh, never-reused pytest scratch under the evidence root:
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$BaseTemp = Join-Path $EvidenceRoot "phase3-pytest-$Stamp"
+if (Test-Path $BaseTemp) { throw "basetemp already exists; choose a new name" }
+New-Item -ItemType Directory -Path $BaseTemp | Out-Null
+if ((Get-Item $BaseTemp).Attributes -match "ReparsePoint") { throw "basetemp must not be a reparse point" }
+& $Python -m pytest backend/tests -q --basetemp $BaseTemp
+& $Python -m ruff check backend tools
+& $Python -m ruff format --check backend tools
+cd backend; & $Python -m mypy; cd ..
+cd apps\desktop; $env:AETHER_DEV_PYTHON = $Python; & $Npm run check; & $Npm test; cd ..\..
+# Fixture: verify the preserved build by hash; do NOT rebuild.
+(Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256).Hash
+# must equal E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D
 ```
 
 Then execute `docs/engineering/PHASE3_NATIVE_ACCEPTANCE.md`
@@ -118,9 +129,9 @@ application database is never opened by the campaign.
 ## Explicitly not authorized by this package
 
 Production enablement in ordinary launches; schema v3 for any
-real-user storage; Phase 4 capabilities; any change to the formal
-Phase 2 acceptance verdict (NOT COMPLETE, unwaived); running the
-historical combined Phase 2 verifier.
+real-user storage; Phase 4 capabilities; running the historical
+combined Phase 2 verifier. (Phase 2 owner acceptance is complete
+and locally archived; nothing here reopens it.)
 
 ---
 
@@ -174,14 +185,17 @@ worktrees, no execution-policy changes.
 git rev-parse HEAD
 git status --porcelain        # must be empty
 
-# 2. Environment checks (no reinstall if already satisfied).
-python --version              # 3.12.10
-node --version                # v22.22.3
-npm.cmd --version             # 10.9.8
+# 2. Environment checks (verify only; never reinstall/rebuild).
+$Python = "D:\A.E.T.H.E.R\backend\.venv\Scripts\python.exe"
+& $Python --version           # 3.12.10 (preserved backend venv)
+$EvidenceRoot = "D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a"
+$NodeDir = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64"
+& (Join-Path $NodeDir "node.exe") --version   # v22.22.3
+& (Join-Path $NodeDir "npm.cmd") --version    # 10.9.8
 
-# 3. Gates at the candidate (skip npm ci when node_modules is present).
-cd backend; python -m pytest; python -m ruff check .; python -m mypy; cd ..
-cd apps\desktop; npm.cmd run check; cd ..\..
+# 3. Gates at the candidate: see "Exact owner-side acceptance
+#    commands" above (pinned Python, fresh basetemp, no npm ci,
+#    no fixture rebuild - hash verification only).
 
 # 4. Fixture build + integrity evidence.
 cd tools\windows-fixture; .\build_fixture.cmd; cd ..\..
@@ -189,18 +203,30 @@ Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256
 
 # 5-7. Authorization artifact + isolated storage (one tool run).
 #     It discovers the approved apps, derives the fixture identity
-#     and token, generates session/epoch/storage identity, writes
-#     D:\AETHER-acceptance\authorization.json and initializes the
-#     isolated v3 acceptance storage. No internal identifier is
-#     constructed by hand.
+#     and token, generates session/epoch/storage identity,
+#     initializes the isolated v3 acceptance storage FIRST and only
+#     then writes D:\AETHER-acceptance\authorization.json, so a
+#     failed run leaves no usable-looking authorization. Run it from
+#     a shell where git resolves (the tool reads the candidate
+#     commit via git). Each campaign uses a NEW --campaign name;
+#     before re-running, archive the previous artifact as
+#     authorization-<campaign>.json - the tool refuses to overwrite
+#     an existing artifact, and storage creation is exclusive.
+#     No internal identifier is constructed by hand. If discovery
+#     reports a requested name as ambiguous, re-run with exact
+#     --app-ids values instead of names.
 cd backend
-python -m aether.core.apps.authorization_artifact --decision-reference "<owner decision reference>" --campaign campaign-<name> --apps "Notepad,Calculator,File Explorer" --acceptance-root D:\AETHER-acceptance
+& $Python -m aether.core.apps.authorization_artifact --decision-reference "<owner decision reference>" --campaign campaign-<unique-name> --apps "Notepad,Calculator,File Explorer" --acceptance-root D:\AETHER-acceptance
 cd ..
 
 # 8. Controlled startup (trusted main selects the controlled entry
 #    point only from this owner-set main-process environment value).
+#    The trusted Git executable is pinned absolutely (the sanitized
+#    backend PATH cannot resolve git by name).
 $env:AETHER_PHASE3_AUTHORIZATION = "D:\AETHER-acceptance\authorization.json"
-cd apps\desktop; npm.cmd run start
+$env:AETHER_GIT_EXECUTABLE = "C:\Program Files\Git\cmd\git.exe"   # verify: Test-Path $env:AETHER_GIT_EXECUTABLE
+$env:AETHER_DEV_PYTHON = $Python
+cd apps\desktop; & $Npm run start   # builds the bundles, then launches Electron
 # Expected indication: Phase 3 surface reports nativeAvailable=true,
 # privacy mode "off" until explicit metadata_only opt-in in the UI.
 

@@ -68,6 +68,17 @@ class Phase3Surface:
     # launch authorization must use exactly these, never literals.
     session_id: str = "session-1"
     activation_scope: str = "test-scope"
+    # Authoritative collection predicate wired by trusted
+    # composition: privacy collection state AND authorization
+    # lifetime AND composition lifecycle (revocation/shutdown),
+    # evaluated synchronously at every collection boundary.
+    collection_permitted: Callable[[], bool] | None = None
+    # Composition-owned project registry (controlled compositions);
+    # registration happens only through the trusted bridge method.
+    project_registry: ResourceRegistry | None = None
+    # Trusted composition clock; freshness/resolution are evaluated
+    # on the same time source as the rest of the composition.
+    clock: Callable[[], datetime] | None = None
 
     @classmethod
     def disabled(cls) -> Phase3Surface:
@@ -95,6 +106,7 @@ if TYPE_CHECKING:
     )
     from aether.core.planning.planner import PlanGoal, PlannedRevision, Planner
     from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+    from aether.core.resources.registry import ResourceRegistry
 
 
 @dataclass(slots=True)
@@ -105,6 +117,27 @@ class Phase3Bridge:
 
     def _unavailable(self, reason: str | None = None) -> dict[str, object]:
         return {"status": "unavailable", "reason": reason or self.surface.native_reason}
+
+    def _collection_permitted(self) -> bool:
+        """Synchronous authoritative collection check.
+
+        Trusted composition wires a predicate covering privacy,
+        authorization expiry and revocation/shutdown. Without one,
+        fall back to the authoritative privacy state; a detector
+        without any authoritative state is never permitted to
+        collect (fail closed).
+        """
+        surface = self.surface
+        if surface.collection_permitted is not None:
+            return bool(surface.collection_permitted())
+        if surface.privacy_authority is not None:
+            return bool(surface.privacy_authority.collection_enabled)
+        privacy = surface.privacy
+        return (
+            bool(privacy.get("optedIn"))
+            and str(privacy.get("mode", "off")) != "off"
+            and not bool(privacy.get("paused", False))
+        )
 
     def _guarded(self, run: Callable[[], dict[str, object]]) -> dict[str, object]:
         try:
@@ -120,7 +153,20 @@ class Phase3Bridge:
         def run() -> dict[str, object]:
             surface = self.surface
             projects = []
-            if surface.detector is not None:
+            if surface.detector is not None and self._collection_permitted():
+                authority = surface.privacy_authority
+                generation = authority.generation if authority is not None else None
+                found = surface.detector.detect()
+                # Never publish evidence collected under an
+                # authorization invalidated while collection ran:
+                # privacy generation, expiry and lifecycle are
+                # re-evaluated synchronously before publication.
+                if generation is not None and (
+                    authority is None
+                    or authority.generation != generation
+                    or not self._collection_permitted()
+                ):
+                    found = ()
                 projects = [
                     {
                         "candidateId": c.candidate_id,
@@ -129,7 +175,7 @@ class Phase3Bridge:
                         "available": c.available,
                         "limitations": list(c.limitations),
                     }
-                    for c in surface.detector.detect()
+                    for c in found
                 ]
             windows = []
             if surface.authority is not None:
@@ -195,21 +241,96 @@ class Phase3Bridge:
     # -- registry / inspection ----------------------------------------------
 
     def search_apps(self, payload: object) -> dict[str, object]:
+        """Discovery listing + the one application resolver (CP2).
+
+        An empty query is a listing of fresh registered records, not
+        a match. Every non-empty query goes through the existing
+        deterministic exact/alias/normalized/fuzzy resolver over the
+        composition registry; no second matching engine exists here.
+        Resolution is evidence for selection only — it never confers
+        launch authorization.
+        """
+
         def run() -> dict[str, object]:
-            if self.surface.app_records is None:
-                return self._unavailable()
+            registry = self.surface.launch_registry
+            if registry is None:
+                if self.surface.app_records is None:
+                    return self._unavailable()
+                # Materialize the composition's records into the one
+                # registry the resolver operates on (no second store
+                # of truth: records still come from the surface).
+                from aether.core.apps.registry import InMemoryApplicationRegistry
+
+                registry = InMemoryApplicationRegistry()
+                for record in self.surface.app_records():
+                    registry.register(record)
             if not isinstance(payload, dict) or set(payload) != {"query"}:
                 raise _Phase3Refused("invalid_request")
-            query = str(payload["query"]).casefold()
-            records = self.surface.app_records
-            if records is None:
-                return self._unavailable()
-            results = [
-                {"appId": r.app_id, "displayName": r.display_name, "available": r.available}
-                for r in records()
-                if query in r.display_name.casefold()
-            ][:25]
-            return {"status": "ready", "results": results}
+            query = str(payload["query"])
+
+            def entry(record: object) -> dict[str, object]:
+                return {
+                    "appId": record.app_id,  # type: ignore[attr-defined]
+                    "displayName": record.display_name,  # type: ignore[attr-defined]
+                    "available": record.available,  # type: ignore[attr-defined]
+                }
+
+            if not query.strip():
+                results = [entry(r) for r in registry.fresh(now=self._now())][:25]
+                return {"status": "ready", "resolution": "list", "results": results}
+            from aether.core.apps.resolution import Fts5AppIndex, resolve_application
+
+            outcome = resolve_application(registry, query, now=self._now())
+            resolution = outcome.kind.value
+            chosen = outcome.candidates or ((outcome.record,) if outcome.record is not None else ())
+            if not chosen:
+                # Retrieval only: FTS candidates are displayed for
+                # explicit user selection; they are never resolved
+                # or authorized by this surface.
+                index = Fts5AppIndex(tuple(registry.all()))
+                try:
+                    found = index.search(query)
+                finally:
+                    index.close()
+                chosen = tuple(found)
+                if found:
+                    resolution = "candidates"
+            return {
+                "status": "ready",
+                "resolution": resolution,
+                "results": [entry(r) for r in chosen][:25],
+            }
+
+        return self._guarded(run)
+
+    def register_project(self, payload: object) -> dict[str, object]:
+        """Trusted project registration for controlled detection (D).
+
+        The path reaches here only from the main-process directory
+        dialog (the renderer never supplies authoritative paths).
+        Registration goes through the canonical ResourceRegistry
+        checks and grants metadata-only detection authority; it
+        enables no filesystem executor.
+        """
+
+        def run() -> dict[str, object]:
+            registry = self.surface.project_registry
+            if registry is None:
+                return self._unavailable("project_registration_unavailable")
+            if not isinstance(payload, dict) or set(payload) != {"alias", "path"}:
+                raise _Phase3Refused("invalid_request")
+            alias, path = payload["alias"], payload["path"]
+            if not isinstance(alias, str) or not isinstance(path, str):
+                raise _Phase3Refused("invalid_request")
+            from aether.core.resources.registry import ResourceRegistryError
+
+            try:
+                root = registry.register_root(
+                    alias, path, allowed_capabilities=frozenset({"fs.inspect_file"})
+                )
+            except ResourceRegistryError as exc:
+                raise _Phase3Refused(exc.reason_code) from exc
+            return {"status": "ready", "rootId": str(root.root_id), "alias": root.alias}
 
         return self._guarded(run)
 
@@ -425,7 +546,8 @@ class Phase3Bridge:
         return self._guarded(run)
 
     def _now(self) -> datetime:
-        return datetime.now(UTC)
+        clock = self.surface.clock
+        return clock() if clock is not None else datetime.now(UTC)
 
     def _create_planned_task(
         self, *, goal: PlanGoal, resource_id: str, arguments: dict[str, object], summary: str
@@ -466,6 +588,22 @@ class Phase3Bridge:
             from aether.core.planning.planner import PlanGoal
 
             app_id = str(payload["appId"])
+            # Refuse records that can never be authorized (unknown,
+            # unsupported launch method, or no fresh method-appropriate
+            # integrity evidence) BEFORE creating an unusable task or
+            # requesting a trusted approval gesture.
+            registry = self.surface.launch_registry
+            authority = self.surface.launch_authority
+            if registry is not None and authority is not None:
+                record = registry.get(app_id)
+                if record is None:
+                    return self._unavailable("application_not_registered")
+                from aether.core.apps.launch_authority import LaunchAuthorityError
+
+                try:
+                    authority.fresh_evidence(record)
+                except LaunchAuthorityError as exc:
+                    return self._unavailable(exc.reason_code)
             task_id, planned = self._create_planned_task(
                 goal=PlanGoal.LAUNCH_APPLICATION,
                 resource_id=app_id,

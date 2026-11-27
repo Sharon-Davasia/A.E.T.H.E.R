@@ -260,6 +260,8 @@ class Phase3Composition:
     ) -> Phase3Composition:
         """Wire the full controlled composition over shared authorities."""
 
+        from pathlib import Path as _Path
+
         from aether.adapters.windows.native_activity import FakeActivitySource  # noqa: F401
         from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
         from aether.core.apps.activation import WindowActivationService
@@ -649,10 +651,41 @@ class Phase3Composition:
                 clock=now_fn,
             )
             recovery = RecoveryService(store=store)
+            # A/D: one composition-owned project registry with native
+            # Windows semantics, contained to the campaign storage
+            # layout (the explicitly authorized synthetic-project
+            # boundary). Explorer evidence is normalized to Path at
+            # this provider boundary, and every detector collection
+            # is gated synchronously on privacy + authorization
+            # lifetime + composition lifecycle (revocation/shutdown)
+            # - never on the background expiry timer alone.
+            _gate_holder: dict[str, Phase3Composition] = {}
+
+            def _collection_permitted() -> bool:
+                current = _gate_holder.get("composition")
+                if current is not None and current._revoked:
+                    return False
+                if not privacy.collection_enabled:
+                    return False
+                return now_fn() < authorization.expires_at
+
+            _raw_explorer_folder = providers.explorer_folder
+
+            def _explorer_folder() -> _Path | None:
+                if _raw_explorer_folder is None or not _collection_permitted():
+                    return None
+                raw = _raw_explorer_folder()
+                return _Path(str(raw)) if raw else None
+
+            project_registry = ResourceRegistry(
+                windows_semantics=True,
+                registration_boundary=_Path(str(authorization.storage_path)),
+            )
             project_detector = ProjectDetector(
-                registry=ResourceRegistry(windows_semantics=False),
-                explorer_folder=providers.explorer_folder,  # type: ignore[arg-type]
+                registry=project_registry,
+                explorer_folder=_explorer_folder,
                 clock=now_fn,
+                collection_permitted=_collection_permitted,
             )
             dialog_guard = DialogGuard(
                 detector=detector, on_dialog=lambda wid, _a: snapshots.on_dialog(wid)
@@ -690,6 +723,9 @@ class Phase3Composition:
             surface.session_id = authorization.session_id
             surface.activation_scope = authorization.campaign_id
             surface.privacy_authority = privacy
+            surface.collection_permitted = _collection_permitted
+            surface.project_registry = project_registry
+            surface.clock = now_fn
             surface.planner = planner
             surface.launch_coordinator = coordinator
             surface.launch_authority = launch_authority
@@ -718,6 +754,7 @@ class Phase3Composition:
             composition.world_state = world_state
             composition.observer_service = observer_service
             holder["composition"] = composition
+            _gate_holder["composition"] = composition
 
             def _on_privacy_change() -> None:
                 snapshots.note_privacy_change()
@@ -985,9 +1022,8 @@ class Phase3Composition:
                 clock=now_fn,
             )
             recovery = RecoveryService(store=store)
-            detector = ProjectDetector(
-                registry=ResourceRegistry(windows_semantics=False), clock=now_fn
-            )
+            project_registry = ResourceRegistry()
+            detector = ProjectDetector(registry=project_registry, clock=now_fn)
             dialog_guard = DialogGuard(
                 detector=DialogDetector(
                     modal_evidence=lambda _wid: ()  # simulated: no modal unless fixture says so
@@ -1002,6 +1038,14 @@ class Phase3Composition:
             )
 
             composition_holder: dict[str, Phase3Composition] = {}
+
+            def _collection_permitted() -> bool:
+                current = composition_holder.get("composition")
+                if current is not None and current._revoked:
+                    return False
+                return privacy.collection_enabled
+
+            detector.collection_permitted = _collection_permitted
 
             def _route_activity(signal: ActivitySignal) -> None:
                 focus.note_activity(signal)
@@ -1025,12 +1069,15 @@ class Phase3Composition:
                 recovery=recovery,
             )
             surface.privacy_authority = privacy
+            surface.project_registry = project_registry
             surface.planner = planner
             surface.launch_coordinator = launch_coordinator
             surface.launch_authority = launch_authority
             surface.launch_registry = launch_registry
             surface.activation_service = activation_service
             surface.dialog_guard = dialog_guard
+            surface.collection_permitted = _collection_permitted
+            surface.clock = now_fn
             composition = cls(
                 mode=Phase3Mode.SIMULATED,
                 surface=surface,
@@ -1171,6 +1218,7 @@ def build_native_platform(
         NativeIntegrityProvider,
         NativeWindowsLaunchAdapter,
         _CtypesWin32LaunchApi,
+        native_package_query,
     )
     from aether.adapters.windows.native_observer import (
         NativeForegroundProvider,
@@ -1204,7 +1252,7 @@ def build_native_platform(
             discovery_providers=StdlibWindowsDiscoveryProviders(),
             launch_api=_CtypesWin32LaunchApi(),
             observer_api=_CtypesWin32Api(),
-            integrity_verifier=NativeIntegrityProvider(),
+            integrity_verifier=NativeIntegrityProvider(package_query=native_package_query),
             activity_factory=None,
             foreground_provider=foreground,
             explorer_folder=_native_explorer_folder,

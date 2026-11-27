@@ -66,6 +66,7 @@ def build_authorization(
     fixture_executable: str | None = None,
     integrity_verifier: object | None = None,
     commit: str | None = None,
+    app_ids: list[str] | None = None,
 ) -> tuple[dict[str, object], Path]:
     """Compose the artifact dict + storage path from discovered apps."""
     from aether.core.apps.launch_authority import app_version_token
@@ -77,15 +78,30 @@ def build_authorization(
     wanted = {name.casefold() for name in app_display_names}
     from aether.core.contracts.app_window import ApplicationRecord as _Record
 
-    selected = [
-        r
-        for r in discovered_records
-        if isinstance(r, _Record) and r.display_name.casefold() in wanted
-    ]
-    found = {r.display_name.casefold() for r in selected}
-    missing = wanted - found
-    if missing:
-        raise ValueError(f"requested applications were not discovered: {sorted(missing)}")
+    records = [r for r in discovered_records if isinstance(r, _Record)]
+    if app_ids is not None:
+        # Explicit identity selection: exact app ids, never names.
+        by_id = {r.app_id: r for r in records}
+        unknown = [app_id for app_id in app_ids if app_id not in by_id]
+        if unknown:
+            raise ValueError(f"requested application ids were not discovered: {unknown}")
+        selected = [by_id[app_id] for app_id in app_ids]
+    else:
+        selected = [r for r in records if r.display_name.casefold() in wanted]
+        found = {r.display_name.casefold() for r in selected}
+        missing = wanted - found
+        if missing:
+            raise ValueError(f"requested applications were not discovered: {sorted(missing)}")
+        # A shared display name must never silently authorize several
+        # distinct application identities: selection must be exact.
+        ambiguous: dict[str, set[str]] = {}
+        for record in selected:
+            ambiguous.setdefault(record.display_name.casefold(), set()).add(record.app_id)
+        conflicts = {name: sorted(ids) for name, ids in ambiguous.items() if len(ids) > 1}
+        if conflicts:
+            raise ValueError(
+                f"requested application names are ambiguous; re-run with --app-ids: {conflicts}"
+            )
     fixture = _fixture_record(fixture_executable, now=now)
     evidence = integrity_verifier.verify(fixture)  # type: ignore[attr-defined]
     if evidence is None:
@@ -126,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - owner CLI
     parser.add_argument("--decision-reference", required=True)
     parser.add_argument("--campaign", required=True)
     parser.add_argument("--apps", default="Notepad,Calculator,File Explorer")
+    parser.add_argument("--app-ids", default="")
     parser.add_argument("--acceptance-root", required=True)
     parser.add_argument("--expires-hours", type=float, default=4.0)
     args = parser.parse_args(argv)
@@ -160,10 +177,22 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - owner CLI
         discovered_records=list(records),
         fixture_executable=fixture_executable,
         integrity_verifier=NativeIntegrityProvider(),
+        app_ids=[item.strip() for item in args.app_ids.split(",") if item.strip()] or None,
     )
     root.mkdir(parents=True, exist_ok=True)
     artifact_path = root / "authorization.json"
-    artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
+    if artifact_path.exists():
+        # A historical campaign artifact is evidence; it is never
+        # silently overwritten by a new campaign.
+        print(
+            f"authorization artifact already exists: {artifact_path}; "
+            "archive it or choose a new campaign first",
+            file=sys.stderr,
+        )
+        return 2
+    # Initialize the isolated storage FIRST and write the artifact
+    # only after initialization succeeded, so a failed run can never
+    # leave behind usable-looking authorization evidence.
     store = open_acceptance_store(
         storage_path,
         authorization=OwnerAcceptanceAuthorization(
@@ -175,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - owner CLI
         now=now,
     )
     store.close()
+    artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
     print(f"authorization artifact: {artifact_path}")
     print(f"acceptance storage initialized: {storage_path}")
     print(f"fixture app id: {artifact['fixture_app_id']}")
