@@ -13,6 +13,7 @@ Fake platform seams only; nothing here is native Windows evidence.
 
 from __future__ import annotations
 
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -141,7 +142,9 @@ def test_bounded_buffer_string_reads() -> None:
     assert _string_from_buffer(unterminated, ctypes.addressof(unterminated)) is None
 
 
-def test_start_menu_roots_never_use_relative_pseudo_roots() -> None:
+def test_start_menu_roots_never_use_relative_pseudo_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     no_folder = lambda _kind: None  # noqa: E731
     assert _start_menu_roots({}, no_folder) == []
     assert _start_menu_roots({"APPDATA": "", "PROGRAMDATA": ""}, no_folder) == []
@@ -150,9 +153,16 @@ def test_start_menu_roots_never_use_relative_pseudo_roots() -> None:
     # Known folders win over missing env (restricted backend env).
     roots = _start_menu_roots({}, lambda kind: "D:\\KF" if kind == "roaming" else None)
     assert len(roots) == 1 and roots[0].startswith("D:\\KF")
-    # Off-Windows the provider is truthfully unavailable.
-    _candidates, status = StdlibWindowsDiscoveryProviders().start_menu_shortcuts()
+    # Off-Windows the provider is truthfully unavailable - on ANY
+    # host. Pin the platform deterministically (scoped mock) rather
+    # than assuming the machine running this test is not Windows;
+    # on a real Windows host the provider performs actual discovery
+    # and this branch must not assert host Start Menu availability.
+    monkeypatch.setattr(sys, "platform", "linux")
+    candidates, status = StdlibWindowsDiscoveryProviders().start_menu_shortcuts()
+    assert candidates == []
     assert status.status == "unavailable"
+    assert status.detail == "requires_windows"
 
 
 class _Discovery:
