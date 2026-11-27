@@ -94,6 +94,15 @@ retained context to the authoritative campaign lifecycle
 the 60-second freshness window. Candidate awaits independent
 review; no native activation has been performed.
 
+Activation-security clearance AS1/AS2: the captured sample is
+bound to the original handoff identity, generation and deadline,
+revalidated after native collection and scope validation (a sample
+crossing the deadline, or invalidated/re-armed mid-collection, is
+never retained); and the renderer's context-retention timer now
+re-reads authoritative backend lifecycle state, so unexpected
+revocation, expiry or disconnection invalidates displayed context
+and voids in-flight responses.
+
 **Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
 fake-backed** on top of CP4–CP5: authoritative persisted UI-operation
 bindings enforced end-to-end, PolicyBroker/enablement integration,

@@ -406,20 +406,30 @@ class Phase3Composition:
                 folder = _sample_explorer(hwnd)
                 if folder is None:
                     return  # not an Explorer window; stay armed (bounded)
-                # Recheck authorization AFTER native collection,
-                # before retaining anything: an invalidation that
-                # landed while the provider ran voids the sample.
-                if (
-                    _project_context["armed_until"] is None
-                    or privacy.generation != _project_context["generation"]
-                    or not _collection_permitted()
-                ):
-                    _cancel_project_context()
+                # The sample belongs to THIS handoff only: if the arm
+                # was cancelled or replaced while native collection
+                # ran, the sample is dropped (a newer arm is left
+                # untouched) - it can never be retained as evidence
+                # for a handoff it did not start under.
+                if _project_context["armed_until"] is not armed_until:
                     return
                 # Workspace scope is validated BEFORE retention: an
                 # out-of-scope folder path is never stored as
                 # captured evidence (not even transiently).
                 if not project_registry.is_within_registration_boundary(folder):
+                    return
+                # Final revalidation of the ORIGINAL handoff binding
+                # (deadline, generation, authoritative lifecycle)
+                # after native collection and scope validation,
+                # before retaining: a sample that crosses the arm
+                # deadline, or lands after expiry/revocation or a
+                # generation change, is never retained.
+                if (
+                    now_fn() > armed_until  # type: ignore[operator]
+                    or privacy.generation != _project_context["generation"]
+                    or not _collection_permitted()
+                ):
+                    _cancel_project_context()
                     return
                 _project_context["folder"] = folder
                 _project_context["captured_at"] = now_fn()

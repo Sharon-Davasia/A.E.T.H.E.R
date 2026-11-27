@@ -209,6 +209,15 @@ retained context to the authoritative campaign lifecycle
 (execution availability and expiry) in addition to generation and
 the 60-second freshness window.
 
+Activation-security clearance AS1/AS2: the captured sample is
+bound to the original handoff identity, generation and deadline,
+revalidated after native collection and scope validation (a sample
+crossing the deadline, or invalidated/re-armed mid-collection, is
+never retained); and the renderer's context-retention timer now
+re-reads authoritative backend lifecycle state, so unexpected
+revocation, expiry or disconnection invalidates displayed context
+and voids in-flight responses.
+
 ## 7. Performance defaults (provisional, unmeasured)
 
 Queue 256 events; observation TTL 30 s; reconciliation on demand /

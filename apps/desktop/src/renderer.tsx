@@ -5,7 +5,7 @@ import { ApprovalReviewSurface } from './ApprovalReviewSurface';
 import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
 import { Phase3Surface } from './Phase3Surface';
 import type { Phase3AppSearch, Phase3Outcome, Phase3Prepared, Phase3ProjectContext, Phase3ProjectContextArm, Phase3ProjectContextView, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
-import { projectContextView, visibleProjectContext } from '../shared/phase3';
+import { ProjectContextAttemptGuard, lifecycleInvalidatesContext, projectContextView, visibleProjectContext } from '../shared/phase3';
 import { describeLiveApprovalOutcome } from '../shared/live';
 import type {
   LiveApprovalState,
@@ -93,7 +93,7 @@ function App(): React.JSX.Element {
   const [phase3ProjectContext, setPhase3ProjectContext] = React.useState<Phase3ProjectContextView | null>(null);
   const [phase3ContextArmed, setPhase3ContextArmed] = React.useState(false);
   const [phase3ContextNow, setPhase3ContextNow] = React.useState(() => Date.now());
-  const phase3ContextEpoch = React.useRef(0);
+  const [phase3ContextGuard] = React.useState(() => new ProjectContextAttemptGuard());
   const [phase3Windows, setPhase3Windows] = React.useState<Phase3Window[]>([]);
   const [phase3Prepared, setPhase3Prepared] = React.useState<Phase3Prepared | null>(null);
   const [phase3Receipt, setPhase3Receipt] = React.useState<unknown>(null);
@@ -102,14 +102,21 @@ function App(): React.JSX.Element {
   // the epoch makes any in-flight check/arm response stale, so a late
   // response can never restore context after invalidation.
   const invalidateProjectContext = React.useCallback((): void => {
-    phase3ContextEpoch.current += 1;
+    phase3ContextGuard.invalidate();
     setPhase3ProjectContext(null);
     setPhase3ContextArmed(false);
-  }, []);
+  }, [phase3ContextGuard]);
 
   const refreshPhase3 = React.useCallback(async (): Promise<void> => {
-    try { setPhase3State(await window.aetherDesktop.phase3GetState()); }
-    catch {
+    try {
+      const next = await window.aetherDesktop.phase3GetState();
+      setPhase3State(next);
+      // Returned authoritative lifecycle truth (AS2): an unavailable
+      // state, revocation or campaign expiry invalidates retained
+      // context and every in-flight response - the renderer never
+      // keeps trusting its previous lifecycle snapshot.
+      if (lifecycleInvalidatesContext(next, Date.now())) invalidateProjectContext();
+    } catch {
       // Backend disconnect invalidates retained evidence AND any
       // in-flight check response (epoch bump), not just storage.
       invalidateProjectContext();
@@ -149,45 +156,51 @@ function App(): React.JSX.Element {
     finally { setPhase3Busy(false); }
   }
 
-  // Bounded freshness (C3): while Explorer evidence is retained,
-  // re-render on a timer so expired evidence disappears on time.
+  // Bounded freshness + authoritative lifecycle (C3/AS2): while
+  // Explorer evidence is retained, a timer advances local time AND
+  // re-reads the trusted backend lifecycle state, so unexpected
+  // revocation, campaign expiry or backend disconnection invalidate
+  // the display and any in-flight response - not just the local
+  // 60-second freshness window. This observes only AETHER's own
+  // backend state channel; it never touches Explorer or the OS.
   React.useEffect(() => {
     if (phase3ProjectContext === null) return;
-    const timer = setInterval(() => setPhase3ContextNow(Date.now()), 5_000);
+    const timer = setInterval(() => {
+      setPhase3ContextNow(Date.now());
+      void refreshPhase3();
+    }, 5_000);
     return () => clearInterval(timer);
-  }, [phase3ProjectContext]);
+  }, [phase3ProjectContext, refreshPhase3]);
 
   // C2 desktop flow: (1) trusted main establishes the one-shot arm;
   // (2) the owner foregrounds the Explorer window; (3) completion
   // rests only on the backend's fresh captured evidence. Every step
   // is epoch-guarded: invalidation during flight drops late replies.
   async function phase3ArmProjectContext(): Promise<void> {
-    const epoch = phase3ContextEpoch.current + 1;
-    phase3ContextEpoch.current = epoch;
+    const attempt = phase3ContextGuard.begin();
     setPhase3ProjectContext(null);
     setPhase3Busy(true);
     try {
       const result = await window.aetherDesktop.phase3ArmProjectContext();
-      if (phase3ContextEpoch.current !== epoch) return;
+      if (!phase3ContextGuard.isCurrent(attempt)) return;
       setPhase3ContextArmed(result.status === 'armed');
     } catch {
-      if (phase3ContextEpoch.current === epoch) setPhase3ContextArmed(false);
+      if (phase3ContextGuard.isCurrent(attempt)) setPhase3ContextArmed(false);
     } finally { setPhase3Busy(false); }
   }
 
   async function phase3CheckProjectContext(): Promise<void> {
-    const epoch = phase3ContextEpoch.current + 1;
-    phase3ContextEpoch.current = epoch;
+    const attempt = phase3ContextGuard.begin();
     setPhase3Busy(true);
     try {
       const result = await window.aetherDesktop.phase3CheckProjectContext();
-      if (phase3ContextEpoch.current !== epoch) return; // invalidated in flight
+      if (!phase3ContextGuard.isCurrent(attempt)) return; // invalidated in flight
       // Unavailable/failed checks clear retained context (C3); a
       // ready result is bound to its capture instant + generation.
       setPhase3ProjectContext(projectContextView(result));
       setPhase3ContextArmed(false);
     } catch {
-      if (phase3ContextEpoch.current === epoch) {
+      if (phase3ContextGuard.isCurrent(attempt)) {
         setPhase3ProjectContext(null);
         setPhase3ContextArmed(false);
       }

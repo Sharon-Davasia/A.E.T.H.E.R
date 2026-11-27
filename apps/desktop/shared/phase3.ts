@@ -259,6 +259,52 @@ export function visibleProjectContext(
   return view.projects;
 }
 
+/**
+ * Whether authoritative lifecycle state invalidates any retained
+ * project-context evidence (AS2): no state (disconnect), an
+ * unavailable state, a revoked/expired campaign lifecycle, or the
+ * campaign expiry instant. The renderer applies this to every
+ * authoritative state it obtains - a previously valid snapshot is
+ * never trusted past fresh lifecycle truth.
+ */
+export function lifecycleInvalidatesContext(
+  state: Phase3State | null | undefined,
+  nowMs: number,
+): boolean {
+  if (state === null || state === undefined) return true;
+  if (state.status !== 'ready') return true;
+  if (!state.executionAvailable) return true;
+  if (state.expiresAtMs !== null && nowMs >= state.expiresAtMs) return true;
+  return false;
+}
+
+/**
+ * Attempt/epoch guard for project-context responses (C3/AS2).
+ * Every new arm/check attempt and every invalidation advances the
+ * epoch; a response issued under an older epoch is stale and must
+ * be dropped, so a late reply can never restore context after
+ * revocation, disconnect or any other invalidation.
+ */
+export class ProjectContextAttemptGuard {
+  private epoch = 0;
+
+  /** Begin a new attempt; supersedes any in-flight attempt. */
+  begin(): number {
+    this.epoch += 1;
+    return this.epoch;
+  }
+
+  /** Invalidate retained context and all in-flight attempts. */
+  invalidate(): void {
+    this.epoch += 1;
+  }
+
+  /** Whether `attempt` is still the live attempt. */
+  isCurrent(attempt: number): boolean {
+    return attempt > 0 && attempt === this.epoch;
+  }
+}
+
 export interface Phase3ProjectContextArm {
   status: 'armed' | 'unavailable';
   reason?: string;

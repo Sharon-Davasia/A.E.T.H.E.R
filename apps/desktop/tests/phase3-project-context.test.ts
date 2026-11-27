@@ -13,6 +13,7 @@ import test from 'node:test';
 import { ProjectContextHandoff, PROJECT_CONTEXT_HANDOFF_MS, establishProjectContextArm } from '../electron/project-context-handoff';
 import { createPhase3Provider } from '../electron/phase3-provider';
 import {
+  lifecycleInvalidatesContext, ProjectContextAttemptGuard,
   parsePhase3ProjectContext, projectContextView, visibleProjectContext,
   PROJECT_CONTEXT_FRESHNESS_MS,
   type Phase3Privacy, type Phase3ProjectContextView, type Phase3State,
@@ -257,4 +258,51 @@ test('provider: backend arm refusal propagates as unavailable', async () => {
   const arm = await provider.armProjectContext();
   assert.equal(arm.status, 'unavailable');
   assert.equal(arm.reason, 'project_context_not_authorized');
+});
+
+test('authoritative lifecycle invalidation decisions (AS2)', () => {
+  const now = 1_500_000;
+  assert.equal(lifecycleInvalidatesContext(lifecycle(), now), false);
+  // Returned unavailable state (backend disconnect surfaced as state).
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ status: 'unavailable' }), now), true);
+  // Unexpected revocation: lifecycle no longer execution-available.
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ executionAvailable: false }), now), true);
+  // Campaign expiry instant reached.
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ expiresAtMs: now }), now), true);
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ expiresAtMs: now + 1 }), now), false);
+  // No authoritative state at all (disconnect / rejected request).
+  assert.equal(lifecycleInvalidatesContext(null, now), true);
+  assert.equal(lifecycleInvalidatesContext(undefined, now), true);
+});
+
+test('unexpected revocation/disconnection drops late responses (AS2)', () => {
+  const guard = new ProjectContextAttemptGuard();
+  const stored = view();
+
+  // A healthy completion is accepted and visible.
+  const first = guard.begin();
+  assert.equal(guard.isCurrent(first), true);
+  assert.equal(visibleProjectContext(stored, lifecycle(), 1_000_100)?.length, 1);
+
+  // A second check is in flight when the campaign is unexpectedly
+  // revoked: the renderer invalidates on the fresh lifecycle state,
+  // and the in-flight response arriving afterwards is stale.
+  const second = guard.begin();
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ executionAvailable: false }), 1_001_000), true);
+  guard.invalidate();
+  assert.equal(guard.isCurrent(second), false);
+  assert.equal(visibleProjectContext(stored, lifecycle({ executionAvailable: false }), 1_001_000), null);
+
+  // Disconnection (rejected request, no state): same treatment -
+  // the pending attempt is void and stored evidence is hidden.
+  const third = guard.begin();
+  assert.equal(lifecycleInvalidatesContext(null, 1_002_000), true);
+  guard.invalidate();
+  assert.equal(guard.isCurrent(third), false);
+  assert.equal(visibleProjectContext(stored, null, 1_002_000), null);
+
+  // A superseded attempt can never become current again.
+  const fourth = guard.begin();
+  assert.equal(guard.isCurrent(second), false);
+  assert.equal(guard.isCurrent(fourth), true);
 });

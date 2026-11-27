@@ -287,3 +287,66 @@ def test_invalidation_during_native_collection(tmp_path: Path) -> None:
         assert bridge.check_project_context({})["status"] == "unavailable"
     finally:
         assert comp.shutdown() is True
+
+
+def test_collection_crossing_deadline_is_not_retained(tmp_path: Path) -> None:
+    """AS1: a sample that starts before the arm deadline but
+    completes afterwards is never retained (deterministic clock)."""
+    start = datetime.now(UTC)
+    now_holder = [start]
+    comp, explorer, _project = _start(
+        tmp_path,
+        clock=lambda: now_holder[0],
+        expires_at=start + timedelta(hours=2),
+    )
+    try:
+        bridge = comp.bridge
+        # Native collection is slow: the clock crosses the original
+        # 60-second handoff deadline while the provider runs.
+        explorer.on_call = lambda: now_holder.__setitem__(0, start + timedelta(seconds=61))
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == [EXPLORER_HWND]  # collection ran...
+        assert comp.surface.project_context_captured() is None  # ...never retained
+        check = bridge.check_project_context({})
+        assert check["status"] == "unavailable"
+        assert check["reason"] == "explorer_evidence_unavailable"
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_rearm_during_collection_invalidates_sample(tmp_path: Path) -> None:
+    """AS1: cancelling and re-arming during native collection
+    invalidates the in-flight sample but leaves the new arm intact
+    and completable (deterministic clock)."""
+    start = datetime.now(UTC)
+    now_holder = [start]
+    comp, explorer, _project = _start(
+        tmp_path,
+        clock=lambda: now_holder[0],
+        expires_at=start + timedelta(hours=2),
+    )
+    try:
+        bridge = comp.bridge
+        rearmed: list[object] = []
+
+        def _rearm_once() -> None:
+            explorer.on_call = None
+            bridge.cancel_project_context({})
+            rearmed.append(bridge.arm_project_context({})["status"])
+
+        explorer.on_call = _rearm_once
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(EXPLORER_HWND)
+        assert rearmed == ["armed"]
+        # The stale sample was dropped, not retained under the new arm.
+        assert comp.surface.project_context_captured() is None
+        # The replacement arm is intact: a fresh Explorer foreground
+        # completes it normally.
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == [EXPLORER_HWND, EXPLORER_HWND]
+        check = bridge.check_project_context({})
+        assert check["status"] == "ready", check
+        assert [c["evidenceSource"] for c in check["projects"]] == ["explorer_registered"]
+    finally:
+        assert comp.shutdown() is True
