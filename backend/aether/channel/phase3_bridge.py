@@ -171,6 +171,44 @@ class Phase3Bridge:
 
     # -- state / privacy ---------------------------------------------------
 
+    def _lifecycle_fields(self) -> dict[str, object]:
+        """Authoritative lifecycle fields shared by state and the
+        lightweight lifecycle read: execution availability, campaign
+        expiry, disabled reason and the privacy snapshot. Pure state
+        reads - no detection, no Explorer, no filesystem."""
+        surface = self.surface
+        execution_available = surface.executor is not None and (
+            surface.execution_available() if surface.execution_available is not None else True
+        )
+        expires_at = (
+            surface.authorization_expires_at()
+            if surface.authorization_expires_at is not None
+            else None
+        )
+        privacy_state = (
+            surface.privacy_authority.snapshot_dict()
+            if surface.privacy_authority is not None
+            else dict(surface.privacy)
+        )
+        return {
+            "nativeAvailable": execution_available,
+            "executionAvailable": execution_available,
+            "expiresAtMs": (int(expires_at.timestamp() * 1000) if expires_at is not None else None),
+            "disabledReason": None if surface.executor is not None else surface.native_reason,
+            "privacy": privacy_state,
+        }
+
+    def get_lifecycle(self, payload: object) -> dict[str, object]:
+        """Lightweight authoritative lifecycle read (AS2): current
+        lifecycle/privacy truth for renderer invalidation WITHOUT
+        invoking project detection, Explorer collection, UIA or any
+        filesystem inspection."""
+
+        def run() -> dict[str, object]:
+            return {"status": "ready", **self._lifecycle_fields()}
+
+        return self._guarded(run)
+
     def get_state(self, payload: object) -> dict[str, object]:
         def run() -> dict[str, object]:
             surface = self.surface
@@ -204,35 +242,14 @@ class Phase3Bridge:
                     }
                     for w in surface.authority.known_windows()
                 ]
-            privacy_state = (
-                surface.privacy_authority.snapshot_dict()
-                if surface.privacy_authority is not None
-                else dict(surface.privacy)
-            )
             # Capabilities are presented only while the synchronous
             # lifetime predicate holds: an expired/revoked (or not
             # opted-in) authorization never presents expired
             # capabilities as available (R3).
             permitted = self._collection_permitted()
-            execution_available = surface.executor is not None and (
-                surface.execution_available() if surface.execution_available is not None else True
-            )
-            expires_at = (
-                surface.authorization_expires_at()
-                if surface.authorization_expires_at is not None
-                else None
-            )
             return {
                 "status": "ready",
-                "nativeAvailable": execution_available,
-                # Authoritative lifecycle for evidence binding (C3):
-                # revoked/expired campaigns report these truthfully.
-                "executionAvailable": execution_available,
-                "expiresAtMs": (
-                    int(expires_at.timestamp() * 1000) if expires_at is not None else None
-                ),
-                "disabledReason": None if surface.executor is not None else surface.native_reason,
-                "privacy": privacy_state,
+                **self._lifecycle_fields(),
                 "projects": projects,
                 "windows": windows,
                 "capabilities": {

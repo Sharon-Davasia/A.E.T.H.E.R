@@ -368,7 +368,15 @@ class Phase3Composition:
             # because the panel click is not a foreground event for
             # an Explorer window.
             from datetime import timedelta as _td
+            from threading import RLock as _ContextLock
 
+            # Final validation + retention/consumption of captured
+            # evidence is atomic under this lock with respect to
+            # cancellation and re-arming. It is NEVER held across
+            # native Explorer collection or filesystem scope
+            # validation - only around the final binding check and
+            # the retention writes themselves.
+            _project_context_lock = _ContextLock()
             _project_context: dict[str, object] = {
                 "armed_until": None,
                 "generation": None,
@@ -419,21 +427,27 @@ class Phase3Composition:
                 if not project_registry.is_within_registration_boundary(folder):
                     return
                 # Final revalidation of the ORIGINAL handoff binding
-                # (deadline, generation, authoritative lifecycle)
-                # after native collection and scope validation,
-                # before retaining: a sample that crosses the arm
-                # deadline, or lands after expiry/revocation or a
-                # generation change, is never retained.
-                if (
-                    now_fn() > armed_until  # type: ignore[operator]
-                    or privacy.generation != _project_context["generation"]
-                    or not _collection_permitted()
-                ):
-                    _cancel_project_context()
-                    return
-                _project_context["folder"] = folder
-                _project_context["captured_at"] = now_fn()
-                _project_context["armed_until"] = None  # one-shot consumed
+                # (identity, deadline, generation, authoritative
+                # lifecycle) after native collection and scope
+                # validation, ATOMIC with retention/consumption under
+                # the handoff lock: cancellation or replacement that
+                # landed during scope validation cannot leave this
+                # older sample eligible, and no cancellation can slip
+                # between the check and the write. The lock is not
+                # held across collection or scope validation above.
+                with _project_context_lock:
+                    if _project_context["armed_until"] is not armed_until:
+                        return
+                    if (
+                        now_fn() > armed_until  # type: ignore[operator]
+                        or privacy.generation != _project_context["generation"]
+                        or not _collection_permitted()
+                    ):
+                        _cancel_project_context()
+                        return
+                    _project_context["folder"] = folder
+                    _project_context["captured_at"] = now_fn()
+                    _project_context["armed_until"] = None  # one-shot consumed
 
             observer_service = None
             if providers.event_source is not None:
@@ -798,18 +812,24 @@ class Phase3Composition:
             def _arm_project_context() -> bool:
                 if not _collection_permitted():
                     return False
-                _project_context["armed_until"] = now_fn() + _td(seconds=60)
-                _project_context["generation"] = privacy.generation
-                _project_context["folder"] = None
-                _project_context["captured_at"] = None
+                with _project_context_lock:
+                    _project_context["armed_until"] = now_fn() + _td(seconds=60)
+                    _project_context["generation"] = privacy.generation
+                    _project_context["folder"] = None
+                    _project_context["captured_at"] = None
                 return True
 
             def _cancel_project_context() -> None:
-                _project_context["armed_until"] = None
-                _project_context["folder"] = None
-                _project_context["captured_at"] = None
+                with _project_context_lock:
+                    _project_context["armed_until"] = None
+                    _project_context["folder"] = None
+                    _project_context["captured_at"] = None
 
             def _project_context_captured() -> tuple[int, int] | None:
+                with _project_context_lock:
+                    return _project_context_captured_locked()
+
+            def _project_context_captured_locked() -> tuple[int, int] | None:
                 if _project_context["folder"] is None or _project_context["captured_at"] is None:
                     return None
                 if privacy.generation != _project_context["generation"]:

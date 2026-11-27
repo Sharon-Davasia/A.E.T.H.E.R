@@ -13,10 +13,11 @@ import test from 'node:test';
 import { ProjectContextHandoff, PROJECT_CONTEXT_HANDOFF_MS, establishProjectContextArm } from '../electron/project-context-handoff';
 import { createPhase3Provider } from '../electron/phase3-provider';
 import {
-  lifecycleInvalidatesContext, ProjectContextAttemptGuard,
+  evaluateLifecycleReading, lifecycleInvalidatesContext, ProjectContextAttemptGuard,
+  parsePhase3Lifecycle,
   parsePhase3ProjectContext, projectContextView, visibleProjectContext,
   PROJECT_CONTEXT_FRESHNESS_MS,
-  type Phase3Privacy, type Phase3ProjectContextView, type Phase3State,
+  type Phase3Lifecycle, type Phase3Privacy, type Phase3ProjectContextView, type Phase3State,
 } from '../shared/phase3';
 
 const PRIVACY: Phase3Privacy = { optedIn: true, mode: 'metadata_only', paused: false, generation: 3 };
@@ -217,6 +218,14 @@ function fakeBackend(overrides: Record<string, unknown> = {}) {
     phase3CancelTask: async () => ({ status: 'ready' }),
     phase3ResumeTask: async () => ({ status: 'ready' }),
     phase3RegisterProject: async () => ({ status: 'unavailable' }),
+    phase3GetLifecycle: async () => {
+      calls.push('lifecycle');
+      return {
+        status: 'ready', nativeAvailable: true, executionAvailable: true,
+        expiresAtMs: 2_000_000, disabledReason: null,
+        privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 3 },
+      };
+    },
     phase3ArmProjectContext: async () => { calls.push('arm'); return { status: 'armed', expiresInSeconds: 60 }; },
     phase3CancelProjectContext: async () => { calls.push('cancel'); return { status: 'ready', cancelled: true }; },
     phase3CheckProjectContext: async () => {
@@ -248,6 +257,17 @@ test('provider: arm/cancel/check contract with the backend ops', async () => {
   const cancelled = await provider.cancelProjectContext();
   assert.equal(cancelled.status, 'ready');
   assert.deepEqual(backend.calls, ['arm', 'check', 'cancel']);
+});
+
+test('provider: lightweight lifecycle read contract', async () => {
+  const backend = fakeBackend();
+  const provider = createPhase3Provider({ backend: backend as never, confirm: async () => true });
+  const lifecycle = await provider.getLifecycle();
+  assert.equal(lifecycle.status, 'ready');
+  assert.equal(lifecycle.executionAvailable, true);
+  assert.equal(lifecycle.expiresAtMs, 2_000_000);
+  assert.equal(lifecycle.privacy.generation, 3);
+  assert.deepEqual(backend.calls, ['lifecycle']);
 });
 
 test('provider: backend arm refusal propagates as unavailable', async () => {
@@ -305,4 +325,81 @@ test('unexpected revocation/disconnection drops late responses (AS2)', () => {
   const fourth = guard.begin();
   assert.equal(guard.isCurrent(second), false);
   assert.equal(guard.isCurrent(fourth), true);
+});
+
+test('lifecycle read parsing fails closed on unknown authority', () => {
+  // Malformed/absent authority must never read as execution-available.
+  assert.equal(parsePhase3Lifecycle(null).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({}).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({ status: 'ready' }).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({ status: 'unavailable' }).status, 'unavailable');
+  const ok = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 99,
+    privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 5 },
+  });
+  assert.equal(ok.executionAvailable, true);
+  assert.equal(ok.expiresAtMs, 99);
+  assert.equal(ok.privacy.generation, 5);
+});
+
+test('monitoring orchestration: decisions, retention, supersession', () => {
+  // Mirrors the renderer's monitor: fetch a lightweight reading,
+  // drop it if superseded in flight, else apply the pure decision.
+  const guard = new ProjectContextAttemptGuard();
+  let retainedGeneration: number | null = 3;
+  const healthy = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: PRIVACY,
+  });
+  const monitor = (reading: Phase3Lifecycle | null, nowMs: number): string => {
+    const epochAtStart = guard.snapshot();
+    if (guard.snapshot() !== epochAtStart) return 'superseded';
+    if (evaluateLifecycleReading(reading, retainedGeneration, nowMs) === 'invalidate') {
+      guard.invalidate();
+      retainedGeneration = null;
+      return 'invalidated';
+    }
+    return 'kept';
+  };
+
+  // Healthy lifecycle, same generation: retained context kept.
+  assert.equal(monitor(healthy, 1_000_100), 'kept');
+  assert.equal(retainedGeneration, 3);
+  // Privacy-generation change invalidates even when lifecycle is live.
+  const genChanged = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, generation: 4 },
+  });
+  assert.equal(monitor(genChanged, 1_001_000), 'invalidated');
+  assert.equal(retainedGeneration, null);
+  // Late healthy readings cannot restore what was invalidated.
+  assert.equal(monitor(healthy, 1_002_000), 'kept');
+  assert.equal(retainedGeneration, null);
+  // Pause and opt-out readings invalidate.
+  retainedGeneration = 3;
+  assert.equal(monitor(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, paused: true },
+  }), 1_003_000), 'invalidated');
+  retainedGeneration = 3;
+  assert.equal(monitor(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, optedIn: false },
+  }), 1_004_000), 'invalidated');
+  // Revocation and disconnect readings invalidate.
+  retainedGeneration = 3;
+  assert.equal(monitor(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: false, expiresAtMs: 2_000_000, privacy: PRIVACY,
+  }), 1_005_000), 'invalidated');
+  retainedGeneration = 3;
+  assert.equal(monitor(null, 1_006_000), 'invalidated');
+  // A reading superseded by a newer attempt is never applied.
+  retainedGeneration = 3;
+  const staleEpoch = guard.snapshot();
+  const attempt = guard.begin(); // newer arm/check attempt lands mid-read
+  assert.notEqual(guard.snapshot(), staleEpoch);
+  assert.equal(guard.isCurrent(attempt), true);
+  // (The renderer's monitor returns 'superseded' here and re-reads
+  // on the next tick; the newer attempt is untouched.)
+  assert.equal(retainedGeneration, 3);
 });

@@ -350,3 +350,104 @@ def test_rearm_during_collection_invalidates_sample(tmp_path: Path) -> None:
         assert [c["evidenceSource"] for c in check["projects"]] == ["explorer_registered"]
     finally:
         assert comp.shutdown() is True
+
+
+def _during_scope_once(comp, action) -> None:  # type: ignore[no-untyped-def]
+    """Run `action` inside the first scope validation after this
+    call - i.e. in the middle of a capture's retention path."""
+    registry = comp.surface.project_registry
+    assert registry is not None
+    original = registry.is_within_registration_boundary
+    fired: list[bool] = []
+
+    def wrapper(path):  # type: ignore[no-untyped-def]
+        result = original(path)
+        if not fired:
+            fired.append(True)
+            action()
+        return result
+
+    registry.is_within_registration_boundary = wrapper  # type: ignore[method-assign]
+
+
+def test_cancellation_during_scope_validation(tmp_path: Path) -> None:
+    """AS1 completion: cancellation landing during filesystem scope
+    validation cannot leave the older sample eligible for retention
+    (final identity validation is atomic with retention)."""
+    comp, explorer, _project = _start(tmp_path)
+    try:
+        bridge = comp.bridge
+        _during_scope_once(comp, lambda: bridge.cancel_project_context({}))
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == [EXPLORER_HWND]  # collection + scope ran
+        assert comp.surface.project_context_captured() is None  # never retained
+        check = bridge.check_project_context({})
+        assert check["status"] == "unavailable"
+        assert check["reason"] == "explorer_evidence_unavailable"
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_replacement_during_scope_validation_preserved(tmp_path: Path) -> None:
+    """AS1 completion: replacement during scope validation drops the
+    stale sample without consuming the replacement arm, which then
+    completes normally."""
+    comp, explorer, _project = _start(tmp_path)
+    try:
+        bridge = comp.bridge
+
+        def _replace() -> None:
+            bridge.cancel_project_context({})
+            assert bridge.arm_project_context({})["status"] == "armed"
+
+        _during_scope_once(comp, _replace)
+        assert bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(EXPLORER_HWND)
+        # Stale sample not retained; replacement arm NOT consumed.
+        assert comp.surface.project_context_captured() is None
+        comp.project_context_capture(EXPLORER_HWND)
+        assert explorer.calls == [EXPLORER_HWND, EXPLORER_HWND]
+        check = bridge.check_project_context({})
+        assert check["status"] == "ready", check
+        assert [c["evidenceSource"] for c in check["projects"]] == ["explorer_registered"]
+        # And the completed evidence is consumed as usual (one-shot).
+        assert bridge.check_project_context({})["reason"] == "explorer_evidence_unavailable"
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_lifecycle_read_is_lightweight_and_authoritative(tmp_path: Path) -> None:
+    """AS2 completion: the lifecycle read never invokes project
+    detection (or Explorer) and reflects revocation truthfully."""
+    from aether.core.context.project_detection import ProjectDetector
+
+    comp, explorer, _project = _start(tmp_path)
+    try:
+        bridge = comp.bridge
+        original_detect = ProjectDetector.detect
+        detect_calls: list[int] = []
+
+        def _spy(self):  # type: ignore[no-untyped-def]
+            detect_calls.append(1)
+            return original_detect(self)
+
+        ProjectDetector.detect = _spy  # type: ignore[method-assign]
+        try:
+            lifecycle = bridge.get_lifecycle({})
+        finally:
+            ProjectDetector.detect = original_detect  # type: ignore[method-assign]
+        assert detect_calls == []  # detection never invoked
+        assert explorer.calls == []  # no Explorer collection
+        assert lifecycle["status"] == "ready"
+        assert lifecycle["executionAvailable"] is True
+        assert isinstance(lifecycle["expiresAtMs"], int)
+        privacy = lifecycle["privacy"]
+        assert isinstance(privacy, dict)
+        assert privacy["optedIn"] is True and privacy["paused"] is False
+        assert "projects" not in lifecycle and "windows" not in lifecycle
+
+        comp.revoke("test_lifecycle_revocation")
+        assert bridge.get_lifecycle({})["executionAvailable"] is False
+    finally:
+        assert comp.shutdown() is True

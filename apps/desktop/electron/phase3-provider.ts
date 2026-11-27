@@ -12,7 +12,7 @@
 
 import type { BackendClient } from './backend-client';
 import {
-  parsePhase3AppSearch, parsePhase3Outcome, parsePhase3ProjectContext, parsePhase3ProjectContextArm, parsePhase3Prepared, parsePhase3ProjectRegistration, parsePhase3Snapshot, parsePhase3State,
+  parsePhase3AppSearch, parsePhase3Lifecycle, parsePhase3Outcome, parsePhase3ProjectContext, parsePhase3ProjectContextArm, parsePhase3Prepared, parsePhase3ProjectRegistration, parsePhase3Snapshot, parsePhase3State,
   type Phase3Outcome, type Phase3Prepared, type Phase3ProjectRegistration, type Phase3Snapshot, type Phase3State,
 } from '../shared/phase3';
 import type { GestureBindingInput } from './gesture';
@@ -31,7 +31,7 @@ export interface Phase3InteractionSummary {
 export interface Phase3ProviderOptions {
   backend: Pick<
     BackendClient,
-    | 'phase3GetState' | 'phase3SetPrivacy' | 'phase3SearchApps' | 'phase3InspectWindow'
+    | 'phase3GetState' | 'phase3GetLifecycle' | 'phase3SetPrivacy' | 'phase3SearchApps' | 'phase3InspectWindow'
     | 'phase3PreviewInteraction' | 'phase3ApproveInteraction' | 'phase3GetTask'
     | 'phase3PauseTask' | 'signGesture' | 'status'
     | 'phase3ListWindows' | 'phase3PrepareLaunch' | 'phase3PrepareActivation'
@@ -78,6 +78,12 @@ export function createPhase3Provider(options: Phase3ProviderOptions) {
 
   async function getState(): Promise<Phase3State> {
     return parsePhase3State(await backend.phase3GetState());
+  }
+
+  async function getLifecycle() {
+    // Lightweight authoritative lifecycle for invalidation (AS2):
+    // never invokes project detection, Explorer, UIA or filesystem.
+    return parsePhase3Lifecycle(await backend.phase3GetLifecycle());
   }
 
   async function setPrivacy(privacy: { optedIn: boolean; mode: string; paused: boolean }): Promise<Phase3State> {
@@ -259,7 +265,7 @@ export function createPhase3Provider(options: Phase3ProviderOptions) {
   }
 
   return {
-    getState, setPrivacy, searchApps, listWindows, inspectWindow,
+    getState, getLifecycle, setPrivacy, searchApps, listWindows, inspectWindow,
     prepareLaunch, prepareActivation, prepareFixture,
     getReceipt, cancelTask, resumeTask, registerProject, checkProjectContext,
     armProjectContext, cancelProjectContext,

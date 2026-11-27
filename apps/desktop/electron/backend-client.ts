@@ -506,6 +506,11 @@ export class BackendClient {
   // by main (signGesture) after the trusted native confirmation; the
   // renderer never sees a nonce, binding or signature.
 
+  async phase3GetLifecycle(): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.get_lifecycle', {}, ['phase3.lifecycle', 'phase3.error']);
+  }
+
   async phase3GetState(): Promise<unknown> {
     const session = this.reviewSession();
     return this.request(session, 'phase3.get_state', {}, ['phase3.state', 'phase3.error']);

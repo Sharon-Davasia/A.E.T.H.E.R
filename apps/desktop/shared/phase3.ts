@@ -259,6 +259,74 @@ export function visibleProjectContext(
   return view.projects;
 }
 
+/** Structural lifecycle authority: satisfied by both the full
+ * Phase3State and the lightweight Phase3Lifecycle read. */
+export interface Phase3LifecycleAuthority {
+  status: 'ready' | 'unavailable';
+  executionAvailable: boolean;
+  expiresAtMs: number | null;
+}
+
+/** Lightweight authoritative lifecycle (AS2): obtained WITHOUT
+ * invoking project detection, Explorer, UIA or filesystem work. */
+export interface Phase3Lifecycle extends Phase3LifecycleAuthority {
+  reason?: string;
+  privacy: Phase3Privacy;
+}
+
+/**
+ * Parse a lightweight lifecycle read. Unknown or malformed
+ * authority fails closed (never execution-available).
+ */
+export function parsePhase3Lifecycle(value: unknown): Phase3Lifecycle {
+  if (value === null || typeof value !== 'object') {
+    // Unknown lifecycle authority fails closed.
+    return {
+      status: 'unavailable', reason: 'lifecycle_unavailable', executionAvailable: false,
+      expiresAtMs: null, privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
+    };
+  }
+  const item = record(value);
+  const privacy = record(item.privacy ?? {});
+  const parsed: Phase3Lifecycle = {
+    status: item.status === 'unavailable' ? 'unavailable' : 'ready',
+    executionAvailable: item.executionAvailable === true,
+    expiresAtMs: typeof item.expiresAtMs === 'number' && Number.isFinite(item.expiresAtMs) ? item.expiresAtMs : null,
+    privacy: {
+      optedIn: privacy.optedIn === true,
+      mode: typeof privacy.mode === 'string' ? privacy.mode : 'off',
+      paused: privacy.paused === true,
+      generation: typeof privacy.generation === 'number' ? privacy.generation : 0,
+    },
+  };
+  if (item.status === 'unavailable') {
+    return { ...parsed, status: 'unavailable', reason: reason(item), executionAvailable: false };
+  }
+  return parsed;
+}
+
+/**
+ * The renderer's lifecycle-monitoring decision (AS2): given one
+ * authoritative lightweight reading (null = the read itself failed,
+ * i.e. backend disconnect) and the privacy generation retained
+ * evidence is bound to, decide whether retained context and pending
+ * attempts must be invalidated. It never restores anything - it can
+ * only invalidate or keep - so late readings cannot resurrect
+ * invalidated context.
+ */
+export function evaluateLifecycleReading(
+  lifecycle: Phase3Lifecycle | null,
+  retainedGeneration: number | null,
+  nowMs: number,
+): 'invalidate' | 'keep' {
+  if (lifecycleInvalidatesContext(lifecycle, nowMs)) return 'invalidate';
+  if (lifecycle !== null && retainedGeneration !== null) {
+    if (!lifecycle.privacy.optedIn || lifecycle.privacy.paused) return 'invalidate';
+    if (lifecycle.privacy.generation !== retainedGeneration) return 'invalidate';
+  }
+  return 'keep';
+}
+
 /**
  * Whether authoritative lifecycle state invalidates any retained
  * project-context evidence (AS2): no state (disconnect), an
@@ -268,7 +336,7 @@ export function visibleProjectContext(
  * never trusted past fresh lifecycle truth.
  */
 export function lifecycleInvalidatesContext(
-  state: Phase3State | null | undefined,
+  state: Phase3LifecycleAuthority | null | undefined,
   nowMs: number,
 ): boolean {
   if (state === null || state === undefined) return true;
@@ -302,6 +370,13 @@ export class ProjectContextAttemptGuard {
   /** Whether `attempt` is still the live attempt. */
   isCurrent(attempt: number): boolean {
     return attempt > 0 && attempt === this.epoch;
+  }
+
+  /** Current epoch, to detect attempts/invalidations that landed
+   * while an asynchronous lifecycle read was in flight; a stale
+   * reading must never be applied afterwards. */
+  snapshot(): number {
+    return this.epoch;
   }
 }
 

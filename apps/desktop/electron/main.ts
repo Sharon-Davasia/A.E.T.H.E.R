@@ -265,6 +265,10 @@ function registerIpc(): void {
     }
     return state;
   });
+  ipcMain.handle('desktop:phase3-lifecycle', async (event) => {
+    validateInvoke(event);
+    return phase3Provider.getLifecycle();
+  });
   ipcMain.handle('desktop:phase3-set-privacy', async (event, raw: unknown) => {
     validateInvoke(event);
     const item = raw as { optedIn?: unknown; mode?: unknown; paused?: unknown } | null;

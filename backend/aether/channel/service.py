@@ -79,6 +79,7 @@ _GET_OUTCOME_KIND = "review.get_outcome"
 # privileged operation: unknown kinds still terminate the session.
 _PHASE3_KINDS = {
     "phase3.get_state": ("get_state", "phase3.state"),
+    "phase3.get_lifecycle": ("get_lifecycle", "phase3.lifecycle"),
     "phase3.set_privacy": ("set_privacy", "phase3.state"),
     "phase3.search_apps": ("search_apps", "phase3.apps"),
     "phase3.inspect_window": ("inspect_window", "phase3.snapshot"),

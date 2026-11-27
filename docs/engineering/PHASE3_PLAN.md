@@ -217,6 +217,15 @@ never retained); and the renderer's context-retention timer now
 re-reads authoritative backend lifecycle state, so unexpected
 revocation, expiry or disconnection invalidates displayed context
 and voids in-flight responses.
+Completion of AS1/AS2: the final original-arm identity check and
+retention/consumption are atomic under the handoff lock (never held
+across native collection or scope validation; cancellation or
+replacement during scope validation retains nothing and preserves
+any replacement arm); lifecycle monitoring uses a lightweight
+authoritative read (no project detection, Explorer, UIA or
+filesystem work), covers retained context plus pending arm and
+completion attempts, fails closed on unknown lifecycle authority,
+and drops late lifecycle readings superseded in flight.
 
 ## 7. Performance defaults (provisional, unmeasured)
 
