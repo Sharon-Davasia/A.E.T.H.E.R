@@ -240,6 +240,9 @@ def _harness(tmp_path: Path):
     fixture_record = _record("app:fixture", "Fixture App")
     notepad = _record("app:notepad", "Notepad")
     storage = tmp_path / "aether-phase3-acceptance-test"
+    _workspace = tmp_path / "aether-phase3-workspace-test"
+    _workspace.mkdir(parents=True, exist_ok=True)
+    _ws_stat = _workspace.stat()
     authz = ControlledAcceptanceAuthorization(
         approved_commit=COMMIT,
         decision_reference="owner-decision-A01",
@@ -247,6 +250,7 @@ def _harness(tmp_path: Path):
         storage_id="11111111-1111-4111-8111-111111111111",
         storage_path=str(storage),
         workspace_path=str(tmp_path / "aether-phase3-workspace-test"),
+        workspace_identity=(_ws_stat.st_dev, _ws_stat.st_ino),
         authorized_app_ids=frozenset({app_id, notepad.app_id}),
         capability_allowlist=frozenset(
             {

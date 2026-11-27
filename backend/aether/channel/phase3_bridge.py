@@ -76,6 +76,16 @@ class Phase3Surface:
     # Composition-owned project registry (controlled compositions);
     # registration happens only through the trusted bridge method.
     project_registry: ResourceRegistry | None = None
+    # Lifecycle truth for presentation (F4): native execution is
+    # only "available" while the composition is unrevoked and the
+    # authorization unexpired - independent of privacy opt-in.
+    execution_available: Callable[[], bool] | None = None
+    # Explicit project-context arm/disarm (F3): the foreground
+    # Explorer provider is consulted ONLY between begin/end of one
+    # owner-initiated project-context check; generic state refreshes
+    # never retrieve Explorer folder paths.
+    project_context_begin: Callable[[], None] | None = None
+    project_context_end: Callable[[], None] | None = None
     # Trusted composition clock; freshness/resolution are evaluated
     # on the same time source as the rest of the composition.
     clock: Callable[[], datetime] | None = None
@@ -167,16 +177,7 @@ class Phase3Bridge:
                     or not self._collection_permitted()
                 ):
                     found = ()
-                projects = [
-                    {
-                        "candidateId": c.candidate_id,
-                        "evidenceSource": c.evidence_source,
-                        "strength": c.evidence_strength,
-                        "available": c.available,
-                        "limitations": list(c.limitations),
-                    }
-                    for c in found
-                ]
+                projects = self._project_summaries(found)
             windows = []
             if surface.authority is not None:
                 app_names = {}
@@ -201,9 +202,12 @@ class Phase3Bridge:
             # opted-in) authorization never presents expired
             # capabilities as available (R3).
             permitted = self._collection_permitted()
+            execution_available = surface.executor is not None and (
+                surface.execution_available() if surface.execution_available is not None else True
+            )
             return {
                 "status": "ready",
-                "nativeAvailable": surface.executor is not None,
+                "nativeAvailable": execution_available,
                 "disabledReason": None if surface.executor is not None else surface.native_reason,
                 "privacy": privacy_state,
                 "projects": projects,
@@ -355,6 +359,58 @@ class Phase3Bridge:
             except ResourceRegistryError as exc:
                 raise _Phase3Refused(exc.reason_code) from exc
             return {"status": "ready", "rootId": str(root.root_id), "alias": root.alias}
+
+        return self._guarded(run)
+
+    def _project_summaries(self, found: object) -> list[dict[str, object]]:
+        summaries: list[dict[str, object]] = []
+        for candidate in found:  # type: ignore[attr-defined]
+            summaries.append(
+                {
+                    "candidateId": candidate.candidate_id,
+                    "evidenceSource": candidate.evidence_source,
+                    "strength": candidate.evidence_strength,
+                    "available": candidate.available,
+                    "limitations": list(candidate.limitations),
+                }
+            )
+        return summaries
+
+    def check_project_context(self, payload: object) -> dict[str, object]:
+        """Explicit owner-initiated project-context check (F3, P3-23).
+
+        This is the ONLY bridge operation that may consult the
+        foreground Explorer folder provider, and only for comparison
+        against the registered synthetic workspace. It requires the
+        bounded project-context authorization (opted-in, unexpired,
+        unrevoked), arms Explorer collection for this single check,
+        and always disarms it afterwards: generic state refreshes
+        never retrieve arbitrary Explorer paths, and out-of-scope
+        paths are neither retained nor published (detector scope).
+        """
+
+        def run() -> dict[str, object]:
+            surface = self.surface
+            if surface.detector is None or surface.project_registry is None:
+                return self._unavailable("project_context_unavailable")
+            if not self._collection_permitted():
+                return self._unavailable("project_context_not_authorized")
+            authority = surface.privacy_authority
+            generation = authority.generation if authority is not None else None
+            try:
+                if surface.project_context_begin is not None:
+                    surface.project_context_begin()
+                found = surface.detector.detect()
+            finally:
+                if surface.project_context_end is not None:
+                    surface.project_context_end()
+            if generation is not None and (
+                authority is None
+                or authority.generation != generation
+                or not self._collection_permitted()
+            ):
+                found = ()
+            return {"status": "ready", "projects": self._project_summaries(found)}
 
         return self._guarded(run)
 

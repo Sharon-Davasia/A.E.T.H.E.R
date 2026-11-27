@@ -48,10 +48,10 @@ verifier must NOT be run.
 
 Run from non-admin PowerShell 5.1 at `D:\A.E.T.H.E.R`, HEAD equal to
 the approved candidate SHA, clean tree — with exactly one known
-allowed exception: the preserved compiled fixture may appear as the
-untracked file `?? tools/windows-fixture/AETHERFixture.exe` (it is
-owner-held build output, hash-verified below; any *other* porcelain
-output is a stop condition). pytest scratch MUST be a
+allowed exception: `git status --porcelain` may show ONLY the exact
+known untracked fixture `?? tools/windows-fixture/AETHERFixture.exe`
+(it is owner-held build output, hash-verified below; any *other*
+porcelain output is a stop condition). pytest scratch MUST be a
 new, non-reparse, non-protected directory under the existing owner
 evidence root — synthetic projects under protected AppData paths
 fail resource registration by design, and those protections must
@@ -77,8 +77,10 @@ $NodeDir = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec
 $Npm = Join-Path $NodeDir "npm.cmd"
 # Subprocesses (node/tsx/tsc/electron) resolve the portable Node
 # from the session PATH - never from any global installation.
-$env:PATH = "$NodeDir;$env:PATH"
-cd apps/desktop; $env:AETHER_DEV_PYTHON = $Python; & $Npm run check; & $Npm test; cd ..\..
+# NOTE: `npm run check` already includes the desktop test suite;
+# no duplicate `npm test` run is required or wanted.
+$env:PATH = "D:\A.E.T.H.E.R\backend\.venv\Scripts;$NodeDir;$env:PATH"   # pinned venv + portable Node
+cd apps/desktop; $env:AETHER_DEV_PYTHON = $Python; & $Npm run check; cd ..\..
 # fixture integrity (verify only; rebuild is NOT part of verification)
 (Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256).Hash
 # must equal E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D
@@ -91,19 +93,24 @@ always creates a fresh one.
 
 S1. Start from the exact candidate SHA recorded in the activation
     decision package; verify `git rev-parse HEAD` matches.
-S2. Campaign layout (three separate siblings under the acceptance
-    root `D:\AETHER-acceptance`; never nested): the schema-v3
-    database directory `aether-phase3-acceptance-<campaign>`, the
-    synthetic workspace `aether-phase3-workspace-<campaign>`, and
-    the artifact `authorization-<campaign>.json`. Do NOT pre-create
-    any of them: the authorization tool initializes storage
-    exclusively first, then creates the workspace, then writes the
-    artifact exclusively (an existing campaign artifact is never
-    overwritten — choose a fresh campaign name; never delete
-    campaign evidence). Verify `D:\AETHER-acceptance` exists and is
-    not a reparse point before the run; the database directory
-    refuses unrelated content, so NOTHING is ever created inside
-    it. After the tool run, create the synthetic project at
+S2. Campaign layout. Use ONLY the existing owner evidence root
+    `D:\AETHER-A-Evidence-5b02b5d18c3c4e649c469a7920b63c6a`. Inside
+    it, create ONE fresh campaign directory
+    `phase3-campaign-<stamp>` — exclusively created, verified
+    non-reparse, never reusing or renaming any historical evidence.
+    All campaign paths are siblings INSIDE that campaign directory:
+    the schema-v3 database directory
+    `aether-phase3-acceptance-<campaign>`, the synthetic workspace
+    `aether-phase3-workspace-<campaign>`, and the artifact
+    `authorization-<campaign>.json` (this directory is the tool's
+    `--acceptance-root`). Do NOT pre-create any of the three: the
+    authorization tool initializes storage exclusively first, then
+    creates the workspace, then writes the artifact exclusively (an
+    existing campaign artifact is never overwritten — choose a
+    fresh campaign name; never delete campaign evidence). The
+    database directory refuses unrelated content, so NOTHING is
+    ever created inside it. After the tool run, create the
+    synthetic project at
     `aether-phase3-workspace-<campaign>\synthetic-project` inside
     the *workspace* (never inside the database directory), with a
     synthetic `pyproject.toml` marker. The real AETHER repository
@@ -150,7 +157,7 @@ C4. At campaign end: shut the app down (worker must exit; verify no
 | P3-20 | Unexpected dialog | Open fixture modal; attempt an op | Dispatch halted; dialog never auto-dismissed; fresh observation+approval required to resume | No effect behind dialog | Dialog indication |
 | P3-21 | Safe pause/resume | Pause an armed task; resume | PAUSED holds nothing live; resume goes to fresh planning/precheck; consumed approvals never replay | No PAUSED→EXECUTING jump | Task states |
 | P3-22 | Restart reconciliation | Restart the app (controlled config) with an armed/paused task; then re-register the same synthetic project in the workspace and ask for the current project | States reconciled truthfully; uncertain never auto-succeeded; acceptance storage reopens cleanly and workspace project evidence is untouched | No replay after restart; no storage/evidence loss | Task state after restart + project candidate |
-| P3-23 | Project reference resolution | Create the synthetic project inside the synthetic workspace (S2); register it via the panel's trusted directory dialog; focus Explorer there; ask for current project | Deterministic candidate (the synthetic project) or clarification if ambiguous | Registered roots only (synthetic-workspace boundary — never the database directory); no permission expansion; no executor enabled | Candidate/limitations |
+| P3-23 | Project reference resolution | Create the synthetic project inside the synthetic workspace (S2); register it via the panel's trusted directory dialog; focus Explorer on the project folder; in the panel, click **Check current project context** (the only action that reads the foreground Explorer folder — one-shot, for comparison against the registered workspace only) | Deterministic candidate (the synthetic project) or clarification if ambiguous | Registered roots only (synthetic-workspace boundary — never the database directory); generic state refreshes read no Explorer path; out-of-scope folders are neither retained nor shown; no permission expansion; no executor enabled | Candidate/limitations |
 | P3-24 | Real-app read-only navigation suite | For Explorer and VS Code (if installed) and Settings (read/navigation scope): activate window + snapshot only | Verified activation; bounded snapshot; zero interactions sent | No clicks/keys; limitations reported truthfully for missing apps | Receipts |
 | P3-25 | Boundaries preserved | Ordinary relaunch per §"Ordinary-mode verification" below; attempt Phase 3 actions without acceptance config; confirm offline behavior | Ordinary mode default-denied (`phase3_native_disabled`); Phase 2 surfaces unchanged; no outbound network required/observed beyond OS noise recorded | No ordinary-mode execution; no real-user database opened, migrated or modified | Panel + synthetic-DB schema check (`PRAGMA user_version` = 2 on the *synthetic* database) + real-storage fingerprint comparison only when its verified actual path is known (never opened through SQLite; an unverifiable path is reported, not assumed) |
 
@@ -207,7 +214,7 @@ Remove-Item Env:AETHER_ACCEPTANCE_MODE, Env:AETHER_PHASE3_AUTHORIZATION, Env:AET
 # launches Electron (it is not a no-rebuild command). node_modules
 # is preserved; if it is missing, stop and report.
 $Npm = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec0be6861a0\node-v22.22.3-win-x64\npm.cmd"
-$env:PATH = "$((Split-Path $Npm));$env:PATH"   # portable Node resolves for all subprocesses
+$env:PATH = "D:\A.E.T.H.E.R\backend\.venv\Scripts;$((Split-Path $Npm));$env:PATH"   # pinned venv + portable Node for all subprocesses
 cd apps\desktop; & $Npm run start; cd ..\..
 
 # In the app: the Phase 3 panel shows observation off /

@@ -170,6 +170,17 @@ reference resolution and synchronous expiry at observation
 resumption; resolver outcomes preserved across desktop IPC with
 stale-selection invalidation; and reconciled campaign procedures.
 
+Final residual closure F1–F6 is implemented on top in a third
+checkpoint on PR #37 (same Linux/fake test surface): the workspace
+directory itself is filesystem-validated and identity-bound
+(substitution/identity drift refused at startup and registration),
+foreground Explorer collection happens only inside one explicit
+owner-initiated project-context check, desktop selection validity
+is bound to the exact search completion + privacy generation,
+campaign procedures use a fresh campaign directory inside the
+owner evidence root, and package-query buffer reads are contained
+and termination-checked.
+
 ## 7. Performance defaults (provisional, unmeasured)
 
 Queue 256 events; observation TTL 30 s; reconciliation on demand /

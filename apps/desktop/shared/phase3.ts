@@ -11,6 +11,8 @@ export interface Phase3Privacy {
   optedIn: boolean;
   mode: string;
   paused: boolean;
+  /** Monotonic privacy generation; any change invalidates picks. */
+  generation: number;
 }
 
 export interface Phase3ProjectCandidate {
@@ -129,7 +131,7 @@ export function parsePhase3State(value: unknown): Phase3State {
   if (item.status === 'unavailable') {
     return {
       status: 'unavailable', reason: reason(item), nativeAvailable: false,
-      disabledReason: reason(item), privacy: { optedIn: false, mode: 'off', paused: false },
+      disabledReason: reason(item), privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
       projects: [], windows: [], capabilities: {},
     };
   }
@@ -143,6 +145,7 @@ export function parsePhase3State(value: unknown): Phase3State {
       optedIn: privacy.optedIn === true,
       mode: typeof privacy.mode === 'string' ? privacy.mode : 'off',
       paused: privacy.paused === true,
+      generation: typeof privacy.generation === 'number' ? privacy.generation : 0,
     },
     windows: (Array.isArray(item.windows) ? item.windows : []).map((raw) => {
       const w = record(raw);
@@ -153,18 +156,36 @@ export function parsePhase3State(value: unknown): Phase3State {
         version: String(w.version ?? ''),
       };
     }),
-    projects: projects.map((raw) => {
-      const c = record(raw);
-      return {
-        candidateId: String(c.candidateId ?? ''),
-        evidenceSource: String(c.evidenceSource ?? ''),
-        strength: typeof c.strength === 'number' ? c.strength : 0,
-        available: c.available === true,
-        limitations: Array.isArray(c.limitations) ? c.limitations.map(String) : [],
-      };
-    }),
+    projects: projects.map(projectCandidate),
     capabilities: (item.capabilities ?? {}) as Record<string, boolean>,
   };
+}
+
+function projectCandidate(raw: unknown): Phase3ProjectCandidate {
+  const c = record(raw);
+  return {
+    candidateId: String(c.candidateId ?? ''),
+    evidenceSource: String(c.evidenceSource ?? ''),
+    strength: typeof c.strength === 'number' ? c.strength : 0,
+    available: c.available === true,
+    limitations: Array.isArray(c.limitations) ? c.limitations.map(String) : [],
+  };
+}
+
+export interface Phase3ProjectContext {
+  status: 'ready' | 'unavailable';
+  reason?: string;
+  projects: Phase3ProjectCandidate[];
+}
+
+/** Result of one explicit owner-initiated project-context check. */
+export function parsePhase3ProjectContext(value: unknown): Phase3ProjectContext {
+  const item = record(value);
+  if (item.status === 'unavailable') {
+    return { status: 'unavailable', reason: reason(item), projects: [] };
+  }
+  const projects = Array.isArray(item.projects) ? item.projects : [];
+  return { status: 'ready', projects: projects.map(projectCandidate) };
 }
 
 export function parsePhase3Prepared(value: unknown): Phase3Prepared {
@@ -257,4 +278,48 @@ export function parsePhase3Outcome(value: unknown): Phase3Outcome {
     detail: typeof item.detail === 'string' ? item.detail : undefined,
     attemptId: typeof item.attemptId === 'string' ? item.attemptId : null,
   };
+}
+
+/**
+ * Selection validity (F4). A selection is bound to the exact search
+ * completion and authorization state it was made under:
+ * - every completed new search invalidates the prior selection,
+ *   even if the same application appears again;
+ * - a selection once invalid can never silently become effective
+ *   again (its search serial is never reused);
+ * - any privacy-generation / native-availability change invalidates;
+ * - membership in the latest result is still required.
+ * Pure and executable-tested; the backend's approval and integrity
+ * checks remain authoritative regardless of this presentation state.
+ */
+export interface Phase3Selection {
+  appId: string;
+  searchSerial: number;
+  authorizationKey: string;
+}
+
+export function phase3AuthorizationKey(state: Phase3State | null): string {
+  if (state === null) return 'none';
+  return [
+    state.status,
+    state.nativeAvailable,
+    state.disabledReason ?? '',
+    state.privacy.optedIn,
+    state.privacy.mode,
+    state.privacy.paused,
+    state.privacy.generation,
+  ].join(':');
+}
+
+export function effectiveSelectedAppId(
+  selection: Phase3Selection | null,
+  search: Phase3AppSearch | null,
+  searchSerial: number,
+  authorizationKey: string,
+): string {
+  if (selection === null || search === null || search.status !== 'ready') return '';
+  if (selection.searchSerial !== searchSerial) return '';
+  if (selection.authorizationKey !== authorizationKey) return '';
+  if (!search.results.some((r) => r.appId === selection.appId)) return '';
+  return selection.appId;
 }

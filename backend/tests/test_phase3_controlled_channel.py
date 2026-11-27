@@ -88,6 +88,12 @@ def test_controlled_service_cross_process_workflow(tmp_path: Path) -> None:
         integrity_verifier=seams.integrity_verifier,
         commit=commit,
     )
+    # Mirror the owner tool: create the sibling synthetic workspace
+    # and bind its filesystem identity into the artifact.
+    workspace_path = Path(str(artifact["workspace_path"]))
+    workspace_path.mkdir(parents=True)
+    _ws_stat = workspace_path.stat()
+    artifact["workspace_identity"] = [_ws_stat.st_dev, _ws_stat.st_ino]
     artifact_path = tmp_path / "authorization.json"
     artifact_path.write_text(json.dumps(artifact), encoding="utf-8")
     store = open_acceptance_store(

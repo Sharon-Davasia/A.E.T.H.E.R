@@ -56,6 +56,17 @@ generation/lifecycle enforcement, resolver outcomes preserved across
 desktop IPC, and procedure consistency) are implemented on top in a
 follow-up checkpoint on PR #37, same Linux/fake test surface only.
 
+Final residual closure F1–F6 is implemented on top in a third
+checkpoint on PR #37 (same Linux/fake test surface): the workspace
+directory itself is filesystem-validated and identity-bound
+(substitution/identity drift refused at startup and registration),
+foreground Explorer collection happens only inside one explicit
+owner-initiated project-context check, desktop selection validity
+is bound to the exact search completion + privacy generation,
+campaign procedures use a fresh campaign directory inside the
+owner evidence root, and package-query buffer reads are contained
+and termination-checked.
+
 **Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
 fake-backed** on top of CP4–CP5: authoritative persisted UI-operation
 bindings enforced end-to-end, PolicyBroker/enablement integration,

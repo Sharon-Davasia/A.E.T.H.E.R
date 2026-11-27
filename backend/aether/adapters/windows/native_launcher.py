@@ -300,6 +300,34 @@ def package_identity_for_aumid(api: PackageQueryApi, aumid: object) -> tuple[str
     return package_full_name, version
 
 
+def _string_from_buffer(buffer: Any, pointer: int) -> str | None:
+    """Bounded wide-string read from a native-filled buffer (F6).
+
+    The pointer must lie strictly inside the buffer, and a NUL
+    terminator must exist within the remaining buffer bytes.
+    Anything else is a malformed native response and yields None -
+    an unbounded ``ctypes.wstring_at`` dereference is never made on
+    an unvalidated pointer.
+    """
+    import ctypes
+
+    base = ctypes.addressof(buffer)
+    size = ctypes.sizeof(buffer)
+    offset = pointer - base
+    if offset < 0 or offset >= size or offset % ctypes.sizeof(ctypes.c_wchar):
+        return None
+    remaining = (size - offset) // ctypes.sizeof(ctypes.c_wchar)
+    view = (ctypes.c_wchar * remaining).from_address(pointer)
+    chars: list[str] = []
+    for char in view:
+        if char == "\x00":
+            break
+        chars.append(char)
+    else:
+        return None  # unterminated within the buffer: malformed
+    return "".join(chars)
+
+
 def native_package_query(aumid: str) -> tuple[str, str] | None:  # pragma: no cover - Windows only
     """Production package query over the Win32 appmodel APIs."""
     try:
@@ -391,14 +419,16 @@ class _CtypesPackageQueryApi:  # pragma: no cover - Windows only source
             return None
         if filled.value > count.value:
             return None  # malformed response: more names than allocated
+        if filled_length.value > length.value:
+            return None  # reported length exceeds the allocated buffer
         names: list[str] = []
         for index in range(min(filled.value, _MAX_FAMILY_PACKAGES)):
             address = pointers[index]
             if not address:
                 return None
-            name = ctypes.wstring_at(address)
-            if not name or "\x00" in name:
-                return None  # malformed identity string: no evidence
+            name = _string_from_buffer(buffer, int(address))
+            if not name:
+                return None  # outside buffer or unterminated: malformed
             names.append(name)
         return names
 
@@ -503,7 +533,10 @@ class _CtypesPackageQueryApi:  # pragma: no cover - Windows only source
                 address = pointers[index]
                 if not address:
                     return None
-                ids.append(ctypes.wstring_at(address))
+                entry = _string_from_buffer(buffer, int(address))
+                if not entry:
+                    return None  # outside buffer or unterminated: malformed
+                ids.append(entry)
             return ids
         finally:
             kernel32.ClosePackageInfo(reference)

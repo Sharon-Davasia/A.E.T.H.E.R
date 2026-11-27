@@ -680,9 +680,21 @@ class Phase3Composition:
                     return False
                 return now_fn() < authorization.expires_at
 
+            def _execution_available() -> bool:
+                current = _gate_holder.get("composition")
+                if current is not None and current._revoked:
+                    return False
+                return now_fn() < authorization.expires_at
+
             _raw_explorer_folder = providers.explorer_folder
+            # F3: foreground Explorer collection only inside one
+            # explicit owner-initiated project-context check. Generic
+            # metadata state refreshes never consult the provider.
+            _context_gate: dict[str, bool] = {"armed": False}
 
             def _explorer_folder() -> _Path | None:
+                if not _context_gate["armed"]:
+                    return None
                 if _raw_explorer_folder is None or not _collection_permitted():
                     return None
                 raw = _raw_explorer_folder()
@@ -693,6 +705,7 @@ class Phase3Composition:
             project_registry = ResourceRegistry(
                 windows_semantics=True,
                 registration_boundary=_Path(str(authorization.workspace_path)),
+                registration_boundary_identity=authorization.workspace_identity,
             )
             project_detector = ProjectDetector(
                 registry=project_registry,
@@ -740,6 +753,9 @@ class Phase3Composition:
             surface.privacy_authority = privacy
             surface.collection_permitted = _collection_permitted
             surface.project_registry = project_registry
+            surface.execution_available = _execution_available
+            surface.project_context_begin = lambda: _context_gate.__setitem__("armed", True)
+            surface.project_context_end = lambda: _context_gate.__setitem__("armed", False)
             surface.clock = now_fn
             surface.planner = planner
             surface.launch_coordinator = coordinator
@@ -1093,6 +1109,12 @@ class Phase3Composition:
             surface.activation_service = activation_service
             surface.dialog_guard = dialog_guard
             surface.collection_permitted = _collection_permitted
+
+            def _sim_execution_available() -> bool:
+                current = composition_holder.get("composition")
+                return current is None or not current._revoked
+
+            surface.execution_available = _sim_execution_available
             surface.clock = now_fn
             composition = cls(
                 mode=Phase3Mode.SIMULATED,

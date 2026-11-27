@@ -220,6 +220,11 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - owner CLI
         )
         return 2
     workspace_path.mkdir(mode=0o700)
+    # Bind the created workspace's filesystem identity into the
+    # artifact: later substitution or identity drift is refused at
+    # startup and at registration.
+    workspace_metadata = workspace_path.stat()
+    artifact["workspace_identity"] = [workspace_metadata.st_dev, workspace_metadata.st_ino]
     with artifact_path.open("x", encoding="utf-8") as handle:
         handle.write(json.dumps(artifact, indent=2, sort_keys=True))
     print(f"authorization artifact: {artifact_path}")

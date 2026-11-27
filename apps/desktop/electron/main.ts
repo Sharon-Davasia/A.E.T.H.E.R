@@ -274,6 +274,10 @@ function registerIpc(): void {
     if (typeof raw !== 'string' || raw.length > 256) throw new Error('malformed phase3 query');
     return phase3Provider.searchApps(raw);
   });
+  ipcMain.handle('desktop:phase3-check-project-context', async (event) => {
+    validateInvoke(event);
+    return phase3Provider.checkProjectContext();
+  });
   ipcMain.handle('desktop:phase3-inspect-window', async (event, raw: unknown) => {
     validateInvoke(event);
     if (typeof raw !== 'string' || raw.length > 128) throw new Error('malformed phase3 window identity');

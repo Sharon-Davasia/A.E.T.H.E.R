@@ -117,6 +117,30 @@ def test_package_identity_requires_exact_unambiguous_aumid() -> None:
     )
 
 
+def test_bounded_buffer_string_reads() -> None:
+    """F6: package-query string reads are contained and terminated."""
+    import ctypes
+
+    from aether.adapters.windows.native_launcher import _string_from_buffer
+
+    w = ctypes.sizeof(ctypes.c_wchar)
+    buffer = ctypes.create_unicode_buffer("Synthetic.Notes\x00Other", 24)
+    base = ctypes.addressof(buffer)
+    assert _string_from_buffer(buffer, base) == "Synthetic.Notes"
+    assert _string_from_buffer(buffer, base + 16 * w) == "Other"
+    # Pointer outside the buffer (either side) is never dereferenced.
+    assert _string_from_buffer(buffer, base - w) is None
+    assert _string_from_buffer(buffer, base + 24 * w) is None
+    assert _string_from_buffer(buffer, base + 10_000 * w) is None
+    # Misaligned pointer: malformed.
+    assert _string_from_buffer(buffer, base + 1) is None
+    # Unterminated content: malformed, never an unbounded read.
+    unterminated = ctypes.create_unicode_buffer(4)
+    pattern = (b"A" + b"\x00" * (w - 1)) * 4
+    ctypes.memmove(unterminated, pattern, len(pattern))
+    assert _string_from_buffer(unterminated, ctypes.addressof(unterminated)) is None
+
+
 def test_start_menu_roots_never_use_relative_pseudo_roots() -> None:
     no_folder = lambda _kind: None  # noqa: E731
     assert _start_menu_roots({}, no_folder) == []
@@ -224,6 +248,9 @@ def _start_packaged(tmp_path: Path, *, package_query):  # type: ignore[no-untype
         )
     )
     storage = tmp_path / "aether-phase3-acceptance-packaged"
+    _workspace = tmp_path / "aether-phase3-workspace-packaged"
+    _workspace.mkdir(parents=True, exist_ok=True)
+    _ws_stat = _workspace.stat()
     authz = ControlledAcceptanceAuthorization(
         approved_commit=COMMIT,
         decision_reference="owner-decision-packaged",
@@ -231,6 +258,7 @@ def _start_packaged(tmp_path: Path, *, package_query):  # type: ignore[no-untype
         storage_id="66666666-6666-4666-8666-666666666666",
         storage_path=str(storage),
         workspace_path=str(tmp_path / "aether-phase3-workspace-packaged"),
+        workspace_identity=(_ws_stat.st_dev, _ws_stat.st_ino),
         authorized_app_ids=frozenset({packaged_id, legacy_id, fixture_id}),
         capability_allowlist=frozenset(
             {"app.launch", "window.activate", "uia.inspect_snapshot", "uia.inspect_element"}

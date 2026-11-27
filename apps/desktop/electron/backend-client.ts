@@ -522,6 +522,11 @@ export class BackendClient {
     return this.request(session, 'phase3.search_apps', { query }, ['phase3.apps', 'phase3.error']);
   }
 
+  async phase3CheckProjectContext(): Promise<unknown> {
+    const session = this.reviewSession();
+    return this.request(session, 'phase3.check_project_context', {}, ['phase3.project', 'phase3.error']);
+  }
+
   async phase3InspectWindow(windowId: string): Promise<unknown> {
     if (typeof windowId !== 'string' || windowId.length > 128) throw backendError('malformed window identity');
     const session = this.reviewSession();

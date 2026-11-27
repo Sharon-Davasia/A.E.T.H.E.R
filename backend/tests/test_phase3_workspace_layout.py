@@ -50,7 +50,9 @@ class _CountingExplorer:
         return self.value
 
 
-def _authz(tmp_path: Path, *, expires_at: datetime) -> ControlledAcceptanceAuthorization:
+def _authz(
+    tmp_path: Path, *, expires_at: datetime, create_workspace: bool = True
+) -> ControlledAcceptanceAuthorization:
     seams_token_holder = build_fake_seams()
     fixture_id = registration_app_id(
         display_name="AETHER Fixture",
@@ -62,6 +64,12 @@ def _authz(tmp_path: Path, *, expires_at: datetime) -> ControlledAcceptanceAutho
             SimpleNamespace(location_digest=location_identity_digest(fixture_executable()))
         )
     )
+    workspace = tmp_path / "aether-phase3-workspace-layout"
+    identity: tuple[int, int] | None = None
+    if create_workspace:
+        workspace.mkdir(parents=True, exist_ok=True)
+        ws_stat = workspace.stat()
+        identity = (ws_stat.st_dev, ws_stat.st_ino)
     return ControlledAcceptanceAuthorization(
         approved_commit=COMMIT,
         decision_reference="owner-decision-layout",
@@ -69,6 +77,7 @@ def _authz(tmp_path: Path, *, expires_at: datetime) -> ControlledAcceptanceAutho
         storage_id="77777777-7777-4777-8777-777777777777",
         storage_path=str(tmp_path / "aether-phase3-acceptance-layout"),
         workspace_path=str(tmp_path / "aether-phase3-workspace-layout"),
+        workspace_identity=identity,
         authorized_app_ids=frozenset({fixture_id}),
         capability_allowlist=frozenset({"app.launch", "uia.invoke_fixture"}),
         session_id="session-layout",
@@ -93,20 +102,22 @@ def _open_store(authz: ControlledAcceptanceAuthorization, *, now: datetime):  # 
     )
 
 
-def test_campaign_layout_validation() -> None:
-    storage = "/owner/aether-phase3-acceptance-c1"
-    workspace = "/owner/aether-phase3-workspace-c1"
+def test_campaign_layout_validation(tmp_path: Path) -> None:
+    # Platform-native absolute paths only (F1): constructed from
+    # pytest's tmp_path so the cases hold under Windows semantics.
+    storage = str(tmp_path / "aether-phase3-acceptance-c1")
+    workspace = str(tmp_path / "aether-phase3-workspace-c1")
     assert campaign_layout_error(storage, workspace) is None
     assert campaign_layout_error(storage, "") == "synthetic_workspace_missing"
     assert campaign_layout_error(storage, storage) == "campaign_layout_paths_identical"
     # Workspace inside database storage (the old documented layout).
     assert (
-        campaign_layout_error(storage, f"{storage}/aether-phase3-workspace-c1")
+        campaign_layout_error(storage, str(Path(storage) / "aether-phase3-workspace-c1"))
         == "campaign_layout_not_sibling"
     )
-    assert campaign_layout_error(storage, "/other/aether-phase3-workspace-c1") == (
-        "campaign_layout_not_sibling"
-    )
+    assert campaign_layout_error(
+        storage, str(tmp_path / "other" / "aether-phase3-workspace-c1")
+    ) == ("campaign_layout_not_sibling")
 
 
 def test_authorization_without_workspace_is_denied(tmp_path: Path) -> None:
@@ -166,8 +177,14 @@ def test_workspace_lifecycle_and_storage_reopen(tmp_path: Path) -> None:
         registered = bridge.register_project({"alias": "project", "path": str(project)})
         assert registered["status"] == "ready", registered
 
+        # Generic refresh: registered root only, no Explorer use.
         state = bridge.get_state({})
-        candidates = state["projects"]
+        assert explorer.calls == 0
+        assert [c["evidenceSource"] for c in state["projects"]] == ["registered_project"]
+        # Explicit check: Explorer consulted once, scope-validated.
+        check = bridge.check_project_context({})
+        assert explorer.calls == 1
+        candidates = check["projects"]
         assert len(candidates) == 1
         assert candidates[0]["evidenceSource"] == "explorer_registered"
         assert candidates[0]["available"] is True
@@ -200,7 +217,7 @@ def test_workspace_lifecycle_and_storage_reopen(tmp_path: Path) -> None:
     reopened.close()
 
 
-def test_artifact_layout_uses_sibling_workspace() -> None:
+def test_artifact_layout_uses_sibling_workspace(tmp_path: Path) -> None:
     from aether.core.apps.authorization_artifact import build_authorization
     from aether.core.apps.launch_authority import IntegrityEvidence
 
@@ -221,7 +238,7 @@ def test_artifact_layout_uses_sibling_workspace() -> None:
         decision_reference="d",
         campaign_id="c9",
         app_display_names=[],
-        acceptance_root=Path("/owner-root"),
+        acceptance_root=tmp_path,
         now=now,
         discovered_records=[],
         fixture_executable="C:\\Fixture\\AETHERFixture.exe",
@@ -268,9 +285,12 @@ def test_expiry_enforced_synchronously_with_deterministic_clock(tmp_path: Path) 
         bridge = comp.bridge
         bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
         state = bridge.get_state({})
-        assert explorer.calls >= 1
-        assert state["projects"] != []
+        assert explorer.calls == 0  # refresh alone never collects (F3)
         assert state["capabilities"]["app.launch"] is True
+        check = bridge.check_project_context({})
+        assert check["projects"] != []
+        assert explorer.calls == 1
+        assert state["nativeAvailable"] is True
         calls = explorer.calls
 
         # Cross expiry on the deterministic clock only (the real
@@ -280,10 +300,14 @@ def test_expiry_enforced_synchronously_with_deterministic_clock(tmp_path: Path) 
         # A post-expiry privacy update must not restart observation
         # or present expired capabilities as available.
         bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+        assert bridge.check_project_context({})["status"] == "unavailable"
         state = bridge.get_state({})
         assert state["projects"] == []
         assert explorer.calls == calls
         assert all(value is False for value in state["capabilities"].values())
+        # Expired compositions never present native execution as
+        # available (F4), regardless of privacy presentation.
+        assert state["nativeAvailable"] is False
         observer = comp.observer_service
         assert observer is None or getattr(observer, "running", False) is False
         comp.begin_observation()  # direct resumption attempt also denied
@@ -323,3 +347,103 @@ def test_direct_reference_resolution_generation_change(tmp_path: Path) -> None:
     assert resolution.candidate is None
     assert resolution.clarification_required
     assert resolution.reason == "project_evidence_invalidated"
+
+
+def test_workspace_directory_validation_failures(tmp_path: Path) -> None:
+    """Substituted link, missing dir, identity drift and wrong
+    campaign identity all refuse controlled validation (F2)."""
+    import shutil
+
+    from aether.core.apps.acceptance_startup import workspace_directory_error
+
+    now = datetime.now(UTC)
+    authz = _authz(tmp_path, expires_at=now + timedelta(hours=2))
+    storage = Path(authz.storage_path)
+    workspace = Path(authz.workspace_path)
+    assert workspace_directory_error(str(storage), str(workspace), authz.workspace_identity) is None
+
+    def _validate(a):  # type: ignore[no-untyped-def]
+        a.validate(current_commit=COMMIT, now=now, storage_marker=None)
+
+    # Missing workspace directory.
+    (tmp_path / "case-missing").mkdir(exist_ok=True)
+    missing = _authz(
+        tmp_path / "case-missing",
+        expires_at=now + timedelta(hours=2),
+        create_workspace=False,
+    )
+    assert (
+        workspace_directory_error(missing.storage_path, missing.workspace_path, (1, 2))
+        == "synthetic_workspace_missing"
+    )
+
+    # Wrong campaign identity (identity bound to another directory).
+    other = tmp_path / "other-dir"
+    other.mkdir()
+    other_stat = other.stat()
+    assert (
+        workspace_directory_error(
+            str(storage), str(workspace), (other_stat.st_dev, other_stat.st_ino)
+        )
+        == "synthetic_workspace_identity_mismatch"
+    )
+    with pytest.raises(StartupDenied, match="synthetic_workspace_identity_mismatch"):
+        import dataclasses
+
+        _validate(
+            dataclasses.replace(authz, workspace_identity=(other_stat.st_dev, other_stat.st_ino))
+        )
+
+    # Substituted workspace symlink (no privilege needed on POSIX;
+    # skipped where symlink creation is not permitted).
+    moved = tmp_path / "workspace-real"
+    shutil.copytree(workspace, moved)
+    shutil.rmtree(workspace)
+    try:
+        workspace.symlink_to(moved, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlink creation unavailable")
+    assert (
+        workspace_directory_error(str(storage), str(workspace), authz.workspace_identity)
+        == "synthetic_workspace_reparse"
+    )
+    with pytest.raises(StartupDenied, match="synthetic_workspace_reparse"):
+        _validate(authz)
+
+
+def test_registry_boundary_drift_refuses_registration(tmp_path: Path) -> None:
+    """Registration revalidates the boundary directory (F2): identity
+    drift and boundary substitution refuse, and roots outside the
+    ORIGINAL workspace never register."""
+    import shutil
+
+    from aether.core.resources.registry import ResourceRegistry, ResourceRegistryError
+
+    workspace = tmp_path / "aether-phase3-workspace-drift"
+    project = workspace / "synthetic-project"
+    project.mkdir(parents=True)
+    ws_stat = workspace.stat()
+    registry = ResourceRegistry(
+        registration_boundary=workspace,
+        registration_boundary_identity=(ws_stat.st_dev, ws_stat.st_ino),
+    )
+    root = registry.register_root(
+        "project", project, allowed_capabilities=frozenset({"fs.inspect_file"})
+    )
+    assert root.canonical_root == project.resolve()
+
+    # Identity drift: same path, different directory inode. The
+    # original directory is kept alive under another name so its
+    # inode cannot be recycled by the replacement.
+    workspace.rename(tmp_path / "workspace-original")
+    workspace.mkdir()
+    project.mkdir()
+    with pytest.raises(ResourceRegistryError, match="registration_boundary_identity_mismatch"):
+        registry.register_root(
+            "again", project, allowed_capabilities=frozenset({"fs.inspect_file"})
+        )
+
+    # Missing boundary.
+    shutil.rmtree(workspace)
+    with pytest.raises(ResourceRegistryError, match="registration_boundary_invalid"):
+        registry.register_root("gone", project, allowed_capabilities=frozenset({"fs.inspect_file"}))

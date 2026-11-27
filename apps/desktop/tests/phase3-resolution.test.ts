@@ -88,3 +88,20 @@ test('provider passes the resolver outcome through untouched', async () => {
   // Explicit selection remains an exact app id, chosen by the user.
   assert.equal(search.results[1]?.appId, APP_B.appId);
 });
+
+test('provider project-context check parses bounded candidates', async () => {
+  const backend = {
+    phase3CheckProjectContext: async () => ({
+      status: 'ready',
+      projects: [{
+        candidateId: 'project:1', evidenceSource: 'explorer_registered',
+        strength: 0.8, available: true, limitations: [],
+      }],
+    }),
+  };
+  const provider = createPhase3Provider({ backend: backend as never, confirm: async () => true });
+  const context = await provider.checkProjectContext();
+  assert.equal(context.status, 'ready');
+  assert.equal(context.projects[0]?.evidenceSource, 'explorer_registered');
+  assert.equal(context.projects[0]?.available, true);
+});

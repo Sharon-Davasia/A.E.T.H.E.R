@@ -116,6 +116,15 @@ class ProjectDetector:
         candidates: dict[str, ProjectCandidate] = {}
         roots = list(self.registry.known_roots())  # type: ignore[attr-defined]
         explorer = self.explorer_folder() if self.explorer_folder else None
+        if (
+            explorer is not None
+            and self.explorer_scope is not None
+            and not self.explorer_scope(explorer)
+        ):
+            # Scope validation BEFORE any matching use (F3): an
+            # out-of-scope Explorer path is neither retained nor
+            # published, and never influences project matching.
+            explorer = None
         focus_alias = self.recent_focus_root() if self.recent_focus_root else None
         for root in roots:
             # G06: the root's canonical resource identity is issued by
@@ -156,15 +165,6 @@ class ProjectDetector:
                 ),
                 manifests=manifests,
             )
-        if (
-            explorer is not None
-            and self.explorer_scope is not None
-            and not self.explorer_scope(explorer)
-        ):
-            # Outside the authorized project-context scope: the path
-            # is not published at all. General metadata observation
-            # elsewhere never becomes workspace-context collection.
-            explorer = None
         if explorer is not None and not any(
             _same_path(root.canonical_root, explorer) for root in roots
         ):

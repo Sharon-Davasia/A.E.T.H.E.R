@@ -55,6 +55,9 @@ def _start(tmp_path: Path, explorer: object) -> Phase3Composition:
         )
     )
     storage = tmp_path / "aether-phase3-acceptance-gates"
+    _workspace = tmp_path / "aether-phase3-workspace-gates"
+    _workspace.mkdir(parents=True, exist_ok=True)
+    _ws_stat = _workspace.stat()
     authz = ControlledAcceptanceAuthorization(
         approved_commit=COMMIT,
         decision_reference="owner-decision-gates",
@@ -62,6 +65,7 @@ def _start(tmp_path: Path, explorer: object) -> Phase3Composition:
         storage_id="44444444-4444-4444-8444-444444444444",
         storage_path=str(storage),
         workspace_path=str(tmp_path / "aether-phase3-workspace-gates"),
+        workspace_identity=(_ws_stat.st_dev, _ws_stat.st_ino),
         authorized_app_ids=frozenset({fixture_id}),
         capability_allowlist=frozenset({"app.launch", "uia.invoke_fixture"}),
         session_id="session-gates",
@@ -109,36 +113,48 @@ def test_explorer_collection_requires_opt_in_and_stops_on_pause_optout_revoke(
         assert state["projects"] == []
         assert explorer.calls == 0
 
+        # F3: even after opt-in, a generic metadata state refresh
+        # does NOT retrieve the foreground Explorer folder.
         _opt_in(comp)
         state = comp.bridge.get_state({})
-        assert explorer.calls >= 1
-        # The Explorer folder is outside the authorized synthetic
-        # workspace: collection ran under opt-in, but the arbitrary
-        # path is not published as project evidence (R3 scope).
+        assert explorer.calls == 0
         assert state["projects"] == []
 
-        # Pause: collection stops synchronously.
-        calls_after_opt_in = explorer.calls
+        # Only the explicit owner-initiated project-context check
+        # consults the provider (exactly once per check). The path
+        # is outside the authorized synthetic workspace: collected
+        # for comparison, but neither retained nor published.
+        check = comp.bridge.check_project_context({})
+        assert check["status"] == "ready"
+        assert explorer.calls == 1
+        assert check["projects"] == []
+        # Disarmed afterwards: refreshes collect nothing again.
+        comp.bridge.get_state({})
+        assert explorer.calls == 1
+
+        # Pause: the check is refused and the provider untouched.
         comp.bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": True})
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
         assert comp.bridge.get_state({})["projects"] == []
-        assert explorer.calls == calls_after_opt_in
+        assert explorer.calls == 1
 
-        # Opt-out: collection stops.
+        # Opt-out: same refusal, synchronously.
         comp.bridge.set_privacy({"optedIn": False, "mode": "off", "paused": False})
-        assert comp.bridge.get_state({})["projects"] == []
-        assert explorer.calls == calls_after_opt_in
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
+        assert explorer.calls == 1
 
-        # Revocation: a later privacy update cannot reactivate
-        # collection in a revoked composition.
+        # Revocation: a later privacy update cannot reactivate it.
         comp.revoke("test_revocation")
         _opt_in(comp)
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
         assert comp.bridge.get_state({})["projects"] == []
-        assert explorer.calls == calls_after_opt_in
+        assert explorer.calls == 1
     finally:
         assert comp.shutdown() is True
     # After shutdown the provider is likewise never consulted again.
+    assert comp.bridge.check_project_context({})["status"] == "unavailable"
     assert comp.bridge.get_state({})["projects"] == []
-    assert explorer.calls == calls_after_opt_in
+    assert explorer.calls == 1
 
 
 def test_detector_gate_covers_reference_resolution() -> None:
@@ -181,9 +197,17 @@ def test_registration_detection_and_explorer_string_normalization(tmp_path: Path
         registered = comp.bridge.register_project({"alias": "project", "path": str(project)})
         assert registered["status"] == "ready", registered
         root_id = registered["rootId"]
+        # Generic refresh: registered-root evidence only, and the
+        # Explorer provider was never consulted (F3).
         state = comp.bridge.get_state({})
-        assert explorer.calls >= 1
-        candidates = state["projects"]
+        assert explorer.calls == 0
+        assert [c["evidenceSource"] for c in state["projects"]] == ["registered_project"]
+
+        # Explicit project-context check: Explorer is consulted once
+        # and the registered root is upgraded with Explorer evidence.
+        check = comp.bridge.check_project_context({})
+        assert explorer.calls == 1
+        candidates = check["projects"]
         assert len(candidates) == 1
         assert candidates[0]["evidenceSource"] == "explorer_registered"
         assert candidates[0]["available"] is True
@@ -218,14 +242,18 @@ def test_registration_boundary_and_unregistered_explorer(tmp_path: Path) -> None
         assert refused["status"] == "unavailable"
         assert refused["reason"] == "root_outside_activation_boundary"
 
-        # An Explorer folder outside the authorized workspace is not
-        # published as project evidence at all (R3 scope).
+        # An Explorer folder outside the authorized workspace is
+        # not published as project evidence at all (F3 scope), even
+        # by the explicit check.
+        assert comp.bridge.check_project_context({})["projects"] == []
         assert comp.bridge.get_state({})["projects"] == []
 
-        # Inside the workspace but unregistered: reported as a
-        # discovered candidate with no identity and no permission.
+        # Inside the workspace but unregistered: the explicit check
+        # reports a discovered candidate with no identity and no
+        # permission. Generic refresh still shows nothing.
         explorer.value = tmp_path / "aether-phase3-workspace-gates" / "unregistered-project"  # type: ignore[attr-defined]
-        state = comp.bridge.get_state({})
+        assert comp.bridge.get_state({})["projects"] == []
+        state = comp.bridge.check_project_context({})
         assert len(state["projects"]) == 1
         candidate = state["projects"][0]
         assert candidate["evidenceSource"] == "explorer_discovered"
@@ -287,6 +315,9 @@ def test_collection_denied_after_authorization_expiry(tmp_path: Path) -> None:
         )
     )
     storage = tmp_path / "aether-phase3-acceptance-gates"
+    _workspace = tmp_path / "aether-phase3-workspace-gates"
+    _workspace.mkdir(parents=True, exist_ok=True)
+    _ws_stat = _workspace.stat()
     authz = ControlledAcceptanceAuthorization(
         approved_commit=COMMIT,
         decision_reference="owner-decision-gates",
@@ -294,6 +325,7 @@ def test_collection_denied_after_authorization_expiry(tmp_path: Path) -> None:
         storage_id="55555555-5555-4555-8555-555555555555",
         storage_path=str(storage),
         workspace_path=str(tmp_path / "aether-phase3-workspace-gates"),
+        workspace_identity=(_ws_stat.st_dev, _ws_stat.st_ino),
         authorized_app_ids=frozenset({fixture_id}),
         capability_allowlist=frozenset({"app.launch"}),
         session_id="session-gates",
@@ -326,10 +358,11 @@ def test_collection_denied_after_authorization_expiry(tmp_path: Path) -> None:
     )
     try:
         _opt_in(comp)
-        assert comp.bridge.get_state({})["projects"] != []
+        assert comp.bridge.check_project_context({})["projects"] != []
         calls = explorer.calls
         _time.sleep(1.2)  # past expiry (timer + synchronous predicate agree)
         _opt_in(comp)  # attempted reactivation after expiry
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
         assert comp.bridge.get_state({})["projects"] == []
         assert explorer.calls == calls
     finally:

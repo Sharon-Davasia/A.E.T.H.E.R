@@ -106,7 +106,8 @@ if ((Get-Item $BaseTemp).Attributes -match "ReparsePoint") { throw "basetemp mus
 & $Python -m ruff check backend tools
 & $Python -m ruff format --check backend tools
 cd backend; & $Python -m mypy; cd ..
-cd apps\desktop; $env:AETHER_DEV_PYTHON = $Python; & $Npm run check; & $Npm test; cd ..\..
+cd apps\desktop; $env:AETHER_DEV_PYTHON = $Python; & $Npm run check; cd ..\..
+# (`npm run check` already includes the desktop tests - no duplicate run.)
 # Fixture: verify the preserved build by hash; do NOT rebuild.
 (Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256).Hash
 # must equal E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D
@@ -203,16 +204,20 @@ $NodeDir = Join-Path $EvidenceRoot "phase3-final-desktop-a26d2da4a9c54f3cad582ec
 #    must equal E0F51AAA58372DB0EB54CF4D29F750D0D49FCA9BEDB4226D0EAE5963497F569D
 
 # 5-7. Authorization artifact + isolated storage (one tool run).
-#     First verify the campaign root and freshness (nothing from an
-#     earlier campaign is overwritten or reused):
-if ((Get-Item D:\AETHER-acceptance).Attributes -match "ReparsePoint") { throw "acceptance root must not be reparse" }
+#     Campaign root: a FRESH, exclusively created, non-reparse
+#     subdirectory inside the existing owner evidence root only
+#     (nothing historical is overwritten, renamed or reused):
+$CampaignRoot = Join-Path $EvidenceRoot "phase3-campaign-$Stamp"
+if (Test-Path $CampaignRoot) { throw "campaign directory already exists; choose a fresh stamp" }
+New-Item -ItemType Directory -Path $CampaignRoot | Out-Null
+if ((Get-Item $CampaignRoot).Attributes -match "ReparsePoint") { throw "campaign directory must not be reparse" }
 #     The tool discovers the approved apps, derives the fixture
 #     identity and token, generates session/epoch/storage identity,
 #     initializes the isolated v3 database directory
 #     aether-phase3-acceptance-<campaign> FIRST, then creates the
 #     SEPARATE sibling synthetic workspace
 #     aether-phase3-workspace-<campaign>, and only then writes
-#     D:\AETHER-acceptance\authorization-<campaign>.json
+#     $CampaignRoot\authorization-<campaign>.json
 #     (exclusively), so a failed run leaves no usable-looking
 #     authorization. The synthetic project is created by the owner
 #     inside the workspace (never inside the database directory).
@@ -224,18 +229,18 @@ $env:PATH = "C:\Program Files\Git\cmd;$NodeDir;$env:PATH"
 #     requested name as ambiguous, re-run with exact --app-ids
 #     values instead of names.
 cd backend
-& $Python -m aether.core.apps.authorization_artifact --decision-reference "<owner decision reference>" --campaign campaign-<unique-name> --apps "Notepad,Calculator,File Explorer" --acceptance-root D:\AETHER-acceptance
+& $Python -m aether.core.apps.authorization_artifact --decision-reference "<owner decision reference>" --campaign campaign-<unique-name> --apps "Notepad,Calculator,File Explorer" --acceptance-root $CampaignRoot
 cd ..
 
 # 8. Controlled startup (trusted main selects the controlled entry
 #    point only from this owner-set main-process environment value).
 #    The trusted Git executable is pinned absolutely (the sanitized
 #    backend PATH cannot resolve git by name).
-$env:AETHER_PHASE3_AUTHORIZATION = "D:\AETHER-acceptance\authorization-<campaign>.json"   # the exact file written in step 5-7
+$env:AETHER_PHASE3_AUTHORIZATION = Join-Path $CampaignRoot "authorization-<campaign>.json"   # the exact file written in step 5-7
 $env:AETHER_GIT_EXECUTABLE = "C:\Program Files\Git\cmd\git.exe"
 if (-not (Test-Path $env:AETHER_GIT_EXECUTABLE)) { throw "trusted Git executable not found; stop and report" }
 $env:AETHER_DEV_PYTHON = $Python
-$env:PATH = "$NodeDir;$env:PATH"   # portable Node resolves for Electron/backend subprocesses
+$env:PATH = "D:\A.E.T.H.E.R\backend\.venv\Scripts;$NodeDir;$env:PATH"   # pinned venv + portable Node for all subprocesses
 cd apps\desktop; & $Npm run start   # builds the bundles, then launches Electron
 # Expected indication: Phase 3 surface reports nativeAvailable=true,
 # privacy mode "off" until explicit metadata_only opt-in in the UI.

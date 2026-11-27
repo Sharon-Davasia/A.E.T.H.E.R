@@ -7,13 +7,17 @@
  * confirmation; this surface only requests it.
  */
 import React from 'react';
-import type {
-  Phase3AppSearch, Phase3Outcome, Phase3Prepared, Phase3Snapshot, Phase3State, Phase3Window,
+import {
+  effectiveSelectedAppId, phase3AuthorizationKey,
+  type Phase3AppSearch, type Phase3Outcome, type Phase3Prepared, type Phase3ProjectCandidate,
+  type Phase3Selection, type Phase3Snapshot, type Phase3State, type Phase3Window,
 } from '../shared/phase3';
 
 interface Phase3SurfaceProps {
   state: Phase3State | null;
   search: Phase3AppSearch | null;
+  searchSerial: number;
+  projectContext: Phase3ProjectCandidate[] | null;
   windows: Phase3Window[];
   snapshot: Phase3Snapshot | null;
   prepared: Phase3Prepared | null;
@@ -23,6 +27,7 @@ interface Phase3SurfaceProps {
   onRefresh: () => void;
   onPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }) => void;
   onSearchApps: (query: string) => void;
+  onCheckProjectContext: () => void;
   onPrepareLaunch: (appId: string) => void;
   onRegisterProject: () => void;
   onApproveOperation: (effect: string) => void;
@@ -44,22 +49,17 @@ export function Phase3Surface(props: Phase3SurfaceProps): React.JSX.Element {
   // The resolver outcome is authoritative and arrives typed over
   // IPC (R4); ambiguity is never re-derived from result counts.
   const resolution = search?.resolution;
-  // Selection invalidation (derived, not stored): a selection is
-  // effective only while its supporting search result still
-  // contains the exact app and the authorization (privacy/native)
-  // state it was made under is unchanged. A new search result or an
-  // authorization change therefore drops stale picks automatically.
-  const authorizationKey = state === null
-    ? 'none'
-    : `${state.nativeAvailable}:${state.privacy.optedIn}:${state.privacy.mode}:${state.privacy.paused}`;
-  const [selection, setSelection] = React.useState<{ appId: string; key: string }>({
-    appId: '',
-    key: '',
-  });
-  const appId = selection.key === authorizationKey
-    && apps.some((a) => a.appId === selection.appId)
-    ? selection.appId
-    : '';
+  // Selection validity is the pure, tested helper (F4): bound to
+  // this exact search completion (serial) and authorization state
+  // (incl. privacy generation). Every new search, and any privacy
+  // generation change, invalidates the prior pick permanently.
+  const authorizationKey = phase3AuthorizationKey(state);
+  const [selection, setSelection] = React.useState<Phase3Selection | null>(null);
+  const appId = effectiveSelectedAppId(selection, search, props.searchSerial, authorizationKey);
+  // Launch readiness is a third, distinct fact from discovered
+  // availability and launch-method support: it follows the live
+  // native/authorization state, and preparation re-verifies it.
+  const launchReady = state !== null && state.nativeAvailable && state.capabilities['app.launch'] === true;
   return (
     <section className="status" aria-label="Phase 3 verification surface">
       <div>
@@ -125,10 +125,11 @@ export function Phase3Surface(props: Phase3SurfaceProps): React.JSX.Element {
               {apps.map((a) => (
                 <li key={a.appId}>
                   <button type="button" className="ping-button" disabled={busy || !a.available || !a.launchSupported}
-                    onClick={() => setSelection({ appId: a.appId, key: authorizationKey })}>
+                    onClick={() => setSelection({ appId: a.appId, searchSerial: props.searchSerial, authorizationKey })}>
                     {a.appId === appId ? '✓ ' : ''}{a.displayName}
                     {a.available ? '' : ' (discovered record stale)'}
                     {a.launchSupported ? '' : ' (launch method unsupported)'}
+                    {a.launchSupported && !launchReady ? ' (launch not currently ready)' : ''}
                   </button>
                 </li>
               ))}
@@ -214,12 +215,20 @@ export function Phase3Surface(props: Phase3SurfaceProps): React.JSX.Element {
             <div>
               <button type="button" className="ping-button" disabled={busy}
                 onClick={props.onRegisterProject}>Register synthetic project folder…</button>
+              <button type="button" className="ping-button" disabled={busy}
+                onClick={props.onCheckProjectContext}>Check current project context</button>
             </div>
-            {state.projects.length > 0 && (
+            <p>
+              The check is explicit and one-shot: it reads the foreground Explorer
+              folder once and compares it only against the registered synthetic
+              workspace. State refreshes never read it, and out-of-scope paths
+              are neither retained nor shown.
+            </p>
+            {(props.projectContext ?? state.projects).length > 0 && (
               <>
                 <h3>Current project</h3>
                 <ul>
-                  {state.projects.map((c) => (
+                  {(props.projectContext ?? state.projects).map((c) => (
                     <li key={c.candidateId}>
                       {c.evidenceSource} (strength {c.strength.toFixed(2)})
                       {c.available ? '' : ` — unavailable: ${c.limitations.join(', ')}`}

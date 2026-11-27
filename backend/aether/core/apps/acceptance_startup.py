@@ -24,6 +24,63 @@ from pathlib import Path
 WORKSPACE_PREFIX = "aether-phase3-workspace-"
 
 
+def workspace_directory_error(
+    storage_path: str,
+    workspace_path: str,
+    expected_identity: tuple[int, int] | None,
+) -> str | None:
+    """Validate the ACTUAL synthetic workspace directory (F2).
+
+    Lexical layout is not enough: a substituted workspace symlink or
+    junction would silently move the authorized boundary. The real
+    directory must exist, be canonical, sit on a fixed local volume,
+    have no reparse component, not be a protected location, and its
+    filesystem identity must match the identity bound at creation.
+    """
+    layout = campaign_layout_error(storage_path, workspace_path)
+    if layout is not None:
+        return layout
+    from aether.core.resources.path_safety import (
+        PathSafetyError,
+        VolumeKind,
+        inspect_volume,
+        is_protected_path,
+        reject_reparse_components,
+    )
+
+    workspace = Path(workspace_path)
+    if workspace.is_symlink():
+        return "synthetic_workspace_reparse"
+    if not workspace.exists():
+        return "synthetic_workspace_missing"
+    if not workspace.is_dir():
+        return "synthetic_workspace_not_directory"
+    try:
+        reject_reparse_components(workspace)
+    except PathSafetyError:
+        return "synthetic_workspace_reparse"
+    if Path(os.path.abspath(workspace)) != workspace or workspace.resolve() != workspace:
+        return "synthetic_workspace_not_canonical"
+    try:
+        volume = inspect_volume(workspace)
+    except Exception:
+        return "synthetic_workspace_volume_unavailable"
+    if volume.kind is not VolumeKind.FIXED:
+        return "synthetic_workspace_volume_not_fixed"
+    if is_protected_path(workspace):
+        return "synthetic_workspace_protected"
+    try:
+        metadata = workspace.stat()
+    except OSError:
+        return "synthetic_workspace_identity_unavailable"
+    identity = (metadata.st_dev, metadata.st_ino)
+    if expected_identity is None:
+        return "synthetic_workspace_identity_missing"
+    if tuple(expected_identity) != identity:
+        return "synthetic_workspace_identity_mismatch"
+    return None
+
+
 def campaign_layout_error(storage_path: str, workspace_path: str) -> str | None:
     """Validate the campaign directory layout (R2).
 
@@ -90,6 +147,10 @@ class ControlledAcceptanceAuthorization:
     # acceptance database directory; project registration binds here,
     # never inside database storage).
     workspace_path: str = ""
+    # Filesystem identity (st_dev, st_ino) of the workspace directory
+    # as created by the authorization tool; substitution or identity
+    # drift is refused at startup and registration.
+    workspace_identity: tuple[int, int] | None = None
 
     @classmethod
     def load(cls, path: Path) -> ControlledAcceptanceAuthorization:
@@ -121,6 +182,12 @@ class ControlledAcceptanceAuthorization:
             fixture_app_id=str(raw.get("fixture_app_id", "")),
             fixture_identity_token=str(raw.get("fixture_identity_token", "")),
             workspace_path=str(raw.get("workspace_path", "")),
+            workspace_identity=(
+                (int(raw_identity[0]), int(raw_identity[1]))
+                if isinstance(raw_identity := raw.get("workspace_identity"), (list, tuple))
+                and len(raw_identity) == 2
+                else None
+            ),
         )
 
     def validate(
@@ -143,9 +210,11 @@ class ControlledAcceptanceAuthorization:
             raise StartupDenied("authorization_lifetime_exceeds_maximum")
         if self.privacy_mode != REQUIRED_PRIVACY_MODE:
             raise StartupDenied("privacy_mode_not_approved")
-        layout_error = campaign_layout_error(self.storage_path, self.workspace_path)
-        if layout_error is not None:
-            raise StartupDenied(layout_error)
+        directory_error = workspace_directory_error(
+            self.storage_path, self.workspace_path, self.workspace_identity
+        )
+        if directory_error is not None:
+            raise StartupDenied(directory_error)
         if not self.capability_allowlist or not self.capability_allowlist <= MAX_CAPABILITIES:
             raise StartupDenied("capability_allowlist_exceeds_build_ceiling")
         if not self.authorized_app_ids:
