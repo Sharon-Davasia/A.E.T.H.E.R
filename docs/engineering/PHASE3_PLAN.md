@@ -226,6 +226,18 @@ authoritative read (no project detection, Explorer, UIA or
 filesystem work), covers retained context plus pending arm and
 completion attempts, fails closed on unknown lifecycle authority,
 and drops late lifecycle readings superseded in flight.
+Native-acceptance blockers N1/N2 (pre-campaign correction):
+trusted-sender IPC is split - read-only state queries admit exact
+WebContents/frame/URL identity before first focus (hidden startup
+window), while privileged/authorizing/effectful channels keep the
+additional focus requirement, with a bounded renderer startup
+recovery; AppsFolder discovery now uses the documented Shell COM
+contracts (ParseDisplayName 3-tuple, SHCONTF_NONFOLDERS |
+SHCONTF_FASTITEMS, SHGDN_NORMAL vs SHGDN_FORPARSING with
+AUMID-shape-gated identities) with staged truthful statuses and a
+read-only diagnostic; the pinned Electron runtime is preflighted
+offline (check-electron-runtime, wired as prestart) so acceptance
+never triggers Electron's lazy binary download.
 
 ## 7. Performance defaults (provisional, unmeasured)
 

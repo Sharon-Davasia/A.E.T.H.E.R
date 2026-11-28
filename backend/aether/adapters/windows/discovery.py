@@ -138,43 +138,110 @@ class StdlibWindowsDiscoveryProviders:
     def apps_folder_entries(self) -> tuple[list[DiscoveredAppCandidate], SourceStatus]:
         """Enumerate AppsFolder/packaged apps via Shell COM (pywin32).
 
-        Read-only metadata: display name and AppUserModelId / parsing
-        path identity. Nothing is activated or executed.
+        Documented contracts used (read-only throughout):
+        - ``IShellFolder.ParseDisplayName(hwnd, bindCtx, name)``
+          returns ``(pidl, eaten, attributes)``; ``"shell:AppsFolder"``
+          is the parsing name of the AppsFolder.
+        - Items are leaf applications: ``EnumObjects`` must be called
+          with ``SHCONTF_NONFOLDERS | SHCONTF_FASTITEMS`` (folder-only
+          flags enumerate nothing useful here).
+        - ``GetDisplayNameOf(pidl, SHGDN_NORMAL)`` is the
+          human-readable display name; ``SHGDN_FORPARSING`` is the
+          canonical AppUserModelId. The two are never conflated:
+          a parsing name that is not AUMID-shaped confers no
+          activation identity.
+        Stage failures report ``unavailable`` naming the stage;
+        per-item failures degrade to ``partial``. Nothing here
+        invents identities or authorizes anything.
         """
         if sys.platform != "win32":  # pragma: no cover - platform guard
             return [], SourceStatus("apps_folder", "unavailable", "requires_windows")
         try:  # pragma: no cover - Windows only
             import pythoncom  # type: ignore[import-untyped]
-            from win32com.shell import shell  # type: ignore[import-untyped]
-
-            pythoncom.CoInitialize()
-            try:
-                desktop = shell.SHGetDesktopFolder()
-                pidl, _eaten, _attrs = desktop.ParseDisplayName(0, None, "shell:AppsFolder", 0)
-                folder = desktop.BindToObject(pidl, None, shell.IID_IShellFolder)
-                candidates: list[DiscoveredAppCandidate] = []
-                enumerator = folder.EnumObjects(0, 0x1 | 0x2 | 0x20)
-                if enumerator is not None:
-                    while len(candidates) < MAX_RECORDS_PER_SOURCE:
-                        items = enumerator.Next(1)
-                        if not items:
-                            break
-                        item_pidl = items[0]
-                        display = folder.GetDisplayNameOf(item_pidl, 0x8000 | 0x1)
-                        identity = folder.GetDisplayNameOf(item_pidl, 0x8000 | 0x2)
-                        candidates.append(
-                            DiscoveredAppCandidate(
-                                display_name=_bound(display),
-                                executable_identity=_bound(identity) or None,
-                                publisher=None,
-                                source="apps_folder",
-                            )
-                        )
-                return candidates, SourceStatus("apps_folder", "ok")
-            finally:
-                pythoncom.CoUninitialize()
+            from win32com.shell import shell, shellcon  # type: ignore[import-untyped]
         except Exception:
             return [], SourceStatus("apps_folder", "unavailable", "shell_com_unavailable")
+        initialized = False
+        try:  # pragma: no cover - Windows only
+            pythoncom.CoInitialize()
+            initialized = True
+            try:
+                desktop = shell.SHGetDesktopFolder()
+                pidl, _eaten, _attrs = desktop.ParseDisplayName(0, None, "shell:AppsFolder")
+                folder = desktop.BindToObject(pidl, None, shell.IID_IShellFolder)
+            except Exception:
+                return [], SourceStatus("apps_folder", "unavailable", "apps_folder_open_failed")
+            try:
+                enumerator = folder.EnumObjects(
+                    0, shellcon.SHCONTF_NONFOLDERS | shellcon.SHCONTF_FASTITEMS
+                )
+            except Exception:
+                return [], SourceStatus("apps_folder", "unavailable", "apps_folder_enum_failed")
+            candidates: list[DiscoveredAppCandidate] = []
+            failures = 0
+            if enumerator is not None:
+                examined = 0
+                # Bounded enumeration: never walk the shell forever.
+                while (
+                    len(candidates) < MAX_RECORDS_PER_SOURCE
+                    and examined <= MAX_RECORDS_PER_SOURCE * 8
+                ):
+                    try:
+                        items = enumerator.Next(1)
+                    except Exception:
+                        failures += 1
+                        break
+                    if not items:
+                        break
+                    examined += 1
+                    try:
+                        item_pidl = items[0]
+                        display = folder.GetDisplayNameOf(item_pidl, shellcon.SHGDN_NORMAL)
+                        parsing = folder.GetDisplayNameOf(item_pidl, shellcon.SHGDN_FORPARSING)
+                    except Exception:
+                        failures += 1
+                        continue
+                    name = _bound(display).strip() if display else ""
+                    if not name:
+                        failures += 1
+                        continue
+                    candidates.append(
+                        DiscoveredAppCandidate(
+                            display_name=name,
+                            executable_identity=_aumid_or_none(parsing),
+                            publisher=None,
+                            source="apps_folder",
+                        )
+                    )
+            if failures:
+                return candidates, SourceStatus(
+                    "apps_folder", "partial", "apps_folder_items_failed"
+                )
+            return candidates, SourceStatus("apps_folder", "ok")
+        except Exception:  # pragma: no cover - Windows only
+            return [], SourceStatus("apps_folder", "unavailable", "shell_com_unavailable")
+        finally:  # pragma: no cover - Windows only
+            if initialized:
+                pythoncom.CoUninitialize()
+
+
+def _aumid_or_none(parsing_name: object) -> str | None:
+    """Canonical activation identity from an AppsFolder parsing name.
+
+    Only AUMID-shaped values (``PackageFamily!AppId``, no path
+    separators, no whitespace padding games) become identities;
+    anything else - including filesystem paths some shell items
+    report for parsing - stays identity-less, never invented.
+    """
+    if not isinstance(parsing_name, str):
+        return None
+    value = parsing_name.strip()
+    family, separator, application = value.partition("!")
+    if not separator or not family or not application or "!" in application:
+        return None
+    if any(char in value for char in ("\\", "/", " ", "\t", "\x00")):
+        return None
+    return _bound(value)
 
 
 def _start_menu_roots(environ: os._Environ[str], known_folder: object) -> list[str]:

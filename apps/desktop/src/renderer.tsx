@@ -282,6 +282,33 @@ function App(): React.JSX.Element {
     return () => { active = false; window.clearInterval(timer); };
   }, []);
 
+  // Bounded startup recovery (N1): if the initial Phase 3/review
+  // loads raced startup (hidden window, frame not yet settled),
+  // recover through the read-only state queries once the backend
+  // reports ready - a bounded number of attempts, never an
+  // unbounded retry loop; privileged flows are unaffected.
+  const phase3StartupAttempts = React.useRef(0);
+  React.useEffect(() => {
+    if (!status.startsWith('ready')) return;
+    const phase3Pending = phase3State === null || phase3State.status !== 'ready';
+    const reviewPending = reviewState.status === 'unavailable'
+      && reviewState.message.startsWith('Trusted exact-preview review is unavailable');
+    if (!phase3Pending && !reviewPending) return;
+    if (phase3StartupAttempts.current >= 5) return;
+    phase3StartupAttempts.current += 1;
+    // Deferred: recovery runs as a fresh task, not a synchronous
+    // state update inside this effect.
+    const timer = window.setTimeout(() => {
+      if (phase3Pending) void refreshPhase3();
+      if (reviewPending) {
+        void window.aetherDesktop.getApprovalReview()
+          .then((value) => setReviewState(parseReviewPreviewState(value)))
+          .catch(() => undefined);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [status, phase3State, reviewState, refreshPhase3]);
+
   async function ping(): Promise<void> {
     setBusy(true);
     setResult('');

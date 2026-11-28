@@ -46,6 +46,26 @@ verifier must NOT be run.
 
 ## Windows verification commands (exact)
 
+Before the campaign (which runs offline), verify the pinned
+Electron runtime is already installed - otherwise `electron`
+downloads its binary lazily at first launch:
+
+```powershell
+& (Join-Path $NodeDir "node.exe") apps\desktop\scripts\check-electron-runtime.mjs
+# If NOT installed: remediate once online (`cd apps\desktop; npm ci`
+# with postinstall scripts enabled), then re-verify. `npm run start`
+# runs this preflight automatically and refuses to launch into a
+# download.
+```
+
+If application discovery looks wrong (missing packaged apps),
+the read-only diagnostic prints per-source statuses, counts and
+representative identities without launching anything:
+
+```powershell
+& $Python tools\windows_discovery_diagnostic.py
+```
+
 Run from non-admin PowerShell 5.1 at `D:\A.E.T.H.E.R`, HEAD equal to
 the approved candidate SHA, clean tree — with exactly one known
 allowed exception: `git status --porcelain` may show ONLY the exact

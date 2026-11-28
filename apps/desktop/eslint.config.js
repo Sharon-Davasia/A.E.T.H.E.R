@@ -19,4 +19,5 @@ export default tseslint.config(
     }
   },
   { files: ['vite.config.ts'], languageOptions: { globals: globals.node } },
+  { files: ['scripts/**/*.mjs'], languageOptions: { globals: globals.node } },
 );

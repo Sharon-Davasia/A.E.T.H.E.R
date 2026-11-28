@@ -216,6 +216,17 @@ $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 #    commands" above (pinned Python, fresh basetemp, no npm ci,
 #    no fixture rebuild - hash verification only).
 
+# 3b. Electron runtime preflight (offline guarantee): the pinned
+#     Electron binary must already be installed - `electron` lazily
+#     downloads it on first use otherwise, which needs network the
+#     campaign does not have. Verify with the pinned Node:
+& (Join-Path $NodeDir "node.exe") apps\desktop\scripts\check-electron-runtime.mjs
+#     If it reports NOT installed, remediate ONCE online beforehand
+#     (full install, postinstall scripts enabled), then re-verify:
+#       cd apps\desktop; & $Npm ci; cd ..\..
+#     `npm run start` now runs this preflight automatically
+#     (prestart) and refuses to launch into a download.
+
 # 4. Fixture integrity evidence (verify ONLY; never rebuild here -
 #    a mismatch is a stop-and-report condition).
 (Get-FileHash tools\windows-fixture\AETHERFixture.exe -Algorithm SHA256).Hash
