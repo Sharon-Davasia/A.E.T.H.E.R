@@ -1,7 +1,8 @@
 """N2: AppsFolder Shell COM argument/result contract regressions.
 
 The fake Shell objects ENFORCE the documented pywin32 contracts:
-ParseDisplayName(hwnd, bindCtx, name) -> (pidl, eaten, attrs);
+ParseDisplayName(hwnd, bindCtx, name) -> (eaten, pidl, attrs)
+(pinned b312 order, Py_BuildValue("lOl", eaten, pidl, attr));
 EnumObjects(hwnd, SHCONTF_NONFOLDERS | SHCONTF_FASTITEMS);
 GetDisplayNameOf(pidl, SHGDN_NORMAL) = human name and
 GetDisplayNameOf(pidl, SHGDN_FORPARSING) = canonical AUMID.
@@ -63,17 +64,30 @@ class _Folder:
         raise AssertionError(f"undocumented SHGDN flags: {flags:#x}")
 
 
+# Distinct sentinel values per tuple position: consumed count,
+# PIDL and attributes can never be silently interchanged.
+EATEN = 17
+APPS_PID = b"appsfolder-pidl"
+ATTRS = 0x10
+
+
 class _Desktop:
     def __init__(self, folder: _Folder) -> None:
         self._folder = folder
+        self.bound_pidl: object = None
 
-    def ParseDisplayName(self, hwnd: int, bind_ctx: object, name: str):
-        # pywin32 contract: exactly three arguments, 3-tuple result.
+    def ParseDisplayName(self, hwnd: int, bind_ctx: object, name: str):  # type: ignore[no-untyped-def]
+        # pywin32 b312 contract ("OOO|k"): up to four arguments,
+        # 3-tuple result (eaten, pidl, attributes).
         assert (hwnd, bind_ctx, name) == (0, None, "shell:AppsFolder")
-        return (b"appsfolder-pidl", 0, 0)
+        return (EATEN, APPS_PID, ATTRS)
 
     def BindToObject(self, pidl: object, bind_ctx: object, iid: object) -> _Folder:
-        assert pidl == b"appsfolder-pidl" and bind_ctx is None and iid is _IID
+        # Must receive the SECOND tuple value (the PIDL) - not the
+        # consumed count and not the attributes.
+        assert pidl == APPS_PID and pidl != EATEN and pidl != ATTRS
+        assert bind_ctx is None and iid is _IID
+        self.bound_pidl = pidl
         return self._folder
 
 
@@ -119,6 +133,8 @@ def test_appsfolder_contract_names_and_aumids(monkeypatch: pytest.MonkeyPatch) -
     )
     candidates, status = providers.apps_folder_entries()
     assert status.status == "ok"
+    # BindToObject received the PIDL (second tuple value), proven
+    # against distinct eaten/attributes sentinels above.
     # Leaf applications only, fast enumeration: exactly these flags.
     assert enum_flags == [_ShellCon.SHCONTF_NONFOLDERS | _ShellCon.SHCONTF_FASTITEMS]
     by_name = {c.display_name: c for c in candidates}

@@ -140,8 +140,12 @@ class StdlibWindowsDiscoveryProviders:
 
         Documented contracts used (read-only throughout):
         - ``IShellFolder.ParseDisplayName(hwnd, bindCtx, name)``
-          returns ``(pidl, eaten, attributes)``; ``"shell:AppsFolder"``
-          is the parsing name of the AppsFolder.
+          returns ``(eaten, pidl, attributes)`` (pywin32 b312,
+          ``Py_BuildValue("lOl", pchEaten, obppidl, dwAttributes)``;
+          a fourth Attributes argument is optional);
+          ``"shell:AppsFolder"`` is the parsing name of the
+          AppsFolder, and the SECOND tuple value is the PIDL handed
+          to ``BindToObject(pidl, bindCtx, riid)``.
         - Items are leaf applications: ``EnumObjects`` must be called
           with ``SHCONTF_NONFOLDERS | SHCONTF_FASTITEMS`` (folder-only
           flags enumerate nothing useful here).
@@ -167,7 +171,7 @@ class StdlibWindowsDiscoveryProviders:
             initialized = True
             try:
                 desktop = shell.SHGetDesktopFolder()
-                pidl, _eaten, _attrs = desktop.ParseDisplayName(0, None, "shell:AppsFolder")
+                _eaten, pidl, _attrs = desktop.ParseDisplayName(0, None, "shell:AppsFolder")
                 folder = desktop.BindToObject(pidl, None, shell.IID_IShellFolder)
             except Exception:
                 return [], SourceStatus("apps_folder", "unavailable", "apps_folder_open_failed")
