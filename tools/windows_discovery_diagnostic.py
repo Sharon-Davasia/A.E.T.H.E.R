@@ -15,7 +15,10 @@ canonical identity and normalized app ID for each match.
 
 It never launches, activates, installs or modifies anything, and
 a match authorizes nothing; on non-Windows hosts every source
-reports ``requires_windows`` truthfully.
+reports ``requires_windows`` truthfully. Failure details are
+bounded ``stage:ExceptionType`` strings (plus HRESULT where one
+is available); exception messages - which could carry private
+paths - are never printed.
 """
 
 from __future__ import annotations

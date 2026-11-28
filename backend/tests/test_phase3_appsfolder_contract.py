@@ -3,7 +3,7 @@
 The fake Shell objects ENFORCE the documented pywin32 contracts:
 ParseDisplayName(hwnd, bindCtx, name) -> (eaten, pidl, attrs)
 (pinned b312 order, Py_BuildValue("lOl", eaten, pidl, attr));
-EnumObjects(hwnd, SHCONTF_NONFOLDERS | SHCONTF_FASTITEMS);
+EnumObjects(hwnd, SHCONTF_NONFOLDERS);
 GetDisplayNameOf(pidl, SHGDN_NORMAL) = human name and
 GetDisplayNameOf(pidl, SHGDN_FORPARSING) = canonical AUMID.
 Any wrong arity, flag or name identity fails the contract here.
@@ -23,8 +23,17 @@ _IID = object()  # IID_IShellFolder sentinel
 
 
 class _ShellCon:
+    """Constants mirroring pinned pywin32 b312 shellcon.py exactly.
+
+    b312 defines SHCONTF_NONFOLDERS = 64, SHGDN_NORMAL = 0 and
+    SHGDN_FORPARSING = 32768 - and NO SHCONTF_FASTITEMS. A fake
+    providing constants the pinned dependency lacks would again
+    conceal the defect behind apps_folder_enum_failed. Accessing a
+    missing constant on this class raises AttributeError naturally,
+    exactly like the real pinned module.
+    """
+
     SHCONTF_NONFOLDERS = 0x40
-    SHCONTF_FASTITEMS = 0x2000
     SHGDN_NORMAL = 0x0
     SHGDN_FORPARSING = 0x8000
 
@@ -135,8 +144,8 @@ def test_appsfolder_contract_names_and_aumids(monkeypatch: pytest.MonkeyPatch) -
     assert status.status == "ok"
     # BindToObject received the PIDL (second tuple value), proven
     # against distinct eaten/attributes sentinels above.
-    # Leaf applications only, fast enumeration: exactly these flags.
-    assert enum_flags == [_ShellCon.SHCONTF_NONFOLDERS | _ShellCon.SHCONTF_FASTITEMS]
+    # Leaf applications only: exactly the sole supported b312 flag.
+    assert enum_flags == [_ShellCon.SHCONTF_NONFOLDERS]
     by_name = {c.display_name: c for c in candidates}
     assert set(by_name) == {"Notepad", "Calculator"}
     # Human names and canonical identities are never conflated.
@@ -168,7 +177,8 @@ def test_item_failure_is_partial_not_silent(monkeypatch: pytest.MonkeyPatch) -> 
     candidates, status = providers.apps_folder_entries()
     assert [c.display_name for c in candidates] == ["Notepad"]
     assert status.status == "partial"
-    assert status.detail == "apps_folder_items_failed"
+    # Bounded stage detail: type only, never the message content.
+    assert status.detail == "apps_folder_items_failed:RuntimeError"
 
 
 def test_open_and_enum_stage_failures_are_truthful(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -180,7 +190,7 @@ def test_open_and_enum_stage_failures_are_truthful(monkeypatch: pytest.MonkeyPat
     _install(monkeypatch, _BadDesktop(_Folder({}, enum_flags)))
     _candidates, status = StdlibWindowsDiscoveryProviders().apps_folder_entries()
     assert status.status == "unavailable"
-    assert status.detail == "apps_folder_open_failed"
+    assert status.detail == "apps_folder_open_failed:RuntimeError"
 
     class _BadFolder(_Folder):
         def EnumObjects(self, hwnd: int, flags: int) -> _Enum:
@@ -189,7 +199,7 @@ def test_open_and_enum_stage_failures_are_truthful(monkeypatch: pytest.MonkeyPat
     _install(monkeypatch, _Desktop(_BadFolder({}, enum_flags)))
     _candidates, status = StdlibWindowsDiscoveryProviders().apps_folder_entries()
     assert status.status == "unavailable"
-    assert status.detail == "apps_folder_enum_failed"
+    assert status.detail == "apps_folder_enum_failed:RuntimeError"
 
 
 def test_off_windows_provider_is_truthfully_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -198,3 +208,109 @@ def test_off_windows_provider_is_truthfully_unavailable(monkeypatch: pytest.Monk
     assert candidates == []
     assert status.status == "unavailable"
     assert status.detail == "requires_windows"
+
+
+class _ComError(Exception):
+    """Exception carrying an HRESULT, like pywintypes.com_error."""
+
+    def __init__(self, hresult: int) -> None:
+        super().__init__("com failure (message must never surface)")
+        self.hresult = hresult
+
+
+def test_failure_detail_carries_bounded_hresult(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _ComBadFolder(_Folder):
+        def EnumObjects(self, hwnd: int, flags: int) -> _Enum:
+            raise _ComError(-2147024891)  # E_ACCESSDENIED as signed long
+
+    enum_flags: list[int] = []
+    _install(monkeypatch, _Desktop(_ComBadFolder({}, enum_flags)))
+    _candidates, status = StdlibWindowsDiscoveryProviders().apps_folder_entries()
+    assert status.status == "unavailable"
+    assert status.detail == "apps_folder_enum_failed:_ComError(0x80070005)"
+    assert "must never surface" not in status.detail
+
+
+def test_com_refs_released_before_couninitialize(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Desktop/folder/enumerator __del__ events precede CoUninitialize
+    on both the success path and the open-failure path."""
+    import weakref
+
+    def run(mode: str) -> list[str]:
+        events: list[str] = []
+
+        class _Tracked:
+            label = "?"
+
+            def __del__(self) -> None:
+                events.append(f"del:{self.label}")
+
+        class _TrackedEnum(_Tracked):
+            label = "enum"
+
+            def Next(self, count: int) -> list[object]:
+                return []
+
+        class _TrackedFolder(_Tracked):
+            label = "folder"
+
+            def __init__(self) -> None:
+                self._tracked_enum = _TrackedEnum()
+
+            def EnumObjects(self, hwnd: int, flags: int) -> object:
+                return self._tracked_enum
+
+        class _TrackedDesktop(_Tracked):
+            label = "desktop"
+
+            def __init__(self) -> None:
+                self._tracked_folder = _TrackedFolder()
+
+            def ParseDisplayName(self, hwnd: int, bind_ctx: object, name: str):
+                if mode == "open_fails":
+                    raise RuntimeError("no shell")
+                return (EATEN, APPS_PID, ATTRS)
+
+            def BindToObject(self, pidl: object, bind_ctx: object, iid: object) -> object:
+                return self._tracked_folder
+
+        box: list[object] = [_TrackedDesktop()]
+        folder_ref = weakref.ref(box[0]._tracked_folder)  # type: ignore[attr-defined]
+        shell_module = SimpleNamespace(
+            SHGetDesktopFolder=lambda: box.pop(),
+            IID_IShellFolder=_IID,
+        )
+
+        def _co_init() -> None:
+            events.append("co_init")
+
+        def _co_uninit() -> None:
+            events.append("co_uninit")
+
+        monkeypatch.setitem(
+            sys.modules,
+            "pythoncom",
+            SimpleNamespace(CoInitialize=_co_init, CoUninitialize=_co_uninit),
+        )
+        monkeypatch.setitem(sys.modules, "win32com", SimpleNamespace())
+        monkeypatch.setitem(
+            sys.modules,
+            "win32com.shell",
+            SimpleNamespace(shell=shell_module, shellcon=_ShellCon),
+        )
+        monkeypatch.setattr(sys, "platform", "win32")
+        StdlibWindowsDiscoveryProviders().apps_folder_entries()
+        assert folder_ref() is None
+        return events
+
+    for mode in ("ok", "open_fails"):
+        events = run(mode)
+        assert events[0] == "co_init"
+        assert events[-1] == "co_uninit"
+        assert "del:desktop" in events
+        assert events.index("del:desktop") < events.index("co_uninit")
+        if mode == "ok":
+            assert "del:folder" in events
+            assert "del:enum" in events
+            assert events.index("del:folder") < events.index("co_uninit")
+            assert events.index("del:enum") < events.index("co_uninit")

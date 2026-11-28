@@ -138,25 +138,29 @@ class StdlibWindowsDiscoveryProviders:
     def apps_folder_entries(self) -> tuple[list[DiscoveredAppCandidate], SourceStatus]:
         """Enumerate AppsFolder/packaged apps via Shell COM (pywin32).
 
-        Documented contracts used (read-only throughout):
+        Documented contracts used (read-only throughout), verified
+        against the pinned pywin32 b312 sources
+        (PyIShellFolder.cpp / shellcon.py):
         - ``IShellFolder.ParseDisplayName(hwnd, bindCtx, name)``
-          returns ``(eaten, pidl, attributes)`` (pywin32 b312,
-          ``Py_BuildValue("lOl", pchEaten, obppidl, dwAttributes)``;
-          a fourth Attributes argument is optional);
-          ``"shell:AppsFolder"`` is the parsing name of the
-          AppsFolder, and the SECOND tuple value is the PIDL handed
-          to ``BindToObject(pidl, bindCtx, riid)``.
-        - Items are leaf applications: ``EnumObjects`` must be called
-          with ``SHCONTF_NONFOLDERS | SHCONTF_FASTITEMS`` (folder-only
-          flags enumerate nothing useful here).
+          returns ``(eaten, pidl, attributes)``; the SECOND value is
+          the PIDL handed to ``BindToObject(pidl, bindCtx, riid)``.
+        - Items are leaf applications: ``EnumObjects`` is called
+          with ``SHCONTF_NONFOLDERS``. (The pinned b312 ``shellcon``
+          defines no ``SHCONTF_FASTITEMS``; referencing it raises
+          AttributeError, which previously surfaced as
+          ``apps_folder_enum_failed``.)
         - ``GetDisplayNameOf(pidl, SHGDN_NORMAL)`` is the
           human-readable display name; ``SHGDN_FORPARSING`` is the
           canonical AppUserModelId. The two are never conflated:
           a parsing name that is not AUMID-shaped confers no
           activation identity.
-        Stage failures report ``unavailable`` naming the stage;
-        per-item failures degrade to ``partial``. Nothing here
-        invents identities or authorizes anything.
+        COM lifetime: desktop/folder/enumerator references are
+        released BEFORE the matching ``CoUninitialize`` on success
+        and on every exception path. Stage failures report
+        ``unavailable`` with a bounded ``stage:ExceptionType`` (plus
+        HRESULT when the exception carries one); per-item failures
+        degrade to ``partial``. Nothing here invents identities or
+        authorizes anything.
         """
         if sys.platform != "win32":  # pragma: no cover - platform guard
             return [], SourceStatus("apps_folder", "unavailable", "requires_windows")
@@ -166,6 +170,10 @@ class StdlibWindowsDiscoveryProviders:
         except Exception:
             return [], SourceStatus("apps_folder", "unavailable", "shell_com_unavailable")
         initialized = False
+        desktop: object = None
+        folder: object = None
+        enumerator: object = None
+        pidl: object = None
         try:  # pragma: no cover - Windows only
             pythoncom.CoInitialize()
             initialized = True
@@ -173,16 +181,23 @@ class StdlibWindowsDiscoveryProviders:
                 desktop = shell.SHGetDesktopFolder()
                 _eaten, pidl, _attrs = desktop.ParseDisplayName(0, None, "shell:AppsFolder")
                 folder = desktop.BindToObject(pidl, None, shell.IID_IShellFolder)
-            except Exception:
-                return [], SourceStatus("apps_folder", "unavailable", "apps_folder_open_failed")
-            try:
-                enumerator = folder.EnumObjects(
-                    0, shellcon.SHCONTF_NONFOLDERS | shellcon.SHCONTF_FASTITEMS
+            except Exception as exc:
+                return [], SourceStatus(
+                    "apps_folder",
+                    "unavailable",
+                    _failure_detail("apps_folder_open_failed", exc),
                 )
-            except Exception:
-                return [], SourceStatus("apps_folder", "unavailable", "apps_folder_enum_failed")
+            try:
+                enumerator = folder.EnumObjects(0, shellcon.SHCONTF_NONFOLDERS)
+            except Exception as exc:
+                return [], SourceStatus(
+                    "apps_folder",
+                    "unavailable",
+                    _failure_detail("apps_folder_enum_failed", exc),
+                )
             candidates: list[DiscoveredAppCandidate] = []
             failures = 0
+            last_failure: BaseException | None = None
             if enumerator is not None:
                 examined = 0
                 # Bounded enumeration: never walk the shell forever.
@@ -192,8 +207,9 @@ class StdlibWindowsDiscoveryProviders:
                 ):
                     try:
                         items = enumerator.Next(1)
-                    except Exception:
+                    except Exception as exc:
                         failures += 1
+                        last_failure = exc
                         break
                     if not items:
                         break
@@ -202,12 +218,15 @@ class StdlibWindowsDiscoveryProviders:
                         item_pidl = items[0]
                         display = folder.GetDisplayNameOf(item_pidl, shellcon.SHGDN_NORMAL)
                         parsing = folder.GetDisplayNameOf(item_pidl, shellcon.SHGDN_FORPARSING)
-                    except Exception:
+                    except Exception as exc:
                         failures += 1
+                        last_failure = exc
                         continue
                     name = _bound(display).strip() if display else ""
                     if not name:
                         failures += 1
+                        if last_failure is None:
+                            last_failure = ValueError("empty display name")
                         continue
                     candidates.append(
                         DiscoveredAppCandidate(
@@ -218,15 +237,38 @@ class StdlibWindowsDiscoveryProviders:
                         )
                     )
             if failures:
+                assert last_failure is not None
                 return candidates, SourceStatus(
-                    "apps_folder", "partial", "apps_folder_items_failed"
+                    "apps_folder",
+                    "partial",
+                    _failure_detail("apps_folder_items_failed", last_failure),
                 )
             return candidates, SourceStatus("apps_folder", "ok")
         except Exception:  # pragma: no cover - Windows only
             return [], SourceStatus("apps_folder", "unavailable", "shell_com_unavailable")
         finally:  # pragma: no cover - Windows only
+            # Release COM interface references BEFORE CoUninitialize,
+            # on success and every exception path alike.
+            enumerator = None
+            folder = None
+            desktop = None
+            pidl = None
             if initialized:
                 pythoncom.CoUninitialize()
+
+
+def _failure_detail(stage: str, exc: BaseException) -> str:
+    """Bounded failure detail: stage + exception type (+ HRESULT).
+
+    Exception MESSAGES are never included - they can carry paths or
+    other private content. Used in source statuses and surfaced by
+    the read-only discovery diagnostic.
+    """
+    name = type(exc).__name__[:48]
+    hresult = getattr(exc, "hresult", None)
+    if isinstance(hresult, int):
+        return f"{stage}:{name}(0x{hresult & 0xFFFFFFFF:08x})"
+    return f"{stage}:{name}"
 
 
 def _aumid_or_none(parsing_name: object) -> str | None:
