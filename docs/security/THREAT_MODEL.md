@@ -42,3 +42,28 @@ The ordinary chat request path has only the authenticated FastAPI-to-loopback ll
 - A valid schema does not prove semantic correctness; one bounded repair is allowed, then malformed output fails closed.
 - No unit test establishes GPU/VRAM fit, model quality, host firewall enforcement, or V-01 performance.
 - Automated secret scanning remains pending; CI is manual-only.
+
+## Phase 3 extension (CP0–CP2 foundation; native control not enabled)
+
+Scope of this extension: typed app/window contracts, privacy-gated
+in-memory observation with fake sources, guarded inert native source,
+and in-memory app discovery/alias resolution. Launching, UIA
+interaction and native sensors remain disabled; residual threats
+below are design requirements for later checkpoints, not claims of
+implemented native protection.
+
+| Threat | Control in foundation | Fail-closed behaviour / later requirement |
+|---|---|---|
+| HWND/PID reuse, stale/substituted window | Window identity binds HWND+pid+creation time+UIA runtime id; TTL expiry; destruction/exit invalidation | Re-resolution at execution (CP3+); version mismatch denies |
+| Malicious titles/aliases, prompt injection in UI text | Titles bounded, `UNTRUSTED`-grade data, never authority; exact-name precedence over aliases; ambiguity → clarification | Redaction before model context; never instructions |
+| Forged `app:`/`window:` resource ids | Disjoint argument patterns vs `file:`/`directory:`; registry-issued ids only; fabricated ids refused in tests | Broker kind dispatch by registered capability (CP3 design) |
+| Executable substitution / stale registration | Executable-digest evidence; drift marks record unavailable | Re-verification before any launch trust (CP3) |
+| Sensitive collection (password managers, private browsing, elevated, credential UI) | Collection-boundary exclusion; unclassifiable = sensitive; opt-in + mode gating; pause invalidates | Native classifier review before activation |
+| Queue overflow losing destruction/privacy events | Overflow counter, uncertainty marking, reconciliation clears retained state | Measured native budgets; never present uncertain as verified |
+| Manual takeover (incl. same-HWND) | Not implemented in CP0–CP2 (design R2 in PHASE3_PLAN) | Capability denied/limited where detection unreliable |
+| Hung UIA provider / worker death | No UIA worker in this batch (R7 design) | Timeout post-begin = UNVERIFIED, no replay |
+| False success | Fake adapter execution returns FAILED; no launch capability exists | Postcondition-verified receipts only (CP3+) |
+| Privacy retention creep | In-memory observations only; no persisted titles/snapshots/history | Any persistence requires new approval + migration review |
+
+A subprocess worker (future) is a reliability boundary, not an OS
+security sandbox; no same-user isolation claim is made.

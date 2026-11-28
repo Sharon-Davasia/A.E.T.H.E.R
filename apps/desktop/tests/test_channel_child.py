@@ -18,9 +18,9 @@ MAGIC = b"AETHR1\x00\x01"
 
 
 def canonical(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode(
-        "utf-8"
-    )
+    return json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
 
 
 def sign(value: dict[str, object], key: bytes) -> dict[str, object]:
@@ -66,7 +66,9 @@ class ChannelChildTests(unittest.TestCase):
             stderr=subprocess.PIPE,
         )
         assert process.stdin is not None and process.stdout is not None
-        process.stdin.write(MAGIC + bytes.fromhex(session) + key + challenge + bytes(32))
+        process.stdin.write(
+            MAGIC + bytes.fromhex(session) + key + challenge + bytes(32)
+        )
         process.stdin.flush()
         hello = read_frame(process.stdout)
         self.assertEqual(hello["kind"], "channel.hello")
@@ -146,7 +148,10 @@ class ChannelChildTests(unittest.TestCase):
         process.stdin.flush()
         read_frame(process.stdout)
         duplicate_nonce = self.envelope(
-            session, seq=2, nonce=first["nonce"], requestId="123e4567-e89b-42d3-a456-426614174001"
+            session,
+            seq=2,
+            nonce=first["nonce"],
+            requestId="123e4567-e89b-42d3-a456-426614174001",
         )
         process.stdin.write(encode(duplicate_nonce))
         process.stdin.close()

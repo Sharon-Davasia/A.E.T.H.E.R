@@ -1,0 +1,405 @@
+"""A/D corrections: authoritative collection gates for Explorer/project
+detection (privacy + authorization lifetime + composition lifecycle,
+synchronously, with provider-call-count evidence) and the trusted
+controlled project-registration path (composition-owned registry,
+campaign-storage boundary, native Explorer typing).
+
+Fake platform seams only; nothing here is native Windows evidence.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+from test_phase3_controlled_native import COMMIT, GESTURE_KEY
+
+from aether.adapters.windows.fake_windows import build_fake_seams, fixture_executable
+from aether.core.apps.acceptance_startup import ControlledAcceptanceAuthorization
+from aether.core.apps.composition import Phase3Composition, build_native_platform
+from aether.core.apps.launch_authority import app_version_token
+from aether.core.contracts.app_window import (
+    LaunchMethod,
+    location_identity_digest,
+    registration_app_id,
+)
+from aether.core.persistence.acceptance_storage import (
+    OwnerAcceptanceAuthorization,
+    open_acceptance_store,
+)
+
+
+class _CountingExplorer:
+    """Explorer provider fake: counts every collection."""
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+        self.calls = 0
+
+    def __call__(self) -> object:
+        self.calls += 1
+        return self.value
+
+
+def _start(tmp_path: Path, explorer: object) -> Phase3Composition:
+    seams = build_fake_seams()
+    fixture_id = registration_app_id(
+        display_name="AETHER Fixture",
+        executable_identity=fixture_executable(),
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+    )
+    token = app_version_token(
+        seams.integrity_verifier.verify(  # type: ignore[attr-defined]
+            SimpleNamespace(location_digest=location_identity_digest(fixture_executable()))
+        )
+    )
+    storage = tmp_path / "aether-phase3-acceptance-gates"
+    _workspace = tmp_path / "aether-phase3-workspace-gates"
+    _workspace.mkdir(parents=True, exist_ok=True)
+    _ws_stat = _workspace.stat()
+    authz = ControlledAcceptanceAuthorization(
+        approved_commit=COMMIT,
+        decision_reference="owner-decision-gates",
+        campaign_id="campaign-gates",
+        storage_id="44444444-4444-4444-8444-444444444444",
+        storage_path=str(storage),
+        workspace_path=str(tmp_path / "aether-phase3-workspace-gates"),
+        workspace_identity=(_ws_stat.st_dev, _ws_stat.st_ino),
+        authorized_app_ids=frozenset({fixture_id}),
+        capability_allowlist=frozenset({"app.launch", "uia.invoke_fixture"}),
+        session_id="session-gates",
+        activation_epoch="epoch-gates",
+        expires_at=datetime.now(UTC) + timedelta(hours=2),
+        privacy_mode="metadata_only",
+        fixture_app_id=fixture_id,
+        fixture_identity_token=token,
+    )
+    store = open_acceptance_store(
+        storage,
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=authz.decision_reference,
+            storage_id=authz.storage_id,
+            expires_at=authz.expires_at,
+            campaign_id=authz.campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    seams.explorer_folder = explorer  # type: ignore[attr-defined]
+    providers = build_native_platform(authz, seams=seams)
+    return Phase3Composition.native(
+        authorization=authz,
+        current_commit=COMMIT,
+        storage_dir=storage,
+        gesture_key=GESTURE_KEY,
+        platform=providers,
+    )
+
+
+def _opt_in(comp: Phase3Composition) -> None:
+    out = comp.bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": False})
+    assert out["status"] == "ready", out
+
+
+def test_explorer_collection_requires_opt_in_and_stops_on_pause_optout_revoke(
+    tmp_path: Path,
+) -> None:
+    explorer = _CountingExplorer(tmp_path / "somewhere-else")
+    comp = _start(tmp_path, explorer)
+    try:
+        # Before opt-in: no collection at all (provider never called).
+        state = comp.bridge.get_state({})
+        assert state["projects"] == []
+        assert explorer.calls == 0
+
+        # F3/C2: even after opt-in, a generic metadata state refresh
+        # does NOT retrieve the foreground Explorer folder.
+        _opt_in(comp)
+        state = comp.bridge.get_state({})
+        assert explorer.calls == 0
+        assert state["projects"] == []
+
+        # A check with no captured Explorer evidence fails truthfully.
+        assert comp.bridge.check_project_context({})["reason"] == ("explorer_evidence_unavailable")
+        assert explorer.calls == 0
+
+        # The one-shot handoff: arm (trusted-main-established), the
+        # owner focuses an Explorer window, the verified foreground
+        # event consults the provider exactly once. The folder is
+        # outside the synthetic workspace: scope is validated before
+        # retention, so it is never retained as evidence and the
+        # completion is truthfully unavailable (nothing published).
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)  # foreground event HWND
+        assert explorer.calls == 1
+        check = comp.bridge.check_project_context({})
+        assert check["status"] == "unavailable"
+        assert check["reason"] == "explorer_evidence_unavailable"
+        # Disarmed afterwards: refreshes consult nothing again.
+        comp.bridge.get_state({})
+        assert explorer.calls == 1
+
+        # Pause: arming and checking are refused; provider untouched.
+        comp.bridge.set_privacy({"optedIn": True, "mode": "metadata_only", "paused": True})
+        assert comp.bridge.arm_project_context({})["status"] == "unavailable"
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
+        assert comp.bridge.get_state({})["projects"] == []
+        assert explorer.calls == 1
+
+        # Opt-out: same refusal, synchronously.
+        comp.bridge.set_privacy({"optedIn": False, "mode": "off", "paused": False})
+        assert comp.bridge.arm_project_context({})["status"] == "unavailable"
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
+        assert explorer.calls == 1
+
+        # Revocation: a later privacy update cannot reactivate it.
+        comp.revoke("test_revocation")
+        _opt_in(comp)
+        assert comp.bridge.arm_project_context({})["status"] == "unavailable"
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
+        assert comp.bridge.get_state({})["projects"] == []
+        assert explorer.calls == 1
+    finally:
+        assert comp.shutdown() is True
+    # After shutdown the provider is likewise never consulted again.
+    assert comp.bridge.arm_project_context({})["status"] == "unavailable"
+    assert comp.bridge.check_project_context({})["status"] == "unavailable"
+    assert comp.bridge.get_state({})["projects"] == []
+    assert explorer.calls == 1
+
+
+def test_detector_gate_covers_reference_resolution() -> None:
+    from aether.core.context.project_detection import ProjectDetector
+    from aether.core.resources.registry import ResourceRegistry
+
+    explorer = _CountingExplorer(Path("/definitely/not/registered"))
+    detector = ProjectDetector(
+        registry=ResourceRegistry(),
+        explorer_folder=explorer,  # type: ignore[arg-type]
+        collection_permitted=lambda: False,
+    )
+    assert detector.detect() == ()
+    resolution = detector.resolve_reference("this project")
+    assert resolution.candidate is None and resolution.reason == "project_evidence_invalidated"
+    assert explorer.calls == 0
+
+
+def test_registration_detection_and_explorer_string_normalization(tmp_path: Path) -> None:
+    workspace = tmp_path / "aether-phase3-workspace-gates"
+    project = workspace / "synthetic-project"
+    # The native Explorer provider returns a *string*; composition
+    # must normalize it to Path before the detector compares roots.
+    explorer = _CountingExplorer(str(project))
+    comp = _start(tmp_path, explorer)
+    try:
+        project.mkdir(parents=True)
+        (project / "pyproject.toml").write_text('[project]\nname = "synthetic"\n')
+
+        # Registration requires the minimum explicit project-context
+        # authorization (live, opted-in, unexpired): refused before
+        # opt-in, so registration can never precede collection rights.
+        refused = comp.bridge.register_project({"alias": "project", "path": str(project)})
+        assert refused["status"] == "unavailable"
+        assert refused["reason"] == "project_context_not_authorized"
+        assert comp.bridge.get_state({})["projects"] == []
+        assert explorer.calls == 0
+
+        _opt_in(comp)
+        registered = comp.bridge.register_project({"alias": "project", "path": str(project)})
+        assert registered["status"] == "ready", registered
+        root_id = registered["rootId"]
+        # Generic refresh: registered-root evidence only, and the
+        # Explorer provider was never consulted (F3).
+        state = comp.bridge.get_state({})
+        assert explorer.calls == 0
+        assert [c["evidenceSource"] for c in state["projects"]] == ["registered_project"]
+
+        # Explicit handoff: arm, foreground capture, then the check
+        # upgrades the registered root with Explorer evidence.
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
+        check = comp.bridge.check_project_context({})
+        assert explorer.calls == 1
+        candidates = check["projects"]
+        assert len(candidates) == 1
+        assert candidates[0]["evidenceSource"] == "explorer_registered"
+        assert candidates[0]["available"] is True
+
+        # Registry-issued identity + Windows path identity.
+        detector = comp.detector
+        assert detector is not None
+        detected = detector.detect()
+        assert detected[0].resource_id is not None
+        assert detected[0].root_alias == "project"
+        registry = comp.surface.project_registry
+        assert registry is not None and registry._windows_semantics is True  # type: ignore[attr-defined]
+        assert str(detector.registry.known_roots()[0].root_id) == root_id  # type: ignore[attr-defined]
+
+        # Fresh reference resolution resolves deterministically.
+        resolution = detector.resolve_reference("this project")
+        assert resolution.candidate is not None and not resolution.clarification_required
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_registration_boundary_and_unregistered_explorer(tmp_path: Path) -> None:
+    outside = tmp_path / "outside-project"
+    explorer = _CountingExplorer(outside)
+    comp = _start(tmp_path, explorer)
+    try:
+        outside.mkdir()
+        _opt_in(comp)
+        # Outside the synthetic-workspace boundary: refused, and no
+        # authorized identity is issued for it.
+        refused = comp.bridge.register_project({"alias": "outside", "path": str(outside)})
+        assert refused["status"] == "unavailable"
+        assert refused["reason"] == "root_outside_activation_boundary"
+
+        # An Explorer folder outside the authorized workspace is
+        # never retained as evidence (scope before retention), so a
+        # handoff check resting on it is truthfully unavailable and
+        # publishes nothing.
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
+        outside_check = comp.bridge.check_project_context({})
+        assert outside_check["status"] == "unavailable"
+        assert outside_check["reason"] == "explorer_evidence_unavailable"
+        assert comp.bridge.get_state({})["projects"] == []
+
+        # Inside the workspace but unregistered: the explicit check
+        # reports a discovered candidate with no identity and no
+        # permission. Generic refresh still shows nothing.
+        explorer.value = tmp_path / "aether-phase3-workspace-gates" / "unregistered-project"  # type: ignore[attr-defined]
+        assert comp.bridge.get_state({})["projects"] == []
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
+        state = comp.bridge.check_project_context({})
+        assert len(state["projects"]) == 1
+        candidate = state["projects"][0]
+        assert candidate["evidenceSource"] == "explorer_discovered"
+        assert candidate["available"] is False  # unregistered: no resource identity
+        assert "registration_required_before_use" in candidate["limitations"]
+
+        # Ordinary (disabled) surfaces have no registration path.
+        from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
+
+        disabled = Phase3Bridge(Phase3Surface.disabled())
+        assert (
+            disabled.register_project({"alias": "x", "path": str(outside)})["status"]
+            == "unavailable"
+        )
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_ambiguous_project_evidence_requires_clarification(tmp_path: Path) -> None:
+    workspace = tmp_path / "aether-phase3-workspace-gates"
+    first = workspace / "synthetic-project"
+    second = workspace / "synthetic-project-b"
+    explorer = _CountingExplorer(first)
+    comp = _start(tmp_path, explorer)
+    try:
+        for root in (first, second):
+            root.mkdir(parents=True)
+            (root / "pyproject.toml").write_text('[project]\nname = "synthetic"\n')
+        _opt_in(comp)
+        assert comp.bridge.register_project({"alias": "one", "path": str(first)})["status"] == (
+            "ready"
+        )
+        assert comp.bridge.register_project({"alias": "two", "path": str(second)})["status"] == (
+            "ready"
+        )
+        detector = comp.detector
+        assert detector is not None
+        # registered (0.9) vs explorer-registered (0.8): the margin is
+        # below the ambiguity threshold, so no silent choice is made.
+        resolution = detector.resolve_reference("this project")
+        assert resolution.candidate is None and resolution.clarification_required
+        assert resolution.reason == "ambiguous_project_evidence"
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_collection_denied_after_authorization_expiry(tmp_path: Path) -> None:
+    import time as _time
+
+    seams = build_fake_seams()
+    fixture_id = registration_app_id(
+        display_name="AETHER Fixture",
+        executable_identity=fixture_executable(),
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+    )
+    token = app_version_token(
+        seams.integrity_verifier.verify(  # type: ignore[attr-defined]
+            SimpleNamespace(location_digest=location_identity_digest(fixture_executable()))
+        )
+    )
+    storage = tmp_path / "aether-phase3-acceptance-gates"
+    _workspace = tmp_path / "aether-phase3-workspace-gates"
+    _workspace.mkdir(parents=True, exist_ok=True)
+    _ws_stat = _workspace.stat()
+    authz = ControlledAcceptanceAuthorization(
+        approved_commit=COMMIT,
+        decision_reference="owner-decision-gates",
+        campaign_id="campaign-gates",
+        storage_id="55555555-5555-4555-8555-555555555555",
+        storage_path=str(storage),
+        workspace_path=str(tmp_path / "aether-phase3-workspace-gates"),
+        workspace_identity=(_ws_stat.st_dev, _ws_stat.st_ino),
+        authorized_app_ids=frozenset({fixture_id}),
+        capability_allowlist=frozenset({"app.launch"}),
+        session_id="session-gates",
+        activation_epoch="epoch-gates",
+        expires_at=datetime.now(UTC) + timedelta(milliseconds=900),
+        privacy_mode="metadata_only",
+        fixture_app_id=fixture_id,
+        fixture_identity_token=token,
+    )
+    store = open_acceptance_store(
+        storage,
+        authorization=OwnerAcceptanceAuthorization(
+            decision_reference=authz.decision_reference,
+            storage_id=authz.storage_id,
+            expires_at=authz.expires_at,
+            campaign_id=authz.campaign_id,
+        ),
+        now=datetime.now(UTC),
+    )
+    store.close()
+    explorer = _CountingExplorer(tmp_path / "aether-phase3-workspace-gates" / "elsewhere")
+    seams.explorer_folder = explorer  # type: ignore[attr-defined]
+    providers = build_native_platform(authz, seams=seams)
+    comp = Phase3Composition.native(
+        authorization=authz,
+        current_commit=COMMIT,
+        storage_dir=storage,
+        gesture_key=GESTURE_KEY,
+        platform=providers,
+    )
+    try:
+        _opt_in(comp)
+        assert comp.bridge.arm_project_context({})["status"] == "armed"
+        comp.project_context_capture(4242)
+        assert comp.bridge.check_project_context({})["projects"] != []
+        calls = explorer.calls
+        _time.sleep(1.2)  # past expiry (timer + synchronous predicate agree)
+        _opt_in(comp)  # attempted reactivation after expiry
+        assert comp.bridge.check_project_context({})["status"] == "unavailable"
+        assert comp.bridge.get_state({})["projects"] == []
+        assert explorer.calls == calls
+    finally:
+        assert comp.shutdown() is True
+
+
+def test_invalid_registration_payloads_refused(tmp_path: Path) -> None:
+    comp = _start(tmp_path, _CountingExplorer(None))
+    try:
+        assert comp.bridge.register_project({"alias": "x"})["status"] == "unavailable"
+        assert (
+            comp.bridge.register_project({"alias": "x", "path": "relative/dir"})["status"]
+            == "unavailable"
+        )
+        assert comp.bridge.register_project({"alias": "x", "path": 42})["status"] == "unavailable"
+    finally:
+        assert comp.shutdown() is True

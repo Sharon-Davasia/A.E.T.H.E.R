@@ -77,6 +77,31 @@ _GET_OUTCOME_KIND = "review.get_outcome"
 # composition when it could be built; otherwise each answers a bounded
 # `live.error` with reason `composition_unavailable`. There is no generic
 # privileged operation: unknown kinds still terminate the session.
+_PHASE3_KINDS = {
+    "phase3.get_state": ("get_state", "phase3.state"),
+    "phase3.get_lifecycle": ("get_lifecycle", "phase3.lifecycle"),
+    "phase3.set_privacy": ("set_privacy", "phase3.state"),
+    "phase3.search_apps": ("search_apps", "phase3.apps"),
+    "phase3.inspect_window": ("inspect_window", "phase3.snapshot"),
+    "phase3.preview_interaction": ("preview_fixture_interaction", "phase3.preview"),
+    "phase3.approve_interaction": ("approve_fixture_interaction", "phase3.outcome"),
+    "phase3.get_task": ("get_task_state", "phase3.task"),
+    "phase3.pause_task": ("pause_task", "phase3.task"),
+    "phase3.list_windows": ("list_windows", "phase3.windows"),
+    "phase3.register_project": ("register_project", "phase3.project"),
+    "phase3.check_project_context": ("check_project_context", "phase3.project"),
+    "phase3.arm_project_context": ("arm_project_context", "phase3.project"),
+    "phase3.cancel_project_context": ("cancel_project_context", "phase3.project"),
+    "phase3.prepare_launch": ("prepare_launch", "phase3.prepared"),
+    "phase3.prepare_activation": ("prepare_activation", "phase3.prepared"),
+    "phase3.prepare_fixture": ("prepare_fixture_interaction", "phase3.prepared"),
+    "phase3.preview_operation": ("preview_operation", "phase3.preview"),
+    "phase3.approve_operation": ("approve_operation", "phase3.outcome"),
+    "phase3.get_receipt": ("get_receipt", "phase3.receipt"),
+    "phase3.cancel_task": ("cancel_task", "phase3.task"),
+    "phase3.resume_task": ("resume_task", "phase3.task"),
+}
+
 _LIVE_KINDS = {
     "project.register": ("register_project", "project.registered"),
     "project.resolve": ("resolve_resource", "project.resolved"),
@@ -147,7 +172,203 @@ def _error_payload(reason: str) -> dict[str, object]:
     return {"reason": reason}
 
 
-def main() -> int:
+_GIT_BASENAMES = {"git", "git.exe"}
+
+
+def _trusted_git_executable(
+    env: dict[str, str], *, candidates: list[str] | None = None
+) -> str | None:
+    """Resolve Git from an explicitly validated trusted path only.
+
+    The controlled backend is launched by Electron with a sanitized
+    PATH (runtime dir + System32 on Windows) that intentionally
+    excludes the normal Git installation directory, so invoking
+    ``git`` by name cannot work and must not be attempted: a PATH
+    lookup would also let any directory on that PATH supply the
+    executable. Resolution therefore uses, in order:
+
+    1. ``AETHER_GIT_EXECUTABLE`` when the trusted main process
+       forwarded an owner-set absolute path — it must be absolute,
+       name ``git``/``git.exe`` and be an existing regular file;
+       an explicitly configured but invalid path denies resolution
+       outright (no silent fallback).
+    2. Fixed well-known installation locations (Program Files /
+       per-user Git for Windows; ``/usr/bin/git`` etc. elsewhere),
+       each validated the same way.
+
+    Returns the validated absolute path or None (unverifiable).
+    """
+    from pathlib import Path as _Path
+
+    def _valid(value: str) -> str | None:
+        try:
+            path = _Path(value)
+            if not path.is_absolute() or path.name.casefold() not in _GIT_BASENAMES:
+                return None
+            if not path.is_file():
+                return None
+            return str(path)
+        except Exception:
+            return None
+
+    explicit = env.get("AETHER_GIT_EXECUTABLE")
+    if explicit:
+        return _valid(explicit)
+    if candidates is None:
+        import os as _os
+        import sys as _sys
+
+        if _sys.platform == "win32":
+            # The backend child may run with a deliberately stripped
+            # environment (no USERPROFILE/HOME): home resolution must
+            # never raise here, and the service-level env mapping is
+            # consulted before the process environment.
+            local_app_data = env.get("LOCALAPPDATA") or _os.environ.get("LOCALAPPDATA") or ""
+            user_profile = env.get("USERPROFILE") or _os.environ.get("USERPROFILE") or ""
+            roots = [
+                env.get("PROGRAMFILES") or _os.environ.get("PROGRAMFILES", r"C:\Program Files"),
+                env.get("PROGRAMFILES(X86)")
+                or _os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)"),
+            ]
+            if user_profile:
+                roots.append(str(_Path(user_profile) / "AppData" / "Local" / "Programs"))
+            candidates = [str(_Path(root) / "Git" / "cmd" / "git.exe") for root in roots] + [
+                str(_Path(root) / "Git" / "bin" / "git.exe") for root in roots
+            ]
+            if local_app_data:
+                candidates.append(
+                    str(_Path(local_app_data) / "Programs" / "Git" / "cmd" / "git.exe")
+                )
+        else:
+            candidates = ["/usr/bin/git", "/usr/local/bin/git", "/bin/git"]
+    for candidate in candidates:
+        resolved = _valid(candidate)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _controlled_phase3_composition(env: dict[str, str], gesture_key: bytes):  # type: ignore[no-untyped-def]
+    """A01 trusted startup path: explicit controlled-entry marker +
+    owner authorization artifact. Ordinary startup never takes this
+    path (it has no marker and no artifact). Any failure raises and
+    the process refuses to start; there is no fallback storage."""
+    import subprocess
+    from pathlib import Path as _Path
+
+    if env.get("_CONTROLLED_ENTRY") != "acceptance":
+        return None
+    artifact = env.get("AETHER_PHASE3_AUTHORIZATION")
+    if not artifact:
+        from aether.core.apps.acceptance_startup import StartupDenied
+
+        raise StartupDenied("controlled_startup_artifact_missing")
+    git_executable = _trusted_git_executable(env)
+    try:
+        commit = (
+            subprocess.run(
+                [git_executable, "rev-parse", "HEAD"],
+                cwd=_Path(__file__).resolve().parents[2],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            ).stdout.strip()
+            if git_executable is not None
+            else ""
+        )
+    except Exception:
+        commit = ""
+    from aether.core.apps.acceptance_startup import ControlledAcceptanceAuthorization
+    from aether.core.apps.composition import Phase3Composition
+
+    authorization = ControlledAcceptanceAuthorization.load(_Path(artifact))
+    if not commit:
+        from aether.core.apps.acceptance_startup import StartupDenied
+
+        raise StartupDenied("approved_commit_unverifiable")
+    # The gesture secret is the actual independent per-launch secret
+    # from the authenticated Electron bootstrap — never derived from
+    # the authorization artifact, session id or environment.
+    platform = None
+    if env.get("AETHER_PHASE3_PLATFORM") == "fake-windows":
+        # Test-harness platform boundary only: raw Windows-API fakes
+        # feed the identical provider construction path. It enables
+        # no native capability and is never set by the desktop app.
+        from aether.adapters.windows.fake_windows import build_fake_seams
+        from aether.core.apps.composition import build_native_platform
+
+        platform = build_native_platform(authorization, seams=build_fake_seams())
+    # Startup order matters: the authorization artifact's isolated
+    # storage is selected here — before any real-user store exists
+    # (ordinary storage is opened only after this returns).
+    return Phase3Composition.native(
+        authorization=authorization,
+        current_commit=commit,
+        storage_dir=authorization.storage_path,
+        gesture_key=gesture_key,
+        platform=platform,
+    )
+
+
+def _simulated_phase3_bridge(env: dict[str, str], gesture_key: bytes):  # type: ignore[no-untyped-def]
+    """Build the simulated composition for integration tests, or None."""
+    import uuid as _uuid
+    from datetime import UTC, datetime, timedelta
+    from pathlib import Path as _Path
+
+    storage = env.get("AETHER_PHASE3_STORAGE")
+    if not storage:
+        return None
+    try:
+        from aether.core.apps.composition import Phase3Composition
+        from aether.core.apps.fixture import FixtureApp
+        from aether.core.contracts.app_window import (
+            ApplicationRecord,
+            DiscoverySource,
+            LaunchMethod,
+            location_identity_digest,
+            registration_app_id,
+        )
+        from aether.core.persistence.acceptance_storage import (
+            OwnerAcceptanceAuthorization,
+            open_acceptance_store,
+        )
+
+        now = datetime.now(UTC)
+        store = open_acceptance_store(
+            _Path(storage),
+            authorization=OwnerAcceptanceAuthorization(
+                decision_reference="simulated-acceptance-test",
+                storage_id=str(_uuid.uuid4()),
+                expires_at=now + timedelta(hours=1),
+            ),
+            now=now,
+        )
+        exe = "C:\\Fake\\AETHERFixture.exe"
+        record = ApplicationRecord(
+            app_id=registration_app_id(
+                display_name="AETHER Fixture",
+                executable_identity=exe,
+                launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+            ),
+            display_name="AETHER Fixture",
+            launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+            executable_identity=exe,
+            location_digest=location_identity_digest(exe),
+            discovery_source=DiscoverySource.FAKE_FIXTURE,
+            discovered_at=now,
+            fresh_until=now + timedelta(hours=2),
+        )
+        composition = Phase3Composition.simulated(
+            store=store, fixture=FixtureApp(), fixture_record=record, gesture_key=gesture_key
+        )
+        return composition.bridge
+    except Exception:
+        return None
+
+
+def main(env_override: dict[str, str] | None = None) -> int:
     # Bootstrap (private stdin pipe, written once by Electron main):
     # MAGIC | 16B session id | 32B channel HMAC key | 32B challenge |
     # 32B gesture key. The gesture key is an independent per-launch secret
@@ -162,7 +383,7 @@ def main() -> int:
     challenge = bootstrap[offset + 48 : offset + 80].hex()
     gesture_key = bootstrap[offset + 80 : offset + 112]
 
-    env = dict(os.environ)
+    env = dict(env_override if env_override is not None else os.environ)
     # Controlled-activation acceptance launches (AETHER_ACCEPTANCE_MODE
     # =fixture) run ONLY against explicitly configured fixture storage:
     # an invalid or missing fixture configuration refuses startup here
@@ -181,6 +402,12 @@ def main() -> int:
         except AcceptanceStorageError:
             return 3
         bridge = None
+    elif env.get("_CONTROLLED_ENTRY") == "acceptance":
+        # Controlled startup selects isolated acceptance storage
+        # first: no review bridge and no real-user application store
+        # is opened in this mode at all.
+        bridge = None
+        app_store = None
     else:
         bridge = ReviewBridge.from_env(env)
         # FI-02A: the supported application store (AETHER_APP_DB, passed by
@@ -192,6 +419,24 @@ def main() -> int:
         app_store = None if bridge is not None else open_application_store(env)
     composition = None
     live_bridge = None
+    # CP7: the Phase 3 surface is constructed disabled in ordinary
+    # operation (no native providers are wired here); a reviewed
+    # activation decision supplies a wired surface separately.
+    from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
+
+    phase3_bridge = Phase3Bridge(Phase3Surface.disabled())
+    phase3_composition = None
+    if env.get("_CONTROLLED_ENTRY") == "acceptance":
+        phase3_composition = _controlled_phase3_composition(env, gesture_key)
+        phase3_bridge = phase3_composition.bridge
+    # G01/G02 simulated acceptance (automated integration tests only):
+    # an explicit test-harness launch may request the *simulated*
+    # composition, which uses fake platform providers and isolated
+    # acceptance storage. Ordinary launches never set this, native
+    # providers are never constructed here, and this is not an
+    # owner-side activation mechanism.
+    if env.get("AETHER_PHASE3_SIMULATED") == "simulated-acceptance":
+        phase3_bridge = _simulated_phase3_bridge(env, gesture_key) or phase3_bridge
     # Hello is emitted only after storage resolution: an acceptance
     # launch with invalid fixture storage exits above without ever
     # becoming ready.
@@ -279,6 +524,15 @@ def main() -> int:
                     else:
                         response_kind = "review.error"
                         response_payload = _error_payload(reason or "review_unavailable")
+            elif kind in _PHASE3_KINDS:
+                method_name, success_kind = _PHASE3_KINDS[kind]
+                result = getattr(phase3_bridge, method_name)(payload)
+                if result.get("status") == "unavailable":
+                    response_kind = "phase3.error"
+                    response_payload = _error_payload(str(result.get("reason")))
+                else:
+                    response_kind = success_kind
+                    response_payload = result
             elif kind in _LIVE_KINDS:
                 method_name, success_kind = _LIVE_KINDS[kind]
                 if live_bridge is None:
@@ -321,6 +575,8 @@ def main() -> int:
                 _emit_bounded(envelope)
             outbound_seq += 1
     finally:
+        if phase3_composition is not None:
+            phase3_composition.shutdown()
         if composition is not None:
             composition.close()
         if bridge is not None:

@@ -3,6 +3,9 @@ import { createRoot } from 'react-dom/client';
 import './style.css';
 import { ApprovalReviewSurface } from './ApprovalReviewSurface';
 import { LiveWorkflowSurface, stepMessage, type WorkflowView } from './LiveWorkflowSurface';
+import { Phase3Surface } from './Phase3Surface';
+import type { Phase3AppSearch, Phase3Lifecycle, Phase3Outcome, Phase3Prepared, Phase3ProjectContext, Phase3ProjectContextArm, Phase3ProjectContextView, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
+import { ProjectContextAttemptGuard, evaluateLifecycleReading, lifecycleInvalidatesContext, projectContextView, visibleProjectContext } from '../shared/phase3';
 import { describeLiveApprovalOutcome } from '../shared/live';
 import type {
   LiveApprovalState,
@@ -37,6 +40,26 @@ declare global {
       getEditReceipt: (receiptId: string) => Promise<LiveReceiptState>;
       searchProject: (query: string) => Promise<WorkflowStep<SearchOutcome>>;
       openProjectFolder: () => Promise<WorkflowStep<OpenOutcome>>;
+      phase3GetState: () => Promise<Phase3State>;
+      phase3GetLifecycle: () => Promise<Phase3Lifecycle>;
+      phase3SetPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }) => Promise<Phase3State>;
+      phase3SearchApps: (query: string) => Promise<unknown>;
+      phase3ArmProjectContext: () => Promise<Phase3ProjectContextArm>;
+      phase3CheckProjectContext: () => Promise<Phase3ProjectContext>;
+      phase3CancelProjectContext: () => Promise<{ status: 'ready'; cancelled: boolean }>;
+      phase3InspectWindow: (windowId: string) => Promise<Phase3Snapshot>;
+      phase3ApproveInteraction: (request: string | { taskId: string; preview?: Phase3Prepared }) => Promise<Phase3Outcome>;
+      phase3GetTask: (taskId: string) => Promise<{ status: string; taskState?: string; attempts?: unknown[] }>;
+      phase3PauseTask: (taskId: string) => Promise<Phase3Outcome>;
+      phase3ListWindows: () => Promise<Phase3Window[]>;
+      phase3PrepareLaunch: (appId: string) => Promise<Phase3Prepared>;
+      phase3PrepareActivation: (windowId: string) => Promise<Phase3Prepared>;
+      phase3PrepareFixture: (windowId: string) => Promise<Phase3Prepared>;
+      phase3ApproveOperation: (request: { taskId: string; effect: string; preview?: Phase3Prepared }) => Promise<Phase3Outcome>;
+      phase3GetReceipt: (taskId: string) => Promise<unknown>;
+      phase3CancelTask: (taskId: string) => Promise<Phase3Outcome>;
+      phase3ResumeTask: (taskId: string) => Promise<Phase3Outcome>;
+      phase3RegisterProject: () => Promise<Phase3ProjectRegistration>;
       getWorkflowState: () => Promise<{
         project: RegisteredProject | null;
         file: { resourceId: string } | null;
@@ -62,6 +85,185 @@ function App(): React.JSX.Element {
     searchMatches: null, openMessage: null,
   });
   const [receipt, setReceipt] = React.useState<LiveReceiptState | null>(null);
+  const [phase3State, setPhase3State] = React.useState<Phase3State | null>(null);
+  const [phase3Snapshot, setPhase3Snapshot] = React.useState<Phase3Snapshot | null>(null);
+  const [phase3Outcome, setPhase3Outcome] = React.useState<Phase3Outcome | null>(null);
+  const [phase3Busy, setPhase3Busy] = React.useState(false);
+  const [phase3Search, setPhase3Search] = React.useState<Phase3AppSearch | null>(null);
+  const [phase3SearchSerial, setPhase3SearchSerial] = React.useState(0);
+  const [phase3ProjectContext, setPhase3ProjectContext] = React.useState<Phase3ProjectContextView | null>(null);
+  const [phase3ContextArmed, setPhase3ContextArmed] = React.useState(false);
+  const [phase3ContextInFlight, setPhase3ContextInFlight] = React.useState(false);
+  const phase3ContextViewRef = React.useRef<Phase3ProjectContextView | null>(null);
+  // Privacy generation the pending arm/completion attempt is bound
+  // to (captured when the attempt begins), and the monitor binding.
+  const phase3AttemptGenerationRef = React.useRef<number | null>(null);
+  const phase3ContextBindingRef = React.useRef<{ generation: number | null; active: boolean }>({
+    generation: null, active: false,
+  });
+  const [phase3ContextNow, setPhase3ContextNow] = React.useState(() => Date.now());
+  const [phase3ContextGuard] = React.useState(() => new ProjectContextAttemptGuard());
+  const [phase3Windows, setPhase3Windows] = React.useState<Phase3Window[]>([]);
+  const [phase3Prepared, setPhase3Prepared] = React.useState<Phase3Prepared | null>(null);
+  const [phase3Receipt, setPhase3Receipt] = React.useState<unknown>(null);
+
+  // C3: project-context evidence is invalidated as one unit. Bumping
+  // the epoch makes any in-flight check/arm response stale, so a late
+  // response can never restore context after invalidation.
+  const invalidateProjectContext = React.useCallback((): void => {
+    phase3ContextGuard.invalidate();
+    phase3AttemptGenerationRef.current = null;
+    setPhase3ProjectContext(null);
+    setPhase3ContextArmed(false);
+  }, [phase3ContextGuard]);
+
+  const refreshPhase3 = React.useCallback(async (): Promise<void> => {
+    try {
+      const next = await window.aetherDesktop.phase3GetState();
+      setPhase3State(next);
+      // Returned authoritative lifecycle truth (AS2): an unavailable
+      // state, revocation or campaign expiry invalidates retained
+      // context and every in-flight response - the renderer never
+      // keeps trusting its previous lifecycle snapshot.
+      if (lifecycleInvalidatesContext(next, Date.now())) invalidateProjectContext();
+    } catch {
+      // Backend disconnect invalidates retained evidence AND any
+      // in-flight check response (epoch bump), not just storage.
+      invalidateProjectContext();
+      setPhase3State({ status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false, executionAvailable: false, expiresAtMs: null, disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 }, projects: [], windows: [], capabilities: {} });
+    }
+  }, [invalidateProjectContext]);
+
+  React.useEffect(() => {
+    let active = true;
+    void window.aetherDesktop.phase3GetState()
+      .then((next) => { if (active) setPhase3State(next); })
+      .catch(() => {
+        if (active) {
+          setPhase3State({
+            status: 'unavailable', reason: 'backend_unavailable', nativeAvailable: false,
+            executionAvailable: false, expiresAtMs: null,
+            disabledReason: 'backend_unavailable', privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
+            projects: [], windows: [], capabilities: {},
+          });
+        }
+      });
+    return () => { active = false; };
+  }, []);
+
+  async function phase3Privacy(privacy: { optedIn: boolean; mode: string; paused: boolean }): Promise<void> {
+    // Any privacy change invalidates retained Explorer evidence and
+    // any in-flight context check (C3).
+    invalidateProjectContext();
+    setPhase3Busy(true);
+    try { setPhase3State(await window.aetherDesktop.phase3SetPrivacy(privacy)); }
+    finally { setPhase3Busy(false); }
+  }
+
+  async function phase3Inspect(windowId: string): Promise<void> {
+    setPhase3Busy(true);
+    try { setPhase3Snapshot(await window.aetherDesktop.phase3InspectWindow(windowId)); }
+    finally { setPhase3Busy(false); }
+  }
+
+  React.useEffect(() => {
+    phase3ContextViewRef.current = phase3ProjectContext;
+  }, [phase3ProjectContext]);
+
+  // Authoritative lifecycle monitoring (C3/AS2): while context is
+  // retained OR a handoff is armed OR an arm/completion attempt is
+  // in flight, a timer advances local time AND re-reads the trusted
+  // backend lifecycle via the LIGHTWEIGHT read (never the full
+  // state: no project detection, no Explorer, no UIA, no filesystem
+  // inspection). Revocation, expiry, privacy-generation change,
+  // unavailable state or disconnect invalidates retained context
+  // and voids pending responses. A reading superseded in flight by
+  // a newer attempt/invalidation is never applied afterwards.
+  const monitorPhase3Lifecycle = React.useCallback(async (): Promise<void> => {
+    const epochAtStart = phase3ContextGuard.snapshot();
+    // A rejected request means backend disconnect: lifecycle = null.
+    const lifecycle: Phase3Lifecycle | null = await window.aetherDesktop
+      .phase3GetLifecycle()
+      .catch(() => null);
+    if (phase3ContextGuard.snapshot() !== epochAtStart) return; // superseded
+    if (evaluateLifecycleReading(
+      lifecycle,
+      phase3ContextBindingRef.current,
+      Date.now(),
+    ) === 'invalidate') {
+      invalidateProjectContext();
+    }
+  }, [phase3ContextGuard, invalidateProjectContext]);
+
+  const phase3ContextActive = phase3ProjectContext !== null || phase3ContextArmed || phase3ContextInFlight;
+  React.useEffect(() => {
+    phase3ContextBindingRef.current = {
+      generation: phase3ProjectContext?.generation ?? phase3AttemptGenerationRef.current,
+      active: phase3ContextActive,
+    };
+  }, [phase3ProjectContext, phase3ContextActive]);
+  React.useEffect(() => {
+    if (!phase3ContextActive) return;
+    const timer = setInterval(() => {
+      setPhase3ContextNow(Date.now());
+      void monitorPhase3Lifecycle();
+    }, 5_000);
+    return () => clearInterval(timer);
+  }, [phase3ContextActive, monitorPhase3Lifecycle]);
+
+  // C2 desktop flow: (1) trusted main establishes the one-shot arm;
+  // (2) the owner foregrounds the Explorer window; (3) completion
+  // rests only on the backend's fresh captured evidence. Every step
+  // is epoch-guarded: invalidation during flight drops late replies.
+  async function phase3ArmProjectContext(): Promise<void> {
+    const attempt = phase3ContextGuard.begin();
+    // Bind this attempt to the authoritative privacy generation it
+    // starts under; the monitor invalidates it on any change.
+    phase3AttemptGenerationRef.current = phase3State?.privacy.generation ?? null;
+    setPhase3ProjectContext(null);
+    setPhase3ContextInFlight(true);
+    setPhase3Busy(true);
+    try {
+      const result = await window.aetherDesktop.phase3ArmProjectContext();
+      if (!phase3ContextGuard.isCurrent(attempt)) return;
+      setPhase3ContextArmed(result.status === 'armed');
+    } catch {
+      if (phase3ContextGuard.isCurrent(attempt)) setPhase3ContextArmed(false);
+    } finally { setPhase3ContextInFlight(false); setPhase3Busy(false); }
+  }
+
+  async function phase3CheckProjectContext(): Promise<void> {
+    const attempt = phase3ContextGuard.begin();
+    phase3AttemptGenerationRef.current = phase3State?.privacy.generation ?? null;
+    setPhase3ContextInFlight(true);
+    setPhase3Busy(true);
+    try {
+      const result = await window.aetherDesktop.phase3CheckProjectContext();
+      if (!phase3ContextGuard.isCurrent(attempt)) return; // invalidated in flight
+      // Unavailable/failed checks clear retained context (C3); a
+      // ready result is bound to its capture instant + generation.
+      setPhase3ProjectContext(projectContextView(result));
+      setPhase3ContextArmed(false);
+    } catch {
+      if (phase3ContextGuard.isCurrent(attempt)) {
+        setPhase3ProjectContext(null);
+        setPhase3ContextArmed(false);
+      }
+    } finally { setPhase3ContextInFlight(false); setPhase3Busy(false); }
+  }
+
+  async function phase3CancelProjectContext(): Promise<void> {
+    invalidateProjectContext();
+    try { await window.aetherDesktop.phase3CancelProjectContext(); } catch { /* already dropped locally */ }
+  }
+
+  async function phase3Run<T>(fn: () => Promise<T>, apply: (value: T) => void): Promise<void> {
+    setPhase3Busy(true);
+    try { apply(await fn()); } finally { setPhase3Busy(false); }
+  }
+
+  const phase3TaskId = (): string | null => phase3Prepared?.taskId ?? null;
+
 
   React.useEffect(() => {
     let active = true;
@@ -79,6 +281,33 @@ function App(): React.JSX.Element {
     const timer = window.setInterval(refresh, 1000);
     return () => { active = false; window.clearInterval(timer); };
   }, []);
+
+  // Bounded startup recovery (N1): if the initial Phase 3/review
+  // loads raced startup (hidden window, frame not yet settled),
+  // recover through the read-only state queries once the backend
+  // reports ready - a bounded number of attempts, never an
+  // unbounded retry loop; privileged flows are unaffected.
+  const phase3StartupAttempts = React.useRef(0);
+  React.useEffect(() => {
+    if (!status.startsWith('ready')) return;
+    const phase3Pending = phase3State === null || phase3State.status !== 'ready';
+    const reviewPending = reviewState.status === 'unavailable'
+      && reviewState.message.startsWith('Trusted exact-preview review is unavailable');
+    if (!phase3Pending && !reviewPending) return;
+    if (phase3StartupAttempts.current >= 5) return;
+    phase3StartupAttempts.current += 1;
+    // Deferred: recovery runs as a fresh task, not a synchronous
+    // state update inside this effect.
+    const timer = window.setTimeout(() => {
+      if (phase3Pending) void refreshPhase3();
+      if (reviewPending) {
+        void window.aetherDesktop.getApprovalReview()
+          .then((value) => setReviewState(parseReviewPreviewState(value)))
+          .catch(() => undefined);
+      }
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [status, phase3State, reviewState, refreshPhase3]);
 
   async function ping(): Promise<void> {
     setBusy(true);
@@ -237,6 +466,81 @@ function App(): React.JSX.Element {
       onApprove={() => void approveLive()}
       onShowReceipt={(id) => void showReceipt(id)}
       onPrepareUndo={(id) => void prepareUndo(id)}
+    />
+    <Phase3Surface
+      state={phase3State}
+      search={phase3Search}
+      searchSerial={phase3SearchSerial}
+      projectContext={visibleProjectContext(phase3ProjectContext, phase3State, phase3ContextNow)}
+      projectContextArmed={phase3ContextArmed}
+      windows={phase3Windows}
+      snapshot={phase3Snapshot}
+      prepared={phase3Prepared}
+      outcome={phase3Outcome}
+      receipt={phase3Receipt}
+      busy={phase3Busy}
+      onRefresh={() => {
+        void refreshPhase3();
+        void phase3Run(() => window.aetherDesktop.phase3ListWindows(), setPhase3Windows);
+      }}
+      onPrivacy={(privacy) => void phase3Privacy(privacy)}
+      onSearchApps={(query) => void phase3Run(
+        () => window.aetherDesktop.phase3SearchApps(query) as Promise<Phase3AppSearch>,
+        (search) => { setPhase3Search(search); setPhase3SearchSerial((n) => n + 1); },
+      )}
+      onArmProjectContext={() => void phase3ArmProjectContext()}
+      onCheckProjectContext={() => void phase3CheckProjectContext()}
+      onCancelProjectContext={() => void phase3CancelProjectContext()}
+      onRegisterProject={() => {
+        void (async () => {
+          await window.aetherDesktop.phase3RegisterProject();
+          await refreshPhase3();
+        })();
+      }}
+      onPrepareLaunch={(appId) => void phase3Run(
+        () => window.aetherDesktop.phase3PrepareLaunch(appId), setPhase3Prepared,
+      )}
+      onApproveOperation={(effect) => {
+        const taskId = phase3TaskId();
+        if (taskId) {
+          void phase3Run(
+            () => window.aetherDesktop.phase3ApproveOperation({ taskId, effect, preview: phase3Prepared ?? undefined }),
+            setPhase3Outcome,
+          );
+        }
+      }}
+      onInspect={(windowId) => void phase3Inspect(windowId)}
+      onPrepareActivation={(windowId) => void phase3Run(
+        () => window.aetherDesktop.phase3PrepareActivation(windowId), setPhase3Prepared,
+      )}
+      onPrepareFixture={(windowId) => void phase3Run(
+        () => window.aetherDesktop.phase3PrepareFixture(windowId), setPhase3Prepared,
+      )}
+      onApproveFixture={() => {
+        const taskId = phase3TaskId();
+        if (taskId) {
+          void phase3Run(
+            () => window.aetherDesktop.phase3ApproveInteraction({ taskId, preview: phase3Prepared ?? undefined }),
+            setPhase3Outcome,
+          );
+        }
+      }}
+      onPauseTask={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3PauseTask(taskId), setPhase3Outcome);
+      }}
+      onCancelTask={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3CancelTask(taskId), setPhase3Outcome);
+      }}
+      onResumeTask={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3ResumeTask(taskId), setPhase3Outcome);
+      }}
+      onShowReceipt={() => {
+        const taskId = phase3TaskId();
+        if (taskId) void phase3Run(() => window.aetherDesktop.phase3GetReceipt(taskId), setPhase3Receipt);
+      }}
     />
     <p className="notice">Review outcomes above are non-authorizing audit evidence. A live action additionally requires the trusted approval window (complete exact preview with explicit review acknowledgement) and production grant issuance. Issuance is enabled only for the controlled acceptance fixture — validated fixture storage and its designated project directory. In ordinary application launches, issuance and execution remain disabled: an approved gesture is refused and nothing executes.</p>
   </main>;

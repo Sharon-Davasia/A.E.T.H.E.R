@@ -4,42 +4,164 @@
 
 ## Current phase
 
-**Phase 2 implementation is merged to `main`** (PR #34, merge commit
-`a58bd68843091eb339e3c102b8a2cfa204d355c6`; integrated source head
-`3cd5c06`, tree-identical to independently verified commit `bf08ca9`,
-tree `811c9b75b4a42d81a582beb7f37499eb13a55b2a`). The complete stack
-formerly split across PRs #15–#32, plus the CRLF/EOF-trailer and
-legacy-binding corrections and the Windows merge-gate, entered `main`
-exactly once through that PR. PR #14 (closed, superseded — its content is
-integrated) and PR #33 (closed, superseded — corrections incorporated via
-`bf08ca9`) were not merged independently. At the moment of integration there were zero open PRs (historical, as of 2026-11-23; documentation PR #35 was opened afterwards).
+**Phase 2 controlled integration is merged to `main`** (PR #36, merge
+commit `14614dcf99c79477dec36e1c25e10e17397cf763`; final reviewed
+source head `cd3c2930340ad496f0cffc10ed65e7b73bbb08bf`;
+native-tested implementation head
+`35f9bb0e344441ed86878b6b22e8b9d8765de5d8`). Schema v2 is active
+(`ACTIVE_SCHEMA_VERSION = 2`) for the controlled candidate, and
+controlled Activation B enables production-trusted grant issuance
+*only* for validated acceptance-fixture launches, bounded to the
+designated fixture project subtree. Ordinary launches refuse issuance
+(`grant_issuance_disabled`) and execution (`mutation_not_enabled`).
 
-**Phase 2 code integration: COMPLETE. Formal Phase 2 acceptance: NOT
-COMPLETE.** What remains is of two distinct kinds: (a)
-implementation/wiring prerequisites — a separately authorized supported
-live workflow able to issue a real production grant and perform a working
-approved edit and a verified Undo, which the Master Specification's
-acceptance requires demonstrating and which the shipped product
-deliberately cannot do yet; and (b) acceptance evidence: archived native
-Windows evidence, the mandatory human demonstrations in
-`docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §8 (several live
-demonstrations are blocked until a separately authorized live workflow
-exists), a genuine interruption test, and Linux/hosted re-confirmation on
-Python 3.12.10 (Linux verification at `bf08ca9` ran on Python 3.11.2:
-847 passed, 5 skipped). Native Windows results with Python 3.12.10 have
-been user-reported (full suite, desktop 70/70, 6 Python channel tests,
-ruff/mypy/Electron build, ACL unreadable-narrative test 1 passed) but their
-logs are not archived in this repository.
+**Formal Phase 2 acceptance: COMPLETE (owner-accepted).** The owner
+acceptance record, including the independently executed native
+interruption harness, is locally archived with the owner (see
+`docs/engineering/PHASE2_WINDOWS_ACCEPTANCE.md` §8; artifacts remain
+owner-held and are not archived in this repository). Phase 3
+development does not reopen Phase 2.
 
-Security boundaries are unchanged by the integration and verified on
-`main`: `ACTIVE_SCHEMA_VERSION = 1` with `PENDING_MIGRATION_VERSIONS =
-{2}` (schema v2 prepared, **not activated**); production grant issuance
-remains default-deny (`GRANT_ISSUANCE_DISABLED`,
-`NullAttestationVerifier`, `IssuanceDisabledConsumptionLedger`); no live
-mutation path is wired into the running service; Phase 3 has not started.
-Activation of schema v2 or of any live grant/mutation path requires
-separate explicit user approval. The detailed post-merge record is in
-`docs/engineering/PHASE2_ACCEPTANCE_REPORT.md`.
+**Phase 3 integration/activation-readiness gate (G01–G06) is
+implemented** on top of the final batch: a controlled composition
+factory with trusted lifecycle and parent-owned worker bootstrap,
+the complete G02 desktop workflow (no typed internal ids), scoped
+schema-v3 acceptance storage (ordinary storage stays v2), integrated
+takeover/dialog handling, the native fixture contract with a
+reproducibly built executable, and authoritative privacy/project/
+activation hardening. Automated evidence is simulated/Linux only
+(including a genuine authenticated cross-process simulated workflow
+to a durable receipt). The runnable P3-01…P3-25 campaign and the
+activation decision package are prepared for independent review;
+native activation remains disabled in ordinary operation and no
+owner-side run is requested yet.
+
+**Consolidated pre-activation corrections A–E are implemented** on
+PR #37 in one correction checkpoint (Linux/fake test surface only;
+not native evidence): privacy-lifetime collection gates at the
+provider boundary, verified packaged-app identity via the platform
+package query with runtime-AUMID observer attribution, the
+canonical fuzzy/alias resolver connected to the bridge and desktop
+(FTS retrieval/display only), refusal of unsupported/unverifiable
+launch records before approval, main-process-owned trusted project
+registration restricted to the dedicated synthetic workspace
+(sibling of the acceptance database directory), and
+reconciled campaign/ordinary-mode documentation. The next step is
+the single consolidated owner native campaign
+(`PHASE3_NATIVE_ACCEPTANCE.md`), after which independent review
+decides Phase 3 acceptance; no intermediate owner runs are
+requested. Residual corrections R1–R5 (live running-process package
+identity, separate synthetic workspace boundary, complete privacy
+generation/lifecycle enforcement, resolver outcomes preserved across
+desktop IPC, and procedure consistency) are implemented on top in a
+follow-up checkpoint on PR #37, same Linux/fake test surface only.
+
+Final residual closure F1–F6 is implemented on top in a third
+checkpoint on PR #37 (same Linux/fake test surface): the workspace
+directory itself is filesystem-validated and identity-bound
+(substitution/identity drift refused at startup and registration),
+foreground Explorer collection happens only inside one explicit
+owner-initiated project-context check, desktop selection validity
+is bound to the exact search completion + privacy generation,
+campaign procedures use a fresh campaign directory inside the
+owner evidence root, and package-query buffer reads are contained
+and termination-checked.
+
+Acceptance interaction closure C1–C4 is implemented on top in a
+fourth checkpoint on PR #37 (same Linux/fake test surface; native
+junction and Explorer-COM behavior remain owner-verified only): a
+Windows junction regression proves workspace substitution refuses
+startup validation and can never become the registration boundary;
+the Explorer project check runs as a one-shot focus handoff armed
+by the trusted desktop main process and succeeds only on actual
+Explorer evidence captured from a verified foreground change within
+60 seconds (no polling; unrelated windows cannot complete it);
+renderer context display is bound to the privacy generation,
+lifecycle and evidence freshness, dropping late responses after
+invalidation; and the activation proposal permits only the exact
+known untracked fixture in its clean-tree guard with every
+controlled-startup variable defined.
+Completion of C2/C3: arming additionally requires an explicit
+native owner confirmation in the trusted main process (declining
+makes zero backend arm calls); the backend handoff enforces
+privacy/expiry/revocation at the collection boundary, validates
+workspace scope before retaining any evidence, rechecks
+authorization after native collection, and is consumed and purged
+by every completion attempt and by pause, opt-out, generation
+change, revocation, shutdown and expiry; the renderer binds
+retained context to the authoritative campaign lifecycle
+(execution availability and expiry) in addition to generation and
+the 60-second freshness window. Candidate awaits independent
+review; no native activation has been performed.
+
+Activation-security clearance AS1/AS2: the captured sample is
+bound to the original handoff identity, generation and deadline,
+revalidated after native collection and scope validation (a sample
+crossing the deadline, or invalidated/re-armed mid-collection, is
+never retained); and the renderer's context-retention timer now
+re-reads authoritative backend lifecycle state, so unexpected
+revocation, expiry or disconnection invalidates displayed context
+and voids in-flight responses.
+Completion of AS1/AS2: the final original-arm identity check and
+retention/consumption are atomic under the handoff lock (never held
+across native collection or scope validation; cancellation or
+replacement during scope validation retains nothing and preserves
+any replacement arm); lifecycle monitoring uses a lightweight
+authoritative read (no project detection, Explorer, UIA or
+filesystem work), covers retained context plus pending arm and
+completion attempts, fails closed on unknown lifecycle authority,
+and drops late lifecycle readings superseded in flight.
+Native-acceptance blockers N1/N2 (pre-campaign correction):
+trusted-sender IPC is split - read-only state queries admit exact
+WebContents/frame/URL identity before first focus (hidden startup
+window), while privileged/authorizing/effectful channels keep the
+additional focus requirement, with a bounded renderer startup
+recovery; AppsFolder discovery now uses the documented Shell COM
+contracts (ParseDisplayName 3-tuple, SHCONTF_NONFOLDERS |
+SHCONTF_FASTITEMS, SHGDN_NORMAL vs SHGDN_FORPARSING with
+AUMID-shape-gated identities) with staged truthful statuses and a
+read-only diagnostic; the pinned Electron runtime is preflighted
+offline (check-electron-runtime, wired as prestart) so acceptance
+never triggers Electron's lazy binary download.
+
+**Phase 3 final consolidated batch (F09–F14, CP6, CP7) is implemented
+fake-backed** on top of CP4–CP5: authoritative persisted UI-operation
+bindings enforced end-to-end, PolicyBroker/enablement integration,
+production UIA inspection through the real supervised subprocess
+worker, privacy-governed collection with lifecycle-bound snapshots,
+truthful outcome classes, the native Win32 fixture source
+(`tools/windows-fixture/`, never executed here), current-project
+detection/dialog handling/pause-resume/restart reconciliation (CP6),
+and the Electron Phase 3 verification surface over the authenticated
+channel (CP7). The native acceptance campaign P3-01–P3-25 is prepared
+(`PHASE3_NATIVE_ACCEPTANCE.md`, not run) and the activation proposal
+awaits separate owner approval
+(`docs/security/PHASE3_ACTIVATION_PROPOSAL.md`). No native Windows
+evidence exists; native activation remains disabled
+(`phase3_native_disabled` in ordinary launches) and schema v3 remains
+inactive. Implementation-present only — not platform-verified, not
+native-verified, not formally accepted.
+
+**Phase 3 foundation (CP0-CP2) plus the CP3 completion batch
+(CP3-B01..B06) is in development** on
+`integration/phase3-windows-state-app-control` under a bounded
+parallel-development authorization (Phase 2 acceptance is not
+waived): typed app/window contracts with one generation/epoch and
+real session-ephemeral `window:<uuid>` resource authority,
+privacy-gated in-memory WorldState, a thread-owned native observer
+(source written, fake-verified, activation disabled), an in-memory
+application registry with real RapidFuzz alias resolution and trusted
+discovery normalization, trusted launch-authority/confirmation
+separation, and a bounded `app.launch` capability executed only by the
+trusted coordinator against the authoritative persisted plan,
+independently verified over separate fake-platform observations,
+with durable navigation evidence integrated into `SQLiteTaskStore`
+on a *prepared-but-inactive* schema v3 (`ACTIVE_SCHEMA_VERSION = 2`).
+Native launcher/integrity source is written but activation-disabled. No
+native observation is enabled, no real application has been
+launched, and no UI interaction exists. See
+`docs/engineering/PHASE3_PLAN.md` and
+`docs/engineering/PHASE3_R1_DESIGN.md`.
 
 Everything below this section that describes PR #14 or earlier stage
 branches as open/pending is **historical** and superseded by this section.

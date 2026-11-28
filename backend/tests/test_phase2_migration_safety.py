@@ -16,7 +16,7 @@ Proposal A has since activated version 2 in the shipped build
 (controlled Windows acceptance candidate, PR #36). The migration-safety
 properties above are still validated against disposable copies, with
 genuine v1 databases produced under the test-scoped deactivated state;
-``ACTIVE_SCHEMA_VERSION == 2`` and ``PENDING_MIGRATION_VERSIONS == {}``
+``ACTIVE_SCHEMA_VERSION == 2`` and ``PENDING_MIGRATION_VERSIONS == {3}`` (v3 prepared only)
 are asserted directly.
 """
 
@@ -112,7 +112,7 @@ def v1(tmp_path: Path):
 
 def test_shipped_activation_configuration_reflects_proposal_a() -> None:
     assert sqlite_store.ACTIVE_SCHEMA_VERSION == 2
-    assert frozenset() == sqlite_store.PENDING_MIGRATION_VERSIONS
+    assert frozenset({3}) == sqlite_store.PENDING_MIGRATION_VERSIONS  # v3 prepared-only (Phase 3)
 
 
 def test_backup_of_v1_database_restores_and_opens_as_v1(tmp_path: Path, v1, monkeypatch) -> None:

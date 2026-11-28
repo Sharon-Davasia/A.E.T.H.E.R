@@ -2,11 +2,13 @@ import { app, BrowserWindow, dialog, ipcMain, session, type IpcMainInvokeEvent }
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { BackendClient, type BackendLaunchSpec } from './backend-client';
-import { isTrustedSender } from './security';
+import { isFocusedTrustedSender, isTrustedSender, requiresFocusedSender } from './security';
 import { createChannelReviewProvider } from './channel-review-provider';
 import { createLiveApprovalProvider } from './live-approval-provider';
+import { createPhase3Provider, type Phase3InteractionSummary } from './phase3-provider';
 import { createApprovalWindowConfirmer } from './approval-window';
 import { workflowFailureReason } from './workflow';
+import { ProjectContextHandoff, establishProjectContextArm } from './project-context-handoff';
 import { LiveWorkflow } from './workflow';
 import { parseEditReceipt } from '../shared/live';
 import { parseReviewOutcomeRequest } from '../shared/review';
@@ -57,6 +59,33 @@ const liveApprovalProvider = createLiveApprovalProvider({
   confirm: (summary) => approvalConfirmer.confirmApproval(summary),
   approvalGeneration: () => navigationEpoch,
 });
+const phase3Provider = createPhase3Provider({
+  backend,
+  confirm: async (summary: Phase3InteractionSummary) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    const detail = [
+      `Application: ${summary.appDisplayName}`,
+      `Operation: ${summary.capabilityId}`,
+      `Target window: ${summary.windowId}`,
+      summary.elementRef ? `Fixture control: ${summary.elementRef}` : '',
+      `Verified precondition: ${summary.verifiedPrecondition}`,
+      `Intended effect: ${summary.intendedEffect}`,
+      `Expected postcondition: ${summary.expectedPostcondition}`,
+      `Task (diagnostic): ${summary.taskId}`,
+    ].filter(Boolean).join('\n');
+    const result = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Approve exact action'],
+      defaultId: 0,
+      cancelId: 0,
+      title: 'AETHER — confirm exact operation',
+      message: `Approve this exact operation for ${summary.appDisplayName}?`,
+      detail,
+    });
+    return result.response === 1;
+  },
+});
+
 let mainWindow: BrowserWindow | undefined;
 let shuttingDown = false;
 
@@ -147,9 +176,33 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
       env.AETHER_REVIEW_DEV_SEED = 'synthetic-review';
     }
   }
+  // A01 controlled acceptance: only an explicit owner-set absolute
+  // authorization-artifact path in the *main process* environment
+  // (never renderer input) selects the dedicated controlled backend
+  // entry point. Ordinary launches always use the disabled service.
+  const controlledAuth = !packaged ? process.env.AETHER_PHASE3_AUTHORIZATION : undefined;
+  const controlled = typeof controlledAuth === 'string' && isAbsolute(controlledAuth);
+  if (controlled) {
+    env.AETHER_PHASE3_AUTHORIZATION = controlledAuth;
+    delete env.AETHER_APP_DB;
+    // The sanitized backend PATH (runtime dir + System32) excludes
+    // the normal Git installation directory, so the controlled
+    // backend cannot resolve `git` by name. Forward an owner-set
+    // absolute Git executable path from the main-process
+    // environment only (never renderer input); the backend
+    // validates it as an existing regular git/git.exe file before
+    // use and denies controlled startup when it cannot.
+    const gitExecutable = process.env.AETHER_GIT_EXECUTABLE;
+    if (typeof gitExecutable === 'string' && isAbsolute(gitExecutable)) {
+      env.AETHER_GIT_EXECUTABLE = resolve(gitExecutable);
+    }
+  }
   const spec: BackendLaunchSpec = {
     executable: absoluteExecutable,
-    args: ['-P', '-I', '-B', '-u', '-m', 'aether.channel.service'],
+    args: [
+      '-P', '-I', '-B', '-u', '-m',
+      controlled ? 'aether.channel.controlled_service' : 'aether.channel.service',
+    ],
     // cwd is inert for imports under -P (kept only for deterministic diagnostics).
     cwd: backendRoot,
     env,
@@ -161,28 +214,46 @@ function resolveBackendLaunchSpec(): BackendLaunchSpec {
   return spec;
 }
 
-function validateInvoke(event: IpcMainInvokeEvent): void {
+// Two sender classes, both requiring exact WebContents/frame/URL
+// identity (see security.ts): read-only state queries are admitted
+// on identity alone so legitimate startup works while the window
+// is hidden/unfocused; privileged, authorizing and effectful
+// operations additionally require the main window to be focused.
+function validateReadOnlyInvoke(event: IpcMainInvokeEvent): void {
   if (!isTrustedSender(mainWindow, event.sender, event.senderFrame ?? undefined, RENDERER_FILE)) {
     throw new Error('Untrusted desktop IPC sender');
   }
 }
 
+function validateInvoke(event: IpcMainInvokeEvent): void {
+  if (!isFocusedTrustedSender(mainWindow, event.sender, event.senderFrame ?? undefined, RENDERER_FILE)) {
+    throw new Error('Untrusted desktop IPC sender');
+  }
+}
+
+// Every IPC handler routes through here, so the tested channel
+// classification in security.ts is the runtime authority.
+function validateInvokeFor(event: IpcMainInvokeEvent, channel: string): void {
+  if (requiresFocusedSender(channel)) validateInvoke(event);
+  else validateReadOnlyInvoke(event);
+}
+
 function registerIpc(): void {
   approvalConfirmer.registerIpc();
   ipcMain.handle('desktop:backend-status', (event) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:backend-status');
     return backend.status();
   });
   ipcMain.handle('desktop:demo-ping', async (event) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:demo-ping');
     return backend.ping();
   });
   ipcMain.handle('desktop:review-preview', async (event) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:review-preview');
     return reviewProvider.getReview();
   });
   ipcMain.handle('desktop:record-review-outcome', async (event, rawRequest: unknown) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:record-review-outcome');
     const request = parseReviewOutcomeRequest(rawRequest);
     return reviewProvider.recordOutcome(request);
   });
@@ -191,15 +262,209 @@ function registerIpc(): void {
   // native dialog above. The result is a bounded summary (no nonce, no
   // signature, no binding crosses this boundary).
   ipcMain.handle('desktop:live-approve', async (event) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:live-approve');
     return liveApprovalProvider.approveAndExecute();
+  });
+  // CP7 Phase 3 verification surface. The renderer receives bounded
+  // summaries and may only *request* the trusted approval flow with a
+  // task identity; bindings, nonces and signatures never cross IPC.
+  const phase3TaskId = (raw: unknown): string => {
+    if (typeof raw !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(raw)) {
+      throw new Error('malformed phase3 task identity');
+    }
+    return raw;
+  };
+  ipcMain.handle('desktop:phase3-state', async (event) => {
+    validateInvokeFor(event, 'desktop:phase3-state');
+    const state = await phase3Provider.getState();
+    if (state.status === 'unavailable') {
+      // Backend disconnect/unavailability invalidates any handoff.
+      projectContextHandoff.cancel();
+    }
+    return state;
+  });
+  ipcMain.handle('desktop:phase3-lifecycle', async (event) => {
+    validateInvokeFor(event, 'desktop:phase3-lifecycle');
+    return phase3Provider.getLifecycle();
+  });
+  ipcMain.handle('desktop:phase3-set-privacy', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-set-privacy');
+    const item = raw as { optedIn?: unknown; mode?: unknown; paused?: unknown } | null;
+    if (!item || typeof item !== 'object'
+      || typeof item.optedIn !== 'boolean' || typeof item.paused !== 'boolean'
+      || typeof item.mode !== 'string' || !['off', 'metadata_only', 'active_app_only', 'workspace_context', 'content_on_demand'].includes(item.mode)) {
+      throw new Error('malformed phase3 privacy request');
+    }
+    return phase3Provider.setPrivacy({ optedIn: item.optedIn, mode: item.mode, paused: item.paused });
+  });
+  ipcMain.handle('desktop:phase3-search-apps', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-search-apps');
+    if (typeof raw !== 'string' || raw.length > 256) throw new Error('malformed phase3 query');
+    return phase3Provider.searchApps(raw);
+  });
+  // C2 focus handoff: the one-shot owner authorization is
+  // established HERE, in the trusted main process - renderer IPC
+  // sender validation alone is never proof of owner intent. Arming
+  // requires a successful backend arm; a completion attempt is
+  // admitted only while main's own handoff is live, and consumes
+  // it. The backend still requires actual fresh Explorer evidence
+  // captured from a verified foreground change.
+  const projectContextHandoff = new ProjectContextHandoff();
+  ipcMain.handle('desktop:phase3-arm-project-context', async (event) => {
+    validateInvokeFor(event, 'desktop:phase3-arm-project-context');
+    // Sender validation alone NEVER arms collection: the owner
+    // must first confirm, in this native main-process dialog, the
+    // bounded one-shot scope. Declining (or having no window to
+    // confirm in) means zero backend arm calls.
+    return establishProjectContextArm({
+      confirm: async () => {
+        if (!mainWindow || mainWindow.isDestroyed()) return false;
+        const result = await dialog.showMessageBox(mainWindow, {
+          type: 'warning',
+          buttons: ['Cancel', 'Begin 60-second Explorer check'],
+          defaultId: 0,
+          cancelId: 0,
+          title: 'AETHER — Explorer project check',
+          message: 'Begin a one-shot Explorer project check?',
+          detail: [
+            'If you proceed, switch to the Explorer window showing the registered',
+            'synthetic project folder within 60 seconds. AETHER remembers only',
+            'that one foreground Explorer folder, only long enough to compare it',
+            'with the registered synthetic workspace.',
+            '',
+            'Nothing is collected from any other window, state refreshes never',
+            'read Explorer folders, and out-of-scope folders are discarded -',
+            'never retained or shown. The attempt expires after 60 seconds and',
+            'can be cancelled at any time.',
+          ].join('\n'),
+        });
+        return result.response === 1;
+      },
+      armBackend: () => phase3Provider.armProjectContext(),
+      handoff: projectContextHandoff,
+      now: () => Date.now(),
+    });
+  });
+  ipcMain.handle('desktop:phase3-check-project-context', async (event) => {
+    validateInvokeFor(event, 'desktop:phase3-check-project-context');
+    if (!projectContextHandoff.consume(Date.now())) {
+      // No live main-established handoff: refuse without touching
+      // the backend - a renderer click can never self-authorize.
+      return {
+        status: 'unavailable', reason: 'explorer_evidence_unavailable',
+        projects: [], capturedAtMs: null, generation: null,
+      };
+    }
+    return phase3Provider.checkProjectContext();
+  });
+  ipcMain.handle('desktop:phase3-cancel-project-context', async (event) => {
+    validateInvokeFor(event, 'desktop:phase3-cancel-project-context');
+    projectContextHandoff.cancel();
+    return phase3Provider.cancelProjectContext();
+  });
+  ipcMain.handle('desktop:phase3-inspect-window', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-inspect-window');
+    if (typeof raw !== 'string' || raw.length > 128) throw new Error('malformed phase3 window identity');
+    return phase3Provider.inspectWindow(raw);
+  });
+  ipcMain.handle('desktop:phase3-approve-interaction', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-approve-interaction');
+    if (typeof raw === 'string') return phase3Provider.approveFixtureInteraction(phase3TaskId(raw));
+    const item = raw as { taskId?: unknown; preview?: unknown } | null;
+    if (!item || typeof item !== 'object') throw new Error('malformed phase3 interaction');
+    return phase3Provider.approveFixtureInteraction(phase3TaskId(item.taskId), item.preview as never);
+  });
+  ipcMain.handle('desktop:phase3-task', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-task');
+    return phase3Provider.getTaskState(phase3TaskId(raw));
+  });
+  ipcMain.handle('desktop:phase3-pause-task', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-pause-task');
+    return phase3Provider.pauseTask(phase3TaskId(raw));
+  });
+  const phase3BoundedId = (raw: unknown): string => {
+    if (typeof raw !== 'string' || raw.length < 1 || raw.length > 256) {
+      throw new Error('malformed phase3 identity');
+    }
+    return raw;
+  };
+  ipcMain.handle('desktop:phase3-list-windows', async (event) => {
+    validateInvokeFor(event, 'desktop:phase3-list-windows');
+    return phase3Provider.listWindows();
+  });
+  ipcMain.handle('desktop:phase3-prepare-launch', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-prepare-launch');
+    return phase3Provider.prepareLaunch(phase3BoundedId(raw));
+  });
+  ipcMain.handle('desktop:phase3-prepare-activation', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-prepare-activation');
+    return phase3Provider.prepareActivation(phase3BoundedId(raw));
+  });
+  ipcMain.handle('desktop:phase3-prepare-fixture', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-prepare-fixture');
+    return phase3Provider.prepareFixture(phase3BoundedId(raw));
+  });
+  ipcMain.handle('desktop:phase3-approve-operation', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-approve-operation');
+    const item = raw as { taskId?: unknown; effect?: unknown; preview?: unknown } | null;
+    if (!item || typeof item !== 'object' || (item.effect !== 'app.launch' && item.effect !== 'window.activate')) {
+      throw new Error('malformed phase3 operation');
+    }
+    return phase3Provider.approveOperation(
+      phase3TaskId(item.taskId), item.effect,
+      item.preview as never,
+    );
+  });
+  ipcMain.handle('desktop:phase3-receipt', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-receipt');
+    return phase3Provider.getReceipt(phase3TaskId(raw));
+  });
+  ipcMain.handle('desktop:phase3-cancel-task', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-cancel-task');
+    return phase3Provider.cancelTask(phase3TaskId(raw));
+  });
+  ipcMain.handle('desktop:phase3-resume-task', async (event, raw: unknown) => {
+    validateInvokeFor(event, 'desktop:phase3-resume-task');
+    return phase3Provider.resumeTask(phase3TaskId(raw));
+  });
+  // Controlled project registration (P3-23): the directory is chosen
+  // in this main-process dialog and confirmed natively; the renderer
+  // never supplies an authoritative filesystem path. Registration
+  // grants detection metadata only (no file read/search/open/edit).
+  ipcMain.handle('desktop:phase3-register-project', async (event) => {
+    validateInvokeFor(event, 'desktop:phase3-register-project');
+    if (!mainWindow) return { status: 'unavailable', reason: 'window_unavailable' };
+    const picked = await dialog.showOpenDialog(mainWindow, {
+      title: 'Choose the synthetic project directory',
+      properties: ['openDirectory'],
+    });
+    if (picked.canceled || picked.filePaths.length !== 1) {
+      return { status: 'unavailable', reason: 'selection_cancelled' };
+    }
+    const directory = picked.filePaths[0]!;
+    const granted = await dialog.showMessageBox(mainWindow, {
+      type: 'warning',
+      buttons: ['Cancel', 'Register project'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+      title: 'Register project for detection',
+      message: `Allow AETHER to use this directory only as current-project detection context:\n\n${directory}`,
+      detail: 'Detection metadata only: this enables no file reading, searching, opening or editing, and applies to this session only.',
+    });
+    if (granted.response !== 1) return { status: 'unavailable', reason: 'registration_declined' };
+    try {
+      return await phase3Provider.registerProject(directory);
+    } catch {
+      return { status: 'unavailable', reason: 'registration_failed' };
+    }
   });
   // FI-02 workflow steps. The renderer requests operations; main owns
   // every identity. Project registration additionally requires a native
   // confirmation naming the directory — that dialog *is* the explicit
   // user authorization for the bounded capability scope.
   ipcMain.handle('desktop:workflow-select-project', async (event) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-select-project');
     if (!mainWindow) return { status: 'unavailable', reason: 'window_unavailable' };
     const picked = await dialog.showOpenDialog(mainWindow, {
       title: 'Choose a project directory',
@@ -228,7 +493,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('desktop:workflow-open-file', async (event, relativePath: unknown) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-open-file');
     if (typeof relativePath !== 'string' || !relativePath || relativePath.length > 512) {
       return { status: 'unavailable', reason: 'invalid_path' };
     }
@@ -239,7 +504,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('desktop:workflow-prepare-edit', async (event, find: unknown, replace: unknown) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-prepare-edit');
     if (typeof find !== 'string' || typeof replace !== 'string' || find.length > 4096 || replace.length > 4096) {
       return { status: 'unavailable', reason: 'invalid_edit' };
     }
@@ -250,7 +515,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('desktop:workflow-prepare-undo', async (event, receiptId: unknown) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-prepare-undo');
     if (typeof receiptId !== 'string' || !UUID.test(receiptId)) {
       return { status: 'unavailable', reason: 'invalid_receipt' };
     }
@@ -261,7 +526,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('desktop:workflow-receipt', async (event, receiptId: unknown) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-receipt');
     if (typeof receiptId !== 'string' || !UUID.test(receiptId)) {
       return { status: 'unavailable', message: 'invalid_receipt' };
     }
@@ -272,7 +537,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('desktop:workflow-search', async (event, query: unknown) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-search');
     if (typeof query !== 'string' || !query || query.length > 512) {
       return { status: 'unavailable', reason: 'invalid_query' };
     }
@@ -283,7 +548,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('desktop:workflow-open-folder', async (event) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-open-folder');
     try {
       return await workflow.openProjectFolder();
     } catch (error) {
@@ -291,7 +556,7 @@ function registerIpc(): void {
     }
   });
   ipcMain.handle('desktop:workflow-state', (event) => {
-    validateInvoke(event);
+    validateInvokeFor(event, 'desktop:workflow-state');
     return workflow.state();
   });
 }

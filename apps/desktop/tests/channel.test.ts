@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import {
   encodeFrame, FrameDecoder, parseEnvelope, PROTOCOL_VERSION, SessionGuard, signEnvelope,
 } from '../shared/channel';
-import { isTrustedSender } from '../electron/security';
+import { isFocusedTrustedSender, isTrustedSender } from '../electron/security';
 
 const key = randomBytes(32);
 const session = randomBytes(16).toString('hex');
@@ -77,7 +77,11 @@ test('IPC sender trust rejects URL mutation on the same main frame and all untru
   frame.url = pathToFileURL(expected).href;
   assert.equal(isTrustedSender(undefined, sender as never, frame as never, expected), false);
   assert.equal(isTrustedSender({ ...window, isDestroyed: () => true } as never, sender as never, frame as never, expected), false);
-  assert.equal(isTrustedSender({ ...window, isFocused: () => false } as never, sender as never, frame as never, expected), false);
+  // N1 split: an unfocused-but-exact sender passes identity (the
+  // startup case) but is refused for privileged operations.
+  assert.equal(isTrustedSender({ ...window, isFocused: () => false } as never, sender as never, frame as never, expected), true);
+  assert.equal(isFocusedTrustedSender({ ...window, isFocused: () => false } as never, sender as never, frame as never, expected), false);
+  assert.equal(isFocusedTrustedSender(window as never, sender as never, frame as never, expected), true);
   assert.equal(isTrustedSender(window as never, { ...sender, isDestroyed: () => true } as never, frame as never, expected), false);
   assert.equal(isTrustedSender(window as never, { ...sender } as never, frame as never, expected), false);
   assert.equal(isTrustedSender(window as never, sender as never, undefined, expected), false);

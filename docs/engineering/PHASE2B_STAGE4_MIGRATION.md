@@ -55,10 +55,10 @@ Three constants in `sqlite_store.py` express the split. Registration is preparat
 activation is authority.
 
 ```python
-_EXPECTED_MIGRATIONS: dict[int, tuple[str, str]]        # every known version + byte pin
-_EXPECTED_SCHEMA_SHA256: dict[int, str]                 # every known version + fingerprint
-ACTIVE_SCHEMA_VERSION = 1                               # what this build creates and accepts
-PENDING_MIGRATION_VERSIONS = frozenset({2})             # prepared, must never run
+_EXPECTED_MIGRATIONS: dict[int, tuple[str, str]]  # every known version + byte pin
+_EXPECTED_SCHEMA_SHA256: dict[int, str]  # every known version + fingerprint
+ACTIVE_SCHEMA_VERSION = 1  # what this build creates and accepts
+PENDING_MIGRATION_VERSIONS = frozenset({2})  # prepared, must never run
 ```
 
 Consequences, each covered by a test:

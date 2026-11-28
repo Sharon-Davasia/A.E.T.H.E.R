@@ -1,0 +1,497 @@
+/**
+ * C2/C3 contract tests (pure, node:test - no DOM harness required):
+ * - the trusted-main one-shot handoff state machine;
+ * - renderer evidence binding: displayed project context is bound
+ *   to the authoritative privacy generation, lifecycle and a
+ *   bounded freshness window; stale/future/generation-mismatched
+ *   evidence is never visible;
+ * - the provider contract between desktop and backend ops.
+ */
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { ProjectContextHandoff, PROJECT_CONTEXT_HANDOFF_MS, establishProjectContextArm } from '../electron/project-context-handoff';
+import { createPhase3Provider } from '../electron/phase3-provider';
+import {
+  evaluateLifecycleReading, lifecycleInvalidatesContext, ProjectContextAttemptGuard,
+  parsePhase3Lifecycle,
+  parsePhase3ProjectContext, projectContextView, visibleProjectContext,
+  PROJECT_CONTEXT_FRESHNESS_MS,
+  type Phase3Lifecycle, type Phase3Privacy, type Phase3ProjectContextView, type Phase3State,
+} from '../shared/phase3';
+
+const PRIVACY: Phase3Privacy = { optedIn: true, mode: 'metadata_only', paused: false, generation: 3 };
+
+function lifecycle(overrides: Partial<Phase3State> = {}): Phase3State {
+  return {
+    status: 'ready', nativeAvailable: true, disabledReason: null,
+    executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: PRIVACY, projects: [], windows: [], capabilities: {},
+    ...overrides,
+  };
+}
+
+function view(overrides: Partial<Phase3ProjectContextView> = {}): Phase3ProjectContextView {
+  return {
+    projects: [{
+      candidateId: 'c1', evidenceSource: 'explorer_registered', strength: 0.9, available: true, limitations: [],
+    }],
+    capturedAtMs: 1_000_000,
+    generation: 3,
+    ...overrides,
+  };
+}
+
+test('handoff: establish, one-shot consume, expiry, cancel', () => {
+  const handoff = new ProjectContextHandoff();
+  assert.equal(handoff.isLive(0), false);
+  assert.equal(handoff.consume(0), false);
+
+  handoff.establish(10_000);
+  assert.equal(handoff.isLive(10_000), true);
+  assert.equal(handoff.isLive(10_000 + PROJECT_CONTEXT_HANDOFF_MS), true);
+  assert.equal(handoff.isLive(10_000 + PROJECT_CONTEXT_HANDOFF_MS + 1), false);
+
+  const armed = new ProjectContextHandoff();
+  armed.establish(0);
+  assert.equal(armed.consume(1_000), true);
+  // One-shot: a second completion attempt is refused.
+  assert.equal(armed.consume(1_001), false);
+
+  const cancelled = new ProjectContextHandoff();
+  cancelled.establish(0);
+  cancelled.cancel();
+  assert.equal(cancelled.consume(10), false);
+
+  const expired = new ProjectContextHandoff();
+  expired.establish(0);
+  assert.equal(expired.consume(PROJECT_CONTEXT_HANDOFF_MS + 1), false);
+  // Expiry also clears: it cannot be revived by a later consume.
+  assert.equal(expired.isLive(5), false);
+});
+
+test('visible context binds to generation, lifecycle and freshness', () => {
+  const v = view();
+  assert.equal(visibleProjectContext(v, lifecycle(), 1_000_100)?.length, 1);
+  // Freshness boundary: exactly 60s old is still bounded-fresh.
+  assert.equal(visibleProjectContext(v, lifecycle(), 1_000_000 + PROJECT_CONTEXT_FRESHNESS_MS)?.length, 1);
+  // Evidence-freshness expiry.
+  assert.equal(visibleProjectContext(v, lifecycle(), 1_000_000 + PROJECT_CONTEXT_FRESHNESS_MS + 1), null);
+  // Evidence from the future is never displayed.
+  assert.equal(visibleProjectContext(v, lifecycle(), 999_999), null);
+  // Privacy generation change invalidates.
+  assert.equal(visibleProjectContext(v, lifecycle({ privacy: { ...PRIVACY, generation: 4 } }), 1_000_100), null);
+  // Pause / opt-out invalidates.
+  assert.equal(visibleProjectContext(v, lifecycle({ privacy: { ...PRIVACY, paused: true } }), 1_000_100), null);
+  assert.equal(visibleProjectContext(v, lifecycle({ privacy: { ...PRIVACY, optedIn: false } }), 1_000_100), null);
+  // Backend disconnect shape: unavailable state hides everything.
+  assert.equal(visibleProjectContext(v, {
+    status: 'unavailable', nativeAvailable: false, executionAvailable: false, expiresAtMs: null,
+    disabledReason: 'backend_unavailable',
+    privacy: { optedIn: false, mode: 'off', paused: false, generation: 0 },
+    projects: [], windows: [], capabilities: {},
+  }, 1_000_100), null);
+  // Missing authoritative state hides everything.
+  assert.equal(visibleProjectContext(v, null, 1_000_100), null);
+  assert.equal(visibleProjectContext(v, undefined, 1_000_100), null);
+  assert.equal(visibleProjectContext(null, lifecycle(), 1_000_100), null);
+});
+
+test('campaign expiry/revocation hides evidence inside its freshness window', () => {
+  const v = view();
+  // Captured 5 s ago: evidence is fresh, everything else live...
+  const fresh = 1_005_000;
+  assert.equal(visibleProjectContext(v, lifecycle(), fresh)?.length, 1);
+  // ...but the campaign expired before now (freshness is irrelevant).
+  assert.equal(visibleProjectContext(v, lifecycle({ expiresAtMs: 1_004_999 }), fresh), null);
+  assert.equal(visibleProjectContext(v, lifecycle({ expiresAtMs: fresh }), fresh), null);
+  // Revoked campaign: authoritative lifecycle unavailable.
+  assert.equal(visibleProjectContext(v, lifecycle({ executionAvailable: false }), fresh), null);
+  // Unknown campaign expiry fails closed.
+  assert.equal(visibleProjectContext(v, lifecycle({ expiresAtMs: null }), fresh), null);
+  // Expired state status hides regardless of other fields.
+  assert.equal(visibleProjectContext(v, lifecycle({ status: 'unavailable' }), fresh), null);
+});
+
+test('only an explicit owner confirmation + backend arm establishes the handoff', async () => {
+  const order: string[] = [];
+  let backendArmCalls = 0;
+  const armBackend = async () => {
+    backendArmCalls += 1;
+    order.push('arm');
+    return { status: 'armed' as const, expiresInSeconds: 60 };
+  };
+
+  // Sender validation alone (no confirmation flow at all): the
+  // handoff is simply not live - nothing to consume.
+  const bare = new ProjectContextHandoff();
+  assert.equal(bare.consume(Date.now()), false);
+
+  // Declined confirmation: zero backend arm calls, no handoff.
+  const declinedHandoff = new ProjectContextHandoff();
+  const declined = await establishProjectContextArm({
+    confirm: async () => { order.push('confirm'); return false; },
+    armBackend, handoff: declinedHandoff, now: () => 1_000,
+  });
+  assert.equal(declined.status, 'unavailable');
+  assert.equal(declined.reason, 'owner_confirmation_declined');
+  assert.equal(backendArmCalls, 0);
+  assert.equal(declinedHandoff.isLive(1_000), false);
+
+  // Confirmed: confirmation is obtained BEFORE the backend arm,
+  // and only then does the handoff exist (one-shot).
+  const handoff = new ProjectContextHandoff();
+  const armed = await establishProjectContextArm({
+    confirm: async () => { order.push('confirm'); return true; },
+    armBackend, handoff, now: () => 1_000,
+  });
+  assert.equal(armed.status, 'armed');
+  assert.equal(backendArmCalls, 1);
+  assert.deepEqual(order, ['confirm', 'confirm', 'arm']);
+  assert.equal(handoff.isLive(1_000), true);
+  assert.equal(handoff.consume(1_500), true);
+  assert.equal(handoff.consume(1_600), false);
+
+  // Confirmed but the backend refuses: still no handoff.
+  const refusedHandoff = new ProjectContextHandoff();
+  const refused = await establishProjectContextArm({
+    confirm: async () => true,
+    armBackend: async () => ({ status: 'unavailable' as const, reason: 'project_context_not_authorized' }),
+    handoff: refusedHandoff, now: () => 1_000,
+  });
+  assert.equal(refused.status, 'unavailable');
+  assert.equal(refusedHandoff.isLive(1_000), false);
+});
+
+test('check results bind to evidence metadata or to nothing', () => {
+  const ready = parsePhase3ProjectContext({
+    status: 'ready',
+    projects: [{ candidateId: 'c1', evidenceSource: 'explorer_registered', strength: 0.9, available: true, limitations: [] }],
+    capturedAtMs: 1234, generation: 7,
+  });
+  assert.deepEqual(projectContextView(ready), {
+    projects: ready.projects, capturedAtMs: 1234, generation: 7,
+  });
+
+  // A ready result WITHOUT captured-evidence metadata must not be
+  // displayable as current context (no mere-registration success).
+  const unbound = parsePhase3ProjectContext({ status: 'ready', projects: [] });
+  assert.equal(unbound.capturedAtMs, null);
+  assert.equal(unbound.generation, null);
+  assert.equal(projectContextView(unbound), null);
+
+  // Unavailable/failed checks bind to nothing (renderer clears).
+  const unavailable = parsePhase3ProjectContext({ status: 'unavailable', reason: 'explorer_evidence_unavailable' });
+  assert.equal(projectContextView(unavailable), null);
+  assert.equal(unavailable.reason, 'explorer_evidence_unavailable');
+});
+
+function fakeBackend(overrides: Record<string, unknown> = {}) {
+  const calls: string[] = [];
+  return {
+    calls,
+    status: () => ({ state: 'ready', message: 'ready' }),
+    phase3GetState: async () => ({
+      status: 'ready', nativeAvailable: true, disabledReason: null,
+      privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 3 },
+      projects: [], windows: [], capabilities: {},
+    }),
+    phase3SetPrivacy: async () => ({
+      status: 'ready', nativeAvailable: true, disabledReason: null,
+      privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 4 },
+      projects: [], windows: [], capabilities: {},
+    }),
+    phase3SearchApps: async () => ({ status: 'ready', results: [] }),
+    phase3InspectWindow: async () => ({ status: 'unavailable', reason: 'none' }),
+    phase3PreviewInteraction: async () => { throw new Error('unused'); },
+    phase3ApproveInteraction: async () => ({ status: 'unavailable' }),
+    phase3GetTask: async () => ({ status: 'ready', taskState: 'COMPLETED', attempts: [] }),
+    phase3PauseTask: async () => ({ status: 'ready' }),
+    signGesture: () => { throw new Error('unused'); },
+    phase3ListWindows: async () => ({ status: 'ready', windows: [] }),
+    phase3PrepareLaunch: async () => ({ status: 'unavailable' }),
+    phase3PrepareActivation: async () => ({ status: 'unavailable' }),
+    phase3PrepareFixture: async () => ({ status: 'unavailable' }),
+    phase3PreviewOperation: async () => { throw new Error('unused'); },
+    phase3ApproveOperation: async () => ({ status: 'unavailable' }),
+    phase3GetReceipt: async () => ({ status: 'unavailable' }),
+    phase3CancelTask: async () => ({ status: 'ready' }),
+    phase3ResumeTask: async () => ({ status: 'ready' }),
+    phase3RegisterProject: async () => ({ status: 'unavailable' }),
+    phase3GetLifecycle: async () => {
+      calls.push('lifecycle');
+      return {
+        status: 'ready', nativeAvailable: true, executionAvailable: true,
+        expiresAtMs: 2_000_000, disabledReason: null,
+        privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 3 },
+      };
+    },
+    phase3ArmProjectContext: async () => { calls.push('arm'); return { status: 'armed', expiresInSeconds: 60 }; },
+    phase3CancelProjectContext: async () => { calls.push('cancel'); return { status: 'ready', cancelled: true }; },
+    phase3CheckProjectContext: async () => {
+      calls.push('check');
+      return {
+        status: 'ready',
+        projects: [{ candidateId: 'c1', evidenceSource: 'explorer_registered', strength: 0.9, available: true, limitations: [] }],
+        capturedAtMs: 424242, generation: 3,
+      };
+    },
+    ...overrides,
+  };
+}
+
+test('provider: arm/cancel/check contract with the backend ops', async () => {
+  const backend = fakeBackend();
+  const provider = createPhase3Provider({ backend: backend as never, confirm: async () => true });
+
+  const arm = await provider.armProjectContext();
+  assert.equal(arm.status, 'armed');
+  assert.equal(arm.expiresInSeconds, 60);
+
+  const check = await provider.checkProjectContext();
+  assert.equal(check.status, 'ready');
+  assert.equal(check.capturedAtMs, 424242);
+  assert.equal(check.generation, 3);
+  assert.equal(check.projects[0]?.evidenceSource, 'explorer_registered');
+
+  const cancelled = await provider.cancelProjectContext();
+  assert.equal(cancelled.status, 'ready');
+  assert.deepEqual(backend.calls, ['arm', 'check', 'cancel']);
+});
+
+test('provider: lightweight lifecycle read contract', async () => {
+  const backend = fakeBackend();
+  const provider = createPhase3Provider({ backend: backend as never, confirm: async () => true });
+  const lifecycle = await provider.getLifecycle();
+  assert.equal(lifecycle.status, 'ready');
+  assert.equal(lifecycle.executionAvailable, true);
+  assert.equal(lifecycle.expiresAtMs, 2_000_000);
+  assert.equal(lifecycle.privacy.generation, 3);
+  assert.deepEqual(backend.calls, ['lifecycle']);
+});
+
+test('provider: backend arm refusal propagates as unavailable', async () => {
+  const backend = fakeBackend({
+    phase3ArmProjectContext: async () => ({ status: 'unavailable', reason: 'project_context_not_authorized' }),
+  });
+  const provider = createPhase3Provider({ backend: backend as never, confirm: async () => true });
+  const arm = await provider.armProjectContext();
+  assert.equal(arm.status, 'unavailable');
+  assert.equal(arm.reason, 'project_context_not_authorized');
+});
+
+test('authoritative lifecycle invalidation decisions (AS2)', () => {
+  const now = 1_500_000;
+  assert.equal(lifecycleInvalidatesContext(lifecycle(), now), false);
+  // Returned unavailable state (backend disconnect surfaced as state).
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ status: 'unavailable' }), now), true);
+  // Unexpected revocation: lifecycle no longer execution-available.
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ executionAvailable: false }), now), true);
+  // Campaign expiry instant reached.
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ expiresAtMs: now }), now), true);
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ expiresAtMs: now + 1 }), now), false);
+  // No authoritative state at all (disconnect / rejected request).
+  assert.equal(lifecycleInvalidatesContext(null, now), true);
+  assert.equal(lifecycleInvalidatesContext(undefined, now), true);
+  // Unknown campaign expiry fails closed.
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ expiresAtMs: null }), now), true);
+});
+
+test('unexpected revocation/disconnection drops late responses (AS2)', () => {
+  const guard = new ProjectContextAttemptGuard();
+  const stored = view();
+
+  // A healthy completion is accepted and visible.
+  const first = guard.begin();
+  assert.equal(guard.isCurrent(first), true);
+  assert.equal(visibleProjectContext(stored, lifecycle(), 1_000_100)?.length, 1);
+
+  // A second check is in flight when the campaign is unexpectedly
+  // revoked: the renderer invalidates on the fresh lifecycle state,
+  // and the in-flight response arriving afterwards is stale.
+  const second = guard.begin();
+  assert.equal(lifecycleInvalidatesContext(lifecycle({ executionAvailable: false }), 1_001_000), true);
+  guard.invalidate();
+  assert.equal(guard.isCurrent(second), false);
+  assert.equal(visibleProjectContext(stored, lifecycle({ executionAvailable: false }), 1_001_000), null);
+
+  // Disconnection (rejected request, no state): same treatment -
+  // the pending attempt is void and stored evidence is hidden.
+  const third = guard.begin();
+  assert.equal(lifecycleInvalidatesContext(null, 1_002_000), true);
+  guard.invalidate();
+  assert.equal(guard.isCurrent(third), false);
+  assert.equal(visibleProjectContext(stored, null, 1_002_000), null);
+
+  // A superseded attempt can never become current again.
+  const fourth = guard.begin();
+  assert.equal(guard.isCurrent(second), false);
+  assert.equal(guard.isCurrent(fourth), true);
+});
+
+test('lifecycle read parsing fails closed on unknown authority', () => {
+  // Malformed/absent authority must never read as execution-available.
+  assert.equal(parsePhase3Lifecycle(null).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({}).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({ status: 'ready' }).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({ status: 'unavailable' }).status, 'unavailable');
+  const ok = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 99,
+    privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 5 },
+  });
+  assert.equal(ok.executionAvailable, true);
+  assert.equal(ok.expiresAtMs, 99);
+  assert.equal(ok.privacy.generation, 5);
+});
+
+test('lifecycle parser rejects unknown status and malformed authority', () => {
+  const base = {
+    executionAvailable: true, expiresAtMs: 99,
+    privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: 5 },
+  };
+  // Unknown status is rejected, never normalized into 'ready'.
+  const unknown = parsePhase3Lifecycle({ status: 'banana', ...base });
+  assert.equal(unknown.status, 'unavailable');
+  assert.equal(unknown.executionAvailable, false);
+  assert.equal(unknown.reason, 'lifecycle_status_unknown');
+  // Missing required lifecycle authority (ready status claim).
+  assert.equal(parsePhase3Lifecycle({ status: 'ready', expiresAtMs: 99, privacy: base.privacy }).reason, 'lifecycle_malformed');
+  assert.equal(parsePhase3Lifecycle({ status: 'ready', executionAvailable: true, privacy: base.privacy }).reason, 'lifecycle_expiry_unknown');
+  assert.equal(parsePhase3Lifecycle({ status: 'ready', executionAvailable: true, expiresAtMs: 99 }).reason, 'lifecycle_malformed');
+  // Malformed privacy authority.
+  assert.equal(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 99,
+    privacy: { optedIn: true, mode: 'metadata_only', paused: false, generation: '5' },
+  }).executionAvailable, false);
+  assert.equal(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: Number.NaN, privacy: base.privacy,
+  }).reason, 'lifecycle_expiry_unknown');
+  // A well-formed unavailable reading stays unavailable (not 'ready').
+  const unavailable = parsePhase3Lifecycle({ status: 'unavailable', reason: 'revoked' });
+  assert.equal(unavailable.status, 'unavailable');
+  assert.equal(unavailable.executionAvailable, false);
+});
+
+test('monitoring orchestration: decisions, retention, supersession', () => {
+  // Mirrors the renderer's monitor: fetch a lightweight reading,
+  // drop it if superseded in flight, else apply the pure decision.
+  const guard = new ProjectContextAttemptGuard();
+  let retainedGeneration: number | null = 3;
+  const healthy = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: PRIVACY,
+  });
+  const monitor = (reading: Phase3Lifecycle | null, nowMs: number): string => {
+    const epochAtStart = guard.snapshot();
+    if (guard.snapshot() !== epochAtStart) return 'superseded';
+    if (evaluateLifecycleReading(reading, { generation: retainedGeneration, active: retainedGeneration !== null }, nowMs) === 'invalidate') {
+      guard.invalidate();
+      retainedGeneration = null;
+      return 'invalidated';
+    }
+    return 'kept';
+  };
+
+  // Healthy lifecycle, same generation: retained context kept.
+  assert.equal(monitor(healthy, 1_000_100), 'kept');
+  assert.equal(retainedGeneration, 3);
+  // Privacy-generation change invalidates even when lifecycle is live.
+  const genChanged = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, generation: 4 },
+  });
+  assert.equal(monitor(genChanged, 1_001_000), 'invalidated');
+  assert.equal(retainedGeneration, null);
+  // Late healthy readings cannot restore what was invalidated.
+  assert.equal(monitor(healthy, 1_002_000), 'kept');
+  assert.equal(retainedGeneration, null);
+  // Pause and opt-out readings invalidate.
+  retainedGeneration = 3;
+  assert.equal(monitor(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, paused: true },
+  }), 1_003_000), 'invalidated');
+  retainedGeneration = 3;
+  assert.equal(monitor(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, optedIn: false },
+  }), 1_004_000), 'invalidated');
+  // Revocation and disconnect readings invalidate.
+  retainedGeneration = 3;
+  assert.equal(monitor(parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: false, expiresAtMs: 2_000_000, privacy: PRIVACY,
+  }), 1_005_000), 'invalidated');
+  retainedGeneration = 3;
+  assert.equal(monitor(null, 1_006_000), 'invalidated');
+  // A reading superseded by a newer attempt is never applied.
+  retainedGeneration = 3;
+  const staleEpoch = guard.snapshot();
+  const attempt = guard.begin(); // newer arm/check attempt lands mid-read
+  assert.notEqual(guard.snapshot(), staleEpoch);
+  assert.equal(guard.isCurrent(attempt), true);
+  // (The renderer's monitor returns 'superseded' here and re-reads
+  // on the next tick; the newer attempt is untouched.)
+  assert.equal(retainedGeneration, 3);
+});
+
+test('pending attempts are bound to their privacy generation', () => {
+  const healthyFor = (generation: number) => parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, generation },
+  });
+  const paused = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, paused: true },
+  });
+  const optedOut = parsePhase3Lifecycle({
+    status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+    privacy: { ...PRIVACY, optedIn: false },
+  });
+  const pending = { generation: 3, active: true };
+
+  // Healthy lifecycle under the bound generation: pending kept.
+  assert.equal(evaluateLifecycleReading(healthyFor(3), pending, 1_000_100), 'keep');
+  // Generation changed since the attempt began: invalidated.
+  assert.equal(evaluateLifecycleReading(healthyFor(4), pending, 1_000_100), 'invalidate');
+  // Pause / opt-out invalidate pending attempts regardless of any
+  // retained evidence (there is none here).
+  assert.equal(evaluateLifecycleReading(paused, pending, 1_000_100), 'invalidate');
+  assert.equal(evaluateLifecycleReading(optedOut, pending, 1_000_100), 'invalidate');
+  // Missing binding generation fails closed for pending work.
+  assert.equal(evaluateLifecycleReading(healthyFor(3), { generation: null, active: true }, 1_000_100), 'invalidate');
+  // No active work: privacy readings alone do not invalidate.
+  assert.equal(evaluateLifecycleReading(paused, { generation: null, active: false }, 1_000_100), 'keep');
+  assert.equal(evaluateLifecycleReading(optedOut, { generation: 3, active: false }, 1_000_100), 'keep');
+});
+
+test('late pending response after invalidation is dropped', () => {
+  const guard = new ProjectContextAttemptGuard();
+  // Pending arm attempt bound to generation 3; no retained context.
+  const attempt = guard.begin();
+  // The monitor sees a pause reading and invalidates.
+  const decision = evaluateLifecycleReading(
+    parsePhase3Lifecycle({
+      status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+      privacy: { ...PRIVACY, paused: true },
+    }),
+    { generation: 3, active: true },
+    1_000_100,
+  );
+  assert.equal(decision, 'invalidate');
+  guard.invalidate();
+  // The arm response arriving now is stale and must be dropped.
+  assert.equal(guard.isCurrent(attempt), false);
+  // Same for a completion attempt invalidated by generation change.
+  const attempt2 = guard.begin();
+  const decision2 = evaluateLifecycleReading(
+    parsePhase3Lifecycle({
+      status: 'ready', executionAvailable: true, expiresAtMs: 2_000_000,
+      privacy: { ...PRIVACY, generation: 9 },
+    }),
+    { generation: 3, active: true },
+    1_001_000,
+  );
+  assert.equal(decision2, 'invalidate');
+  guard.invalidate();
+  assert.equal(guard.isCurrent(attempt2), false);
+});

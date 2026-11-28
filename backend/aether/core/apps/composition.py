@@ -1,0 +1,1548 @@
+"""G01: controlled Phase 3 composition factory and trusted lifecycle.
+
+One composition owns every Phase 3 component instance so that
+observation, policy, planning, execution, worker, takeover/dialog
+signals and the channel bridge all share the *same* authorities.
+Modes:
+
+* ``disabled`` — ordinary operation. No native providers, no worker,
+  truthful ``phase3_native_disabled`` surface.
+* ``simulated`` — explicit isolated simulated acceptance for automated
+  integration tests. Platform providers are simulated fakes injected
+  at the platform boundary only; all policy/planning/persistence
+  components are the real ones.
+* ``native_prepared`` — a prepared native composition descriptor. It
+  cannot start: construction raises until trusted composition is
+  given a separately approved owner activation (out of scope for this
+  gate). This is deliberate — prepared is not enabled.
+
+Lifecycle: ``start()`` wires activity/dialog routing; ``revoke()``
+revokes enablement, purges snapshots and stops worker/activity;
+``shutdown()`` additionally closes storage. Any initialization
+failure shuts down whatever partially started, leaving no active
+sensors, workers or executable capabilities.
+"""
+
+from __future__ import annotations
+
+import contextlib
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import TYPE_CHECKING
+
+from aether.core.apps.acceptance_startup import ControlledAcceptanceAuthorization
+from aether.core.apps.dialogs import DialogDetector, DialogGuard
+from aether.core.apps.enablement import OwnerEnablementConfig, Phase3Enablement
+from aether.core.apps.focus import ActivitySignal, FocusCoordinator
+from aether.core.apps.recovery import RecoveryService
+from aether.core.context.project_detection import ProjectDetector
+from aether.world_state.privacy import ObservationPolicy, PrivacyMode
+
+if TYPE_CHECKING:
+    from aether.adapters.windows.native_activity import FakeActivitySource
+    from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
+    from aether.core.apps.activation import WindowActivationService
+    from aether.core.apps.dialogs import ModalWindowEvidence
+    from aether.core.apps.fixture import FixtureApp
+    from aether.core.apps.launch_authority import IntegrityVerifier, LaunchAuthority
+    from aether.core.apps.launcher import TrustedLaunchCoordinator
+    from aether.core.apps.registry import InMemoryApplicationRegistry
+    from aether.core.apps.ui_executor import UiOperationExecutor
+    from aether.core.apps.uia_snapshot import UiaSnapshotService
+    from aether.core.contracts.app_window import ApplicationRecord
+    from aether.core.persistence.sqlite_store import SQLiteTaskStore
+    from aether.core.planning.planner import Planner
+    from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+    from aether.core.workers.subprocess_supervisor import SubprocessWorkerSupervisor
+
+
+class CompositionUnavailable(RuntimeError):
+    pass
+
+
+class Phase3Mode(StrEnum):
+    DISABLED = "disabled"
+    SIMULATED = "simulated"
+    NATIVE_PREPARED = "native_prepared"
+
+
+@dataclass(slots=True)
+class ObservationPrivacyAuthority:
+    """The single authoritative observation/privacy state (G06).
+
+    The bridge never owns privacy truth: updates go through here,
+    bump the privacy generation, purge snapshots and notify listeners
+    (e.g. approval invalidation) atomically from the caller's view.
+    """
+
+    policy: ObservationPolicy = field(default_factory=ObservationPolicy)
+    paused: bool = False
+    generation: int = 0
+    # Campaign ceiling: modes outside this set can never be selected
+    # through any caller (e.g. metadata-only campaigns cannot be
+    # escalated to content collection by a bridge request).
+    permitted_modes: frozenset[str] | None = None
+    _listeners: list[Callable[[], None]] = field(default_factory=list)
+
+    def add_listener(self, listener: Callable[[], None]) -> None:
+        self._listeners.append(listener)
+
+    def snapshot_dict(self) -> dict[str, object]:
+        return {
+            "optedIn": self.policy.opted_in,
+            "mode": self.policy.mode.value,
+            "paused": self.paused,
+            "generation": self.generation,
+        }
+
+    def update(self, *, opted_in: bool, mode: str, paused: bool) -> dict[str, object]:
+        if self.permitted_modes is not None and mode not in self.permitted_modes:
+            raise ValueError("privacy mode exceeds the authorized campaign ceiling")
+        try:
+            parsed = PrivacyMode(mode)
+        except ValueError as exc:
+            raise ValueError("privacy mode is not permitted") from exc
+        self.policy = ObservationPolicy(mode=parsed, opted_in=opted_in)
+        self.paused = paused
+        self.generation += 1
+        for listener in list(self._listeners):
+            listener()
+        return self.snapshot_dict()
+
+    @property
+    def collection_enabled(self) -> bool:
+        return self.policy.collection_enabled and not self.paused
+
+
+@dataclass(slots=True)
+class Phase3Composition:
+    mode: Phase3Mode
+    surface: Phase3Surface
+    bridge: Phase3Bridge
+    enablement: Phase3Enablement
+    privacy: ObservationPrivacyAuthority
+    focus: FocusCoordinator | None = None
+    snapshots: UiaSnapshotService | None = None
+    executor: UiOperationExecutor | None = None
+    activation_service: WindowActivationService | None = None
+    launch_coordinator: TrustedLaunchCoordinator | None = None
+    detector: ProjectDetector | None = None
+    recovery: RecoveryService | None = None
+    dialog_guard: DialogGuard | None = None
+    activity_source: FakeActivitySource | None = None
+    worker: SubprocessWorkerSupervisor | None = None
+    store: SQLiteTaskStore | None = None
+    authority: AppWindowResourceAuthority | None = None
+    fixture_window_id: str | None = None
+    fixture: FixtureApp | None = None
+    world_state: object | None = None  # InMemoryWorldState
+    observer_service: object | None = None  # ObserverService
+    expiry_timer: object | None = None  # threading.Timer at expiry
+    # One-shot project-context capture delegate (C2): invoked by the
+    # verified foreground-event boundary with the foreground HWND.
+    project_context_capture: Callable[[int], None] | None = None
+    project_context_cancel: Callable[[], None] | None = None
+    _started: bool = False
+    _revoked: bool = False
+
+    # -- lifecycle ------------------------------------------------------
+
+    def start(self) -> Phase3Composition:
+        if self._revoked:
+            raise CompositionUnavailable("composition has been revoked")
+        # Expiration is a lifecycle boundary, not a suggestion.
+        if self.enablement.config.enabled and self.privacy is not None:
+            pass  # enablement.is_active enforces expiry per operation
+        self._started = True
+        return self
+
+    @property
+    def active(self) -> bool:
+        return self._started and not self._revoked and self.executor is not None
+
+    def revoke(self, reason: str = "revoked") -> None:
+        """Revoke capabilities and purge volatile observation state."""
+        self._revoked = True
+        self.enablement.revoke()
+        # Revocation (including shutdown and authorization expiry)
+        # cancels and purges any armed project-context handoff and
+        # any captured Explorer evidence with it.
+        if self.project_context_cancel is not None:
+            with contextlib.suppress(Exception):
+                self.project_context_cancel()
+        if self.snapshots is not None:
+            self.snapshots.note_privacy_change()
+        if self.activity_source is not None:
+            stop = getattr(self.activity_source, "stop", None)
+            if stop is not None:
+                stop()
+        if self.worker is not None:
+            self.worker.shutdown()
+
+    def begin_observation(self) -> None:
+        """Start observer + activity source (privacy opt-in only).
+
+        A revoked composition (shutdown/expiry) can never restart
+        collection through a later privacy update.
+        """
+        if self._revoked:
+            return
+        if self.privacy is not None and not self.privacy.collection_enabled:
+            # Privacy is authoritative: a paused/opted-out privacy
+            # state cannot start or resume observation, regardless
+            # of which caller asks.
+            return
+        if (
+            self.surface is not None
+            and self.surface.collection_permitted is not None
+            and not self.surface.collection_permitted()
+        ):
+            # Synchronous lifetime predicate at the observation
+            # startup/resumption boundary (R3): an expired or revoked
+            # authorization never restarts observation, even when a
+            # privacy update arrives before the expiry timer fires.
+            return
+        if self.observer_service is None:
+            # No observer means observation cannot start; a privacy
+            # change in that state must not run resume/reconcile
+            # work against WorldState.
+            return
+        # Observation starts at the observer lifecycle boundary
+        # first. Only after the observer has started (and any
+        # authoritative pause latch has been explicitly resumed
+        # under the current privacy decision) does WorldState
+        # resume and a bounded reconciliation republish fresh
+        # windows. If the observer remains paused, WorldState is
+        # not resumed and no reconciliation is attempted.
+        self.observer_service.start()  # type: ignore[attr-defined]
+        if getattr(self.observer_service, "collection_paused", False):
+            resume_collection = getattr(self.observer_service, "resume_collection", None)
+            if resume_collection is not None:
+                resume_collection()
+        if getattr(self.observer_service, "collection_paused", False):
+            return
+        if self.world_state is not None:
+            self.world_state.resume()  # type: ignore[attr-defined]
+        reconcile = getattr(self.observer_service, "reconcile", None)
+        if reconcile is not None:
+            reconcile()
+        if self.activity_source is not None:
+            start = getattr(self.activity_source, "start", None)
+            if start is not None:
+                start()
+
+    def pause_observation(self) -> None:
+        if self.observer_service is not None:
+            self.observer_service.stop()  # type: ignore[attr-defined]
+        if self.activity_source is not None:
+            stop = getattr(self.activity_source, "stop", None)
+            if stop is not None:
+                stop()
+        if self.world_state is not None:
+            self.world_state.pause()  # type: ignore[attr-defined]
+        if self.snapshots is not None:
+            self.snapshots.note_privacy_change()
+
+    def shutdown(self) -> bool:
+        """Revoke, stop native collection/worker, purge, close storage.
+
+        Returns True only when the worker's exit is confirmed and
+        observers are stopped; never claims success over live threads.
+        """
+        if self.expiry_timer is not None:
+            self.expiry_timer.cancel()  # type: ignore[attr-defined]
+            self.expiry_timer = None
+        self.pause_observation()
+        self.revoke("shutdown")
+        confirmed = True
+        if self.worker is not None:
+            confirmed = bool(self.worker.shutdown())
+        if self.observer_service is not None and getattr(self.observer_service, "running", False):
+            confirmed = False
+        if self.store is not None:
+            self.store.close()
+        return confirmed
+
+    # -- shared controlled construction (native + injected platforms) -----
+
+    @classmethod
+    def _build_controlled(
+        cls,
+        *,
+        store: SQLiteTaskStore,
+        providers: NativePlatformProviders,
+        authorization: ControlledAcceptanceAuthorization,
+        gesture_key: bytes,
+        clock: Callable[[], datetime] | None,
+        mode: Phase3Mode,
+    ) -> Phase3Composition:
+        """Wire the full controlled composition over shared authorities."""
+
+        from pathlib import Path as _Path
+
+        from aether.adapters.windows.native_activity import FakeActivitySource  # noqa: F401
+        from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
+        from aether.core.apps.activation import WindowActivationService
+        from aether.core.apps.confirmation import TrustedNavigationConfirmer
+        from aether.core.apps.launch_authority import LaunchAuthority, app_version_token
+        from aether.core.apps.launcher import TrustedLaunchCoordinator
+        from aether.core.apps.registry import InMemoryApplicationRegistry
+        from aether.core.apps.ui_executor import UiOperationExecutor
+        from aether.core.apps.uia_snapshot import UiaSnapshotService
+        from aether.core.apps.verification import LaunchVerifier
+        from aether.core.planning.authorizing_gesture import (
+            GestureNonceRegister,
+            TrustedGestureAuthority,
+        )
+        from aether.core.planning.planner import Planner
+        from aether.core.policy.broker import PolicyBroker
+        from aether.core.policy.capabilities import CapabilityRegistry
+        from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+        from aether.core.resources.registry import ResourceRegistry
+        from aether.world_state.observer import ObserverService
+        from aether.world_state.service import InMemoryWorldState
+
+        now_fn = clock or (lambda: datetime.now(UTC))
+        cleanups: list[Callable[[], None]] = []
+        try:
+            # Observation starts OFF (A01): opted out, mode off, and
+            # capped at the authorization's approved privacy mode.
+            privacy = ObservationPrivacyAuthority(
+                permitted_modes=frozenset({"off", authorization.privacy_mode})
+            )
+            authority = AppWindowResourceAuthority(session_id=authorization.session_id)
+            registry = InMemoryApplicationRegistry()
+            records = [r for r in providers.records if r.app_id in authorization.authorized_app_ids]
+            if providers.fixture_record.app_id not in {r.app_id for r in records}:
+                records.append(providers.fixture_record)
+            for record in records:
+                registry.register(record)
+                evidence = providers.integrity_verifier.verify(record)
+                token = app_version_token(evidence) if evidence is not None else None
+                if token is not None:
+                    authority.register_app(record, version_token=token)
+            capabilities = CapabilityRegistry.phase3_with_uia()
+            focus = FocusCoordinator()
+            worker = providers.worker
+            if worker is not None:
+                if not worker.start():
+                    raise CompositionUnavailable("uia worker failed to start")
+                cleanups.append(lambda: _shutdown_result(worker))
+            snapshots = UiaSnapshotService(
+                inspection_permitted=lambda app_id: (
+                    privacy.collection_enabled
+                    and enablement.is_active(
+                        capability_id="uia.inspect_snapshot", app_id=app_id, now=now_fn()
+                    )
+                ),
+                authority=authority,
+                backend_factory=providers.uia_backend_factory,  # type: ignore[arg-type]
+                session_id=authorization.session_id,
+                clock=now_fn,
+                content_inspection_permitted=lambda app_id: (
+                    privacy.collection_enabled and app_id == providers.fixture_record.app_id
+                ),
+                worker=worker,
+            )
+            if worker is not None:
+                worker.on_worker_restart = snapshots.note_privacy_change
+            from pathlib import PureWindowsPath as _PWP
+
+            world_state = InMemoryWorldState(
+                policy=privacy.policy,
+                authority=authority,
+                app_id_by_identity={
+                    _PWP(r.executable_identity or "").as_posix().casefold(): r.app_id
+                    for r in records
+                    if r.executable_identity
+                },
+            )
+            # C2: bounded one-shot project-context capture. Arming
+            # is established by the trusted main process (through
+            # the bridge); Explorer collection happens ONLY when a
+            # verified foreground-change event for a window arrives
+            # while armed - never by polling, never on refresh, and
+            # clicking the panel can never be its own evidence,
+            # because the panel click is not a foreground event for
+            # an Explorer window.
+            from datetime import timedelta as _td
+            from threading import RLock as _ContextLock
+
+            # Final validation + retention/consumption of captured
+            # evidence is atomic under this lock with respect to
+            # cancellation and re-arming. It is NEVER held across
+            # native Explorer collection or filesystem scope
+            # validation - only around the final binding check and
+            # the retention writes themselves.
+            _project_context_lock = _ContextLock()
+            _project_context: dict[str, object] = {
+                "armed_until": None,
+                "generation": None,
+                "folder": None,
+                "captured_at": None,
+            }
+            # Detect-time gate: only captured evidence is ever read.
+            _context_gate: dict[str, bool] = {"armed": False}
+
+            def _sample_explorer(hwnd: int) -> _Path | None:
+                raw_provider = providers.explorer_folder
+                if raw_provider is None:
+                    return None
+                try:
+                    raw = raw_provider(hwnd)
+                except TypeError:
+                    raw = raw_provider()
+                return _Path(str(raw)) if raw else None
+
+            def _capture_foreground(hwnd: int) -> None:
+                armed_until = _project_context["armed_until"]
+                if armed_until is None:
+                    return
+                if (
+                    now_fn() > armed_until  # type: ignore[operator]
+                    or privacy.generation != _project_context["generation"]
+                    # Authoritative lifecycle at the collection
+                    # boundary: current privacy, authorization expiry
+                    # and composition revocation in one predicate.
+                    or not _collection_permitted()
+                ):
+                    # Expired/stale/revoked arm: purge, never collect.
+                    _cancel_project_context()
+                    return
+                folder = _sample_explorer(hwnd)
+                if folder is None:
+                    return  # not an Explorer window; stay armed (bounded)
+                # The sample belongs to THIS handoff only: if the arm
+                # was cancelled or replaced while native collection
+                # ran, the sample is dropped (a newer arm is left
+                # untouched) - it can never be retained as evidence
+                # for a handoff it did not start under.
+                if _project_context["armed_until"] is not armed_until:
+                    return
+                # Workspace scope is validated BEFORE retention: an
+                # out-of-scope folder path is never stored as
+                # captured evidence (not even transiently).
+                if not project_registry.is_within_registration_boundary(folder):
+                    return
+                # Final revalidation of the ORIGINAL handoff binding
+                # (identity, deadline, generation, authoritative
+                # lifecycle) after native collection and scope
+                # validation, ATOMIC with retention/consumption under
+                # the handoff lock: cancellation or replacement that
+                # landed during scope validation cannot leave this
+                # older sample eligible, and no cancellation can slip
+                # between the check and the write. The lock is not
+                # held across collection or scope validation above.
+                with _project_context_lock:
+                    if _project_context["armed_until"] is not armed_until:
+                        return
+                    if (
+                        now_fn() > armed_until  # type: ignore[operator]
+                        or privacy.generation != _project_context["generation"]
+                        or not _collection_permitted()
+                    ):
+                        _cancel_project_context()
+                        return
+                    _project_context["folder"] = folder
+                    _project_context["captured_at"] = now_fn()
+                    _project_context["armed_until"] = None  # one-shot consumed
+
+            observer_service = None
+            if providers.event_source is not None:
+                from dataclasses import replace as _event_replace
+
+                def _handle_observer_event(event):  # type: ignore[no-untyped-def]
+                    """Boundary translation for incremental events.
+
+                    ObserverService owns its local collection
+                    generation and drops queued events that are stale
+                    in that namespace before invoking this handler.
+                    WorldState owns the independent privacy
+                    generation; the composition boundary therefore
+                    presents the already-fresh event under
+                    WorldState's current generation. Paused/policy
+                    checks inside WorldState remain authoritative.
+                    """
+                    world_state.handle_event(event, now=now_fn(), generation=world_state.generation)
+                    if getattr(event.kind, "value", event.kind) == "foreground_changed":
+                        _capture_foreground(int(getattr(event, "hwnd", 0) or 0))
+
+                def _apply_observer_snapshot(events):  # type: ignore[no-untyped-def]
+                    """Explicit initial/reconciled snapshot wiring.
+
+                    ObserverService invokes this synchronously only
+                    for a complete reconciliation in its current
+                    local generation, so the enumerated snapshot is
+                    fresh in the observer namespace. It is re-stamped
+                    at this composition boundary into WorldState's
+                    independent privacy generation; WorldState still
+                    rejects publication while paused or when its
+                    policy/generation changes mid-apply, and stale
+                    queued events never take this path.
+                    """
+                    generation = world_state.generation
+                    translated = [_event_replace(event, generation=generation) for event in events]
+                    return world_state.apply_snapshot(translated, now=now_fn())
+
+                observer_service = ObserverService(
+                    source=providers.event_source,  # type: ignore[arg-type]
+                    on_event=_handle_observer_event,
+                    snapshot_handler=_apply_observer_snapshot,
+                )
+            broker = PolicyBroker(
+                capabilities=capabilities,
+                resources=ResourceRegistry(windows_semantics=False),
+                app_authority=authority,
+                executors=frozenset({"app.launch", "window.activate", "uia.invoke_fixture"}),
+            )
+            enablement = Phase3Enablement.from_owner_config(
+                OwnerEnablementConfig(
+                    enabled=True,
+                    capability_allowlist=authorization.capability_allowlist,
+                    app_allowlist=authorization.authorized_app_ids,
+                    session_lifetime=authorization.expires_at - now_fn(),
+                    scope_name=authorization.campaign_id,
+                ),
+                now=now_fn(),
+            )
+            confirmer = TrustedNavigationConfirmer()
+            launch_authority = LaunchAuthority(
+                verifier=providers.integrity_verifier,
+                clock=now_fn,
+            )
+
+            class _AuthorityObservationProvider:
+                """Independent launch verification over authoritative
+                window/process registrations (observer-published)."""
+
+                def observe(self):  # type: ignore[no-untyped-def]
+                    from aether.core.apps.verification import (
+                        ObservedProcess,
+                        ObservedWindow,
+                        PlatformObservation,
+                    )
+
+                    windows = []
+                    processes = []
+                    seen: set[str] = set()
+                    for binding in authority.known_windows():
+                        windows.append(
+                            ObservedWindow(
+                                window_token=binding.version_token,
+                                process_token=binding.process_token,
+                                app_id=binding.app_resource_id or "",
+                            )
+                        )
+                        if binding.process_token not in seen:
+                            seen.add(binding.process_token)
+                            processes.append(
+                                ObservedProcess(
+                                    process_token=binding.process_token,
+                                    app_id=binding.app_resource_id or "",
+                                    integrity_sha256=None,
+                                    started_after_attempt=False,
+                                )
+                            )
+                    return PlatformObservation(
+                        processes=tuple(processes), windows=tuple(windows), complete=True
+                    )
+
+            observation_provider = providers.observation_provider or _AuthorityObservationProvider()
+            coordinator = TrustedLaunchCoordinator(
+                store=store,
+                capabilities=capabilities,
+                registry=registry,
+                authority=launch_authority,
+                confirmer=confirmer,
+                broker=broker,
+                adapter=providers.launch_adapter,  # type: ignore[arg-type]
+                verifier=LaunchVerifier(observation_provider),  # type: ignore[arg-type]
+                enablement=enablement,
+                session_id=authorization.session_id,
+                activation_scope=authorization.campaign_id,
+                clock=now_fn,
+            )
+            activation_service = WindowActivationService(
+                store=store,
+                authority=authority,
+                confirmer=confirmer,
+                broker=broker,
+                enablement=enablement,
+                focus=focus,
+                activate=providers.activate,
+                foreground_hwnd=providers.foreground_hwnd,
+                session_id=authorization.session_id,
+                activation_scope=authorization.campaign_id,
+                clock=now_fn,
+            )
+
+            def _native_modal_evidence(window_id: str):  # type: ignore[no-untyped-def]
+                """Bounded modal evidence, including separate owned
+                modal windows.
+
+                Two bounded sources, both through supervised/bounded
+                inspection: (a) the target window's supervised
+                snapshot tree, and (b) separate top-level windows
+                owned by the same process, enumerated through the
+                observer's bounded reconciliation and inspected via
+                the bounded UIA backend — a separate owned window
+                whose root reports modal (or is a secondary Window)
+                is modal evidence. Missing, truncated or failed
+                evidence is *unknown* (None) and prevents dispatch.
+                """
+                from aether.core.apps.dialogs import ModalWindowEvidence
+
+                result = snapshots.inspect(window_id, require_content=False)
+                if result.snapshot is None or result.snapshot.truncated:
+                    return None
+                try:
+                    binding = authority.resolve_window(window_id)
+                except Exception:
+                    return None
+                evidence = [
+                    ModalWindowEvidence(
+                        window_resource_id=window_id,
+                        owner_process_token=binding.process_token,
+                        is_modal=True,
+                        title_hint=None,
+                        elevated=binding.elevated,
+                        accessible=True,
+                    )
+                    for element in result.snapshot.elements
+                    if element.depth >= 1 and element.control_type in ("Window", "Dialog")
+                ]
+                # Separate owned windows: bounded enumeration via
+                # the observer event source's reconciliation.
+                source = providers.event_source
+                reconcile = getattr(source, "reconcile", None)
+                if reconcile is not None:
+                    try:
+                        events = reconcile()
+                    except Exception:
+                        return None
+                    candidates = [
+                        event
+                        for event in events
+                        if event.hwnd
+                        and event.hwnd != binding.hwnd
+                        and f"{event.pid}:{event.process_creation_time or 'unknown'}"
+                        == binding.process_token
+                    ][:8]
+                    for event in candidates:
+                        # All UIA access for separate windows goes
+                        # through the snapshot service (supervised
+                        # worker when configured; bounded backend
+                        # otherwise) — never a direct backend call
+                        # from composition. Unavailable evidence is
+                        # unknown and denies dispatch.
+                        modal = snapshots.probe_window_root(event.hwnd)
+                        if modal is None:
+                            return None
+                        if modal:
+                            evidence.append(
+                                ModalWindowEvidence(
+                                    window_resource_id=window_id,
+                                    owner_process_token=binding.process_token,
+                                    is_modal=True,
+                                    title_hint=None,
+                                    elevated=binding.elevated,
+                                    accessible=True,
+                                )
+                            )
+                return tuple(evidence)
+
+            detector = DialogDetector(
+                modal_evidence=providers.modal_evidence or _native_modal_evidence
+            )
+
+            def _live_fixture_process_verified(window_id: str) -> bool:
+                """Fresh, independent live-process integrity check.
+
+                Re-observes the platform now, finds the process
+                owning this exact window instance, and compares its
+                independently reported integrity digest against
+                freshly computed trusted evidence for the registered
+                fixture executable. Registration-time path equality
+                alone is never sufficient.
+                """
+                from aether.core.apps.launch_authority import app_version_token
+
+                try:
+                    binding = authority.resolve_window(window_id)
+                    if binding.app_resource_id != providers.fixture_record.app_id:
+                        return False
+                    # The anchor is the *approved* fixture identity
+                    # token from the owner authorization, not a pair
+                    # of freshly computed hashes: fresh trusted
+                    # evidence must still reproduce the approved
+                    # token, and the live process must match it.
+                    approved_token = providers.fixture_identity_token
+                    evidence = providers.integrity_verifier.verify(providers.fixture_record)
+                    if evidence is None:
+                        return False
+                    if app_version_token(evidence) != approved_token:
+                        return False
+                    observe_fixture = getattr(observation_provider, "observe_fixture", None)
+                    if observe_fixture is None:
+                        return False
+                    observation = observe_fixture(
+                        providers.fixture_record,
+                        binding.process_token,
+                        binding.hwnd,
+                    )
+                    if not observation.complete:
+                        return False
+                    process = next(
+                        (
+                            p
+                            for p in observation.processes
+                            if p.process_token == binding.process_token
+                            and p.app_id == providers.fixture_record.app_id
+                        ),
+                        None,
+                    )
+                    if process is None or process.integrity_sha256 is None:
+                        return False
+                    return bool(process.integrity_sha256 == approved_token)
+                except Exception:
+                    return False
+
+            def _dialog_present(window_id: str) -> str | None:
+                try:
+                    binding = authority.resolve_window(window_id)
+                except Exception:
+                    return "dialog_state_unknown"
+                assessment = detector.assess(window_id, process_token=binding.process_token)
+                if assessment.present:
+                    return assessment.redacted_reason
+                if assessment.unknown:
+                    return "dialog_state_unknown"
+                return None
+
+            def _route_activity_early(signal: ActivitySignal) -> None:
+                if (
+                    signal.kind == "manual_activity_in_window"
+                    and focus._active_operation_window is None
+                ):
+                    return
+                focus.note_activity(signal)
+                for binding in authority.known_windows():
+                    if focus.takeover_detected(binding.window_id):
+                        snapshots.on_takeover(binding.window_id)
+
+            activity = providers.activity_factory(_route_activity_early)
+            executor = UiOperationExecutor(
+                store=store,
+                snapshots=snapshots,
+                backend_factory=providers.uia_backend_factory,  # type: ignore[arg-type]
+                focus=focus,
+                capabilities=capabilities,
+                session_id=authorization.session_id,
+                activation_scope=authorization.campaign_id,
+                clock=now_fn,
+                broker=broker,
+                enablement=enablement,
+                approved_fixture_app_id=providers.fixture_record.app_id,
+                approved_fixture_identity_token=providers.fixture_identity_token,
+                dialog_present=_dialog_present,
+                worker=worker,
+                takeover_monitor_available=lambda: bool(
+                    getattr(activity, "healthy", lambda: False)()
+                ),
+                privacy_check=lambda: privacy.collection_enabled,
+                live_process_verifier=lambda window_id: _live_fixture_process_verified(window_id),
+            )
+            planner = Planner(
+                capabilities=capabilities,
+                resources=ResourceRegistry(windows_semantics=False),
+                app_authority=authority,
+                app_registry=registry,
+                integrity_verifier=providers.integrity_verifier,
+                clock=now_fn,
+            )
+            recovery = RecoveryService(store=store)
+            # A/D + R2: one composition-owned project registry with
+            # native Windows semantics, contained to the dedicated
+            # synthetic workspace directory (sibling of the schema-v3
+            # database directory, never inside it). Explorer evidence
+            # is normalized to Path at
+            # this provider boundary, and every detector collection
+            # is gated synchronously on privacy + authorization
+            # lifetime + composition lifecycle (revocation/shutdown)
+            # - never on the background expiry timer alone.
+            _gate_holder: dict[str, Phase3Composition] = {}
+
+            def _collection_permitted() -> bool:
+                current = _gate_holder.get("composition")
+                if current is not None and current._revoked:
+                    return False
+                if not privacy.collection_enabled:
+                    return False
+                return now_fn() < authorization.expires_at
+
+            def _execution_available() -> bool:
+                current = _gate_holder.get("composition")
+                if current is not None and current._revoked:
+                    return False
+                return now_fn() < authorization.expires_at
+
+            # F3+C2: detection NEVER consults the Explorer provider.
+            # It reads only the fresh captured evidence from the
+            # one-shot focus handoff (verified foreground event), and
+            # only while the bounded project-context check is running.
+            def _explorer_folder() -> _Path | None:
+                if not _context_gate["armed"]:
+                    return None
+                folder = _project_context["folder"]
+                captured_at = _project_context["captured_at"]
+                if folder is None or captured_at is None:
+                    return None
+                if privacy.generation != _project_context["generation"]:
+                    return None
+                if now_fn() - captured_at > _td(seconds=60):  # type: ignore[operator]
+                    return None  # stale evidence is not evidence
+                if not _collection_permitted():
+                    return None
+                if not project_registry.is_within_registration_boundary(folder):  # type: ignore[arg-type]
+                    return None  # out-of-scope evidence is never used
+                return folder  # type: ignore[return-value]
+
+            def _arm_project_context() -> bool:
+                if not _collection_permitted():
+                    return False
+                with _project_context_lock:
+                    _project_context["armed_until"] = now_fn() + _td(seconds=60)
+                    _project_context["generation"] = privacy.generation
+                    _project_context["folder"] = None
+                    _project_context["captured_at"] = None
+                return True
+
+            def _cancel_project_context() -> None:
+                with _project_context_lock:
+                    _project_context["armed_until"] = None
+                    _project_context["folder"] = None
+                    _project_context["captured_at"] = None
+
+            def _project_context_captured() -> tuple[int, int] | None:
+                with _project_context_lock:
+                    return _project_context_captured_locked()
+
+            def _project_context_captured_locked() -> tuple[int, int] | None:
+                if _project_context["folder"] is None or _project_context["captured_at"] is None:
+                    return None
+                if privacy.generation != _project_context["generation"]:
+                    return None
+                captured_at = _project_context["captured_at"]
+                if now_fn() - captured_at > _td(seconds=60):  # type: ignore[operator]
+                    return None  # stale evidence is not evidence
+                epoch_ms = int(captured_at.timestamp() * 1000)  # type: ignore[attr-defined]
+                captured_generation = _project_context["generation"]
+                if not isinstance(captured_generation, int):
+                    return None
+                return (epoch_ms, captured_generation)
+
+            if not authorization.workspace_path:
+                raise CompositionUnavailable("synthetic_workspace_missing")
+            project_registry = ResourceRegistry(
+                windows_semantics=True,
+                registration_boundary=_Path(str(authorization.workspace_path)),
+                registration_boundary_identity=authorization.workspace_identity,
+            )
+            project_detector = ProjectDetector(
+                registry=project_registry,
+                explorer_folder=_explorer_folder,
+                clock=now_fn,
+                collection_permitted=_collection_permitted,
+                collection_generation=lambda: privacy.generation,
+                explorer_scope=project_registry.is_within_registration_boundary,
+            )
+            dialog_guard = DialogGuard(
+                detector=detector, on_dialog=lambda wid, _a: snapshots.on_dialog(wid)
+            )
+            nonces = GestureNonceRegister(clock=now_fn)
+            gesture_authority = TrustedGestureAuthority(
+                key=gesture_key, nonces=nonces, clock=now_fn
+            )
+            holder: dict[str, Phase3Composition] = {}
+
+            def _route_activity(signal: ActivitySignal) -> None:
+                # Only signals relevant to an active operation are
+                # forwarded; idle user activity is not retained.
+                if (
+                    signal.kind == "manual_activity_in_window"
+                    and focus._active_operation_window is None
+                ):
+                    return
+                focus.note_activity(signal)
+                for binding in authority.known_windows():
+                    if focus.takeover_detected(binding.window_id):
+                        snapshots.on_takeover(binding.window_id)
+
+            surface = Phase3Surface(
+                store=store,
+                snapshots=snapshots,
+                executor=executor,
+                authority=authority,
+                app_records=lambda: list(registry.all()),
+                detector=project_detector,
+                gesture_authority=gesture_authority,
+                nonces=nonces,
+                recovery=recovery,
+            )
+            surface.session_id = authorization.session_id
+            surface.activation_scope = authorization.campaign_id
+            surface.privacy_authority = privacy
+            surface.collection_permitted = _collection_permitted
+            surface.project_registry = project_registry
+            surface.execution_available = _execution_available
+            surface.authorization_expires_at = lambda: authorization.expires_at
+            surface.project_context_begin = lambda: _context_gate.__setitem__("armed", True)
+            surface.project_context_end = lambda: _context_gate.__setitem__("armed", False)
+            surface.project_context_arm = _arm_project_context
+            surface.project_context_cancel = _cancel_project_context
+            surface.project_context_captured = _project_context_captured
+            surface.clock = now_fn
+            surface.planner = planner
+            surface.launch_coordinator = coordinator
+            surface.launch_authority = launch_authority
+            surface.launch_registry = registry
+            surface.activation_service = activation_service
+            surface.dialog_guard = dialog_guard
+            composition = cls(
+                mode=mode,
+                surface=surface,
+                bridge=Phase3Bridge(surface),
+                enablement=enablement,
+                privacy=privacy,
+                focus=focus,
+                snapshots=snapshots,
+                executor=executor,
+                activation_service=activation_service,
+                launch_coordinator=coordinator,
+                detector=project_detector,
+                recovery=recovery,
+                dialog_guard=dialog_guard,
+                activity_source=activity,  # type: ignore[arg-type]
+                worker=worker,
+                store=store,
+                authority=authority,
+            )
+            composition.world_state = world_state
+            composition.observer_service = observer_service
+            composition.project_context_capture = _capture_foreground
+            composition.project_context_cancel = _cancel_project_context
+            holder["composition"] = composition
+            _gate_holder["composition"] = composition
+
+            def _on_privacy_change() -> None:
+                _cancel_project_context()
+                snapshots.note_privacy_change()
+                world_state.set_policy(privacy.policy)
+                if _collection_permitted():
+                    composition.begin_observation()
+                else:
+                    composition.pause_observation()
+
+            privacy.add_listener(_on_privacy_change)
+            # Reconcile before accepting any new execution (also done
+            # by the storage factory; idempotent and truthful).
+            recovery.reconcile_after_restart()
+            # Expiry is enforced as a lifecycle boundary: when the
+            # authorization expires, collection stops and execution
+            # authority is revoked even if nobody interacts again.
+            import threading as _threading
+
+            delay = max(0.0, (authorization.expires_at - now_fn()).total_seconds())
+
+            def _expire() -> None:
+                composition.pause_observation()
+                composition.revoke("authorization_expired")
+
+            timer = _threading.Timer(delay, _expire)
+            timer.daemon = True
+            timer.start()
+            composition.expiry_timer = timer
+            return composition.start()
+        except Exception:
+            for cleanup in reversed(cleanups):
+                with contextlib.suppress(Exception):
+                    cleanup()
+            raise
+
+    # -- factories --------------------------------------------------------
+
+    @classmethod
+    def disabled(cls) -> Phase3Composition:
+        from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
+
+        privacy = ObservationPrivacyAuthority()
+        surface = Phase3Surface.disabled()
+        surface.privacy_authority = privacy
+        return cls(
+            mode=Phase3Mode.DISABLED,
+            surface=surface,
+            bridge=Phase3Bridge(surface),
+            enablement=Phase3Enablement.disabled(),
+            privacy=privacy,
+        )
+
+    @classmethod
+    def native_prepared(cls, **_kwargs: object) -> Phase3Composition:
+        """Back-compatible alias: use ``native(...)`` with authorization."""
+        raise CompositionUnavailable(
+            "native composition requires a validated controlled acceptance authorization"
+        )
+
+    @classmethod
+    def native(
+        cls,
+        *,
+        authorization: ControlledAcceptanceAuthorization,
+        current_commit: str,
+        storage_dir: object,
+        gesture_key: bytes,
+        platform: NativePlatformProviders | None = None,
+        clock: Callable[[], datetime] | None = None,
+        now: datetime | None = None,
+    ) -> Phase3Composition:
+        """A01: operational controlled native acceptance composition.
+
+        Validates the owner authorization against the candidate
+        commit, the acceptance-storage marker and this build's hard
+        ceilings *before* opening storage or constructing any native
+        component; opens isolated v3 acceptance storage (never any
+        real-user store); then wires the real native (or injected
+        fake-platform) providers into the same shared authorities as
+        the simulated composition. Observation starts OFF: no
+        observer or activity source runs until privacy opt-in.
+        """
+        from pathlib import Path as _Path
+
+        from aether.core.persistence.acceptance_storage import (
+            OwnerAcceptanceAuthorization,
+            open_acceptance_store,
+            read_acceptance_marker,
+        )
+
+        moment = now or (clock() if clock else datetime.now(UTC))
+        # Authorization is validated against reality first; unsafe or
+        # unauthorized startup fails before any storage is opened.
+        marker = read_acceptance_marker(_Path(str(storage_dir)))
+        authorization.validate(current_commit=current_commit, now=moment, storage_marker=marker)
+        if authorization.storage_path != str(storage_dir):
+            raise CompositionUnavailable("storage_path_mismatch")
+        providers = platform or build_native_platform(authorization)
+        store = open_acceptance_store(
+            _Path(str(storage_dir)),
+            authorization=OwnerAcceptanceAuthorization(
+                decision_reference=authorization.decision_reference,
+                storage_id=authorization.storage_id,
+                expires_at=authorization.expires_at,
+                campaign_id=authorization.campaign_id,
+            ),
+            now=moment,
+        )
+        try:
+            return cls._build_controlled(
+                store=store,
+                providers=providers,
+                authorization=authorization,
+                gesture_key=gesture_key,
+                clock=clock,
+                mode=Phase3Mode.NATIVE_PREPARED,
+            )
+        except Exception:
+            store.close()
+            raise
+
+    @classmethod
+    def simulated(
+        cls,
+        *,
+        store: SQLiteTaskStore,
+        fixture: FixtureApp,
+        fixture_record: ApplicationRecord,
+        fixture_identity_token: str = "fixture-identity-v1",
+        clock: Callable[[], datetime] | None = None,
+        session_id: str = "session-1",
+        activation_scope: str = "test-scope",
+        use_worker: bool = False,
+        launch_coordinator: TrustedLaunchCoordinator | None = None,
+        launch_authority: LaunchAuthority | None = None,
+        launch_registry: InMemoryApplicationRegistry | None = None,
+        activation_service: WindowActivationService | None = None,
+        gesture_key: bytes | None = None,
+        planner: Planner | None = None,
+    ) -> Phase3Composition:
+        """Explicit isolated simulated acceptance composition.
+
+        All real policy/planning/persistence components; only the
+        platform providers (fixture backend, optional simulated worker
+        child) are simulated, at the platform boundary.
+        """
+        from datetime import timedelta
+
+        from aether.adapters.windows.native_activity import FakeActivitySource
+        from aether.channel.phase3_bridge import Phase3Bridge, Phase3Surface
+        from aether.core.apps.ui_executor import UiOperationExecutor
+        from aether.core.apps.uia_snapshot import UiaSnapshotService
+        from aether.core.persistence.sqlite_store import SQLiteTaskStore as _Store  # noqa: F401
+        from aether.core.planning.authorizing_gesture import (
+            GestureNonceRegister,
+            TrustedGestureAuthority,
+        )
+        from aether.core.planning.planner import Planner
+        from aether.core.policy.broker import PolicyBroker
+        from aether.core.policy.capabilities import CapabilityRegistry
+        from aether.core.resources.app_window_authority import AppWindowResourceAuthority
+        from aether.core.resources.registry import ResourceRegistry
+
+        now_fn = clock or (lambda: datetime.now(UTC))
+        started: list[Callable[[], None]] = []
+        try:
+            privacy = ObservationPrivacyAuthority(
+                policy=ObservationPolicy(mode=PrivacyMode.METADATA_ONLY, opted_in=True)
+            )
+            authority = AppWindowResourceAuthority(session_id=session_id)
+            authority.register_app(fixture_record, version_token=fixture_identity_token)
+            from aether.core.apps.fixture import FIXTURE_HWND
+            from aether.world_state.privacy import ContextClassification
+
+            fixture_window_ref = authority.register_window(
+                hwnd=FIXTURE_HWND,
+                process_token="pid:7:ct",
+                instance_generation=1,
+                version_token="pid:7:ct#1",
+                expires_at=now_fn() + timedelta(hours=1),
+                app_resource_id=fixture_record.app_id,
+                classification=ContextClassification.PERMITTED_METADATA,
+            )
+            capabilities = CapabilityRegistry.phase3_with_uia()
+            focus = FocusCoordinator()
+            worker = None
+            if use_worker:
+                from aether.core.workers.subprocess_supervisor import (
+                    SubprocessWorkerSupervisor,
+                    default_worker_command,
+                )
+
+                worker = SubprocessWorkerSupervisor(command=default_worker_command(simulated=True))
+                if not worker.start():
+                    raise CompositionUnavailable("simulated worker failed to start")
+                started.append(lambda: _shutdown_result(worker))
+            snapshots = UiaSnapshotService(
+                authority=authority,
+                backend_factory=fixture.backend,
+                session_id=session_id,
+                clock=now_fn,
+                content_inspection_permitted=lambda app_id: (
+                    app_id == getattr(fixture_record, "app_id", None)
+                ),
+                worker=worker,
+            )
+            privacy.add_listener(snapshots.note_privacy_change)
+            broker = PolicyBroker(
+                capabilities=capabilities,
+                resources=ResourceRegistry(windows_semantics=False),
+                app_authority=authority,
+                executors=frozenset({"uia.invoke_fixture"}),
+            )
+            enablement = Phase3Enablement.from_owner_config(
+                OwnerEnablementConfig(
+                    enabled=True,
+                    capability_allowlist=frozenset(
+                        {"uia.invoke_fixture", "window.activate", "app.launch"}
+                    ),
+                    app_allowlist=frozenset({fixture_record.app_id}),
+                    session_lifetime=timedelta(hours=1),
+                    scope_name=activation_scope,
+                ),
+                now=now_fn(),
+            )
+
+            def _dialog_present(window_id: str) -> str | None:
+                # Simulated modal evidence from the fixture platform:
+                # a relevant modal stops dispatch (never dismissed).
+                backend = fixture.backend()
+                try:
+                    root = backend.find_root(hwnd=_fixture_hwnd())
+                    if root is None:
+                        return "dialog_state_unknown"
+                    stack = [root]
+                    while stack:
+                        node = stack.pop()
+                        if getattr(node, "key", "") == "fixture-modal-dialog":
+                            return "unexpected_dialog:modal_application"
+                        stack.extend(backend.children(node))
+                    return None
+                except Exception:
+                    return "dialog_state_unknown"
+
+            executor = UiOperationExecutor(
+                store=store,
+                snapshots=snapshots,
+                backend_factory=fixture.backend,
+                focus=focus,
+                capabilities=capabilities,
+                session_id=session_id,
+                activation_scope=activation_scope,
+                clock=now_fn,
+                broker=broker,
+                enablement=enablement,
+                approved_fixture_app_id=fixture_record.app_id,
+                approved_fixture_identity_token=fixture_identity_token,
+                dialog_present=_dialog_present,
+                worker=worker,
+            )
+            planner = planner or Planner(
+                capabilities=capabilities,
+                resources=ResourceRegistry(windows_semantics=False),
+                app_authority=authority,
+                clock=now_fn,
+            )
+            recovery = RecoveryService(store=store)
+            project_registry = ResourceRegistry()
+            detector = ProjectDetector(registry=project_registry, clock=now_fn)
+            dialog_guard = DialogGuard(
+                detector=DialogDetector(
+                    modal_evidence=lambda _wid: ()  # simulated: no modal unless fixture says so
+                ),
+                on_dialog=lambda wid, _a: snapshots.on_dialog(wid),
+            )
+            nonces = GestureNonceRegister(clock=now_fn)
+            gesture_authority = (
+                TrustedGestureAuthority(key=gesture_key, nonces=nonces, clock=now_fn)
+                if gesture_key is not None
+                else None
+            )
+
+            composition_holder: dict[str, Phase3Composition] = {}
+
+            def _collection_permitted() -> bool:
+                current = composition_holder.get("composition")
+                if current is not None and current._revoked:
+                    return False
+                return privacy.collection_enabled
+
+            detector.collection_permitted = _collection_permitted
+            detector.collection_generation = lambda: privacy.generation
+
+            def _route_activity(signal: ActivitySignal) -> None:
+                focus.note_activity(signal)
+                comp = composition_holder.get("composition")
+                if comp is not None and comp.authority is not None:
+                    for binding in comp.authority.known_windows():
+                        if focus.takeover_detected(binding.window_id):
+                            snapshots.on_takeover(binding.window_id)
+
+            activity = FakeActivitySource(emit_to=_route_activity)
+
+            surface = Phase3Surface(
+                store=store,
+                snapshots=snapshots,
+                executor=executor,
+                authority=authority,
+                app_records=lambda: [fixture_record],
+                detector=detector,
+                gesture_authority=gesture_authority,
+                nonces=nonces,
+                recovery=recovery,
+            )
+            surface.privacy_authority = privacy
+            surface.project_registry = project_registry
+            surface.planner = planner
+            surface.launch_coordinator = launch_coordinator
+            surface.launch_authority = launch_authority
+            surface.launch_registry = launch_registry
+            surface.activation_service = activation_service
+            surface.dialog_guard = dialog_guard
+            surface.collection_permitted = _collection_permitted
+
+            def _sim_execution_available() -> bool:
+                current = composition_holder.get("composition")
+                return current is None or not current._revoked
+
+            surface.execution_available = _sim_execution_available
+            surface.clock = now_fn
+            composition = cls(
+                mode=Phase3Mode.SIMULATED,
+                surface=surface,
+                bridge=Phase3Bridge(surface),
+                enablement=enablement,
+                privacy=privacy,
+                focus=focus,
+                snapshots=snapshots,
+                executor=executor,
+                activation_service=activation_service,
+                launch_coordinator=launch_coordinator,
+                detector=detector,
+                recovery=recovery,
+                dialog_guard=dialog_guard,
+                activity_source=activity,
+                worker=worker,
+                store=store,
+                authority=authority,
+                fixture=fixture,
+            )
+            composition.fixture_window_id = fixture_window_ref.resource_id
+            composition_holder["composition"] = composition
+            return composition.start()
+        except Exception:
+            # Initialization failure leaves nothing active behind.
+            for cleanup in reversed(started):
+                with contextlib.suppress(Exception):
+                    cleanup()
+            raise
+
+
+def _fixture_hwnd() -> int:
+    from aether.core.apps.fixture import FIXTURE_HWND
+
+    return FIXTURE_HWND
+
+
+def _shutdown_result(worker: SubprocessWorkerSupervisor) -> None:
+    worker.shutdown()
+
+
+@dataclass(slots=True)
+class NativePlatformProviders:
+    """Injectable platform boundary for the native composition.
+
+    Production builds these from the real Windows providers; Arena
+    tests inject Windows-API fakes. Everything above this boundary —
+    policy, planning, persistence, authorization — is identical.
+    """
+
+    records: list[ApplicationRecord]
+    fixture_record: ApplicationRecord
+    fixture_identity_token: str
+    integrity_verifier: IntegrityVerifier
+    launch_adapter: object  # LaunchAdapter
+    uia_backend_factory: Callable[[], object]
+    activity_factory: Callable[[Callable[[ActivitySignal], None]], object]
+    activate: Callable[[int], bool]
+    foreground_hwnd: Callable[[], int | None]
+    observation_provider: object | None = None  # LaunchVerifier provider
+    event_source: object | None = None  # WindowEventSource (observer)
+    explorer_folder: Callable[..., object] | None = None
+    modal_evidence: Callable[[str], tuple[ModalWindowEvidence, ...] | None] | None = None
+    worker: SubprocessWorkerSupervisor | None = None
+
+
+@dataclass(slots=True)
+class NativePlatformSeams:
+    """Raw Windows platform boundary for provider construction.
+
+    Seams carry *unconstructed* platform surfaces (Win32 API objects,
+    discovery providers, a pywinauto module object). Every provider
+    is constructed by ``build_native_platform`` itself, so the test
+    path exercises the identical construction logic as production;
+    injecting an already-constructed replacement provider is not
+    possible through this seam.
+    """
+
+    discovery_providers: object
+    launch_api: object
+    observer_api: object
+    integrity_verifier: IntegrityVerifier
+    activity_factory: Callable[[Callable[[ActivitySignal], None]], object] | None
+    foreground_provider: object  # activate(hwnd)/foreground_hwnd()
+    explorer_folder: Callable[..., object] | None = None
+    worker_command: list[str] | None = None
+    pywinauto_module: object | None = None
+
+
+def _native_explorer_folder(hwnd: object = None) -> object:  # pragma: no cover - Windows COM
+    """Explorer folder for one verified window identity.
+
+    The composition passes the HWND from a verified foreground-change
+    event (the existing window-identity mechanism); only a Shell
+    window with exactly that HWND yields its folder. Without an HWND
+    the current foreground window is used (direct callers).
+    """
+    try:
+        import win32com.client  # type: ignore[import-untyped]
+
+        shell = win32com.client.Dispatch("Shell.Application")
+        if isinstance(hwnd, int) and hwnd:
+            target = hwnd
+        else:
+            import ctypes
+            from typing import Any as _Any
+
+            _windll: _Any = getattr(ctypes, "windll", None)
+            target = int(_windll.user32.GetForegroundWindow())
+        for window in shell.Windows():
+            try:
+                if int(window.HWND) == target:
+                    return window.Document.Folder.Self.Path
+            except Exception:
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def build_native_platform(
+    authorization: ControlledAcceptanceAuthorization,
+    *,
+    seams: NativePlatformSeams | None = None,
+) -> NativePlatformProviders:
+    """One trusted platform-provider construction path.
+
+    With no seams this constructs the real Windows providers and
+    raises on any other platform or when a required provider cannot
+    be constructed, so controlled startup fails closed instead of
+    falling back. Tests pass raw Windows-API fakes as seams and
+    exercise this exact construction logic; that is simulated
+    evidence, never native evidence.
+    """
+    import sys
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+    from pathlib import Path as _Path
+
+    from aether.adapters.windows.discovery import (
+        StdlibWindowsDiscoveryProviders,
+        discover_applications,
+    )
+    from aether.adapters.windows.native_activity import NativeActivitySource
+    from aether.adapters.windows.native_launcher import (
+        NativeIntegrityProvider,
+        NativeWindowsLaunchAdapter,
+        _CtypesWin32LaunchApi,
+        native_package_query,
+    )
+    from aether.adapters.windows.native_observer import (
+        NativeForegroundProvider,
+        NativeObservationProvider,
+        NativeWindowsEventSource,
+        _CtypesWin32Api,
+        activation_context_from_parent_bootstrap,
+    )
+    from aether.adapters.windows.native_uia import build_native_uia_backend
+    from aether.core.apps.discovery_normalize import normalize_discovery
+    from aether.core.apps.fixture_contract import FIXTURE_EXECUTABLE_NAME
+    from aether.core.contracts.app_window import (
+        ApplicationRecord as _Record,
+    )
+    from aether.core.contracts.app_window import (
+        DiscoverySource,
+        LaunchMethod,
+        location_identity_digest,
+        registration_app_id,
+    )
+    from aether.core.workers.subprocess_supervisor import (
+        SubprocessWorkerSupervisor,
+        default_worker_command,
+    )
+
+    if seams is None:
+        if sys.platform != "win32":  # pragma: no cover - exercised on Windows
+            raise CompositionUnavailable("native_platform_requires_windows")
+        foreground = NativeForegroundProvider()
+        seams = NativePlatformSeams(
+            discovery_providers=StdlibWindowsDiscoveryProviders(),
+            launch_api=_CtypesWin32LaunchApi(),
+            observer_api=_CtypesWin32Api(),
+            integrity_verifier=NativeIntegrityProvider(package_query=native_package_query),
+            activity_factory=None,
+            foreground_provider=foreground,
+            explorer_folder=_native_explorer_folder,
+        )
+    now = _dt.now(_UTC)
+    batch = discover_applications(seams.discovery_providers)  # type: ignore[arg-type]
+    records = [
+        r
+        for r in normalize_discovery(batch, now=now)
+        if r.app_id in authorization.authorized_app_ids
+    ]
+    # The fixture is an explicit portable registration (owner-built
+    # executable), never auto-discovered as launchable software. Its
+    # identity is derived from the executable, exactly as registered;
+    # an authorization naming any other fixture identity is refused.
+    fixture_exe = str(
+        _Path(__file__).resolve().parents[4] / "tools" / "windows-fixture" / FIXTURE_EXECUTABLE_NAME
+    )
+    expected_fixture_id = registration_app_id(
+        display_name="AETHER Fixture",
+        executable_identity=fixture_exe,
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+    )
+    if authorization.fixture_app_id != expected_fixture_id:
+        raise CompositionUnavailable("fixture_identity_mismatch")
+    fixture_record = _Record(
+        app_id=expected_fixture_id,
+        display_name="AETHER Fixture",
+        launch_method=LaunchMethod.APPROVED_EXECUTABLE,
+        executable_identity=fixture_exe,
+        location_digest=location_identity_digest(fixture_exe),
+        discovery_source=DiscoverySource.USER_REGISTERED_PORTABLE,
+        discovered_at=now,
+        fresh_until=now + _td(hours=2),
+    )
+    records = [r for r in records if r.app_id != fixture_record.app_id] + [fixture_record]
+    activation = activation_context_from_parent_bootstrap(
+        {
+            "issuer": "aether-trusted-composition",
+            "session_id": authorization.session_id,
+            "activation_epoch": authorization.activation_epoch,
+            "activation_scope": authorization.campaign_id,
+            "permitted_operations": ["inspect", "invoke", "health", "shutdown"],
+            "expires_at": authorization.expires_at.timestamp(),
+        }
+    )
+    # Do not mutate the caller's seams during construction: an
+    # assignment retained on ``seams`` before provider construction
+    # completes would poison a later retry with the previous
+    # attempt's activation context. The factory is a local binding
+    # for this construction only; a retry builds a fresh one from
+    # the then-current authorization.
+    activity_factory = seams.activity_factory
+    if activity_factory is None:
+        activity_factory = lambda emit_to: NativeActivitySource(  # noqa: E731
+            activation=activation, emit_to=emit_to
+        )
+    worker = SubprocessWorkerSupervisor(
+        command=seams.worker_command or default_worker_command(),
+        bootstrap_payload={
+            "issuer": "aether-trusted-composition",
+            "session_id": authorization.session_id,
+            "activation_epoch": authorization.activation_epoch,
+            "activation_scope": authorization.campaign_id,
+            "worker_id": f"worker:{authorization.activation_epoch}",
+            "permitted_operations": ["inspect", "invoke", "health", "shutdown"],
+            "expires_at": authorization.expires_at.timestamp(),
+        },
+    )
+    return NativePlatformProviders(
+        records=records,
+        fixture_record=fixture_record,
+        fixture_identity_token=authorization.fixture_identity_token,
+        integrity_verifier=seams.integrity_verifier,
+        launch_adapter=NativeWindowsLaunchAdapter(api=seams.launch_api, activation=activation),  # type: ignore[arg-type]
+        uia_backend_factory=(
+            lambda: (
+                build_native_uia_backend(
+                    activation=activation, pywinauto_module=seams.pywinauto_module
+                )
+                if seams.pywinauto_module is not None
+                else build_native_uia_backend(activation=activation)
+            )
+        ),
+        activity_factory=activity_factory,
+        activate=seams.foreground_provider.activate,  # type: ignore[attr-defined]
+        foreground_hwnd=seams.foreground_provider.foreground_hwnd,  # type: ignore[attr-defined]
+        event_source=NativeWindowsEventSource(api=seams.observer_api, activation=activation),  # type: ignore[arg-type]
+        observation_provider=NativeObservationProvider(
+            api=seams.observer_api,  # type: ignore[arg-type]
+            records=records,
+            integrity_verifier=seams.integrity_verifier,
+        ),
+        explorer_folder=seams.explorer_folder,
+        worker=worker,
+    )

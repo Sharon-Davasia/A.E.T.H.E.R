@@ -359,6 +359,10 @@ class EventMetadata(BaseModel):
             "mutation_may_have_happened",
             "pre_sha256",
             "post_sha256",
+            # Navigation-evidence audit (Phase 3 CP3). Opaque evidence
+            # identifiers only; never credentials or content.
+            "confirmation_id",
+            "attempt_id",
         }
         if any(key not in allowed for key in value):
             raise ValueError("event metadata key is not allow-listed")
@@ -399,6 +403,12 @@ class EventMetadata(BaseModel):
                 # written by the evidence-gated execution transition path. The
                 # event still authorizes nothing; the ledger rows did.
                 "BACKEND_EXECUTION_EVIDENCE",
+                # Phase 3 CP3: marks a transition driven by re-read
+                # durable navigation evidence; the rows did the work.
+                "BACKEND_NAVIGATION_EVIDENCE",
+                # Phase 3 CP5: marks a transition driven by re-read
+                # durable exact UI-operation evidence (separate class).
+                "BACKEND_UI_OPERATION_EVIDENCE",
             }:
                 raise ValueError("event authority metadata is invalid")
             if key == "requires_fresh_plan_and_consent" and not isinstance(item, bool):

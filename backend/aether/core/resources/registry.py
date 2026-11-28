@@ -70,15 +70,34 @@ class ResourceRegistry:
         allowed_volume_kinds: frozenset[VolumeKind] = frozenset({VolumeKind.FIXED}),
         windows_semantics: bool | None = None,
         registration_boundary: Path | None = None,
+        registration_boundary_identity: tuple[int, int] | None = None,
     ) -> None:
         self._volume_inspector = volume_inspector or _SystemVolumeInspector()
         self._allowed_volume_kinds = allowed_volume_kinds
         # Controlled-activation boundary (Activation B): when set, roots
         # may register only at or below this canonical directory. The
         # comparison uses the canonical (reparse-checked, resolved)
-        # root path, never a string prefix.
+        # root path, never a string prefix. The boundary path itself
+        # is reparse-checked BEFORE any resolution (F2): a substituted
+        # symlink/junction boundary must never silently move the
+        # authorized directory.
+        self._registration_boundary_path = (
+            Path(registration_boundary) if registration_boundary is not None else None
+        )
+        if self._registration_boundary_path is not None:
+            try:
+                reject_reparse_components(self._registration_boundary_path)
+            except PathSafetyError as exc:
+                raise ResourceRegistryError("registration_boundary_invalid") from exc
         self._registration_boundary = (
-            Path(registration_boundary).resolve() if registration_boundary is not None else None
+            self._registration_boundary_path.resolve()
+            if self._registration_boundary_path is not None
+            else None
+        )
+        self._registration_boundary_identity = (
+            tuple(registration_boundary_identity)
+            if registration_boundary_identity is not None
+            else None
         )
         self._windows_semantics = (
             os.name == "nt" if windows_semantics is None else windows_semantics
@@ -102,6 +121,9 @@ class ResourceRegistry:
         candidate = Path(path)
         if not candidate.is_absolute():
             raise ResourceRegistryError("root_must_be_absolute")
+        # The boundary itself is revalidated before the candidate is
+        # probed at all (F2).
+        boundary = self._validated_boundary()
         try:
             reject_reparse_components(candidate)
             canonical = candidate.resolve(strict=True)
@@ -110,9 +132,7 @@ class ResourceRegistry:
             raise ResourceRegistryError(_path_error_code(exc)) from exc
         if not stat.S_ISDIR(metadata.st_mode):
             raise ResourceRegistryError("root_not_directory")
-        if self._registration_boundary is not None and not canonical.is_relative_to(
-            self._registration_boundary
-        ):
+        if boundary is not None and not canonical.is_relative_to(boundary):
             raise ResourceRegistryError("root_outside_activation_boundary")
         if _is_volume_root(canonical):
             raise ResourceRegistryError("volume_root_registration_forbidden")
@@ -153,6 +173,54 @@ class ResourceRegistry:
         self._roots[root.root_id] = root
         self._aliases[normalized_alias] = root.root_id
         return root
+
+    def _validated_boundary(self) -> Path | None:
+        """Revalidate the boundary directory itself (F2).
+
+        Runs on every registration: the boundary must still exist,
+        have no reparse component, and still be the same filesystem
+        directory bound at construction. Substitution or identity
+        drift refuses registration.
+        """
+        if self._registration_boundary is None or self._registration_boundary_path is None:
+            return None
+        try:
+            reject_reparse_components(self._registration_boundary_path)
+            metadata = os.stat(self._registration_boundary_path)
+        except (OSError, PathSafetyError) as exc:
+            raise ResourceRegistryError("registration_boundary_invalid") from exc
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise ResourceRegistryError("registration_boundary_invalid")
+        if (
+            self._registration_boundary_identity is not None
+            and (
+                metadata.st_dev,
+                metadata.st_ino,
+            )
+            != self._registration_boundary_identity
+        ):
+            raise ResourceRegistryError("registration_boundary_identity_mismatch")
+        return self._registration_boundary
+
+    def is_within_registration_boundary(self, path: Path) -> bool:
+        """Whether a path lies inside the registration boundary.
+
+        With no boundary configured every path is in scope (the
+        boundary is then enforced by registration itself). With a
+        boundary, comparison uses the canonical resolved path, and
+        an unresolvable path is out of scope (fail closed).
+        """
+        if self._registration_boundary is None:
+            return True
+        try:
+            canonical = Path(path).resolve()
+        except OSError:
+            return False
+        return canonical.is_relative_to(self._registration_boundary)
+
+    def known_roots(self) -> tuple[RegisteredRoot, ...]:
+        """Read-only enumeration of registered roots (CP6 detection)."""
+        return tuple(self._roots.values())
 
     def known_resources(self) -> tuple[ResolvedResource, ...]:
         """Return every resource this registry has issued, in issuance order.

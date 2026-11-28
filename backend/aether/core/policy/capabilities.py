@@ -4,13 +4,21 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from aether.core.contracts.policy import RiskTier
 from aether.core.contracts.resource import DataClass
 
+# F09/F10: the only capability approved for the T2 exact
+# UI-operation evidence class. Read-only UIA inspection capabilities
+# never enter the effectful execution path.
+UI_EFFECTFUL_CAPABILITIES: frozenset[str] = frozenset({"uia.invoke_fixture"})
+
 _RESOURCE_ID = r"^(?:file|directory):[0-9a-fA-F-]{36}$"
+_APP_RESOURCE_ID = r"^app:[0-9a-fA-F-]{36}$"
+_WINDOW_RESOURCE_ID = r"^window:[0-9a-fA-F-]{36}$"
 _HEX_SHA256 = r"^[0-9a-fA-F]{64}$"
 
 
@@ -20,6 +28,67 @@ class CapabilityArguments(BaseModel):
 
 class ResourceArguments(CapabilityArguments):
     resource_id: str = Field(pattern=_RESOURCE_ID)
+
+
+class AppResourceArguments(CapabilityArguments):
+    """App-scoped arguments; an ``app:`` id is never a filesystem id."""
+
+    resource_id: str = Field(pattern=_APP_RESOURCE_ID)
+
+
+class WindowResourceArguments(CapabilityArguments):
+    """Window-scoped arguments; a ``window:`` id is never a filesystem id."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+
+
+class AppResolveArguments(CapabilityArguments):
+    query: str = Field(min_length=1, max_length=256)
+
+
+class WindowActivateArguments(CapabilityArguments):
+    """Bounded window activation (T1 navigation): one window ref."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+
+
+class UiaInspectArguments(CapabilityArguments):
+    """Bounded UIA snapshot inspection of one authorized window."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+    require_content: bool = False
+
+
+class UiaElementArguments(CapabilityArguments):
+    """Read-only inspection of one transient element in one snapshot."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    element_ref: str = Field(pattern=r"^el:[0-9]+$")
+
+
+class UiaInvokeFixtureArguments(CapabilityArguments):
+    """The single bounded fixture interaction (CP5): exact transient
+    element identity in one snapshot of one window. No pattern name,
+    no coordinates, no keys, no value payload can be expressed."""
+
+    resource_id: str = Field(pattern=_WINDOW_RESOURCE_ID)
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    element_ref: str = Field(pattern=r"^el:[0-9]+$")
+
+
+class AppLaunchArguments(CapabilityArguments):
+    """Immutable launch *intent*: registry-issued app id + postcondition.
+
+    Execution credentials (confirmation / authorization references)
+    are deliberately NOT plan arguments: they are issued after the
+    immutable plan exists and must never become part of the plan-hash
+    dependency. No executable path, command string or arbitrary
+    arguments can be expressed by this schema.
+    """
+
+    resource_id: str = Field(pattern=_APP_RESOURCE_ID)
+    postcondition: Literal["window_required", "background_no_window"] = "window_required"
 
 
 class ReadFileArguments(ResourceArguments):
@@ -89,6 +158,9 @@ class CapabilityRegistry:
             raise CapabilityRegistryError("CAPABILITY_ALREADY_REGISTERED")
         self._definitions[definition.capability_id] = definition
 
+    def definitions(self) -> tuple[CapabilityDefinition, ...]:
+        return tuple(self._definitions.values())
+
     def get(self, capability_id: str) -> CapabilityDefinition:
         try:
             return self._definitions[capability_id]
@@ -135,6 +207,77 @@ class CapabilityRegistry:
             ),
         ):
             registry.register(definition)
+        return registry
+
+    @classmethod
+    def phase3_foundation(cls) -> CapabilityRegistry:
+        """Phase 3 CP0-CP2 foundation contracts (observation/discovery only).
+
+        No executor is registered anywhere for these capabilities in
+        CP0-CP2, no launch/interaction capability exists here, and this
+        registry is not wired into the trusted composition. Resource
+        dispatch is by the capability's declared ``resource_kind``;
+        app/window kinds are disjoint from filesystem kinds.
+        """
+        registry = cls()
+        for definition in (
+            CapabilityDefinition("world.observe", RiskTier.OBSERVE, CapabilityArguments, None),
+            CapabilityDefinition("app.discover", RiskTier.OBSERVE, CapabilityArguments, None),
+            CapabilityDefinition("app.resolve", RiskTier.OBSERVE, AppResolveArguments, None),
+            CapabilityDefinition("app.inspect", RiskTier.OBSERVE, AppResourceArguments, "app"),
+            CapabilityDefinition(
+                "window.inspect", RiskTier.OBSERVE, WindowResourceArguments, "window"
+            ),
+        ):
+            registry.register(definition)
+        return registry
+
+    @classmethod
+    def phase3_with_launch(cls) -> CapabilityRegistry:
+        """Foundation + the bounded CP3 ``app.launch`` capability (T1).
+
+        Registration is a contract only: no executor is enabled by
+        this factory, and ordinary composition never builds it.
+        """
+        registry = cls.phase3_foundation()
+        registry.register(
+            CapabilityDefinition("app.launch", RiskTier.NAVIGATE, AppLaunchArguments, "app")
+        )
+        return registry
+
+    @classmethod
+    def phase3_with_uia(cls) -> CapabilityRegistry:
+        """Launch + CP4/CP5 bounded window/UIA capabilities.
+
+        ``window.activate`` is T1 navigation. ``uia.inspect_snapshot``
+        and ``uia.inspect_element`` are read-only observation.
+        ``uia.invoke_fixture`` is the single exact-operation fixture
+        interaction; it is risk-classified MODIFY (T2) by its intended
+        consequence and is executable only under the exact UI-operation
+        binding (CP5 sec.8). No generic invoke/set-value/keyboard/mouse
+        capability exists. Registration enables no executor by itself.
+        """
+        registry = cls.phase3_with_launch()
+        registry.register(
+            CapabilityDefinition(
+                "window.activate", RiskTier.NAVIGATE, WindowActivateArguments, "window"
+            )
+        )
+        registry.register(
+            CapabilityDefinition(
+                "uia.inspect_snapshot", RiskTier.OBSERVE, UiaInspectArguments, "window"
+            )
+        )
+        registry.register(
+            CapabilityDefinition(
+                "uia.inspect_element", RiskTier.OBSERVE, UiaElementArguments, "window"
+            )
+        )
+        registry.register(
+            CapabilityDefinition(
+                "uia.invoke_fixture", RiskTier.MODIFY, UiaInvokeFixtureArguments, "window"
+            )
+        )
         return registry
 
 

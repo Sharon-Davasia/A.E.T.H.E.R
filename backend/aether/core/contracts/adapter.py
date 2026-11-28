@@ -1,8 +1,11 @@
-"""Adapter capabilities (Phase 0 foundation).
+"""Adapter capabilities.
 
 Spec refs: Application adapter contract, Control ladder.
 Adapters declare what they can do; the broker decides authority.
-Phase 0: fake adapters only, no real OS adapters.
+Phase 0: fake adapters only. Phase 3 CP0 adds declared preparation
+semantics (``supports_prepare``) without changing existing adapters:
+preparation builds a bounded, non-effectful operation description and
+never executes anything.
 """
 
 from __future__ import annotations
@@ -23,4 +26,7 @@ class AdapterCapabilities(BaseModel):
     supports_pause: bool = False
     supports_resume: bool = False
     supports_rollback: bool = False
+    # Phase 3: adapter can prepare (describe/precompute) an operation
+    # without performing it. Default False preserves Phase 0 behaviour.
+    supports_prepare: bool = False
     health: str = Field(default="unknown", max_length=64)

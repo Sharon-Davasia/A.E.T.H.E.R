@@ -805,25 +805,29 @@ from enum import Enum
 from pydantic import BaseModel, Field
 from typing import Literal
 
+
 class RiskTier(int, Enum):
     OBSERVE = 0
     NAVIGATE = 1
     MODIFY = 2
     CRITICAL = 3
 
+
 class ResourceRef(BaseModel):
     kind: Literal["file", "directory", "app", "window", "browser_tab", "service"]
-    resource_id: str            # broker-resolved, not a trusted raw path
+    resource_id: str  # broker-resolved, not a trusted raw path
     observed_version: str | None = None
+
 
 class ProposedStep(BaseModel):
     step_id: str
     capability_id: str
-    arguments: dict             # validated against capability-specific schema
+    arguments: dict  # validated against capability-specific schema
     resources: list[ResourceRef]
     depends_on: list[str] = []
     reason: str
     expected_effect: str
+
 
 class PlanProposal(BaseModel):
     task_id: str
@@ -831,6 +835,7 @@ class PlanProposal(BaseModel):
     user_goal: str
     steps: list[ProposedStep]
     evidence_refs: list[str] = []
+
 
 class ApprovalGrant(BaseModel):
     approval_id: str
@@ -842,6 +847,7 @@ class ApprovalGrant(BaseModel):
     expires_at: str
     uses_remaining: int = Field(ge=0)
 
+
 class ActionReceipt(BaseModel):
     task_id: str
     step_id: str
@@ -849,7 +855,7 @@ class ActionReceipt(BaseModel):
     observed_effects: list[dict]
     verification_refs: list[str]
     recovery_class: Literal[
-      "REVERSIBLE", "SNAPSHOT_RESTORABLE", "COMPENSATABLE", "IRREVERSIBLE"
+        "REVERSIBLE", "SNAPSHOT_RESTORABLE", "COMPENSATABLE", "IRREVERSIBLE"
     ]
 ```
 

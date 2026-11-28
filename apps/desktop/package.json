@@ -19,7 +19,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "npm run build:renderer && tsx --test tests/*.test.ts",
     "test:python": "python -m unittest discover -s tests -p \"test_*.py\" -v",
-    "check": "npm run lint && npm run typecheck && npm test && npm run test:python && npm run build:electron"
+    "check": "npm run lint && npm run typecheck && npm test && npm run test:python && npm run build:electron",
+    "prestart": "node scripts/check-electron-runtime.mjs"
   },
   "dependencies": {
     "react": "19.2.0",

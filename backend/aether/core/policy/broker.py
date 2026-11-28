@@ -26,6 +26,15 @@ class PolicyBroker:
     broker. A valid Stage 4 exact grant is *scope-verified* by the optional
     ``grant_authority`` — it is never execution authorization, and grant
     consumption happens only at execution time (which does not exist yet).
+
+    For Phase 3 navigation the broker's ``allowed`` decision is
+    *preliminary eligibility only*: it establishes that the registered
+    capability, typed arguments and authority-issued resource scope
+    are coherent. Actual authorization to execute additionally
+    requires the trusted execution coordinator to validate and
+    consume the authoritative confirmation and launch authorization
+    and to commit the durable attempt before any external effect.
+    There is no alternate launch path around those checks.
     """
 
     def __init__(
@@ -35,10 +44,24 @@ class PolicyBroker:
         resources: ResourceRegistry | None = None,
         grant_authority: GrantAuthority | None = None,
         executors: frozenset[str] = frozenset(),
+        app_authority: object | None = None,
+        ui_authorizer: object | None = None,
     ) -> None:
         self._capabilities = capabilities
         self._resources = resources
         self._grant_authority = grant_authority
+        # F10: explicit capability-specific UI authorization check.
+        # For window-kind MODIFY capabilities the trusted approval is
+        # the exact UI-operation binding (a separate evidence class);
+        # the callable returns None when authorized, else a reason
+        # code. Filesystem capabilities never take this path and keep
+        # the exact-grant requirement untouched.
+        self._ui_authorizer = ui_authorizer
+        # Phase 3 app/window authority (AppWindowResourceAuthority).
+        # Dispatch is by the *registered capability's* declared kind,
+        # never by caller claims; filesystem kinds keep the existing
+        # ResourceRegistry path unchanged.
+        self._app_authority = app_authority
         # Capability ids for which a real, bounded execution adapter is wired in
         # *this process*. Declaring one is an explicit integration act: the
         # default is empty, so a broker built without this argument authorizes
@@ -51,6 +74,7 @@ class PolicyBroker:
         *,
         grant: GrantRequest | None = None,
         now: datetime | None = None,
+        ui_authorizer: object | None = None,
     ) -> PolicyDecision:
         """Return deterministic authorization status, without running a capability."""
         if self._capabilities is None and self._resources is None:
@@ -90,6 +114,35 @@ class PolicyBroker:
                     "Typed resource argument must match the registry-issued resource reference.",
                     definition.risk_tier >= RiskTier.MODIFY,
                 )
+            if definition.resource_kind in ("app", "window"):
+                # App/window dispatch via the Phase 3 authority only.
+                from aether.core.resources.app_window_authority import (
+                    AppWindowAuthorityError,
+                )
+
+                if self._app_authority is None:
+                    return self._deny(
+                        definition.risk_tier,
+                        "APP_RESOURCE_AUTHORITY_NOT_CONFIGURED",
+                        "No app/window resource authority is configured.",
+                        definition.risk_tier >= RiskTier.MODIFY,
+                    )
+                try:
+                    self._app_authority.authorize_ref(  # type: ignore[attr-defined]
+                        resource_ref, expected_kind=definition.resource_kind, now=now
+                    )
+                except AppWindowAuthorityError as exc:
+                    return self._deny(
+                        definition.risk_tier,
+                        exc.reason_code.upper(),
+                        "App/window resource is forged, stale or out of scope.",
+                        definition.risk_tier >= RiskTier.MODIFY,
+                    )
+                # Skip the filesystem registry check entirely.
+                authorized_via_app_authority = True
+                return self._after_resource_check(
+                    definition, request, grant, now, authorized_via_app_authority, ui_authorizer
+                )
             try:
                 self._resources.authorize_ref(
                     resource_ref,
@@ -112,6 +165,21 @@ class PolicyBroker:
                 definition.risk_tier >= RiskTier.MODIFY,
             )
 
+        return self._after_resource_check(definition, request, grant, now, False, ui_authorizer)
+
+    def _after_resource_check(
+        self,
+        definition: object,
+        request: ToolRequest,
+        grant: GrantRequest | None,
+        now: datetime | None,
+        _via_app_authority: bool,
+        ui_authorizer: object | None = None,
+    ) -> PolicyDecision:
+        """Post-resource-check policy tail (shared fs/app dispatch)."""
+        from aether.core.policy.capabilities import CapabilityDefinition
+
+        assert isinstance(definition, CapabilityDefinition)
         if definition.risk_tier == RiskTier.CRITICAL:
             return self._deny(
                 RiskTier.CRITICAL,
@@ -120,6 +188,50 @@ class PolicyBroker:
                 True,
             )
         if definition.risk_tier == RiskTier.MODIFY:
+            if definition.resource_kind == "window":
+                # Exact UI-operation authorization path (F10). Only
+                # the specifically approved fixture-interaction
+                # capability may be authorized this way.
+                from aether.core.policy.capabilities import UI_EFFECTFUL_CAPABILITIES
+
+                if definition.capability_id not in UI_EFFECTFUL_CAPABILITIES:
+                    return self._deny(
+                        RiskTier.MODIFY,
+                        "UI_CAPABILITY_NOT_APPROVED",
+                        "This window capability is not approved for UI-operation authorization.",
+                        True,
+                    )
+                authorizer = ui_authorizer if ui_authorizer is not None else self._ui_authorizer
+                if authorizer is None:
+                    return self._deny(
+                        RiskTier.MODIFY,
+                        "TRUSTED_APPROVAL_NOT_AVAILABLE",
+                        "No UI-operation authorizer is configured.",
+                        True,
+                    )
+                reason = authorizer(request)  # type: ignore[operator]
+                if reason is not None:
+                    return self._deny(
+                        RiskTier.MODIFY, str(reason), "UI-operation approval failed.", True
+                    )
+                if definition.capability_id not in self._executors:
+                    return self._deny(
+                        definition.risk_tier,
+                        "CAPABILITY_EXECUTOR_NOT_AVAILABLE",
+                        "The capability contract is registered but no execution adapter is enabled.",
+                        False,
+                    )
+                return PolicyDecision(
+                    allowed=True,
+                    risk_tier=definition.risk_tier,
+                    reason_code="UI_OPERATION_AUTHORIZED",
+                    reason=(
+                        "The exact UI-operation binding was verified by the "
+                        "trusted authorizer for this capability and scope."
+                    ),
+                    requires_approval=False,
+                    approval_id=None,
+                )
             if grant is None or self._grant_authority is None:
                 return self._deny(
                     RiskTier.MODIFY,
@@ -140,9 +252,6 @@ class PolicyBroker:
                     "T2 mutation remains denied: the exact grant failed closed validation.",
                     True,
                 )
-            # Exact scope verified, but no execution adapter exists in this
-            # phase. This is not authorization to run anything, and it never
-            # becomes one without a separately approved Phase 2C executor.
             return PolicyDecision(
                 allowed=False,
                 risk_tier=RiskTier.MODIFY,
@@ -162,17 +271,13 @@ class PolicyBroker:
                 "The capability contract is registered but no execution adapter is enabled.",
                 False,
             )
-        # A typed T0/T1 observation adapter is wired and the resource scope was
-        # verified above. This authorizes the caller to *invoke that adapter* --
-        # nothing more. The adapter still performs its own bounded, canonical
-        # re-verification before touching the filesystem.
         return PolicyDecision(
             allowed=True,
             risk_tier=definition.risk_tier,
             reason_code="CAPABILITY_AUTHORIZED",
             reason=(
-                "A bounded read-tier execution adapter is enabled for this capability "
-                "and the resource scope was verified against the registry."
+                "A bounded read/navigation-tier execution adapter is enabled for "
+                "this capability and the resource scope was verified."
             ),
             requires_approval=False,
             approval_id=None,

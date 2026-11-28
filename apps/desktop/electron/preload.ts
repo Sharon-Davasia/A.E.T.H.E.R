@@ -14,6 +14,7 @@ import type {
 } from '../shared/live';
 import type { ExactPreview } from '../shared/review';
 import type { WorkflowState } from './workflow';
+import type { Phase3AppSearch, Phase3Lifecycle, Phase3Outcome, Phase3ProjectContext, Phase3ProjectContextArm, Phase3Prepared, Phase3ProjectRegistration, Phase3Snapshot, Phase3State, Phase3Window } from '../shared/phase3';
 
 const desktopApi = Object.freeze({
   getBackendStatus: (): Promise<{ state: string; message: string }> => ipcRenderer.invoke('desktop:backend-status'),
@@ -42,6 +43,35 @@ const desktopApi = Object.freeze({
   openProjectFolder: (): Promise<WorkflowStep<OpenOutcome>> =>
     ipcRenderer.invoke('desktop:workflow-open-folder'),
   getWorkflowState: (): Promise<WorkflowState> => ipcRenderer.invoke('desktop:workflow-state'),
+  // CP7 Phase 3 verification surface: bounded summaries only. The
+  // approval request carries only a task identity; the trusted flow
+  // (preview -> native confirmation -> main-signed gesture) is owned
+  // entirely by the main process.
+  phase3GetState: (): Promise<Phase3State> => ipcRenderer.invoke('desktop:phase3-state'),
+  phase3GetLifecycle: (): Promise<Phase3Lifecycle> => ipcRenderer.invoke('desktop:phase3-lifecycle'),
+  phase3SetPrivacy: (privacy: { optedIn: boolean; mode: string; paused: boolean }): Promise<Phase3State> =>
+    ipcRenderer.invoke('desktop:phase3-set-privacy', privacy),
+  phase3SearchApps: (query: string): Promise<Phase3AppSearch> => ipcRenderer.invoke('desktop:phase3-search-apps', query),
+  phase3ArmProjectContext: (): Promise<Phase3ProjectContextArm> => ipcRenderer.invoke('desktop:phase3-arm-project-context'),
+  phase3CheckProjectContext: (): Promise<Phase3ProjectContext> => ipcRenderer.invoke('desktop:phase3-check-project-context'),
+  phase3CancelProjectContext: (): Promise<{ status: 'ready'; cancelled: boolean }> => ipcRenderer.invoke('desktop:phase3-cancel-project-context'),
+  phase3InspectWindow: (windowId: string): Promise<Phase3Snapshot> => ipcRenderer.invoke('desktop:phase3-inspect-window', windowId),
+  phase3ApproveInteraction: (request: string | { taskId: string; preview?: Phase3Prepared }): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-approve-interaction', request),
+  phase3GetTask: (taskId: string): Promise<{ status: string; taskState?: string; attempts?: unknown[] }> =>
+    ipcRenderer.invoke('desktop:phase3-task', taskId),
+  phase3PauseTask: (taskId: string): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-pause-task', taskId),
+  phase3ListWindows: (): Promise<Phase3Window[]> => ipcRenderer.invoke('desktop:phase3-list-windows'),
+  phase3PrepareLaunch: (appId: string): Promise<Phase3Prepared> => ipcRenderer.invoke('desktop:phase3-prepare-launch', appId),
+  phase3PrepareActivation: (windowId: string): Promise<Phase3Prepared> => ipcRenderer.invoke('desktop:phase3-prepare-activation', windowId),
+  phase3PrepareFixture: (windowId: string): Promise<Phase3Prepared> => ipcRenderer.invoke('desktop:phase3-prepare-fixture', windowId),
+  phase3ApproveOperation: (request: { taskId: string; effect: string; preview?: Phase3Prepared }): Promise<Phase3Outcome> =>
+    ipcRenderer.invoke('desktop:phase3-approve-operation', request),
+  phase3GetReceipt: (taskId: string): Promise<unknown> => ipcRenderer.invoke('desktop:phase3-receipt', taskId),
+  phase3CancelTask: (taskId: string): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-cancel-task', taskId),
+  phase3ResumeTask: (taskId: string): Promise<Phase3Outcome> => ipcRenderer.invoke('desktop:phase3-resume-task', taskId),
+  // No path argument: the directory is chosen and confirmed in the
+  // main process; the renderer can only request the trusted flow.
+  phase3RegisterProject: (): Promise<Phase3ProjectRegistration> => ipcRenderer.invoke('desktop:phase3-register-project'),
 });
 
 contextBridge.exposeInMainWorld('aetherDesktop', desktopApi);
